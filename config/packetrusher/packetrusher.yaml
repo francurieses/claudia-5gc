@@ -1,0 +1,52 @@
+# PacketRusher configuration for Xn Handover testing
+# https://github.com/HewlettPackard/PacketRusher
+# Used with: make handover-test (docker compose --profile handover)
+# Xn handover is triggered via CLI: multi-ue-pdu --timeBeforeXnHandover 5000
+
+gnodeb:
+  controlif:
+    ip: "172.30.1.20"
+    port: 9487
+  dataif:
+    ip: "172.30.3.10"
+    port: 2152
+  plmnlist:
+    mcc: "001"
+    mnc: "01"
+    tac: "000001"
+    gnbid: "000002"
+  slicesupportlist:
+    sst: "01"
+    sd: "000001"
+
+ue:
+  msin: "0000000001"
+  key: "465b5ce8b199b49faa5f0a2ee238a6bc"
+  opc: "cd63cb71954a9f4e48a5994e37a02baf"
+  amf: "b9b9"
+  sqn: "000000000000"
+  dnn: "internet"
+  routingindicator: "0000"
+  hplmn:
+    mcc: "001"
+    mnc: "01"
+  snssai:
+    sst: "01"
+    sd: "000001"
+  integrity:
+    nia0: false
+    nia1: false
+    nia2: true
+    nia3: false
+  ciphering:
+    nea0: false
+    nea1: false
+    nea2: true
+    nea3: false
+
+amfif:
+  - ip: "amf"
+    port: 38412
+
+logs:
+  level: 4

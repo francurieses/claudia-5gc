@@ -1,0 +1,20 @@
+# NRF — Development configuration
+# Schema: nf/nrf/internal/config/config.go
+
+# UUID estable para esta instancia de NRF (TS 29.510 §6.1.6.2.2)
+nf_instance_id: "00000000-0000-4000-8000-000000000001"
+
+# plmn is read from config/operator.yaml — single source of truth.
+
+sbi:
+  address: "0.0.0.0:8000"
+  tls:
+    cert_file: "/etc/5gc/pki/nrf.crt"
+    key_file: "/etc/5gc/pki/nrf.key"
+    ca_file: "/etc/5gc/pki/ca.crt"
+
+# Heartbeat default per TS 29.510 (recommended 90s)
+heartbeat_timeout_sec: 90
+
+metrics:
+  address: "0.0.0.0:9100"

@@ -1,0 +1,51 @@
+supi: 'imsi-001010000000002'
+mcc: '001'
+mnc: '01'
+protectionScheme: 0
+routingIndicator: '0000'
+key: '465b5ce8b199b49faa5f0a2ee238a6bc'
+op: 'cd63cb71954a9f4e48a5994e37a02baf'
+opType: 'OPC'
+amf: 'b9b9'
+imei: '356938035643804'
+imeiSv: '4370816125816152'
+gnbSearchList:
+  - ueransim-gnb
+uacAic:
+  mps: false
+  mcs: false
+uacAcc:
+  normalClass: 0
+  class11: false
+  class12: false
+  class13: false
+  class14: false
+  class15: false
+sessions:
+  - type: 'IPv4'
+    apn: 'internet'
+    slice:
+      sst: 1
+      sd: 0x000001
+  - type: 'IPv4'
+    apn: 'gold'
+    slice:
+      sst: 1
+      sd: 0x000002   # gold slice (eMBB premium)
+configured-nssai:
+  - sst: 1
+    sd: 0x000002
+default-nssai:
+  - sst: 1
+    sd: 0x000002
+integrity:
+  IA1: false
+  IA2: true
+  IA3: false
+ciphering:
+  EA1: false
+  EA2: true
+  EA3: false
+integrityMaxRate:
+  uplink: 'full'
+  downlink: 'full'

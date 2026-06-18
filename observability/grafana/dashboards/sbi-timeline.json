@@ -1,0 +1,51 @@
+{
+  "title": "5GC — SBI Procedures Timeline",
+  "uid": "5gc-sbi-timeline",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["5gc", "sbi"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "logs",
+      "title": "All NF Logs (last 15m)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{nf=~\".+\"} | json",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Procedures by NF",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "sum by (nf, procedure) (count_over_time({nf=~\".+\"} | json | procedure != \"\" [5m]))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Last 50 procedures",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{nf=~\".+\"} | json | procedure != \"\" | line_format \"{{.ts}} {{.nf}} {{.procedure}} {{.interface}} {{.direction}} supi={{.supi}}\"",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 }
+    }
+  ]
+}

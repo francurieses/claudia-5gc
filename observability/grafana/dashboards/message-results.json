@@ -1,0 +1,369 @@
+{
+  "title": "5GC — Message Results (Success / Failure)",
+  "uid": "5gc-message-results",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["5gc", "nas", "sbi", "ngap"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "NAS Messages (N1 — AMF)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "NAS Message Rate (all types)",
+      "description": "Rate of NAS messages processed by the AMF, by message type and direction.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (message_type, direction) (rate(fivegc_nas_messages_total{nf=\"AMF\"}[1m]) * 60)",
+          "legendFormat": "{{message_type}} {{direction}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "NAS Success vs Failure Rate",
+      "description": "NAS messages by result (OK vs FAILURE) aggregated across all types.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(fivegc_nas_messages_total{nf=\"AMF\",result=\"OK\"}[1m])) * 60",
+          "legendFormat": "Success",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fivegc_nas_messages_total{nf=\"AMF\",result=\"FAILURE\"}[1m])) * 60",
+          "legendFormat": "Failure",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Success" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failure" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "NAS Message Totals by Type",
+      "description": "Cumulative NAS message counters by type and direction.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (message_type, direction, result) (fivegc_nas_messages_total{nf=\"AMF\"})",
+          "legendFormat": "{{message_type}} {{direction}} {{result}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "options": {
+        "sortBy": [{ "displayName": "Value", "desc": true }]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "SBI Requests (HTTP/2 — all NFs)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "SBI Request Rate by NF",
+      "description": "SBI HTTP/2 request rate per NF, any status code.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (nf) (rate(fivegc_sbi_requests_total[1m])) * 60",
+          "legendFormat": "{{nf}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "SBI Success (2xx) vs Error (4xx/5xx) Rate",
+      "description": "SBI requests by HTTP status class across all NFs.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(fivegc_sbi_requests_total{status_code=\"2xx\"}[1m])) * 60",
+          "legendFormat": "2xx Success",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fivegc_sbi_requests_total{status_code=\"4xx\"}[1m])) * 60",
+          "legendFormat": "4xx Client Error",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(fivegc_sbi_requests_total{status_code=\"5xx\"}[1m])) * 60",
+          "legendFormat": "5xx Server Error",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "2xx Success" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "4xx Client Error" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "5xx Server Error" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 }
+    },
+    {
+      "id": 8,
+      "type": "heatmap",
+      "title": "SBI Request Latency Distribution",
+      "description": "Heatmap of SBI handler latency buckets (all NFs combined).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (le) (rate(fivegc_sbi_request_duration_seconds_bucket[1m]))",
+          "legendFormat": "{{le}}",
+          "refId": "A",
+          "format": "heatmap"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": { "unit": "s", "decimals": 3 }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "SBI Latency P95 per NF",
+      "description": "95th-percentile SBI request duration per NF. Computed from the fivegc_sbi_request_duration_seconds histogram.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (nf, le)(rate(fivegc_sbi_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{nf}} P95",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 5 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "SBI Latency P99 per NF",
+      "description": "99th-percentile SBI request duration per NF — tail latency indicator.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (nf, le)(rate(fivegc_sbi_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{nf}} P99",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.05 },
+              { "color": "red", "value": 0.2 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "3GPP Procedures",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }
+    },
+    {
+      "id": 10,
+      "type": "piechart",
+      "title": "Procedure Results Distribution",
+      "description": "Pie chart of all procedure outcomes (OK / REJECT / FAILURE) across all NFs.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (result) (fivegc_procedure_total)",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "OK" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "REJECT" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "FAILURE" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "pieType": "donut",
+        "legend": { "displayMode": "table", "placement": "right" }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 43 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Procedure Success Rate Over Time",
+      "description": "Ratio of OK procedures to total procedures per NF.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (nf, procedure) (rate(fivegc_procedure_total{result=\"OK\"}[5m])) / sum by (nf, procedure) (rate(fivegc_procedure_total[5m]))",
+          "legendFormat": "{{nf}} {{procedure}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.9 },
+              { "color": "green", "value": 0.99 }
+            ]
+          },
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 43 }
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Distributed Traces (Jaeger)",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 }
+    },
+    {
+      "id": 13,
+      "type": "traces",
+      "title": "Recent Traces — InitialRegistration",
+      "description": "Live trace list for the InitialRegistration span from Jaeger. Click a trace to open the flame graph.",
+      "datasource": { "type": "jaeger", "uid": "jaeger" },
+      "targets": [
+        {
+          "query": "InitialRegistration/Phase1",
+          "queryType": "search",
+          "refId": "A",
+          "service": "AMF"
+        }
+      ],
+      "options": {
+        "dedupStrategy": "none"
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 }
+    }
+  ]
+}

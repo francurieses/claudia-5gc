@@ -1,0 +1,16 @@
+# UDR — Development configuration
+
+nf_instance_id: "00000000-0000-4008-8000-000000000001"
+
+sbi:
+  address: "0.0.0.0:8005"
+  tls:
+    cert_file: "/etc/5gc/pki/udr.crt"
+    key_file:  "/etc/5gc/pki/udr.key"
+    ca_file:   "/etc/5gc/pki/ca.crt"
+
+metrics:
+  address: "0.0.0.0:9104"
+
+peers:
+  nrf: "nrf:8000"

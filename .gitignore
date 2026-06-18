@@ -1,0 +1,43 @@
+# Binaries
+**/bin/
+**/*.test
+**/*.out
+coverage.out
+
+# PKI — private keys are never committed
+pki/*.key
+pki/*.csr
+pki/*.srl
+pki/*.cnf
+# ca.crt is public and needed to verify NF connections
+!pki/ca.crt
+
+# PCAPs
+pcaps/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker local overrides
+docker-compose.override.yml
+
+# UERANSIM dev fork (throwaway source tree — the patch set is the committed artifact)
+tools/ueransim/.fork/
+graphify-out/
+
+# 3GPP OpenAPI: YAML specs committed (frozen Rel-17); generated Go code is not
+**/generated/
+
+# MCP local config has machine-specific absolute paths — copy from local.yaml.example
+mcp/config/local.yaml
+
+# Go toolchain tarballs should never be committed
+go*.linux-amd64.tar.gz
+go*.darwin-amd64.tar.gz
+go*.windows-amd64.zip

@@ -1,0 +1,354 @@
+{
+  "title": "5GC — UE Connections",
+  "uid": "5gc-ue-connections",
+  "schemaVersion": 39,
+  "version": 1,
+  "tags": ["5gc", "ue", "amf"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "UEs Registered (5GMM-REGISTERED)",
+      "description": "Number of UEs in 5GMM-REGISTERED state right now. Source: fivegc_ue_registered gauge.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fivegc_ue_registered{nf=\"AMF\"})",
+          "legendFormat": "Registered UEs",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "UEs Connected (N2 Associations)",
+      "description": "Number of UE contexts with an active N2/NGAP association. Source: fivegc_ue_connected gauge.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fivegc_ue_connected{nf=\"AMF\"})",
+          "legendFormat": "Connected UEs",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 200 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Registrations OK (last 5m)",
+      "description": "Successful Initial Registration procedures in the last 5 minutes.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=\"OK\"}[5m])",
+          "legendFormat": "OK",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Registrations Failed (last 5m)",
+      "description": "Rejected or failed Initial Registration procedures in the last 5 minutes.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=~\"REJECT|FAILURE\"}[5m])",
+          "legendFormat": "Failed",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "UE Count Over Time",
+      "description": "Registered and connected UE count sampled every 10 seconds by the AMF.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "fivegc_ue_registered{nf=\"AMF\"}",
+          "legendFormat": "Registered",
+          "refId": "A"
+        },
+        {
+          "expr": "fivegc_ue_connected{nf=\"AMF\"}",
+          "legendFormat": "Connected (N2)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "opacity"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Registered" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Connected (N2)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Registration Rate (per minute)",
+      "description": "Rate of Initial Registration procedures broken down by result.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fivegc_procedure_total{procedure=\"InitialRegistration\",result=\"OK\"}[1m]) * 60",
+          "legendFormat": "OK / min",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(fivegc_procedure_total{procedure=\"InitialRegistration\",result=~\"REJECT|FAILURE\"}[1m]) * 60",
+          "legendFormat": "Failed / min",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "OK / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failed / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 }
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "Recent Registration Events",
+      "description": "Live log stream filtered to InitialRegistration procedure events.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [
+        {
+          "expr": "{nf=\"AMF\"} | json | procedure=\"InitialRegistration\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "dedupStrategy": "none"
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 }
+    },
+    {
+      "id": 8,
+      "type": "piechart",
+      "title": "CM-CONNECTED vs CM-IDLE",
+      "description": "Current ratio of UEs in CM-CONNECTED (active N2) vs CM-IDLE state.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(fivegc_ue_connected{nf=\"AMF\"})",
+          "legendFormat": "CM-CONNECTED",
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "expr": "clamp_min(sum(fivegc_ue_registered{nf=\"AMF\"}) - sum(fivegc_ue_connected{nf=\"AMF\"}), 0)",
+          "legendFormat": "CM-IDLE",
+          "refId": "B",
+          "instant": true
+        }
+      ],
+      "options": {
+        "displayLabels": ["name", "percent"],
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "tooltip": { "mode": "single" }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 21 }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Service Request Rate (per minute)",
+      "description": "UE-triggered Service Requests — UEs transitioning from CM-IDLE to CM-CONNECTED.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"ServiceRequest\",result=\"OK\"}[1m]) * 60",
+          "legendFormat": "OK / min",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"ServiceRequest\",result=~\"REJECT|FAILURE\"}[1m]) * 60",
+          "legendFormat": "Failed / min",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "OK / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failed / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 21 }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "NW-Deregistration Rate (per minute)",
+      "description": "Network-initiated deregistrations — management API calls or timer-based implicit detach.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"NetworkDeregistration\",result=\"OK\"}[1m]) * 60",
+          "legendFormat": "OK / min",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"NetworkDeregistration\",result=~\"REJECT|FAILURE\"}[1m]) * 60",
+          "legendFormat": "Failed / min",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "OK / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failed / min" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 21 }
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+nf_instance_id: "00000000-0000-4006-8000-000000000001"
+
+# plmn is read from config/operator.yaml — single source of truth.
+
+sbi:
+  address: "0.0.0.0:8006"
+  cert_file: /etc/5gc/pki/pcf.crt
+  key_file: /etc/5gc/pki/pcf.key
+  ca_file: /etc/5gc/pki/ca.crt
+
+peers:
+  nrf: "nrf:8000"
+  udr: "udr:8005"
+
+metrics:
+  address: "0.0.0.0:9106"
+
+# Default SM policy returned to SMF for all PDU sessions.
+# Ref: TS 29.512 §5.2.2.2
+default_sm_policy:
+  session_ambr_uplink: "100 Mbps"
+  session_ambr_downlink: "100 Mbps"
+  5qi: 9
+  arp_priority_level: 8
+  arp_preempt_cap: "NOT_PREEMPT"
+  arp_preempt_vuln: "NOT_PREEMPTABLE"
+  flow_description: "permit out ip from any to assigned"
+  flow_precedence: 100
+
+# Default URSP rules delivered to all UEs at registration.
+# Per-subscriber overrides are stored in UDR (subscription_policy table).
+# Ref: TS 24.526 §4.2, TS 23.503 §6.6
+default_ursp:
+  rules:
+    - precedence: 255
+      traffic_descriptor:
+        match_all: true
+      route_descriptors:
+        - precedence: 1
+          ssc_mode: 1
+          snssai:
+            sst: 1
+            sd: "000001"
+          dnn: "internet"
+          pdu_session_type: 1

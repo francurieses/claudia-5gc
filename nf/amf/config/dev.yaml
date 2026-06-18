@@ -1,0 +1,40 @@
+amf_id: 1
+amf_region_id: 1
+amf_set_id: 1
+features:
+    ursp_enabled: true
+metrics:
+    address: 0.0.0.0:9101
+nf_instance_id: 00000000-0000-4001-8000-000000000001
+ngap:
+    address: 0.0.0.0:38412
+peers:
+    ausf: ausf:8002
+    nrf: nrf:8000
+    nssf: nssf:8007
+    pcf: pcf:8006
+    smf: smf:8004
+    udm: udm:8003
+sbi:
+    address: 0.0.0.0:8001
+    ca_file: /etc/5gc/pki/ca.crt
+    cert_file: /etc/5gc/pki/amf.crt
+    key_file: /etc/5gc/pki/amf.key
+security:
+    null_ciphering: true
+snssais:
+    - sd: "000001"
+      sst: 1
+    - sd: "000002"
+      sst: 1
+    - sd: "000001"
+      sst: 2
+    - sd: "000001"
+      sst: 3
+    - sd: "001234"
+      sst: 1
+timers:
+    implicit_detach_secs: 60
+    mobile_reachable_guard_secs: 120
+    pending_removal_watchdog_secs: 30
+    t3512_secs: 60

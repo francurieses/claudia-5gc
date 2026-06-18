@@ -1,0 +1,361 @@
+================================================================================
+UERANSIM v3.2.8 — NAS Authentication Request (0x56) Decoding Analysis
+================================================================================
+
+REPOSITORY: https://github.com/aligungr/UERANSIM
+VERSION: v3.2.8 (tagged release)
+ANALYSIS DATE: 2026-05-11
+
+================================================================================
+1. ERROR: "Bad constructed NAS message"
+================================================================================
+
+FILE: src/lib/nas/encode.cpp
+LINE: 236 (in DecodeViaBuilder<T> template function)
+
+EXACT CODE:
+───────────────────────────────────────────────────────────────────────────────
+template <typename T>
+static T *DecodeViaBuilder(const OctetView &stream)
+{
+    T *p = new T();
+
+    NasMessageBuilder builder{};
+    p->onBuild(builder);
+
+    for (auto &f : builder.mandatoryDecoders)
+        f(stream);
+
+    while (stream.hasNext())
+    {
+        int iei = stream.peekI();
+        if (builder.optionalDecoders.count(iei))
+            builder.optionalDecoders[iei](stream);
+        else if (builder.optionalDecoders.count((iei >> 4) & 0xF))
+            builder.optionalDecoders[(iei >> 4) & 0xF](stream);
+        else
+            throw std::runtime_error("Bad constructed NAS message");  // LINE 236
+    }
+
+    return p;
+}
+───────────────────────────────────────────────────────────────────────────────
+
+TRIGGER CONDITION:
+──────────────────
+The error is thrown when:
+1. All mandatory IEs are successfully decoded
+2. The stream still has remaining bytes (stream.hasNext() == true)
+3. The next IEI (Information Element Identifier) at stream position:
+   - Is NOT found in the optionalDecoders map (exact match)
+   - AND is NOT found when masked as (iei >> 4) & 0xF (half-octet match for Type-1 IEs)
+
+EXPLANATION:
+────────────
+The decoder reads the IEI byte, checks two conditions:
+  a) Direct lookup: Is this IEI in the optional decoders table?
+  b) Half-octet match: For Type-1 IEs (variable in high nibble), mask the lower
+     4 bits and check if that's in the optional decoders table
+
+If both checks fail, the decoder rejects the message as malformed because it
+encountered an unexpected/unrecognized optional IE.
+
+================================================================================
+2. AUTHENTICATION REQUEST (0x56) STRUCTURE
+================================================================================
+
+FILE: src/lib/nas/msg.hpp (struct definition)
+FILE: src/lib/nas/msg.cpp (onBuild method)
+FILE: src/lib/nas/encode.cpp (DecodePlainMmMessage dispatcher at line 244)
+
+MESSAGE TYPE:
+─────────────
+Binary:  0b01010110
+Hex:     0x56
+Decimal: 86
+Location in enum: EMessageType::AUTHENTICATION_REQUEST
+
+STRUCT DEFINITION:
+──────────────────
+struct AuthenticationRequest : PlainMmMessage
+{
+    IENasKeySetIdentifier ngKSI{};              // Type-1 IE (half-octet)
+    IEAbba abba{};                              // Mandatory variable-length IE
+    std::optional<IEAuthenticationParameterRand> authParamRAND{};   // Type-3 or 4 IE
+    std::optional<IEAuthenticationParameterAutn> authParamAUTN{};   // Type-3 or 4 IE
+    std::optional<IEEapMessage> eapMessage{};   // Type-3 or 4 IE
+
+    AuthenticationRequest();
+    void onBuild(NasMessageBuilder &b);
+};
+
+BUILD SPECIFICATION (onBuild method):
+──────────────────────────────────────
+void AuthenticationRequest::onBuild(NasMessageBuilder &b)
+{
+    b.mandatoryIE1(&ngKSI);           // MANDATORY: Type-1, in high nibble of 1st byte
+    b.mandatoryIE(&abba);             // MANDATORY: Variable-length IE
+    b.optionalIE(0x21, &authParamRAND);   // OPTIONAL: IEI=0x21
+    b.optionalIE(0x20, &authParamAUTN);   // OPTIONAL: IEI=0x20
+    b.optionalIE(0x78, &eapMessage);      // OPTIONAL: IEI=0x78
+}
+
+================================================================================
+3. DECODING PROCESS FOR AUTHENTICATION REQUEST
+================================================================================
+
+ENTRY POINT:
+────────────
+Function: DecodeNasMessage(const OctetView &stream)
+Location: src/lib/nas/encode.cpp
+
+CALL CHAIN:
+───────────
+DecodeNasMessage()
+  ↓
+[Parses EPD (Extended Protocol Discriminriptor)]
+  ↓
+[Checks if EPD == EExtendedProtocolDiscriminator::MOBILITY_MANAGEMENT_MESSAGES]
+  ↓
+DecodePlainMmMessage(stream, messageType)  [where messageType = 0x56]
+  ↓
+DecodeViaBuilder<AuthenticationRequest>(stream)
+
+STEP-BY-STEP DECODING:
+──────────────────────
+
+STEP 1: Parse message header (outside DecodeViaBuilder)
+────────────────────────────────────────────────────────
+- Byte 0: Extended Protocol Discriminator (EPD)
+  Expected: 0x7E (MOBILITY_MANAGEMENT_MESSAGES)
+  
+- Byte 1: Security Header Type (SHT) in high nibble, Sequence Number in low nibble
+  For plain message: SHT = 0x0 (NOT_PROTECTED)
+  
+- Byte 2: Message Type
+  Expected: 0x56 (AUTHENTICATION_REQUEST)
+
+STEP 2: Inside DecodeViaBuilder<AuthenticationRequest>
+──────────────────────────────────────────────────────
+
+Execution phase:
+1. Create AuthenticationRequest object
+2. Call AuthenticationRequest::onBuild(builder)
+   - Registers mandatory decoders for ngKSI and abba
+   - Registers optional decoders for IEIs 0x21, 0x20, 0x78
+
+3. Decode MANDATORY IEs (byte 3 onwards):
+   
+   a) ngKSI (Type-1, 4 bits)
+      - Read 1 byte (byte 3)
+      - Byte format: [ngKSI nibble in high 4 bits][spare in low 4 bits]
+      - Extract: ngKSI = (byte >> 4) & 0xF
+      - EXAMPLE: byte=0x62 → ngKSI=6 (binary 0110)
+   
+   b) abba (Variable-length, Type-4 IE)
+      - Read 1 byte (length)
+      - Read N bytes of data
+      - EXAMPLE: byte 4 = 0x04, bytes 5-8 = [ABBA data 1] [ABBA data 2] ...
+
+4. Loop over remaining bytes as optional IEs:
+   
+   While stream.hasNext():
+   - Peek at IEI byte
+   - Check if IEI matches 0x21 (authParamRAND) → decode it
+   - Check if IEI matches 0x20 (authParamAUTN) → decode it
+   - Check if IEI matches 0x78 (eapMessage) → decode it
+   - Else → throw "Bad constructed NAS message"
+
+================================================================================
+4. INFORMATION ELEMENT (IE) TYPES
+================================================================================
+
+UERANSIM uses a 6-type IE encoding scheme:
+
+TYPE-1 (T1): Half-octet (4 bits)
+──────────────────────────────
+- Occupies 4 bits (either high or low nibble)
+- No length field
+- Example: ngKSI in AuthenticationRequest
+- Format: [iei:4bits][value:4bits] in one octet
+
+TYPE-2 (T2): Single octet, no value
+──────────────────────────────────
+- Presence indicates value
+- No length, no content
+- Example: certain flags
+
+TYPE-3 (T3): Variable length, with IEI
+──────────────────────────────────────
+- Format: [IEI:8bits][data...]
+- IEI is 8-bit identifier
+- Data length determined by IE-specific decode function
+
+TYPE-4 (T4): Variable length with length field
+──────────────────────────────────────────
+- Format: [IEI:8bits][Length:8bits][data...]
+- Typical for larger IEs
+- Example: ABBA (most likely), authParamRAND, authParamAUTN
+
+TYPE-6 (T6): Variable length with 2-byte length field
+────────────────────────────────────────────────────
+- Format: [IEI:8bits][Length:16bits][data...]
+- For very large IEs
+
+For AuthenticationRequest optional IEs:
+- 0x21 (authParamRAND): Likely Type-4 (with length byte)
+- 0x20 (authParamAUTN): Likely Type-4 (with length byte)
+- 0x78 (eapMessage): Likely Type-4 (with length byte)
+
+================================================================================
+5. BYTE-LEVEL AUTHENTICATION REQUEST EXAMPLE
+================================================================================
+
+Assuming a minimal Authentication Request with all mandatory IEs and two
+optional IEs (authParamRAND and authParamAUTN):
+
+BYTE POSITION | HEX VALUE | DESCRIPTION
+──────────────┼───────────┼─────────────────────────────────────────────
+0             | 0x7E      | EPD: Mobility Management Messages
+1             | 0x00      | SHT: Not Protected (high nibble=0), Seq=0 (low nibble=0)
+2             | 0x56      | Message Type: Authentication Request
+3             | 0x62      | ngKSI: 6 (high nibble), spare: 2 (low nibble)
+4             | 0x04      | ABBA length: 4 bytes
+5             | 0xAA      | ABBA[0]
+6             | 0xBB      | ABBA[1]
+7             | 0xCC      | ABBA[2]
+8             | 0xDD      | ABBA[3]
+9             | 0x21      | IEI: authParamRAND
+10            | 0x10      | RAND length: 16 bytes
+11-26         | ...       | RAND value (16 bytes)
+27            | 0x20      | IEI: authParamAUTN
+28            | 0x10      | AUTN length: 16 bytes
+29-44         | ...       | AUTN value (16 bytes)
+
+TOTAL: 45 bytes
+
+ERROR SCENARIO:
+───────────────
+If after position 44 there's an extra byte, say 0xAF:
+- Decoder reads 0xAF as IEI
+- Checks: Is 0xAF in optionalDecoders? NO
+- Checks: Is (0xAF >> 4) & 0xF = 0xA in optionalDecoders? NO
+- THROWS: "Bad constructed NAS message"
+
+================================================================================
+6. DECODER STATE MACHINE
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        DecodeViaBuilder<T> Flow                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+START
+  ↓
+Create message object T()
+  ↓
+Call T::onBuild(builder)
+  ↓
+[Populate builder.mandatoryDecoders and builder.optionalDecoders]
+  ↓
+FOR EACH mandatory decoder in builder:
+    Call decoder(stream)
+    │
+    └─→ Reads from stream
+        Stores result in message field
+  ↓
+WHILE stream.hasNext():
+    Peek IEI from stream
+    │
+    ├─→ IF IEI in optionalDecoders:
+    │   └─→ Call optionalDecoders[IEI](stream)
+    │       (This also reads and consumes the IEI byte)
+    │
+    ├─→ ELSE IF (IEI >> 4) in optionalDecoders:
+    │   └─→ Call optionalDecoders[(IEI >> 4)](stream)
+    │       (For Type-1 IEs where IEI varies in high nibble)
+    │
+    └─→ ELSE:
+        THROW std::runtime_error("Bad constructed NAS message")
+  ↓
+RETURN message object
+  ↓
+END
+
+KEY OBSERVATION:
+────────────────
+The half-octet check (iei >> 4) & 0xF is intended for Type-1 IEs where:
+- The IEI value is in the HIGH nibble (bits 4-7)
+- The value is in the LOW nibble (bits 0-3)
+- But when peeking, you see the full byte with both nibbles
+
+For AuthenticationRequest, ngKSI is a Type-1 IE, but it's the FIRST mandatory
+IE (handled in mandatory phase), not optional. The optional IEs (0x21, 0x20,
+0x78) are all Type-3/4 with full 8-bit IEI, so they don't benefit from the
+half-octet optimization.
+
+================================================================================
+7. VALIDATION RULES IN DECODE PATH
+================================================================================
+
+VALIDATION CHECKPOINT 1: Mandatory IE Completeness
+──────────────────────────────────────────────────
+- For AuthenticationRequest, the mandatory decoders list contains:
+  1. ngKSI decoder
+  2. ABBA decoder
+  
+- These MUST be present in the stream, in order
+- If stream ends before decoding both, OctetView will throw its own error
+  (e.g., "Insufficient data for IE1 decode")
+
+VALIDATION CHECKPOINT 2: Optional IE Recognition
+────────────────────────────────────────────────
+- After mandatory IEs are consumed, any remaining bytes must be recognized as
+  one of the 3 optional IEI values: 0x21, 0x20, 0x78
+- Unknown IEIs trigger "Bad constructed NAS message"
+
+VALIDATION CHECKPOINT 3: IE-Specific Validation
+───────────────────────────────────────────────
+- Each IE's Decode method (e.g., IEAbba::Decode) may have internal checks
+- For example, authParamRAND and authParamAUTN may check that length is
+  exactly 16 bytes (RAND/AUTN are fixed 16 bytes per 3GPP TS 24.501)
+
+NO GLOBAL VALIDATION FOR:
+─────────────────────────
+- Order of optional IEs (can appear in any order)
+- Multiplicity of optional IEs (if encoder allows sending 0x21 twice, decoder
+  would accept second occurrence, overwriting first)
+- Presence/absence of specific optional IEs (all optional)
+
+================================================================================
+8. IMPLICATIONS FOR YOUR 5GC IMPLEMENTATION
+================================================================================
+
+WHEN YOU SEND AUTHENTICATION REQUEST FROM AMF TO UE:
+
+Your encoder must follow the EXACT byte structure:
+1. Byte 0: EPD (0x7E for plain MM message, 0x78 for secured)
+2. Byte 1: SHT + Sequence Number
+3. Byte 2: Message Type (0x56)
+4. Byte 3: ngKSI (high nibble) + spare (low nibble)
+5. Byte 4: ABBA length
+6. Bytes 5+: ABBA data
+7. [Optional] IEI 0x21 + RAND length + RAND data (16 bytes)
+8. [Optional] IEI 0x20 + AUTN length + AUTN data (16 bytes)
+9. [Optional] IEI 0x78 + EAP message
+
+IF YOU SEND ANYTHING ELSE:
+──────────────────────────
+- UERANSIM will throw "Bad constructed NAS message" at DecodeViaBuilder line 236
+
+CRITICAL CHECKS FOR YOUR CODE:
+───────────────────────────────
+1. Ensure ngKSI fits in 4 bits (0-15)
+2. Ensure ABBA length byte is correct (matches actual data length)
+3. Ensure RAND and AUTN lengths are exactly 16 bytes each (fixed by TS 24.501)
+4. Do NOT include any other IEI values in the optional part
+5. Do NOT include padding or filler bytes after the last IE
+6. When security is applied (SHT != 0x0), the plaintext structure is the same,
+   but it's wrapped with [MAC:4bytes][SN:1byte][encrypted plaintext]
+
+================================================================================

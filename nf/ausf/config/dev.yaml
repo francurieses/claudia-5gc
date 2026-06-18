@@ -1,0 +1,19 @@
+# AUSF — Development configuration
+
+nf_instance_id: "00000000-0000-4002-8000-000000000001"
+
+# plmn is read from config/operator.yaml — single source of truth.
+
+sbi:
+  address: "0.0.0.0:8002"
+  tls:
+    cert_file: "/etc/5gc/pki/ausf.crt"
+    key_file:  "/etc/5gc/pki/ausf.key"
+    ca_file:   "/etc/5gc/pki/ca.crt"
+
+peers:
+  nrf: "nrf:8000"
+  udm: "udm:8003"
+
+metrics:
+  address: "0.0.0.0:9102"

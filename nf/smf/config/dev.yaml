@@ -1,0 +1,35 @@
+dnns:
+    - name: internet
+      ue_ip_pool: 10.60.0.0/24
+    - name: ims
+      ue_ip_pool: 10.61.0.0/24
+    - name: gaming
+      ue_ip_pool: 10.62.0.0/24
+    - name: gold
+      ue_ip_pool: 10.63.0.0/24
+metrics:
+    address: 0.0.0.0:9105
+nf_instance_id: 00000000-0000-4004-8000-000000000001
+peers:
+    amf_mgmt: amf:9002
+    nrf: nrf:8000
+    pcf: pcf:8006
+    udm: udm:8003
+    upf: upf:8805
+sbi:
+    address: 0.0.0.0:8004
+    ca_file: /etc/5gc/pki/ca.crt
+    cert_file: /etc/5gc/pki/smf.crt
+    key_file: /etc/5gc/pki/smf.key
+snssais:
+    - sd: "000001"
+      sst: 1
+    - sd: "000002"
+      sst: 1
+    - sd: "000001"
+      sst: 2
+    - sd: "000001"
+      sst: 3
+    - sd: "001234"
+      sst: 1
+upf_n3_addr: 172.30.3.100

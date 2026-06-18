@@ -1,0 +1,821 @@
+# 5GC Rel-17 — docker-compose.yml
+# Profiles:
+#   core            → Implemented NFs
+#   observability   → Loki + Promtail + Grafana + Prometheus + Jaeger
+#   integration-ueransim → UERANSIM gNB + UE for E2E tests
+#   handover        → PacketRusher dual-gNB Xn handover test (make handover-test)
+
+name: 5gc-rel17
+
+networks:
+  sbi-net:
+    name: 5gc-sbi
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  n2-net:
+    name: 5gc-n2
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+  n4-net:
+    name: 5gc-n4
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+  n3-net:
+    name: 5gc-n3
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.3.0/24
+  n6-net:
+    name: 5gc-n6
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.6.0/24
+  # N6 network for the "ims" DNN — IMS voice and multimedia UE traffic.
+  # Gateway 172.30.7.1 is the Docker bridge; UPF TUN upfgtp1 MASQUERADEs through it.
+  # To add a new DNN: copy this block, change name/subnet, attach UPF below.
+  n6-ims-net:
+    name: 5gc-n6-ims
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.7.0/24
+  obs-net:
+    name: 5gc-obs
+    driver: bridge
+
+volumes:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+  postgres-data:
+  redis-data:
+
+services:
+
+  # ============================================================
+  # CORE NFs
+  # ============================================================
+
+  nrf:
+    image: 5gc/nrf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/nrf/Dockerfile
+    container_name: nrf
+    hostname: nrf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [nrf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8000:8000"   # SBI HTTPS
+      - "9100:9100"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/nrf.crt:/etc/5gc/pki/nrf.crt:ro
+      - ./pki/nrf.key:/etc/5gc/pki/nrf.key:ro
+      - ./nf/nrf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      REDIS_URL: "redis:6379"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/bin/nrf", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      logging.5gc/nf: "NRF"
+
+  amf:
+    image: 5gc/amf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/amf/Dockerfile
+    container_name: amf
+    hostname: amf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [amf.5gc.local]
+      n2-net:
+        aliases: [amf-n2.5gc.local]
+      obs-net: {}
+    ports:
+      - "38412:38412"   # N2 NGAP/SCTP (TCP stub in dev)
+      - "8001:8001"     # SBI
+      - "9002:9002"     # Management API (NW-initiated ops + UCU push)
+      - "9101:9101"     # Prometheus
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/amf.crt:/etc/5gc/pki/amf.crt:ro
+      - ./pki/amf.key:/etc/5gc/pki/amf.key:ro
+      - ./nf/amf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      METRICS_ADDRESS: "0.0.0.0:9101"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
+      REDIS_URL: "redis:6379"
+      # URSP delivery toggle. Set URSP_ENABLED=false on the host to bring the
+      # core up without URSP (the AMF makes no N15 call and delivers no UE policy
+      # container). Default: enabled. See `make ueransim-ursp` / `make ueransim-no-ursp`.
+      URSP_ENABLED: "${URSP_ENABLED:-true}"
+    labels:
+      logging.5gc/nf: "AMF"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      nrf:
+        condition: service_started
+      ausf:
+        condition: service_started
+      udm:
+        condition: service_started
+      smf:
+        condition: service_started
+      nssf:
+        condition: service_started
+
+  ausf:
+    image: 5gc/ausf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/ausf/Dockerfile
+    container_name: ausf
+    hostname: ausf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [ausf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8002:8002"
+      - "9102:9102"     # Prometheus
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/ausf.crt:/etc/5gc/pki/ausf.crt:ro
+      - ./pki/ausf.key:/etc/5gc/pki/ausf.key:ro
+      - ./nf/ausf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      REDIS_URL: "redis:6379"
+    labels:
+      logging.5gc/nf: "AUSF"
+    depends_on:
+      udm:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  udm:
+    image: 5gc/udm:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/udm/Dockerfile
+    container_name: udm
+    hostname: udm.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [udm.5gc.local]
+      obs-net: {}
+    ports:
+      - "8003:8003"
+      - "9103:9103"     # Prometheus
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/udm.crt:/etc/5gc/pki/udm.crt:ro
+      - ./pki/udm.key:/etc/5gc/pki/udm.key:ro
+      - ./nf/udm/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "UDM"
+    depends_on: [udr]
+
+  udr:
+    image: 5gc/udr:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/udr/Dockerfile
+    container_name: udr
+    hostname: udr.local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      sbi-net:
+        aliases: [udr.5gc.local]
+      obs-net: {}
+    ports:
+      - "8005:8005"
+      - "9104:9104"     # Prometheus
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/udr.crt:/etc/5gc/pki/udr.crt:ro
+      - ./pki/udr.key:/etc/5gc/pki/udr.key:ro
+      - ./nf/udr/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      UE_COUNT: ${UE_COUNT:-1}
+      DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
+    labels:
+      logging.5gc/nf: "UDR"
+
+  smf:
+    image: 5gc/smf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/smf/Dockerfile
+    container_name: smf
+    hostname: smf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [smf.5gc.local]
+      n4-net:
+        aliases: [smf-n4.5gc.local]
+      obs-net: {}
+    ports:
+      - "8004:8004"   # SBI Nsmf_PDUSession
+      - "9105:9105"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/smf.crt:/etc/5gc/pki/smf.crt:ro
+      - ./pki/smf.key:/etc/5gc/pki/smf.key:ro
+      - ./nf/smf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
+    labels:
+      logging.5gc/nf: "SMF"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nrf:
+        condition: service_started
+      pcf:
+        condition: service_started
+      upf:
+        condition: service_started
+
+  pcf:
+    image: 5gc/pcf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/pcf/Dockerfile
+    container_name: pcf
+    hostname: pcf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [pcf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8006:8006"   # SBI Npcf_SMPolicyControl
+      - "9106:9106"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/pcf.crt:/etc/5gc/pki/pcf.crt:ro
+      - ./pki/pcf.key:/etc/5gc/pki/pcf.key:ro
+      - ./nf/pcf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "PCF"
+    depends_on: [nrf]
+
+  upf:
+    image: 5gc/upf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/upf/Dockerfile
+    container_name: upf
+    hostname: upf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [upf.5gc.local]
+      n3-net:
+        ipv4_address: 172.30.3.100
+        aliases: [upf-n3.5gc.local]
+      n4-net:
+        aliases: [upf-n4.5gc.local]
+      n6-net: {}       # internet DNN — TUN upfgtp0 → 172.30.6.1 gateway
+      n6-ims-net: {}   # ims DNN     — TUN upfgtp1 → 172.30.7.1 gateway
+      obs-net: {}
+    ports:
+      - "8805:8805/udp"   # N4 PFCP
+      - "2152:2152/udp"   # N3 GTP-U
+      - "9107:9107"       # Prometheus metrics
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./nf/upf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "UPF"
+
+  # NRF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  nrf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: nrf-pcap
+    network_mode: "service:nrf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [nrf]
+    volumes:
+      - ./pcaps/nrf:/pcaps
+    command: sleep infinity
+
+  # AMF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  amf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: amf-pcap
+    network_mode: "service:amf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [amf]
+    volumes:
+      - ./pcaps/amf:/pcaps
+    command: sleep infinity
+
+  nssf:
+    image: 5gc/nssf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/nssf/Dockerfile
+    container_name: nssf
+    hostname: nssf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [nssf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8007:8007"   # SBI Nnssf_NSSelection
+      - "9109:9109"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/nssf.crt:/etc/5gc/pki/nssf.crt:ro
+      - ./pki/nssf.key:/etc/5gc/pki/nssf.key:ro
+      - ./nf/nssf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "NSSF"
+    depends_on: [nrf]
+
+  # NSSF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  nssf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: nssf-pcap
+    network_mode: "service:nssf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [nssf]
+    volumes:
+      - ./pcaps/nssf:/pcaps
+    command: sleep infinity
+
+  # ============================================================
+  # OBSERVABILIDAD
+  # ============================================================
+
+  loki:
+    image: grafana/loki:2.9.4
+    profiles: [observability]
+    container_name: loki
+    networks: [obs-net]
+    ports: ["3100:3100"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    profiles: [observability]
+    container_name: promtail
+    networks: [obs-net]
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on: [loki]
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    profiles: [observability]
+    container_name: prometheus
+    networks: [obs-net, sbi-net]
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    profiles: [observability]
+    container_name: grafana
+    networks: [obs-net]
+    ports: ["3000:3000"]
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on: [loki, prometheus]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    profiles: [observability]
+    container_name: jaeger
+    networks: [obs-net, sbi-net]
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP HTTP
+      - "4317:4317"     # OTLP gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ============================================================
+  # PERSISTENCIA (compartida entre NFs que la requieran)
+  # ============================================================
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: [core]
+    container_name: postgres
+    networks: [sbi-net]
+    environment:
+      POSTGRES_USER: 5gc
+      POSTGRES_PASSWORD: 5gc-dev
+      POSTGRES_DB: 5gc
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U 5gc -d 5gc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    profiles: [core]
+    container_name: redis
+    networks: [sbi-net]
+    volumes:
+      - redis-data:/data
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ============================================================
+  # MANAGEMENT PORTAL
+  # ============================================================
+
+  mgmt-portal:
+    image: 5gc/mgmt-portal:dev
+    build:
+      context: tools/mgmt-portal
+      dockerfile: Dockerfile
+    profiles: [core]
+    container_name: mgmt-portal
+    hostname: mgmt-portal
+    restart: unless-stopped
+    networks:
+      sbi-net: {}
+      obs-net: {}
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./nf:/app/nf-configs
+      - ./pcaps:/pcaps
+      - ./config/operator.yaml:/etc/5gc/operator.yaml  # RW — portal can add/remove DNNs
+      - ./pki/mgmt-portal.crt:/etc/5gc/pki/portal.crt:ro
+      - ./pki/mgmt-portal.key:/etc/5gc/pki/portal.key:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+    environment:
+      DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
+      NRF_URL: "https://nrf:8000"
+      PROMETHEUS_URL: "http://prometheus:9090"
+      SMF_URL: "https://smf:8004"
+      AMF_URL: "http://amf:9002"
+      UDM_URL: "https://udm:8003"
+      PCF_URL: "https://pcf:8006"
+      NF_CONFIGS_PATH: "/app/nf-configs"
+      OPERATOR_CONFIG_PATH: "/etc/5gc/operator.yaml"
+      LISTEN_ADDR: ":8080"
+      PORTAL_CERT_FILE: "/etc/5gc/pki/portal.crt"
+      PORTAL_KEY_FILE: "/etc/5gc/pki/portal.key"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nrf:
+        condition: service_started
+      udr:
+        condition: service_started
+
+  # ============================================================
+  # TOOLING: MCP server (Model Context Protocol)
+  # Standalone NF exposing NAS codec / NF lifecycle / UE context /
+  # trace tools to LLM clients. Profile `tools` (not started with core).
+  #   docker compose --profile core --profile tools up
+  # ============================================================
+  mcp:
+    image: 5gc/mcp:dev
+    build:
+      context: .
+      dockerfile: mcp/Dockerfile
+    profiles: [tools]
+    container_name: mcp
+    hostname: mcp
+    restart: unless-stopped
+    networks:
+      sbi-net: {}   # reach NRF (SBI) and AMF management API
+      obs-net: {}   # reach Jaeger and Prometheus query APIs
+    ports:
+      - "9300:9300" # SSE transport
+    volumes:
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/mcp.crt:/etc/5gc/pki/mcp.crt:ro
+      - ./pki/mcp.key:/etc/5gc/pki/mcp.key:ro
+      - ./mcp/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      # In a container only the SSE transport is useful (no stdin peer).
+      MCP_TRANSPORT: "sse"
+      NRF_ADDR: "https://nrf:8000"
+      AMF_ADDR: "http://amf:9002"
+      SMF_ADDR: "https://smf:8004"
+      UDM_ADDR: "https://udm:8003"
+      JAEGER_ADDR: "http://jaeger:16686"
+      PROMETHEUS_ADDR: "http://prometheus:9090"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      # Set MCP_BEARER_TOKEN to require Bearer auth on the SSE transport.
+    depends_on:
+      nrf:
+        condition: service_started
+      amf:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/bin/mcp", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      logging.5gc/nf: "MCP"
+
+  # ============================================================
+  # INTEGRATION: UERANSIM
+  # ============================================================
+
+  ueransim-gnb:
+    image: 5gc/ueransim:dev
+    build:
+      context: .
+      dockerfile: tools/ueransim/Dockerfile
+    profiles: [integration-ueransim]
+    container_name: ueransim-gnb
+    command: nr-gnb -c /ueransim/config/gnb.yaml
+    networks:
+      sbi-net: {}
+      n2-net:
+        aliases: [ueransim-gnb]
+      n3-net:
+        ipv4_address: 172.30.3.3
+        aliases: [ueransim-gnb-n3]
+    volumes:
+      - ./config/ueransim/gnb.yaml:/ueransim/config/gnb.yaml:ro
+    cap_add: [NET_ADMIN]
+
+  ueransim-ue:
+    image: 5gc/ueransim:dev
+    build:
+      context: .
+      dockerfile: tools/ueransim/Dockerfile
+    profiles: [integration-ueransim]
+    container_name: ueransim-ue
+    # `nr-ue -n N` spawns N UEs from a single config, incrementing the IMSI
+    # (imsi-001010000000001, ...000002, ...) — each must be seeded in the UDR.
+    command: nr-ue -c /ueransim/config/ue.yaml -n ${UE_COUNT:-1}
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue.yaml:/ueransim/config/ue.yaml:ro
+    depends_on:
+      - ueransim-gnb
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  # ============================================================
+  # MULTI-SLICE TEST: 4 UEs on different slices simultaneously
+  # Start with: make ueransim-slices
+  # ============================================================
+
+  # gNB for multi-slice UEs — uses 172.30.3.4 on n3-net (avoids conflict with
+  # ueransim-gnb which holds 172.30.3.3). gtpIp in gnb-ms.yaml matches.
+  ueransim-gnb-ms:
+    image: 5gc/ueransim:dev
+    profiles: [multi-slice]
+    container_name: ueransim-gnb-ms
+    command: nr-gnb -c /ueransim/config/gnb-ms.yaml
+    networks:
+      sbi-net: {}
+      n2-net:
+        aliases: [ueransim-gnb]
+      n3-net:
+        ipv4_address: 172.30.3.4
+        aliases: [ueransim-gnb-n3]
+    volumes:
+      - ./config/ueransim/gnb-ms.yaml:/ueransim/config/gnb-ms.yaml:ro
+    cap_add: [NET_ADMIN]
+
+  ueransim-ue-internet:
+    image: 5gc/ueransim:dev
+    profiles: [multi-slice]
+    container_name: ueransim-ue-internet
+    command: nr-ue -c /ueransim/config/ue.yaml
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue.yaml:/ueransim/config/ue.yaml:ro
+    depends_on: [ueransim-gnb-ms]
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  ueransim-ue-gold:
+    image: 5gc/ueransim:dev
+    profiles: [multi-slice]
+    container_name: ueransim-ue-gold
+    command: nr-ue -c /ueransim/config/ue-gold.yaml
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue-gold.yaml:/ueransim/config/ue-gold.yaml:ro
+    depends_on: [ueransim-gnb-ms]
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  ueransim-ue-silver:
+    image: 5gc/ueransim:dev
+    profiles: [multi-slice]
+    container_name: ueransim-ue-silver
+    command: nr-ue -c /ueransim/config/ue-silver.yaml
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue-silver.yaml:/ueransim/config/ue-silver.yaml:ro
+    depends_on: [ueransim-gnb-ms]
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  ueransim-ue-bronze:
+    image: 5gc/ueransim:dev
+    profiles: [multi-slice]
+    container_name: ueransim-ue-bronze
+    command: nr-ue -c /ueransim/config/ue-bronze.yaml
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue-bronze.yaml:/ueransim/config/ue-bronze.yaml:ro
+    depends_on: [ueransim-gnb-ms]
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  # ============================================================
+  # SUCI PROFILE A TEST: Single UE with X25519 ECIES protection (TS 33.501 §C.3)
+  # Start with: make ueransim-profile-a  (shares ueransim-gnb on 172.30.3.3)
+  # Or from portal: UERANSIM page → Scenarios → SUCI Profile A → Start
+  # ============================================================
+  ueransim-ue-profile-a:
+    image: 5gc/ueransim:dev
+    profiles: [suci-profile-a]
+    container_name: ueransim-ue-profile-a
+    command: nr-ue -c /ueransim/config/ue-profile-a.yaml
+    networks:
+      n2-net: {}
+    volumes:
+      - ./config/ueransim/ue-profile-a.yaml:/ueransim/config/ue-profile-a.yaml:ro
+    privileged: true
+    cap_add: [NET_ADMIN]
+
+  # ============================================================
+  # XN HANDOVER TEST: PacketRusher dual-gNB scenario
+  # Start with: make handover-test
+  # PacketRusher: https://github.com/HewlettPackard/PacketRusher
+  # Runs UE registration + PDU session + Xn handover simulation.
+  # ============================================================
+  packetrusher:
+    build:
+      context: ./docker/packetrusher
+      dockerfile: Dockerfile
+    image: packetrusher-local
+    profiles: [handover]
+    container_name: packetrusher
+    command: >
+      --config /config/packetrusher.yaml
+      multi-ue-pdu
+      -n 1
+      --timeBeforeXnHandover 15000
+    networks:
+      sbi-net: {}
+      n2-net:
+        ipv4_address: 172.30.1.20
+      n3-net:
+        ipv4_address: 172.30.3.10
+    volumes:
+      - ./config/packetrusher:/config:ro
+    cap_add: [NET_ADMIN]
+    privileged: true
+
+  # N2 HANDOVER TEST: same dual-gNB setup, AMF-mediated preparation phase.
+  # Start with: make handover-n2-test
+  # ============================================================
+  packetrusher-n2:
+    build:
+      context: ./docker/packetrusher
+      dockerfile: Dockerfile
+    image: packetrusher-local
+    profiles: [handover-n2]
+    container_name: packetrusher-n2
+    command: >
+      --config /config/packetrusher.yaml
+      multi-ue-pdu
+      -n 1
+      --timeBeforeNgapHandover 15000
+    networks:
+      sbi-net: {}
+      n2-net:
+        ipv4_address: 172.30.1.20
+      n3-net:
+        ipv4_address: 172.30.3.10
+    volumes:
+      - ./config/packetrusher:/config:ro
+    cap_add: [NET_ADMIN]
+    privileged: true

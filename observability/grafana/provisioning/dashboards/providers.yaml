@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: 5GC Dashboards
+    orgId: 1
+    folder: 5GC
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

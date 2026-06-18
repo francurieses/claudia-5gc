@@ -1,0 +1,280 @@
+--- a/src/ue/nas/ursp.hpp	2026-06-15 20:12:22.453331802 +0200
++++ b/src/ue/nas/ursp.hpp	2026-06-15 20:12:22.457331829 +0200
+@@ -78,4 +78,14 @@
+ // Render a decoded policy as a human-readable multi-line string (for logs / nr-cli).
+ std::string UrspPolicyToString(const UrspPolicy &policy);
+ 
++// Evaluate the URSP policy for a target token (a DNN, application name, or FQDN
++// substring). Rules are considered in ascending precedence (lower value = higher
++// priority, TS 24.526 §5.2). A rule applies when its traffic descriptor is
++// match-all, an FQDN component contains the target, or one of its route selection
++// descriptors routes to a DNN equal to the target. Returns the selected route
++// selection descriptor (preferring the one whose DNN equals the target) and sets
++// `matchInfo` to a human-readable reason, or nullptr when no rule applies.
++const UrspRouteSelectionDescriptor *MatchUrspTarget(const UrspPolicy &policy, const std::string &target,
++                                                    std::string &matchInfo);
++
+ } // namespace nr::ue
+--- a/src/ue/nas/ursp.cpp	2026-06-15 20:12:22.465331881 +0200
++++ b/src/ue/nas/ursp.cpp	2026-06-15 20:12:22.469331908 +0200
+@@ -6,6 +6,7 @@
+ 
+ #include "ursp.hpp"
+ 
++#include <algorithm>
+ #include <sstream>
+ #include <stdexcept>
+ 
+@@ -343,6 +344,58 @@
+             static_cast<uint8_t>(cause)};
+ }
+ 
++const UrspRouteSelectionDescriptor *MatchUrspTarget(const UrspPolicy &policy, const std::string &target,
++                                                    std::string &matchInfo)
++{
++    // Consider rules in ascending precedence (lower value = higher priority).
++    std::vector<const UrspRule *> ordered;
++    ordered.reserve(policy.rules.size());
++    for (const auto &r : policy.rules)
++        ordered.push_back(&r);
++    std::sort(ordered.begin(), ordered.end(),
++              [](const UrspRule *a, const UrspRule *b) { return a->precedence < b->precedence; });
++
++    for (const UrspRule *rule : ordered)
++    {
++        if (rule->rsds.empty())
++            continue;
++
++        // Prefer an RSD that routes explicitly to the requested DNN.
++        for (const auto &rsd : rule->rsds)
++        {
++            if (rsd.dnn && *rsd.dnn == target)
++            {
++                matchInfo = "rule precedence " + std::to_string(rule->precedence) + " matched on DNN '" + target + "'";
++                return &rsd;
++            }
++        }
++
++        // Otherwise, does the traffic descriptor select this rule for the target?
++        bool applies = rule->td.matchAll;
++        std::string why = "match-all traffic descriptor";
++        if (!applies)
++        {
++            for (const auto &f : rule->td.fqdns)
++            {
++                if (f.find(target) != std::string::npos)
++                {
++                    applies = true;
++                    why = "FQDN '" + f + "' contains '" + target + "'";
++                    break;
++                }
++            }
++        }
++        if (applies)
++        {
++            matchInfo = "rule precedence " + std::to_string(rule->precedence) + " matched on " + why;
++            return &rule->rsds.front();
++        }
++    }
++
++    matchInfo = "no URSP rule matches '" + target + "'";
++    return nullptr;
++}
++
+ std::string UrspPolicyToString(const UrspPolicy &policy)
+ {
+     std::ostringstream os;
+--- a/src/lib/app/cli_cmd.hpp	2026-06-15 20:12:22.481331987 +0200
++++ b/src/lib/app/cli_cmd.hpp	2026-06-15 20:12:22.481331987 +0200
+@@ -56,6 +56,11 @@
+         DE_REGISTER,
+         RLS_STATE,
+         COVERAGE,
++        // 5GC Rel-17 mod
++        PS_MODIFY,
++        URSP_SHOW,
++        URSP_MATCH,
++        URSP_ESTABLISH,
+     } present;
+ 
+     // DE_REGISTER
+@@ -70,6 +75,13 @@
+     std::optional<std::string> apn{};
+     bool isEmergency{};
+ 
++    // 5GC Rel-17 mod: PS_MODIFY
++    int psModifyPsi{};
++    std::optional<int> psModifyFiveQi{};
++
++    // 5GC Rel-17 mod: URSP_MATCH / URSP_ESTABLISH
++    std::string urspTarget{};
++
+     explicit UeCliCommand(PR present) : present(present)
+     {
+     }
+--- a/src/lib/app/cli_cmd.cpp	2026-06-15 20:12:22.493332066 +0200
++++ b/src/lib/app/cli_cmd.cpp	2026-06-15 20:12:22.497332093 +0200
+@@ -124,6 +124,19 @@
+     return {{}, {}, entry.descriptionText, {}, subCommand, {entry.usageText}, {}, entry.helpIfEmpty, true};
+ }
+ 
++static opt::OptionsDescription DescForPsModify(const std::string &subCommand, const CmdEntry &entry)
++{
++    std::string example1 = "1 --5qi 7";
++
++    auto res = opt::OptionsDescription{
++        {}, {}, entry.descriptionText, {}, subCommand, {entry.usageText}, {example1}, entry.helpIfEmpty, true};
++
++    res.items.emplace_back(std::nullopt, "5qi", "Requested 5QI for the session (network authorizes the actual value)",
++                           "value");
++
++    return res;
++}
++
+ static opt::OptionsDescription DescForPsEstablish(const std::string &subCommand, const CmdEntry &entry)
+ {
+     std::string example1 = "IPv4 --sst 1 --sd 1 --dnn internet";
+@@ -167,6 +180,16 @@
+     {"ps-release-all", {"Trigger PDU session release procedures for all active sessions", "", DefaultDesc, false}},
+     {"deregister",
+      {"Perform a de-registration by the UE", "<normal|disable-5g|switch-off|remove-sim>", DefaultDesc, true}},
++    // 5GC Rel-17 mod
++    {"ps-modify",
++     {"Trigger a UE-requested PDU session modification procedure", "<pdu-session-id> [--5qi value]", DescForPsModify,
++      true}},
++    {"ursp-show", {"Show the URSP rules currently provisioned in the UE", "", DefaultDesc, false}},
++    {"ursp-match",
++     {"Show which URSP rule matches a target DNN/app/FQDN (no session established)", "<dnn|app|fqdn>", DefaultDesc,
++      true}},
++    {"ursp-establish",
++     {"Evaluate URSP for a target and establish the steered PDU session", "<dnn|app|fqdn>", DefaultDesc, true}},
+ };
+ 
+ static std::unique_ptr<GnbCliCommand> GnbCliParseImpl(const std::string &subCmd, const opt::OptionsResult &options,
+@@ -331,6 +354,50 @@
+     {
+         return std::make_unique<UeCliCommand>(UeCliCommand::COVERAGE);
+     }
++    else if (subCmd == "ps-modify")
++    {
++        auto cmd = std::make_unique<UeCliCommand>(UeCliCommand::PS_MODIFY);
++        if (options.positionalCount() == 0)
++            CMD_ERR("PDU session ID is expected")
++        if (options.positionalCount() > 1)
++            CMD_ERR("Only one PDU session ID is expected")
++        int n = 0;
++        if (!utils::TryParseInt(options.getPositional(0), n) || n <= 0 || n > 15)
++            CMD_ERR("Invalid PDU session ID value")
++        cmd->psModifyPsi = n;
++        if (options.hasFlag(std::nullopt, "5qi"))
++        {
++            int q = 0;
++            if (!utils::TryParseInt(options.getOption(std::nullopt, "5qi"), q) || q <= 0 || q > 255)
++                CMD_ERR("Invalid 5QI value")
++            cmd->psModifyFiveQi = q;
++        }
++        return cmd;
++    }
++    else if (subCmd == "ursp-show")
++    {
++        return std::make_unique<UeCliCommand>(UeCliCommand::URSP_SHOW);
++    }
++    else if (subCmd == "ursp-match")
++    {
++        auto cmd = std::make_unique<UeCliCommand>(UeCliCommand::URSP_MATCH);
++        if (options.positionalCount() == 0)
++            CMD_ERR("A target DNN/app/FQDN is expected")
++        if (options.positionalCount() > 1)
++            CMD_ERR("Only one target is expected")
++        cmd->urspTarget = options.getPositional(0);
++        return cmd;
++    }
++    else if (subCmd == "ursp-establish")
++    {
++        auto cmd = std::make_unique<UeCliCommand>(UeCliCommand::URSP_ESTABLISH);
++        if (options.positionalCount() == 0)
++            CMD_ERR("A target DNN/app/FQDN is expected")
++        if (options.positionalCount() > 1)
++            CMD_ERR("Only one target is expected")
++        cmd->urspTarget = options.getPositional(0);
++        return cmd;
++    }
+ 
+     return nullptr;
+ }
+--- a/src/ue/app/cmd_handler.cpp	2026-06-15 20:12:22.509332172 +0200
++++ b/src/ue/app/cmd_handler.cpp	2026-06-15 20:12:22.513332198 +0200
+@@ -267,6 +267,73 @@
+         sendResult(msg.address, json.dumpYaml());
+         break;
+     }
++    case app::UeCliCommand::PS_MODIFY: {
++        m_base->nasTask->sm->sendModificationRequest(msg.cmd->psModifyPsi, msg.cmd->psModifyFiveQi);
++        sendResult(msg.address, "PDU session modification procedure triggered");
++        break;
++    }
++    case app::UeCliCommand::URSP_SHOW: {
++        const auto &policy = m_base->nasTask->mm->m_urspPolicy;
++        if (!policy.has_value())
++            sendResult(msg.address, "No URSP policy provisioned in the UE");
++        else
++            sendResult(msg.address, UrspPolicyToString(*policy));
++        break;
++    }
++    case app::UeCliCommand::URSP_MATCH: {
++        const auto &policy = m_base->nasTask->mm->m_urspPolicy;
++        if (!policy.has_value())
++        {
++            sendResult(msg.address, "No URSP policy provisioned in the UE");
++            break;
++        }
++        std::string info;
++        const auto *rsd = MatchUrspTarget(*policy, msg.cmd->urspTarget, info);
++        if (rsd == nullptr)
++        {
++            sendResult(msg.address, info);
++            break;
++        }
++        std::string out = info + "\n  -> route: ";
++        out += rsd->dnn ? ("dnn=" + *rsd->dnn) : "dnn=<none>";
++        if (rsd->snssai)
++            out += " sst=" + std::to_string(rsd->snssai->sst);
++        if (rsd->sscMode)
++            out += " ssc=" + std::to_string(*rsd->sscMode);
++        sendResult(msg.address, out);
++        break;
++    }
++    case app::UeCliCommand::URSP_ESTABLISH: {
++        const auto &policy = m_base->nasTask->mm->m_urspPolicy;
++        if (!policy.has_value())
++        {
++            sendResult(msg.address, "No URSP policy provisioned in the UE");
++            break;
++        }
++        std::string info;
++        const auto *rsd = MatchUrspTarget(*policy, msg.cmd->urspTarget, info);
++        if (rsd == nullptr)
++        {
++            sendResult(msg.address, info);
++            break;
++        }
++
++        SessionConfig config;
++        config.type = nas::EPduSessionType::IPV4;
++        if (rsd->dnn)
++            config.apn = *rsd->dnn;
++        if (rsd->snssai)
++        {
++            SingleSlice s{};
++            s.sst = static_cast<uint8_t>(rsd->snssai->sst);
++            if (rsd->snssai->sd.has_value())
++                s.sd = octet3{static_cast<int>(*rsd->snssai->sd)};
++            config.sNssai = s;
++        }
++        m_base->nasTask->sm->sendEstablishmentRequest(config);
++        sendResult(msg.address, "URSP-steered PDU session establishment triggered (" + info + ")");
++        break;
++    }
+     }
+ }
+ 

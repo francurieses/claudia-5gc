@@ -1,0 +1,4 @@
+web/node_modules
+bin/
+internal/assets/static/*
+!internal/assets/static/.gitkeep

@@ -1,0 +1,21 @@
+mcc: '001'
+mnc: '01'
+nci: '0x000000011'
+idLength: 32
+tac: 1
+linkIp: 0.0.0.0
+ngapIp: 0.0.0.0
+gtpIp: 172.30.3.4      # different from ueransim-gnb (172.30.3.3) to avoid n3-net conflict
+amfConfigs:
+  - address: amf
+    port: 38412
+slices:
+  - sst: 0x01
+    sd: 0x000001   # internet
+  - sst: 0x01
+    sd: 0x000002   # gold
+  - sst: 0x02
+    sd: 0x000001   # silver
+  - sst: 0x03
+    sd: 0x000001   # bronze
+ignoreStreamIds: true

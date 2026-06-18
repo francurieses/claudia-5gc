@@ -1,0 +1,46 @@
+# MCP server — development configuration.
+# Schema: mcp/internal/config/config.go. Mounted at /etc/5gc/config.yaml.
+
+# Which transports to run: stdio | sse | both. Both serve an identical tool registry.
+transport: both
+
+sse:
+  listen_addr: "0.0.0.0:9300"
+  # dev-only debug endpoint /mcp/sessions listing live SSE clients.
+  debug: true
+  # Empty cert/key ⇒ plain HTTP (dev). Set both for TLS; add ca_file for mTLS.
+  tls:
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+
+auth:
+  # Empty ⇒ authentication disabled (dev). Set to require "Authorization: Bearer <token>".
+  bearer_token: ""
+
+# Upstream services consumed by Group B/C/D tools.
+nrf_addr: "https://nrf:8000"
+amf_addr: "http://amf:9002"
+jaeger_addr: "http://jaeger:16686"
+prometheus_addr: "http://prometheus:9090"
+
+# Group I: PDU session QoS tools — SMF management API (shares the SBI listener,
+# mTLS) and UDM SDM (mTLS).
+smf_addr: "https://smf:8004"
+udm_addr: "https://udm:8003"
+
+# TLS material for the NRF SBI (which enforces mTLS). The AMF management API and
+# Jaeger/Prometheus are plain HTTP and need none of this.
+ca_file: "/etc/5gc/pki/ca.crt"
+client_cert_file: "/etc/5gc/pki/mcp.crt"
+client_key_file: "/etc/5gc/pki/mcp.key"
+
+# Group F: UERANSIM orchestration tools (docker exec).
+ueransim:
+  container_name: ueransim-ue   # matches docker-compose container_name
+  exec_timeout_sec: 15
+
+# Group G: Prometheus metrics tools (supplements prometheus_addr above).
+prometheus:
+  addr: ""                       # empty = use top-level prometheus_addr
+  query_timeout_sec: 5

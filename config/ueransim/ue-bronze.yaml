@@ -1,0 +1,46 @@
+supi: 'imsi-001010000000004'
+mcc: '001'
+mnc: '01'
+protectionScheme: 0
+routingIndicator: '0000'
+key: '465b5ce8b199b49faa5f0a2ee238a6bc'
+op: 'cd63cb71954a9f4e48a5994e37a02baf'
+opType: 'OPC'
+amf: 'b9b9'
+imei: '356938035643806'
+imeiSv: '4370816125816154'
+gnbSearchList:
+  - ueransim-gnb
+uacAic:
+  mps: false
+  mcs: false
+uacAcc:
+  normalClass: 0
+  class11: false
+  class12: false
+  class13: false
+  class14: false
+  class15: false
+sessions:
+  - type: 'IPv4'
+    apn: 'internet'
+    slice:
+      sst: 3
+      sd: 0x000001   # bronze slice (MIoT)
+configured-nssai:
+  - sst: 3
+    sd: 0x000001
+default-nssai:
+  - sst: 3
+    sd: 0x000001
+integrity:
+  IA1: false
+  IA2: true
+  IA3: false
+ciphering:
+  EA1: false
+  EA2: true
+  EA3: false
+integrityMaxRate:
+  uplink: 'full'
+  downlink: 'full'

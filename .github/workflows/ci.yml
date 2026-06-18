@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  matrix:
+    name: ${{ matrix.nf }} — ${{ matrix.task }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        nf: [nrf]   # add new NFs here as they gain lint/test/build targets
+        task: [lint, test, build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: nf/${{ matrix.nf }}/go.sum
+
+      - name: Install golangci-lint
+        if: matrix.task == 'lint'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: nf/${{ matrix.nf }}
+
+      - name: Run task
+        run: make -C nf/${{ matrix.nf }} ${{ matrix.task }}
+
+  docker:
+    name: Build Docker image — ${{ matrix.nf }}
+    runs-on: ubuntu-22.04
+    needs: matrix
+    strategy:
+      matrix:
+        nf: [nrf]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: make -C nf/${{ matrix.nf }} docker
+
+  compose-up:
+    name: Smoke test — docker compose up
+    runs-on: ubuntu-22.04
+    needs: docker
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/gen-pki.sh
+      - run: docker compose --profile core up -d
+      - run: sleep 10
+      - run: docker compose ps
+      - run: docker compose logs nrf
+      - run: |
+          curl --fail --cacert pki/ca.crt https://nrf.local:8000/healthz \
+            || (docker compose logs nrf && exit 1)
+        env:
+          # mapea hostname para el self-signed
+          HOSTALIASES: /etc/hosts
+      - run: docker compose --profile core down -v

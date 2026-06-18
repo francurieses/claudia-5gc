@@ -1,0 +1,23 @@
+diff --git a/src/lib/nas/encode.cpp b/src/lib/nas/encode.cpp
+index 65cda4f..4f898a6 100644
+--- a/src/lib/nas/encode.cpp
++++ b/src/lib/nas/encode.cpp
+@@ -233,7 +233,17 @@ static T *DecodeViaBuilder(const OctetView &stream)
+         else if (builder.optionalDecoders.count((iei >> 4) & 0xF))
+             builder.optionalDecoders[(iei >> 4) & 0xF](stream);
+         else
+-            throw std::runtime_error("Bad constructed NAS message");
++        {
++            // Per TS 24.007 §11.2.4: skip unknown optional IEs gracefully.
++            // IEI 0x70-0x7E: TLV-E (2-byte length); IEI 0x00-0x6F: TLV (1-byte length).
++            // IEI >= 0x80: Type 1 TV half-byte (1 byte total, already consumed).
++            int iei_val = stream.readI();
++            if (iei_val < 0x80)
++            {
++                int len = (iei_val >= 0x70) ? stream.read2I() : stream.readI();
++                stream.readOctetString(len);
++            }
++        }
+     }
+ 
+     return p;

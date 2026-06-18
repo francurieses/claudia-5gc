@@ -1,0 +1,627 @@
+diff --git a/src/ue/nas/mm/mm.hpp b/src/ue/nas/mm/mm.hpp
+index a1de095..4fd69f8 100644
+--- a/src/ue/nas/mm/mm.hpp
++++ b/src/ue/nas/mm/mm.hpp
+@@ -11,6 +11,7 @@
+ #include <lib/crypt/milenage.hpp>
+ #include <lib/nas/nas.hpp>
+ #include <ue/nas/storage.hpp>
++#include <ue/nas/ursp.hpp>
+ #include <ue/nas/usim/usim.hpp>
+ #include <ue/nts.hpp>
+ #include <ue/types.hpp>
+@@ -72,6 +73,10 @@ class NasMm
+     // Last time MM state changed
+     int64_t m_lastTimeMmStateChange{};
+ 
++    // 5GC Rel-17 mod: most recent URSP policy delivered by the network (TS 24.526).
++    // Stored so the SM layer can steer PDU sessions and nr-cli can introspect it.
++    std::optional<UrspPolicy> m_urspPolicy{};
++
+     friend class UeCmdHandler;
+     friend class NasSm;
+     friend class NasTask;
+@@ -110,6 +115,11 @@ class NasMm
+     void receiveDlNasTransport(const nas::DlNasTransport &msg);
+     EProcRc deliverUlTransport(const nas::UlNasTransport &msg, ENasTransportHint hint);
+ 
++  private: /* UE Policy Delivery (5GC Rel-17 mod, TS 24.501 Annex D) */
++    void receiveUePolicyContainer(const OctetString &container);
++    void sendManageUePolicyComplete(int pti);
++    void sendManageUePolicyCommandReject(int pti, int cause);
++
+   private: /* Registration */
+     EProcRc sendInitialRegistration(EInitialRegCause regCause);
+     EProcRc sendMobilityRegistration(ERegUpdateCause updateCause);
+diff --git a/src/ue/nas/mm/transport.cpp b/src/ue/nas/mm/transport.cpp
+index f8d964c..8530e2d 100644
+--- a/src/ue/nas/mm/transport.cpp
++++ b/src/ue/nas/mm/transport.cpp
+@@ -39,6 +39,20 @@ void NasMm::receiveDlNasTransport(const nas::DlNasTransport &msg)
+ {
+     m_timers->t3346.stop();
+ 
++    // 5GC Rel-17 mod: handle the UE policy delivery service (TS 24.501 Annex D).
++    // Stock UERANSIM only knows N1 SM information and logs everything else as
++    // "Unhandled payload container type [5]" without replying.
++    if (msg.payloadContainerType.payloadContainerType == nas::EPayloadContainerType::UE_POLICY_CONTAINER)
++    {
++        if (msg.payloadContainer.data.length() == 0)
++        {
++            m_logger->err("Empty UE policy container received");
++            return;
++        }
++        receiveUePolicyContainer(msg.payloadContainer.data);
++        return;
++    }
++
+     if (msg.payloadContainerType.payloadContainerType != nas::EPayloadContainerType::N1_SM_INFORMATION)
+     {
+         m_logger->err("Unhandled DL NAS Transport payload container type [%d]",
+@@ -155,4 +169,51 @@ EProcRc NasMm::deliverUlTransport(const nas::UlNasTransport &msg, ENasTransportH
+     return EProcRc::OK;
+ }
+ 
++// 5GC Rel-17 mod: UE policy delivery service (TS 24.501 Annex D, TS 24.526).
++// Decodes a MANAGE UE POLICY COMMAND, stores the URSP rules, and acknowledges
++// with a MANAGE UE POLICY COMPLETE so the network completes the §D.2 procedure.
++void NasMm::receiveUePolicyContainer(const OctetString &container)
++{
++    UrspPolicy policy;
++    std::string err;
++    if (!DecodeManageUePolicyCommand(container.data(), static_cast<size_t>(container.length()), policy, err))
++    {
++        m_logger->err("URSP: failed to decode UE policy container: %s", err.c_str());
++        // Best-effort reject so the network is not left waiting. Cause 0x6F =
++        // "protocol error, unspecified" (TS 24.501 §D.4).
++        sendManageUePolicyCommandReject(container.length() > 0 ? container.data()[0] : 0, 0x6F);
++        return;
++    }
++
++    m_urspPolicy = policy;
++
++    m_logger->info("URSP policy received (%zu rule(s), PLMN %s, UPSC %d) — applying", policy.rules.size(),
++                   policy.plmn.c_str(), (int)policy.upsc);
++    m_logger->debug("%s", UrspPolicyToString(policy).c_str());
++
++    sendManageUePolicyComplete(policy.pti);
++}
++
++void NasMm::sendManageUePolicyComplete(int pti)
++{
++    nas::UlNasTransport ul;
++    ul.payloadContainerType.payloadContainerType = nas::EPayloadContainerType::UE_POLICY_CONTAINER;
++    for (uint8_t b : BuildManageUePolicyComplete(pti))
++        ul.payloadContainer.data.appendOctet(b);
++
++    m_logger->info("Sending MANAGE UE POLICY COMPLETE (PTI 0x%02x)", pti);
++    deliverUlTransport(ul, ENasTransportHint::UE_POLICY_DELIVERY);
++}
++
++void NasMm::sendManageUePolicyCommandReject(int pti, int cause)
++{
++    nas::UlNasTransport ul;
++    ul.payloadContainerType.payloadContainerType = nas::EPayloadContainerType::UE_POLICY_CONTAINER;
++    for (uint8_t b : BuildManageUePolicyCommandReject(pti, cause))
++        ul.payloadContainer.data.appendOctet(b);
++
++    m_logger->warn("Sending MANAGE UE POLICY COMMAND REJECT (PTI 0x%02x, cause 0x%02x)", pti, cause);
++    deliverUlTransport(ul, ENasTransportHint::UE_POLICY_DELIVERY);
++}
++
+ } // namespace nr::ue
+diff --git a/src/ue/nas/ursp.cpp b/src/ue/nas/ursp.cpp
+new file mode 100644
+index 0000000..1fc6714
+--- /dev/null
++++ b/src/ue/nas/ursp.cpp
+@@ -0,0 +1,404 @@
++//
++// 5GC Rel-17 modification — URSP / UE policy delivery service codec.
++// See ursp.hpp. Wire format per TS 24.501 Annex D + TS 24.526 §5.2/§5.3,
++// matching the 5GC PCF encoder (nf/pcf/internal/policy/ursp.go).
++//
++
++#include "ursp.hpp"
++
++#include <sstream>
++#include <stdexcept>
++
++namespace nr::ue
++{
++
++namespace
++{
++
++// UE policy delivery service message types (TS 24.501 §D.6.1).
++constexpr int kManageUePolicyCommand = 0x01;
++constexpr int kManageUePolicyComplete = 0x02;
++constexpr int kManageUePolicyCommandReject = 0x03;
++
++// UE policy part type (TS 24.526 §5.1).
++constexpr int kUePolicyPartTypeUrsp = 0x01;
++
++// Traffic descriptor component types (TS 24.526 §5.2, Table 5.2.1).
++constexpr int kTdMatchAll = 0x01;
++constexpr int kTdIPv4RemoteAddr = 0x10;
++constexpr int kTdIPv6RemoteAddr = 0x21;
++constexpr int kTdProtocolId = 0x30;
++constexpr int kTdSingleRemotePort = 0x50;
++constexpr int kTdRemotePortRange = 0x51;
++constexpr int kTdConnCapability = 0x90;
++constexpr int kTdDestFqdn = 0x91;
++
++// Route selection descriptor component types (TS 24.526 §5.3, Table 5.3.1).
++constexpr int kRsdSscMode = 0x01;
++constexpr int kRsdSnssai = 0x02;
++constexpr int kRsdDnn = 0x04;
++constexpr int kRsdPduSessionType = 0x08;
++constexpr int kRsdPreferredAccess = 0x10;
++
++// A bounds-checked forward byte cursor. Throws std::runtime_error on overrun so
++// the top-level decoder can turn any malformed container into a clean failure.
++class Cursor
++{
++  public:
++    Cursor(const uint8_t *data, size_t len) : m_data(data), m_len(len), m_pos(0)
++    {
++    }
++
++    size_t remaining() const
++    {
++        return m_len - m_pos;
++    }
++
++    bool empty() const
++    {
++        return m_pos >= m_len;
++    }
++
++    uint8_t u8()
++    {
++        require(1);
++        return m_data[m_pos++];
++    }
++
++    uint16_t u16()
++    {
++        require(2);
++        uint16_t v = static_cast<uint16_t>((m_data[m_pos] << 8) | m_data[m_pos + 1]);
++        m_pos += 2;
++        return v;
++    }
++
++    uint32_t u32()
++    {
++        require(4);
++        uint32_t v = (static_cast<uint32_t>(m_data[m_pos]) << 24) | (static_cast<uint32_t>(m_data[m_pos + 1]) << 16) |
++                     (static_cast<uint32_t>(m_data[m_pos + 2]) << 8) | static_cast<uint32_t>(m_data[m_pos + 3]);
++        m_pos += 4;
++        return v;
++    }
++
++    std::vector<uint8_t> bytes(size_t n)
++    {
++        require(n);
++        std::vector<uint8_t> out(m_data + m_pos, m_data + m_pos + n);
++        m_pos += n;
++        return out;
++    }
++
++    // A sub-cursor over the next n bytes, advancing this cursor past them.
++    Cursor slice(size_t n)
++    {
++        require(n);
++        Cursor c(m_data + m_pos, n);
++        m_pos += n;
++        return c;
++    }
++
++  private:
++    void require(size_t n) const
++    {
++        if (m_pos + n > m_len)
++            throw std::runtime_error("URSP container truncated");
++    }
++
++    const uint8_t *m_data;
++    size_t m_len;
++    size_t m_pos;
++};
++
++// Decode APN-label format (TS 23.003 §9.1) into a dotted string. "\x08internet"
++// → "internet"; "\x06gaming\x07example\x03com" → "gaming.example.com".
++std::string decodeApnLabels(const std::vector<uint8_t> &b)
++{
++    std::string out;
++    size_t i = 0;
++    while (i < b.size())
++    {
++        size_t l = b[i++];
++        if (l == 0 || i + l > b.size())
++            break;
++        if (!out.empty())
++            out.push_back('.');
++        out.append(reinterpret_cast<const char *>(&b[i]), l);
++        i += l;
++    }
++    return out;
++}
++
++// Decode a PLMN identity (3 octets, TS 24.008 §10.5.1.13) into "MCCMNC".
++std::string decodePlmn(const std::vector<uint8_t> &b)
++{
++    if (b.size() < 3)
++        return {};
++    int mcc1 = b[0] & 0x0F;
++    int mcc2 = (b[0] >> 4) & 0x0F;
++    int mcc3 = b[1] & 0x0F;
++    int mnc3 = (b[1] >> 4) & 0x0F;
++    int mnc1 = b[2] & 0x0F;
++    int mnc2 = (b[2] >> 4) & 0x0F;
++
++    std::string s;
++    s += static_cast<char>('0' + mcc1);
++    s += static_cast<char>('0' + mcc2);
++    s += static_cast<char>('0' + mcc3);
++    s += static_cast<char>('0' + mnc1);
++    s += static_cast<char>('0' + mnc2);
++    if (mnc3 != 0x0F)
++        s += static_cast<char>('0' + mnc3);
++    return s;
++}
++
++void decodeTrafficDescriptor(Cursor &c, UrspTrafficDescriptor &td)
++{
++    while (!c.empty())
++    {
++        int type = c.u8();
++        switch (type)
++        {
++        case kTdMatchAll:
++            td.matchAll = true;
++            break;
++        case kTdIPv4RemoteAddr: {
++            auto v = c.bytes(8); // 4-octet address + 4-octet mask
++            std::ostringstream os;
++            os << (int)v[0] << '.' << (int)v[1] << '.' << (int)v[2] << '.' << (int)v[3] << '/' << (int)v[4] << '.'
++               << (int)v[5] << '.' << (int)v[6] << '.' << (int)v[7];
++            td.ipv4.push_back(os.str());
++            break;
++        }
++        case kTdIPv6RemoteAddr:
++            c.bytes(17); // 16-octet address + 1-octet prefix length (not modelled further)
++            break;
++        case kTdProtocolId:
++            td.protocols.push_back(c.u8());
++            break;
++        case kTdSingleRemotePort: {
++            int p = c.u16();
++            td.portRanges.emplace_back(p, p);
++            break;
++        }
++        case kTdRemotePortRange: {
++            int low = c.u16();
++            int high = c.u16();
++            td.portRanges.emplace_back(low, high);
++            break;
++        }
++        case kTdConnCapability: {
++            int n = c.u8();
++            auto v = c.bytes(n);
++            for (auto x : v)
++                td.connectionCapabilities.push_back(x);
++            break;
++        }
++        case kTdDestFqdn: {
++            int len = c.u8();
++            td.fqdns.push_back(decodeApnLabels(c.bytes(len)));
++            break;
++        }
++        default:
++            // Unknown component: cannot determine its length safely → stop.
++            throw std::runtime_error("URSP: unknown traffic descriptor component");
++        }
++    }
++}
++
++void decodeRsdContents(Cursor &c, UrspRouteSelectionDescriptor &rsd)
++{
++    while (!c.empty())
++    {
++        int type = c.u8();
++        switch (type)
++        {
++        case kRsdSscMode:
++            rsd.sscMode = c.u8() & 0x07;
++            break;
++        case kRsdSnssai: {
++            int len = c.u8();
++            auto v = c.bytes(len);
++            UrspSnssai s;
++            if (!v.empty())
++                s.sst = v[0];
++            if (v.size() >= 4)
++                s.sd = (static_cast<uint32_t>(v[1]) << 16) | (static_cast<uint32_t>(v[2]) << 8) | v[3];
++            rsd.snssai = s;
++            break;
++        }
++        case kRsdDnn: {
++            int len = c.u8();
++            rsd.dnn = decodeApnLabels(c.bytes(len));
++            break;
++        }
++        case kRsdPduSessionType:
++            rsd.pduSessionType = c.u8() & 0x07;
++            break;
++        case kRsdPreferredAccess:
++            c.u8();
++            break;
++        default:
++            throw std::runtime_error("URSP: unknown route selection descriptor component");
++        }
++    }
++}
++
++void decodeUrspRules(Cursor &c, std::vector<UrspRule> &rules)
++{
++    while (!c.empty())
++    {
++        UrspRule rule;
++        int ruleLen = c.u16();
++        Cursor rc = c.slice(ruleLen);
++
++        rule.precedence = rc.u8();
++        int tdLen = rc.u16();
++        Cursor tdc = rc.slice(tdLen);
++        decodeTrafficDescriptor(tdc, rule.td);
++
++        int rsdListLen = rc.u16();
++        Cursor rsdListC = rc.slice(rsdListLen);
++        while (!rsdListC.empty())
++        {
++            int rsdLen = rsdListC.u16();
++            Cursor rsdC = rsdListC.slice(rsdLen);
++            UrspRouteSelectionDescriptor rsd;
++            rsd.precedence = rsdC.u8();
++            int contentsLen = rsdC.u16();
++            Cursor contentsC = rsdC.slice(contentsLen);
++            decodeRsdContents(contentsC, rsd);
++            rule.rsds.push_back(std::move(rsd));
++        }
++        rules.push_back(std::move(rule));
++    }
++}
++
++} // namespace
++
++bool DecodeManageUePolicyCommand(const uint8_t *data, size_t len, UrspPolicy &out, std::string &error)
++{
++    try
++    {
++        Cursor c(data, len);
++        out.pti = c.u8();
++        int msgType = c.u8();
++        if (msgType != kManageUePolicyCommand)
++        {
++            error = "not a MANAGE UE POLICY COMMAND (msg type " + std::to_string(msgType) + ")";
++            return false;
++        }
++
++        // UE policy section management list (LV-E: 2-octet length + value).
++        int listLen = c.u16();
++        Cursor listC = c.slice(listLen);
++
++        // One or more sublists. We keep the last UPSC/PLMN seen (the PCF emits one).
++        while (!listC.empty())
++        {
++            int sublistLen = listC.u16();
++            Cursor subC = listC.slice(sublistLen);
++
++            out.plmn = decodePlmn(subC.bytes(3));
++
++            // One or more instructions.
++            while (!subC.empty())
++            {
++                int instrLen = subC.u16();
++                Cursor instrC = subC.slice(instrLen);
++                out.upsc = instrC.u16();
++
++                // One or more UE policy parts.
++                while (!instrC.empty())
++                {
++                    int partLen = instrC.u16();
++                    Cursor partC = instrC.slice(partLen);
++                    int partType = partC.u8();
++                    if (partType == kUePolicyPartTypeUrsp)
++                        decodeUrspRules(partC, out.rules);
++                    // else: non-URSP part (ANDSP/V2X/...), ignored.
++                }
++            }
++        }
++        return true;
++    }
++    catch (const std::exception &e)
++    {
++        error = e.what();
++        return false;
++    }
++}
++
++std::vector<uint8_t> BuildManageUePolicyComplete(int pti)
++{
++    return {static_cast<uint8_t>(pti), static_cast<uint8_t>(kManageUePolicyComplete)};
++}
++
++std::vector<uint8_t> BuildManageUePolicyCommandReject(int pti, int cause)
++{
++    // PTI | msg type | UE policy section management result (LV-E). For interop we
++    // emit the minimal header + a single result entry carrying the cause.
++    return {static_cast<uint8_t>(pti), static_cast<uint8_t>(kManageUePolicyCommandReject),
++            static_cast<uint8_t>(cause)};
++}
++
++std::string UrspPolicyToString(const UrspPolicy &policy)
++{
++    std::ostringstream os;
++    os << "URSP policy (PLMN " << policy.plmn << ", UPSC " << policy.upsc << ", PTI 0x" << std::hex << policy.pti
++       << std::dec << ", " << policy.rules.size() << " rule(s)):";
++    for (const auto &r : policy.rules)
++    {
++        os << "\n  rule precedence " << r.precedence << " | TD: ";
++        if (r.td.matchAll)
++            os << "match-all";
++        else
++        {
++            bool first = true;
++            for (const auto &f : r.td.fqdns)
++            {
++                os << (first ? "" : ", ") << "fqdn=" << f;
++                first = false;
++            }
++            for (const auto &ip : r.td.ipv4)
++            {
++                os << (first ? "" : ", ") << "ipv4=" << ip;
++                first = false;
++            }
++            for (auto p : r.td.protocols)
++            {
++                os << (first ? "" : ", ") << "proto=" << p;
++                first = false;
++            }
++            for (const auto &pr : r.td.portRanges)
++            {
++                os << (first ? "" : ", ") << "ports=" << pr.first << "-" << pr.second;
++                first = false;
++            }
++        }
++        for (const auto &rsd : r.rsds)
++        {
++            os << "\n    -> RSD precedence " << rsd.precedence;
++            if (rsd.snssai)
++            {
++                os << " snssai=sst" << rsd.snssai->sst;
++                if (rsd.snssai->sd)
++                {
++                    char buf[8];
++                    std::snprintf(buf, sizeof(buf), "%06x", *rsd.snssai->sd);
++                    os << "/sd" << buf;
++                }
++            }
++            if (rsd.dnn)
++                os << " dnn=" << *rsd.dnn;
++            if (rsd.sscMode)
++                os << " ssc=" << *rsd.sscMode;
++            if (rsd.pduSessionType)
++                os << " pdutype=" << *rsd.pduSessionType;
++        }
++    }
++    return os.str();
++}
++
++} // namespace nr::ue
+diff --git a/src/ue/nas/ursp.hpp b/src/ue/nas/ursp.hpp
+new file mode 100644
+index 0000000..fc46125
+--- /dev/null
++++ b/src/ue/nas/ursp.hpp
+@@ -0,0 +1,81 @@
++//
++// 5GC Rel-17 modification — UE Route Selection Policy (URSP) support.
++//
++// Adds UE-side decoding of the UE policy delivery service messages carried in a
++// DL NAS TRANSPORT with payload container type "UE policy container" (0x05), per
++// TS 24.501 Annex D and TS 24.526 §5.2/§5.3. Stock UERANSIM v3.2.8 has no URSP
++// support and logs "Unhandled payload container type [5]".
++//
++// The wire format mirrors the 5GC PCF encoder (nf/pcf/internal/policy/ursp.go).
++//
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace nr::ue
++{
++
++// S-NSSAI value as carried in a route selection descriptor (TS 24.501 §9.11.2.8).
++struct UrspSnssai
++{
++    int sst = 0;
++    std::optional<uint32_t> sd; // 3-octet SD when present
++};
++
++// Traffic descriptor of a URSP rule (TS 24.526 §5.2).
++struct UrspTrafficDescriptor
++{
++    bool matchAll = false;
++    std::vector<std::string> fqdns;                  // destination FQDN (dotted)
++    std::vector<std::string> ipv4;                   // "a.b.c.d/mask"
++    std::vector<int> protocols;                      // IPv4 protocol / IPv6 next header
++    std::vector<std::pair<int, int>> portRanges;     // {low, high}
++    std::vector<int> connectionCapabilities;         // connection capability ids
++};
++
++// Route selection descriptor of a URSP rule (TS 24.526 §5.3).
++struct UrspRouteSelectionDescriptor
++{
++    int precedence = 0;
++    std::optional<int> sscMode;
++    std::optional<UrspSnssai> snssai;
++    std::optional<std::string> dnn;
++    std::optional<int> pduSessionType;
++};
++
++// A single URSP rule (TS 24.526 §5.2).
++struct UrspRule
++{
++    int precedence = 0;
++    UrspTrafficDescriptor td;
++    std::vector<UrspRouteSelectionDescriptor> rsds;
++};
++
++// The decoded UE policy (one MANAGE UE POLICY COMMAND worth of URSP rules).
++struct UrspPolicy
++{
++    int pti = 0;
++    uint16_t upsc = 0;
++    std::string plmn; // e.g. "00101"
++    std::vector<UrspRule> rules;
++};
++
++// Decode a MANAGE UE POLICY COMMAND (the value bytes of payload container type 0x05).
++// Returns true on success; on failure returns false and sets `error`.
++bool DecodeManageUePolicyCommand(const uint8_t *data, size_t len, UrspPolicy &out, std::string &error);
++
++// Build the value bytes of a MANAGE UE POLICY COMPLETE container for the given PTI.
++std::vector<uint8_t> BuildManageUePolicyComplete(int pti);
++
++// Build the value bytes of a MANAGE UE POLICY COMMAND REJECT container.
++// `cause` is a UE policy delivery service cause (TS 24.501 §D.4).
++std::vector<uint8_t> BuildManageUePolicyCommandReject(int pti, int cause);
++
++// Render a decoded policy as a human-readable multi-line string (for logs / nr-cli).
++std::string UrspPolicyToString(const UrspPolicy &policy);
++
++} // namespace nr::ue
+diff --git a/src/ue/types.hpp b/src/ue/types.hpp
+index e660267..36edf79 100644
+--- a/src/ue/types.hpp
++++ b/src/ue/types.hpp
+@@ -642,7 +642,12 @@ enum class ENasTransportHint
+     PDU_SESSION_RELEASE_COMMAND,
+     PDU_SESSION_RELEASE_COMPLETE,
+ 
+-    FIVEG_SM_STATUS
++    FIVEG_SM_STATUS,
++
++    // 5GC Rel-17 mod: UE policy delivery service (TS 24.501 Annex D). Carried in an
++    // UL NAS TRANSPORT with payload container type "UE policy container" (0x05);
++    // not subject to UAC nor to the N1-SM/SMS non-allowed-area restriction.
++    UE_POLICY_DELIVERY
+ };
+ 
+ Json ToJson(const ECmState &state);

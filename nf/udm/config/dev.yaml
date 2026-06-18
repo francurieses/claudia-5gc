@@ -1,0 +1,29 @@
+# UDM — Development configuration
+
+nf_instance_id: "00000000-0000-4003-8000-000000000001"
+
+# plmn is read from config/operator.yaml — single source of truth.
+
+sbi:
+  address: "0.0.0.0:8003"
+  tls:
+    cert_file: "/etc/5gc/pki/udm.crt"
+    key_file:  "/etc/5gc/pki/udm.key"
+    ca_file:   "/etc/5gc/pki/ca.crt"
+
+peers:
+  nrf: "nrf:8000"
+  udr: "udr:8005"
+
+metrics:
+  address: "0.0.0.0:9103"
+
+# Home network X25519 private key for SUCI Profile A (ECIES) deconcealment.
+# ⚠️  THIS IS THE TS 33.501 ANNEX C.3 PUBLISHED TEST VECTOR — NOT A PRODUCTION SECRET.
+#     It is intentionally included here so the dev stack works out of the box.
+#     For any real deployment, generate a fresh key pair:
+#       openssl genpkey -algorithm X25519 | openssl pkey -text -noout
+# Corresponding public key (load into AUSF/UDM for UE SUCI generation):
+#   61cdb319f72eddfbac55c06c3ec38d15828880a259cbc11cc03ca92abb60fb5e
+# Ref: TS 33.501 §6.12, Annex C.3 — SUCI Profile A (protectionScheme: 1)
+hn_private_key_x25519: "c80949d0c3e4d73a54f8b49fbee7793c5c1de649d7e26ef8b05e0a1e0c8c12e9"

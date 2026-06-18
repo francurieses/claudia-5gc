@@ -1,0 +1,21 @@
+allowed_slices:
+    - sd: "000001"
+      sst: 1
+    - sd: "000002"
+      sst: 1
+    - sd: "000001"
+      sst: 2
+    - sd: "000001"
+      sst: 3
+    - sd: "001234"
+      sst: 1
+metrics:
+    address: 0.0.0.0:9109
+nf_instance_id: 00000000-0000-4007-8000-000000000001
+peers:
+    nrf: nrf:8000
+sbi:
+    address: 0.0.0.0:8007
+    ca_file: /etc/5gc/pki/ca.crt
+    cert_file: /etc/5gc/pki/nssf.crt
+    key_file: /etc/5gc/pki/nssf.key
