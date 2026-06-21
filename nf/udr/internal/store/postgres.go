@@ -357,3 +357,59 @@ func (p *Postgres) ListPolicySubscriptions() ([]*PolicySubscription, error) {
 	}
 	return out, rows.Err()
 }
+
+// ---- SmPolicyData (TS 29.519 §5.6.2.4) ----------------------------------
+
+func (p *Postgres) GetSmPolicyData(supi string) (*SmPolicyData, error) {
+	ctx := context.Background()
+	row := p.pool.QueryRow(ctx,
+		`SELECT data FROM subscription_sm_policy WHERE supi = $1`, supi)
+	var dataJSON []byte
+	if err := row.Scan(&dataJSON); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("udr: GetSmPolicyData: %w", err)
+	}
+	var data SmPolicyData
+	if err := json.Unmarshal(dataJSON, &data); err != nil {
+		return nil, fmt.Errorf("udr: unmarshal sm policy data: %w", err)
+	}
+	data.SUPI = supi
+	return &data, nil
+}
+
+func (p *Postgres) PutSmPolicyData(data *SmPolicyData) error {
+	ctx := context.Background()
+	dataJSON, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	_, err = p.pool.Exec(ctx, `
+		INSERT INTO subscription_sm_policy (supi, data, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (supi) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+		data.SUPI, dataJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("udr: PutSmPolicyData: %w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) PatchSmPolicyData(supi string, patch *SmPolicyData) error {
+	cur, err := p.GetSmPolicyData(supi)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		return ErrNotFound
+	}
+	if cur.SmPolicySnssaiData == nil {
+		cur.SmPolicySnssaiData = make(map[string]SmPolicySnssaiData)
+	}
+	for k, v := range patch.SmPolicySnssaiData {
+		cur.SmPolicySnssaiData[k] = v
+	}
+	return p.PutSmPolicyData(cur)
+}

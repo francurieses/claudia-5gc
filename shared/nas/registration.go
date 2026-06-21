@@ -368,3 +368,18 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 
 // RegistrationComplete is the 5GMM Registration Complete message (no body IEs).
 type RegistrationComplete struct{}
+
+// RegistrationReject is the body of a 5GMM Registration Reject (0x44).
+// Contains a mandatory 5GMM Cause IE. Ref: TS 24.501 §8.2.8.2
+type RegistrationReject struct {
+	// Cause5GMM — TS 24.501 §9.11.3.2.
+	// 0x49 = cause 73 = "Serving network not authorized" (Service Area Restriction).
+	Cause5GMM byte
+}
+
+// EncodeRegistrationReject encodes a Registration Reject body (1 byte: cause).
+// The common header (EPD + SHT + MsgType) is prepended by the NAS encoder.
+// Ref: TS 24.501 §8.2.8.2
+func EncodeRegistrationReject(r *RegistrationReject) ([]byte, error) {
+	return []byte{r.Cause5GMM}, nil
+}

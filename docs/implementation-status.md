@@ -10,14 +10,30 @@ For code conventions and workflow, see root `CLAUDE.md`.
 | NF | Status | Notes |
 |---|---|---|
 | NRF | ✅ | Register/Discover/Deregister + Heartbeat TTL eviction + OAuth2 HS256 JWT + mTLS; Redis backend (`REDIS_URL`) |
-| AMF | ✅ | Registration + PDU Session Establishment/Release/Modification; NAS security NIA2+NEA2; NSSAI validation + NSSF delegation; PostgreSQL UE contexts + Redis TMSI; timers T3512/MobileReachable/ImplicitDetach/PendingRemoval |
-| AUSF | 🟡 | 5G-AKA happy path; SUCI null-scheme via UDM; Redis auth context store (TTL 5 min, `ausf:auth:{id}`) |
-| UDM | 🟡 | Auth + AM data + UECM; SUCI deconcealment implemented |
-| UDR | ✅ | PostgreSQL 16 + fallback in-memory; pgx/v5; auto-migrate; `UE_COUNT` seeded subscribers |
-| SMF | ✅ | PDU Session Establishment + Modification; IP allocation; N1SM/N2SM encoding e2e; 4 SNSSAIs on NRF; PostgreSQL sessions |
-| PCF | ✅ | SM Policy Control (N7, config-driven QoS/AMBR); UE Policy Control N15 (TS 29.525) + URSP delivery (TS 24.526); per-subscriber UDR override; config-default fallback |
+| AMF | ✅ | Registration + PDU Session Establishment/Release/Modification; NAS security NIA2+NEA2; NSSAI validation + NSSF delegation; NSSAA slice auth (TS 23.502 §4.2.9 — EAP relay via AUSF, control plane); PostgreSQL UE contexts + Redis TMSI; timers T3512/MobileReachable/ImplicitDetach/PendingRemoval; inbound `namf-comm` SBI (:8001 mTLS+h2) — UEContextTransfer + N1N2MessageTransfer/CN Paging |
+| AUSF | 🟡 | 5G-AKA happy path; EAP-AKA' (RFC 5448, `PUT …/eap-session`, key hierarchy in `shared/crypto/eapaka`); NSSAA EAP relay (`POST /nausf-nssaa/.../authenticate`, simulated AAA-S); SUCI null-scheme via UDM; Redis auth context store (TTL 5 min, `ausf:auth:{id}`) |
+| UDM | 🟡 | Auth + AM data (incl. subjectToNssaa flag) + UECM + SDM Subscribe/Notify; SUCI deconcealment implemented |
+| UDR | ✅ | PostgreSQL 16 + fallback in-memory; pgx/v5; auto-migrate; `UE_COUNT` seeded subscribers; policy data: UE Policy Set (URSP) + **SM Policy Data** (`/policy-data/{supi}/sm-data` GET/PUT/PATCH, TS 29.519 §5.6.2.4 — per-S-NSSAI/DNN authorized QoS, `subscription_sm_policy` JSONB) consumed by PCF over N36 |
+| SMF | ✅ | PDU Session Establishment + Modification (consults PCF SM Policy Update for QoS authorization on UE-requested + NW-initiated mod, TS 29.512 §5.2.2.3; fail-open if PCF absent); IPv4 allocation; IPv6/IPv4v6 prefix delegation (control plane — granted-type selection + /64+IID + PDU Address IE per TS 24.501 §9.11.4.10; UPF RA/PFCP v6 install escalated, SMF-002); N1SM/N2SM encoding e2e; 4 SNSSAIs on NRF; PostgreSQL sessions |
+| PCF | ✅ | SM Policy Control (N7, config-driven QoS/AMBR) + SM Policy **Update** (TS 29.512 §5.2.2.3 — authorizes/rejects requested 5QI + Session-AMBR via `authorized_5qi`/`max_session_ambr_mbps`); UE Policy Control N15 (TS 29.525) + URSP delivery (TS 24.526); per-subscriber UDR override (now write-through to UDR SM Policy Data over N36; read tier `UDR_POLICY_DATA` at SmPolicyControl_Create); config-default fallback |
 | UPF | ✅ | PFCP session table; GTP-U decap + ext. header skip; TUN `upfgtp0` + iptables MASQUERADE; e2e ping verified |
 | NSSF | ✅ | Nnssf_NSSelection_Get; static NSSAI intersection; NRF registration; 8 unit tests |
+| MCP | ✅ | `mcp/` standalone server; stdio + SSE (port 9300); NAS/NF/UE/QoS/crypto/UERANSIM tool suite |
+
+## Agentic Development & Backlog Gaps
+
+Autonomous development infrastructure lives in `dev/` (`BACKLOG.md`, `ORCHESTRATOR_PROMPT.md`,
+`SESSION_LOG.md`) with agent roles defined in root `AGENTS.md`. The current TS 23.501 §5
+gap queue (reconciled against live code 2026-06-18):
+
+| Priority | Open gaps |
+|---|---|
+| P1 | ✅ AMF-002 UEContextTransfer (producer side — inbound namf-comm server now exists) · ✅ AMF-004 CN Paging + NW-Triggered Service Request (control-plane core; DL-data trigger simulated, real PFCP DDN = UPF-001) · ✅ UDM-001 Nudm_SDM Subscribe/Notify (subscribe CRUD + async notify fan-out; 3 godog scenarios) · ✅ PCF-001 AM Policy Association · ✅ AMF-003 Service Area Restriction · 🟡 SMF-002 IPv6/IPv4v6 prefix delegation (control plane done; UPF RA + IPv6 PFCP PDR escalated — hard stop) |
+| P2 | ~~PCF-002 SMPolicyControl Update~~ (DONE — Update op + QoS authorization; SMF consults on both modification paths) · ~~AUSF-001 EAP-AKA'~~ (DONE) · ~~AMF-005 NSSAA~~ (DONE — control plane; AAA-S simulated behind AUSF) · SMF-003 Secondary Auth/DN-AAA · ~~UDR-001 Policy Data resource~~ (DONE — SM Policy Data resource + PCF reads/write-throughs via Nudr_DR) · UPF-001 URR usage reporting (PFCP hard-stop) |
+| P3 | NRF-001 NFListRetrieval + richer NFDiscover filters |
+
+Already implemented (were on the gap list, verified done): Mobility/Periodic Registration
+Update (AMF), UE-requested PDU Session Modification (SMF), Xn + N2 Handover.
 
 ## Web Management Portal
 
@@ -109,7 +125,19 @@ All SBI connections verified as HTTP/2 over mTLS (`Go-http-client/2.0` in NRF ac
 - **NSSF ALPN** (`nf/nssf/internal/server/server.go`): `http2.ConfigureServer` was called before `TLSConfig` was assigned, so "h2" was added to a temp config that was immediately overwritten. Clients using `golang.org/x/net/http2.Transport` check `NegotiatedProtocol == "h2"` and would fail. Fixed by adding `NextProtos: []string{"h2"}` to `tlsCfg` and assigning `TLSConfig` before `ConfigureServer`. Ref: TS 29.500 §4.4.2.
 - **NRF NFStatusNotify client** (`nf/nrf/internal/server/server.go`): Used `newH2CClient()` (cleartext H2C) for outbound POST callbacks to subscriber NFs. All NF SBI servers require mTLS → every notify would fail at TLS handshake. Fixed by using `sbi.NewMTLSClient` when cert/key are configured. Ref: TS 29.500 §4.4.1, TS 33.501 §13.
 
-**Known implementation gap:** AMF has no inbound SBI server (`namf-comm`, port 8001). Outbound calls from AMF work; NFs cannot call back into AMF over SBI yet.
+**Inbound SBI server (Jun 2026):** AMF now exposes an inbound `namf-comm` SBI server
+(`nf/amf/internal/sbi/`, port 8001, mTLS + HTTP/2 h2 ALPN) serving:
+- `Namf_Communication_UEContextTransfer` (TS 29.518 §5.3.2 — producer/old-AMF side).
+- `Namf_Communication_N1N2MessageTransfer` (TS 29.518 §5.2.2.3 / TS 23.502 §4.2.3.3) — for a
+  CM-IDLE UE it triggers NGAP **Paging** (`ngap.SendPaging`, ProcCode=24) and returns 202;
+  for a CM-CONNECTED UE it returns 200. The SMF drives this via an internal
+  `dl-data-notification` endpoint that simulates the UPF Downlink Data Report (the real N4
+  PFCP DDN is UPF-001). The SMF SBI client was upgraded to mTLS to call this server.
+
+The healthcheck (`/healthz` on :8001) now hits a live server. Remaining gaps: UEContextTransfer
+has no `regRequest` integrity replay and no `RegistrationStatusUpdate` consumer (old context
+released by implicit-detach timers); N1N2MessageTransfer does not yet forward an N1/N2 payload
+on the CM-CONNECTED path; buffered-data forwarding awaits UPF-001.
 
 **Server-side rule for new NFs:** always set `TLSConfig` before calling `http2.ConfigureServer`, and include `NextProtos: []string{"h2"}` in the `tls.Config` struct. See NRF/AUSF/UDM/SMF/PCF `internal/server/server.go` as reference.
 

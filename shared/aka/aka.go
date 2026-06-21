@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/shared/crypto/eapaka"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/crypto/milenage"
 )
@@ -40,6 +41,12 @@ type AuthContext struct {
 	AUTN           [16]byte
 	CreatedAt      time.Time
 	Confirmed      bool
+
+	// EAP-AKA' fields (TS 33.501 §6.1.3.1). Populated only when AuthType is
+	// "EAP_AKA_PRIME"; the 5G-AKA path leaves them zero.
+	AuthType      string // "" / "5G_AKA" (RES* flow) or "EAP_AKA_PRIME" (EAP flow)
+	EAPKAut       []byte // 32 bytes — K_aut used to verify the EAP-Response AT_MAC
+	EAPIdentifier byte   // EAP identifier echoed on the challenge/response pair
 }
 
 // AuthStore is the interface for auth context storage.
@@ -174,6 +181,45 @@ func GenerateFull(in HEAVInput, snName string) (*HEAVFull, error) {
 	}, nil
 }
 
+// ---- EAP-AKA' transformed AV (UDM/ARPF side) ----------------------------
+
+// EAPAKAPrimeAV is the EAP-AKA' transformed authentication vector: a Milenage AV
+// plus CK'/IK' derived per TS 33.402 Annex A.2. The UDM returns this to the AUSF,
+// which runs the EAP-AKA' method (RFC 5448). Ref: TS 33.501 §6.1.3.1.
+type EAPAKAPrimeAV struct {
+	RAND    [16]byte
+	AUTN    [16]byte
+	XRES    [8]byte
+	CKPrime [16]byte
+	IKPrime [16]byte
+}
+
+// GenerateEAPAKAPrime generates the EAP-AKA' transformed AV. It reuses the
+// existing Milenage AV generation and derives CK'/IK' with the FC=0x20 KDF; no
+// existing primitive is modified. Ref: TS 33.402 Annex A.2, RFC 5448.
+func GenerateEAPAKAPrime(in HEAVInput, snName string) (*EAPAKAPrimeAV, error) {
+	var randBytes [16]byte
+	if _, err := rand.Read(randBytes[:]); err != nil {
+		return nil, fmt.Errorf("aka: rand: %w", err)
+	}
+	av, ak, err := milenage.GenerateAV(in.K, in.OPc, randBytes, in.SQN, in.AMF)
+	if err != nil {
+		return nil, fmt.Errorf("aka: milenage: %w", err)
+	}
+	var sqnXorAK [6]byte
+	for i := 0; i < 6; i++ {
+		sqnXorAK[i] = in.SQN[i] ^ ak[i]
+	}
+	ckPrime, ikPrime := eapaka.DeriveCKPrimeIKPrime(av.CK, av.IK, snName, sqnXorAK)
+	return &EAPAKAPrimeAV{
+		RAND:    av.RAND,
+		AUTN:    av.AUTN,
+		XRES:    av.XRES,
+		CKPrime: ckPrime,
+		IKPrime: ikPrime,
+	}, nil
+}
+
 // ---- AUSF Verification (step 8) -----------------------------------------
 
 // VerifyRES verifies the RES* received from the UE via AMF.
@@ -246,8 +292,9 @@ func ParseHexAMF(s string) ([2]byte, error) {
 // synchronisation failure and verifies the MAC-S.
 //
 // AUTS format (TS 33.501 §C.2): CONC_SQNMS (6 bytes) || MAC-S (8 bytes).
-//   SQN_MS = CONC_SQNMS ⊕ f5*(K, RAND, OPc)
-//   MAC-S  = f1*(K, RAND, OPc, SQN_MS, AMF=0x0000)
+//
+//	SQN_MS = CONC_SQNMS ⊕ f5*(K, RAND, OPc)
+//	MAC-S  = f1*(K, RAND, OPc, SQN_MS, AMF=0x0000)
 //
 // Returns (SQN_MS, nil) when MAC-S is valid; error otherwise.
 // Ref: TS 33.501 §6.1.3.2 step 11, TS 35.206 §3.5 (f5*), §3.4 (f1*)

@@ -63,6 +63,20 @@ The optional `dnn` field scopes an override to one DNN — used by the NW-trigge
 PDU session flow (`docs/procedures/nw-triggered-pdu-session.md`) so the new session gets its
 own 5QI/AMBR without disturbing the subscriber's other sessions. In-memory only (reset on restart).
 
+### Per-subscriber RFSP override (internal management API — not 3GPP SBI)
+
+```
+PUT    /pcf-internal/v1/subscribers/{supi}/am-policy-override   # body: {"rfsp": 1-256}
+GET    /pcf-internal/v1/subscribers/{supi}/am-policy-override   # 404 if none → caller uses operator default
+DELETE /pcf-internal/v1/subscribers/{supi}/am-policy-override
+```
+
+Consulted in `handleCreateAMPolicy` (Npcf_AMPolicyControl, TS 29.507): when the AMF creates
+the AM policy association at registration, PCF returns the per-subscriber RFSP override if set,
+else `1`. The AMF puts this into the NGAP `IndexToRFSP` IE (TS 38.413 §9.3.1.27). Takes effect
+on the UE's next registration — the mgmt portal triggers a NW-initiated dereg to re-apply live.
+In-memory only (reset on restart). Set via the portal Subscribers page (RFSP column).
+
 ## 5. UE Policy Control (N15) — URSP Delivery
 
 At UE registration, AMF calls `POST /npcf-ue-policy-control/v1/ue-policies` with the UE's SUPI.

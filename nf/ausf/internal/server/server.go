@@ -3,9 +3,10 @@
 // Service: Nausf_UEAuthentication (TS 29.509)
 //
 // Endpoints:
-//   POST /nausf-auth/v1/ue-authentications              — initiate auth (step 2/3)
-//   PUT  /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation — confirm (step 8)
-//   DELETE /nausf-auth/v1/ue-authentications/{authCtxId} — cancel
+//
+//	POST /nausf-auth/v1/ue-authentications              — initiate auth (step 2/3)
+//	PUT  /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation — confirm (step 8)
+//	DELETE /nausf-auth/v1/ue-authentications/{authCtxId} — cancel
 //
 // Ref: TS 29.509 v17.x §5.7 + §5.8 (5G-AKA flow)
 package server
@@ -58,6 +59,10 @@ type UDMAuthDataRequest struct {
 }
 
 // UDMAuthDataResponse mirrors the Nudm_UEAuthentication_Get response.
+//
+// For 5G-AKA: XresStar/HxresStar/Kausf are populated.
+// For EAP-AKA' (TS 33.501 §6.1.3.1): CkPrime/IkPrime/Xres are populated instead
+// and the AUSF derives the EAP-AKA' key hierarchy itself.
 type UDMAuthDataResponse struct {
 	AuthType  string `json:"authType"`
 	Rand      string `json:"rand"`
@@ -66,6 +71,10 @@ type UDMAuthDataResponse struct {
 	HxresStar string `json:"hxresStar"`
 	Kausf     string `json:"kausf"`
 	Supi      string `json:"supi"`
+	// EAP-AKA' transformed AV (TS 33.402 Annex A.2).
+	CkPrime string `json:"ckPrime,omitempty"`
+	IkPrime string `json:"ikPrime,omitempty"`
+	Xres    string `json:"xres,omitempty"`
 }
 
 // Server is the AUSF SBI server.
@@ -79,11 +88,11 @@ type Server struct {
 
 // Config holds AUSF runtime configuration.
 type Config struct {
-	NFInstanceID string
-	SBIAddress   string
-	MetricsAddr  string
+	NFInstanceID       string
+	SBIAddress         string
+	MetricsAddr        string
 	ServingNetworkName string // e.g. "5G:mnc093.mcc208.3gppnetwork.org"
-	TLS struct {
+	TLS                struct {
 		CertFile string
 		KeyFile  string
 		CAFile   string
@@ -119,7 +128,9 @@ func New(cfg Config, udm UDMClient, authStore aka.AuthStore, logger *slog.Logger
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /nausf-auth/v1/ue-authentications", s.handleInitAuth)
 	mux.HandleFunc("PUT /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation", s.handleConfirm)
+	mux.HandleFunc("PUT /nausf-auth/v1/ue-authentications/{authCtxId}/eap-session", s.handleEAPSession)
 	mux.HandleFunc("DELETE /nausf-auth/v1/ue-authentications/{authCtxId}", s.handleDelete)
+	mux.HandleFunc("POST /nausf-nssaa/v1/{supi}/authenticate", s.handleNSSAAAuthenticate)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	// Load TLS config
@@ -142,6 +153,9 @@ func New(cfg Config, udm UDMClient, authStore aka.AuthStore, logger *slog.Logger
 	}
 	return s, nil
 }
+
+// Handler returns the server's HTTP handler for in-process testing.
+func (s *Server) Handler() http.Handler { return s.httpSrv.Handler }
 
 func (s *Server) Start(ctx context.Context) error {
 	s.logger.Info("AUSF SBI server listening", "addr", s.cfg.SBIAddress, "tls", s.httpSrv.TLSConfig != nil)
@@ -185,9 +199,9 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 
 	// Parse request body (AuthenticationInfo — TS 29.509 §6.1.6.2.2)
 	var authInfo struct {
-		SUPIUSUCI          string `json:"supiOrSuci"`
-		ServingNetworkName string `json:"servingNetworkName"`
-		AUSFInstanceID     string `json:"ausfInstanceId,omitempty"`
+		SUPIUSUCI             string `json:"supiOrSuci"`
+		ServingNetworkName    string `json:"servingNetworkName"`
+		AUSFInstanceID        string `json:"ausfInstanceId,omitempty"`
 		ResynchronizationInfo *struct {
 			RAND string `json:"rand"`
 			AUTS string `json:"auts"`
@@ -229,6 +243,14 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 		span.SetStatus(codes.Error, "UDM call failed")
 		problem(w, http.StatusInternalServerError, "NF_FAILURE",
 			fmt.Sprintf("UDM error: %v", err))
+		return
+	}
+
+	// EAP-AKA' branch (TS 33.501 §6.1.3.1): UDM/ARPF selected EAP-AKA' for this
+	// subscriber and returned the transformed AV (CK'/IK'). The AUSF runs the EAP
+	// method itself rather than the RES* verification flow below.
+	if udmResp.AuthType == "EAP_AKA_PRIME" {
+		s.initEAPAKAPrime(w, r, log, authInfo.ServingNetworkName, udmResp)
 		return
 	}
 
@@ -282,11 +304,11 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 				"href": locationURL + "/5g-aka-confirmation",
 			},
 		},
-		"rand":       udmResp.Rand,
-		"hxresStar":  hex.EncodeToString(hresStar),
-		"autn":       udmResp.Autn,
-		"supi":       udmResp.Supi,
-		"authType":   "5G_AKA",
+		"rand":      udmResp.Rand,
+		"hxresStar": hex.EncodeToString(hresStar),
+		"autn":      udmResp.Autn,
+		"supi":      udmResp.Supi,
+		"authType":  "5G_AKA",
 	})
 }
 

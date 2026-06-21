@@ -234,8 +234,8 @@ func extractUplinkNASTransport(msg *ngapType.UplinkNASTransport) *UplinkNASTrans
 
 // ErrorIndicationMsg holds decoded fields from an NGAP ErrorIndication.
 type ErrorIndicationMsg struct {
-	AMFUENGAPId  int64
-	RANUENGAPId  int64
+	AMFUENGAPId int64
+	RANUENGAPId int64
 	// CausePresent: 1=RadioNetwork 2=Transport 3=NAS 4=Protocol 5=Misc; 0=absent
 	CausePresent int
 	CauseValue   int64
@@ -407,7 +407,8 @@ func BuildDownlinkNASTransport(amfID, ranID int64, nasPDU []byte) []byte {
 // BuildInitialContextSetupRequest builds an Initial Context Setup Request PDU.
 // encAlgsBitmap and intAlgsBitmap are the UE's advertised capability bitmasks
 // (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3) per TS 38.413 §9.3.1.86.
-// Ref: TS 38.413 §8.3.1
+// rfsp is the Radio Frequency Selection Priority index (1-256) from PCF; 0 means omit.
+// Ref: TS 38.413 §8.3.1, §9.3.1.27 (IndexToRFSP, IE id=31)
 func BuildInitialContextSetupRequest(
 	amfUEID, ranUEID int64,
 	nasPDU []byte,
@@ -416,11 +417,15 @@ func BuildInitialContextSetupRequest(
 	mcc, mnc string,
 	regionID byte, setID uint16, amfIDByte byte,
 	allowedNSSAI []amfctx.SNSSAISubscribed,
+	rfsp int,
 ) []byte {
 	plmn := plmnFromMCCMNC(mcc, mnc)
 
+	// IEs in the exact order specified by TS 38.413 Table 9.2.2.1-1.
+	// TS 38.413 §8.1: "Protocol IEs shall be contained in the order specified in the
+	// corresponding IE table." Out-of-order IEs may be rejected by strict ASN.1 decoders.
 	ieList := []ngapType.InitialContextSetupRequestIEs{
-		// AMF-UE-NGAP-ID (id=10)
+		// (1) AMF-UE-NGAP-ID (id=10) — Mandatory
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAMFUENGAPID},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
@@ -429,7 +434,7 @@ func BuildInitialContextSetupRequest(
 				AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUEID},
 			},
 		},
-		// RAN-UE-NGAP-ID (id=85)
+		// (2) RAN-UE-NGAP-ID (id=85) — Mandatory
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRANUENGAPID},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
@@ -438,7 +443,7 @@ func BuildInitialContextSetupRequest(
 				RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUEID},
 			},
 		},
-		// UEAggregateMaximumBitRate (id=110)
+		// (4) UEAggregateMaximumBitRate (id=110) — Conditional (mandatory without PDU session list)
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUEAggregateMaximumBitRate},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
@@ -450,7 +455,7 @@ func BuildInitialContextSetupRequest(
 				},
 			},
 		},
-		// GUAMI (id=28)
+		// (6) GUAMI (id=28) — Mandatory
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDGUAMI},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
@@ -459,46 +464,10 @@ func BuildInitialContextSetupRequest(
 				GUAMI:   buildGUAMI(plmn, regionID, setID, amfIDByte),
 			},
 		},
-		// UESecurityCapabilities (id=119)
-		{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUESecurityCapabilities},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
-			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present:                ngapType.InitialContextSetupRequestIEsPresentUESecurityCapabilities,
-				UESecurityCapabilities: buildUESecurityCapabilities(encAlgsBitmap, intAlgsBitmap),
-			},
-		},
-		// SecurityKey (id=94)
-		{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDSecurityKey},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
-			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present: ngapType.InitialContextSetupRequestIEsPresentSecurityKey,
-				SecurityKey: &ngapType.SecurityKey{
-					Value: aper.BitString{
-						Bytes:  secKey[:],
-						BitLength: 256,
-					},
-				},
-			},
-		},
 	}
 
-	// NAS-PDU (id=38) — optional, include only if non-empty
-	if len(nasPDU) > 0 {
-		nasPduVal := ngapType.NASPDU{Value: aper.OctetString(nasPDU)}
-		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNASPDU},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
-			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present: ngapType.InitialContextSetupRequestIEsPresentNASPDU,
-				NASPDU:  &nasPduVal,
-			},
-		})
-	}
-
-	// AllowedNSSAI (id=0) — informs gNB which slices are permitted for this UE.
-	// Required by gNBs (e.g. PacketRusher) to allow PDU session setup per slice.
+	// (8) AllowedNSSAI (id=0) — position 8 in the spec table, before UESecurityCapabilities.
+	// Informs gNB which slices are permitted for this UE.
 	// Ref: TS 38.413 §9.2.2.1, §9.3.1.52
 	if len(allowedNSSAI) > 0 {
 		var items []ngapType.AllowedNSSAIItem
@@ -514,6 +483,60 @@ func BuildInitialContextSetupRequest(
 			Value: ngapType.InitialContextSetupRequestIEsValue{
 				Present:      ngapType.InitialContextSetupRequestIEsPresentAllowedNSSAI,
 				AllowedNSSAI: &nssai,
+			},
+		})
+	}
+
+	// (9) UESecurityCapabilities (id=119) — Mandatory
+	ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUESecurityCapabilities},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.InitialContextSetupRequestIEsValue{
+			Present:                ngapType.InitialContextSetupRequestIEsPresentUESecurityCapabilities,
+			UESecurityCapabilities: buildUESecurityCapabilities(encAlgsBitmap, intAlgsBitmap),
+		},
+	})
+
+	// (10) SecurityKey (id=94) — Mandatory
+	ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDSecurityKey},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.InitialContextSetupRequestIEsValue{
+			Present: ngapType.InitialContextSetupRequestIEsPresentSecurityKey,
+			SecurityKey: &ngapType.SecurityKey{
+				Value: aper.BitString{
+					Bytes:     secKey[:],
+					BitLength: 256,
+				},
+			},
+		},
+	})
+
+	// (13) NAS-PDU (id=38) — Optional, position 13 in the spec table.
+	if len(nasPDU) > 0 {
+		nasPduVal := ngapType.NASPDU{Value: aper.OctetString(nasPDU)}
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNASPDU},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitialContextSetupRequestIEsValue{
+				Present: ngapType.InitialContextSetupRequestIEsPresentNASPDU,
+				NASPDU:  &nasPduVal,
+			},
+		})
+	}
+
+	// (15) IndexToRFSP (id=31) — Optional, position 15 in the spec table (after NAS-PDU).
+	// Radio Frequency Selection Priority index: 1=lowest priority, 256=highest.
+	// Operator default (1) guarantees this IE is always on the wire.
+	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2, TS 29.507 §4.2.2.2
+	if rfsp > 0 {
+		rfspVal := ngapType.IndexToRFSP{Value: int64(rfsp)}
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDIndexToRFSP},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitialContextSetupRequestIEsValue{
+				Present:     ngapType.InitialContextSetupRequestIEsPresentIndexToRFSP,
+				IndexToRFSP: &rfspVal,
 			},
 		})
 	}
@@ -759,7 +782,7 @@ func BuildPDUSessionResourceSetupRequest(
 												PDUSessionNASPDU: &ngapType.NASPDU{
 													Value: aper.OctetString(nasPDU),
 												},
-												SNSSAI: buildNGAPSNSSAI(sst, sdBytes),
+												SNSSAI:                                 buildNGAPSNSSAI(sst, sdBytes),
 												PDUSessionResourceSetupRequestTransfer: aper.OctetString(n2SmInfo),
 											},
 										},
@@ -908,7 +931,7 @@ func BuildPDUSessionResourceReleaseCommand(amfUEID, ranUEID int64, pduSessionID 
 									PDUSessionResourceToReleaseListRelCmd: &ngapType.PDUSessionResourceToReleaseListRelCmd{
 										List: []ngapType.PDUSessionResourceToReleaseItemRelCmd{
 											{
-												PDUSessionID: ngapType.PDUSessionID{Value: int64(pduSessionID)},
+												PDUSessionID:                             ngapType.PDUSessionID{Value: int64(pduSessionID)},
 												PDUSessionResourceReleaseCommandTransfer: aper.OctetString(transferBytes),
 											},
 										},
@@ -1059,6 +1082,89 @@ func BuildUEContextReleaseCommand(amfUEID, ranUEID int64, causePresent int, caus
 	return b
 }
 
+// ---- Paging (AMF→gNB, InitiatingMessage, ProcedureCode=24) ------------------
+// Ref: TS 38.413 §9.2.8 (Paging), TS 23.502 §4.2.3.3 (Network Triggered Service Request)
+
+// TAIForPaging is one Tracking Area Identity in the paging area.
+type TAIForPaging struct {
+	PLMN []byte // 3-byte nibble-encoded PLMN identity
+	TAC  uint32 // 24-bit Tracking Area Code
+}
+
+// BuildPaging builds an NGAP Paging PDU (non-UE-associated) addressed at the UE
+// via its 5G-S-TMSI, covering the supplied TAI list (the UE's registration area).
+//
+// 5G-S-TMSI = AMFSetID(10b) + AMFPointer(6b) + 5G-TMSI(32b). Ref: TS 23.003 §2.10.
+func BuildPaging(setID uint16, amfID byte, tmsi uint32, tais []TAIForPaging) []byte {
+	// AMFSetID is a 10-bit field: the top 10 bits of the two bytes carry setID.
+	amfSetID := ngapType.AMFSetID{
+		Value: aper.BitString{Bytes: []byte{byte(setID >> 2), byte(setID << 6)}, BitLength: 10},
+	}
+	// AMFPointer is a 6-bit field: the top 6 bits carry amfID.
+	amfPointer := ngapType.AMFPointer{
+		Value: aper.BitString{Bytes: []byte{amfID << 2}, BitLength: 6},
+	}
+	tmsiBytes := []byte{byte(tmsi >> 24), byte(tmsi >> 16), byte(tmsi >> 8), byte(tmsi)}
+
+	var taiItems []ngapType.TAIListForPagingItem
+	for _, t := range tais {
+		taiItems = append(taiItems, ngapType.TAIListForPagingItem{
+			TAI: ngapType.TAI{
+				PLMNIdentity: ngapType.PLMNIdentity{Value: t.PLMN},
+				TAC:          ngapType.TAC{Value: aper.OctetString{byte(t.TAC >> 16), byte(t.TAC >> 8), byte(t.TAC)}},
+			},
+		})
+	}
+
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentInitiatingMessage,
+		InitiatingMessage: &ngapType.InitiatingMessage{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodePaging},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitiatingMessageValue{
+				Present: ngapType.InitiatingMessagePresentPaging,
+				Paging: &ngapType.Paging{
+					ProtocolIEs: ngapType.ProtocolIEContainerPagingIEs{
+						List: []ngapType.PagingIEs{
+							// UE Paging Identity (5G-S-TMSI) — mandatory
+							{
+								Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUEPagingIdentity},
+								Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+								Value: ngapType.PagingIEsValue{
+									Present: ngapType.PagingIEsPresentUEPagingIdentity,
+									UEPagingIdentity: &ngapType.UEPagingIdentity{
+										Present: ngapType.UEPagingIdentityPresentFiveGSTMSI,
+										FiveGSTMSI: &ngapType.FiveGSTMSI{
+											AMFSetID:   amfSetID,
+											AMFPointer: amfPointer,
+											FiveGTMSI:  ngapType.FiveGTMSI{Value: aper.OctetString(tmsiBytes)},
+										},
+									},
+								},
+							},
+							// TAI List for Paging — mandatory
+							{
+								Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDTAIListForPaging},
+								Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+								Value: ngapType.PagingIEsValue{
+									Present:          ngapType.PagingIEsPresentTAIListForPaging,
+									TAIListForPaging: &ngapType.TAIListForPaging{List: taiItems},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	b, err := libngap.Encoder(pdu)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 // buildCause constructs an NGAP Cause IE.
 // causePresent: 1=RadioNetwork, 2=Transport, 3=NAS, 4=Protocol, 5=Misc.
 func buildCause(causePresent int, causeValue int64) ngapType.Cause {
@@ -1092,13 +1198,13 @@ type PDUSessionHORqdItem struct {
 
 // HandoverRequiredMsg holds decoded fields from an NGAP HandoverRequired.
 type HandoverRequiredMsg struct {
-	AMFUENGAPId                    int64
-	RANUENGAPId                    int64
-	HandoverType                   int // 0=intra5GS, 1=5GS→EPS, 2=EPS→5GS
-	CausePresent                   int
-	CauseValue                     int64
-	TargetGlobalRANNodeID          []byte // GlobalRANNodeID bytes for gNB lookup
-	PDUSessions                    []PDUSessionHORqdItem
+	AMFUENGAPId                        int64
+	RANUENGAPId                        int64
+	HandoverType                       int // 0=intra5GS, 1=5GS→EPS, 2=EPS→5GS
+	CausePresent                       int
+	CauseValue                         int64
+	TargetGlobalRANNodeID              []byte // GlobalRANNodeID bytes for gNB lookup
+	PDUSessions                        []PDUSessionHORqdItem
 	SourceToTargetTransparentContainer []byte // opaque RRC container
 }
 
@@ -1163,7 +1269,7 @@ func extractHandoverRequired(req *ngapType.HandoverRequired) *HandoverRequiredMs
 
 // PDUSessionHOAdmittedItem carries one successfully admitted PDU session.
 type PDUSessionHOAdmittedItem struct {
-	PDUSessionID                      uint8
+	PDUSessionID                       uint8
 	HandoverRequestAcknowledgeTransfer []byte // opaque transfer per TS 38.413 §9.3.4.18
 }
 
@@ -1191,7 +1297,7 @@ func extractHandoverRequestAcknowledge(ack *ngapType.HandoverRequestAcknowledge)
 			if ie.Value.PDUSessionResourceAdmittedList != nil {
 				for _, item := range ie.Value.PDUSessionResourceAdmittedList.List {
 					out.AdmittedSessions = append(out.AdmittedSessions, PDUSessionHOAdmittedItem{
-						PDUSessionID:                      uint8(item.PDUSessionID.Value),
+						PDUSessionID:                       uint8(item.PDUSessionID.Value),
 						HandoverRequestAcknowledgeTransfer: []byte(item.HandoverRequestAcknowledgeTransfer),
 					})
 				}
@@ -1211,8 +1317,8 @@ func extractHandoverRequestAcknowledge(ack *ngapType.HandoverRequestAcknowledge)
 
 // HandoverNotifyMsg holds decoded fields from an NGAP HandoverNotify.
 type HandoverNotifyMsg struct {
-	AMFUENGAPId int64
-	RANUENGAPId int64
+	AMFUENGAPId             int64
+	RANUENGAPId             int64
 	UserLocationInformation *ngapType.UserLocationInformation
 }
 
@@ -1398,7 +1504,7 @@ func BuildHandoverRequest(
 			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeHandoverResourceAllocation},
 			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.InitiatingMessageValue{
-				Present:        ngapType.InitiatingMessagePresentHandoverRequest,
+				Present: ngapType.InitiatingMessagePresentHandoverRequest,
 				HandoverRequest: &ngapType.HandoverRequest{
 					ProtocolIEs: ngapType.ProtocolIEContainerHandoverRequestIEs{List: ieList},
 				},
@@ -1561,8 +1667,8 @@ func BuildPDUSessionResourceModifyRequest(amfUEID, ranUEID int64, pduSessionID u
 									PDUSessionResourceModifyListModReq: &ngapType.PDUSessionResourceModifyListModReq{
 										List: []ngapType.PDUSessionResourceModifyItemModReq{
 											{
-												PDUSessionID: ngapType.PDUSessionID{Value: int64(pduSessionID)},
-												NASPDU:       &ngapType.NASPDU{Value: nasPDU},
+												PDUSessionID:                            ngapType.PDUSessionID{Value: int64(pduSessionID)},
+												NASPDU:                                  &ngapType.NASPDU{Value: nasPDU},
 												PDUSessionResourceModifyRequestTransfer: aper.OctetString(n2SmInfo),
 											},
 										},
@@ -1705,7 +1811,7 @@ func BuildPathSwitchRequestAcknowledge(amfUENGAPId, ranUENGAPId int64, switchedP
 				ngapType.PathSwitchRequestAcknowledgeTransfer{}, "valueExt")
 			switchedList.List = append(switchedList.List,
 				ngapType.PDUSessionResourceSwitchedItem{
-					PDUSessionID: ngapType.PDUSessionID{Value: int64(sess.PDUSessionID)},
+					PDUSessionID:                         ngapType.PDUSessionID{Value: int64(sess.PDUSessionID)},
 					PathSwitchRequestAcknowledgeTransfer: aper.OctetString(ackTransfer),
 				},
 			)

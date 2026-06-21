@@ -21,13 +21,20 @@ type SMPolicyDefaults struct {
 	ARPPreemptVuln      string `yaml:"arp_preempt_vuln"`
 	FlowDescription     string `yaml:"flow_description"`
 	FlowPrecedence      int    `yaml:"flow_precedence"`
+	// Authorized5QI is the set of 5QI values the PCF permits on an SM Policy
+	// Association Update (TS 29.512 §5.2.2.3). Empty ⇒ any standardised/operator
+	// 5QI is allowed. Ref: TS 23.501 Table 5.7.4-1.
+	Authorized5QI []int `yaml:"authorized_5qi"`
+	// MaxSessionAMBRMbps caps the Session-AMBR (UL or DL, in Mbps) a modification
+	// may request. 0 ⇒ no ceiling. Ref: TS 29.512 §5.2.2.3.
+	MaxSessionAMBRMbps int `yaml:"max_session_ambr_mbps"`
 }
 
 // URSPRouteDescriptorConfig is a single Route Selection Descriptor within a default URSP rule.
 type URSPRouteDescriptorConfig struct {
-	Precedence     uint8  `yaml:"precedence"`
-	SSCMode        *uint8 `yaml:"ssc_mode,omitempty"`
-	SNSSAI         *struct {
+	Precedence uint8  `yaml:"precedence"`
+	SSCMode    *uint8 `yaml:"ssc_mode,omitempty"`
+	SNSSAI     *struct {
 		SST uint8  `yaml:"sst"`
 		SD  string `yaml:"sd"`
 	} `yaml:"snssai,omitempty"`
@@ -37,7 +44,7 @@ type URSPRouteDescriptorConfig struct {
 
 // URSPRuleConfig is a single URSP rule in the PCF default policy config.
 type URSPRuleConfig struct {
-	Precedence        uint8  `yaml:"precedence"`
+	Precedence        uint8 `yaml:"precedence"`
 	TrafficDescriptor struct {
 		MatchAll    bool     `yaml:"match_all,omitempty"`
 		DNNs        []string `yaml:"dnns,omitempty"`

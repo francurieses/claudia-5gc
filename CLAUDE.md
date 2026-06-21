@@ -394,6 +394,44 @@ docker logs smf | grep '"dnn":"ims"'        # ims pool
 docker logs upf | grep "upfgtp1"           # TUN used for IMS
 ```
 
+### UE Context Transfer (TS 29.518 §5.3.2)
+AMF inbound `namf-comm` SBI server (mTLS + HTTP/2, port 8001) — producer/old-AMF side.
+```bash
+make ueransim   # register a UE first
+# Retrieve the UE context by SUPI (or 5g-guti-<…>); mTLS with any NF dev cert:
+curl -sk --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt \
+  -X POST https://localhost:8001/namf-comm/v1/ue-contexts/imsi-001010000000001/transfer \
+  -H 'Content-Type: application/json' -d '{"reason":"MOBI_REG"}' | jq
+# Expect 200 + ueContext.mmContextList (NasSecurityMode NIAx/NEAx + kamf) + sessionContextList.
+docker logs amf | grep "UE context transferred"
+# Errors: unknown UE → 404 CONTEXT_NOT_FOUND; missing reason → 400 MANDATORY_IE_MISSING.
+# Unit/functional: go test ./nf/amf/internal/sbi/...  &&  go test -tags=functional ./nf/amf/tests/features/...
+```
+
+### CN Paging / Network-Triggered Service Request (TS 23.502 §4.2.3.3)
+SMF DL-data trigger → AMF `N1N2MessageTransfer` (mTLS SBI :8001) → NGAP **Paging** of a CM-IDLE UE.
+The real UPF N4 PFCP Downlink Data Report is UPF-001 (hard stop); the SMF endpoint simulates it.
+```bash
+make ueransim
+docker exec ueransim-ue nr-cli imsi-001010000000001 -e "ps-establish IPv4 --dnn internet"
+
+# Paging only fires for a CM-IDLE UE. UERANSIM has no UE-side idle command and
+# self-reconnects in ~1-3 s, so force CM-IDLE from the gNB and fire DL data immediately:
+GNB=UERANSIM-gnb-1-1-1
+UEID=$(docker exec ueransim-gnb nr-cli $GNB --exec "ue-list" | grep -oE 'ue-id: [0-9]+' | grep -oE '[0-9]+' | head -1)
+docker exec ueransim-gnb nr-cli $GNB --exec "ue-release $UEID"        # AN Release → CM-IDLE
+curl -sk --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt \
+  -X POST "https://localhost:8004/nsmf-management/v1/sessions/1/dl-data-notification?supi=imsi-001010000000001"
+# → {"amfCause":"ATTEMPTING_TO_REACH_UE"}
+docker logs amf | grep "NGAP Paging sent"            # gnbs_paged, tmsi, tac (TS 38.413 §9.2.8)
+docker logs ueransim-gnb | grep -i "Paging received" # gNB got it over N2
+
+# CM-CONNECTED smoke test (no idle needed) → {"amfCause":"N1_N2_TRANSFER_INITIATED"}, no paging.
+# NOTE: UERANSIM v3.2.8 UE does not auto-respond to paging with a Service Request — the
+# network side (Paging emit + gNB receive) is what is validated live; the UE-side
+# reactivation leg is covered by unit + functional tests.
+```
+
 ### BDD Functional Tests
 ```bash
 # NRF — 3 scenarios, fully in-process (no running stack needed):
@@ -411,3 +449,42 @@ cd nf/amf && make test-functional
 Sidecar tcpdump (5 min/file, max 12). `./scripts/pcap-control.sh [status|pause|resume|rotate|list] [nf]`.
 See `docs/pcap-diagnostics.md` for NGAP/HTTP2 troubleshooting.
 Every new NF: canonical logs + NRF registration + `/metrics` Prometheus + PCAP sidecar in docker-compose.
+
+## Documentation Maintenance
+
+After every session in which a new feature, NF procedure, MCP tool, configuration parameter,
+or observability component is implemented or modified, the agent MUST:
+
+1. Open `docs/CLAUDIA_5GC_MANUAL.md`.
+2. Locate the section(s) that correspond to the changed component.
+3. Update that section to reflect the new state — new procedures, new parameters,
+   new tools, changed behavior, removed limitations.
+4. If a completely new functional domain is introduced, add a new subsection under
+   Section 3 (Implemented Features) following the existing template:
+
+   ### <Feature Name>
+   - **Description**: ...
+   - **3GPP spec**: TS XX.XXX § X.X
+   - **NFs involved**: ...
+   - **How to trigger**: (step-by-step)
+   - **Expected outcome**: (logs / metrics / traces / Grafana)
+   - **Known limitations**: ...
+
+5. Update Section 7 (Configuration Reference) if any new environment variables
+   or Docker Compose changes were introduced.
+6. Update Section 5 (MCP Tools Reference) if any MCP tool was added, removed,
+   or its schema changed.
+7. Append a one-line entry to the Changelog at the bottom of the manual:
+   `- [YYYY-MM-DD] <NF or domain>: <brief description of what changed>`
+8. Commit the updated manual in the same git commit as the feature code,
+   with the message suffix `docs: update CLAUDIA_5GC_MANUAL`.
+
+## Pre-commit Checklist
+
+Before closing any implementation session, verify:
+- [ ] All new Go files have package-level doc comments.
+- [ ] New environment variables are documented in Section 7 of CLAUDIA_5GC_MANUAL.md.
+- [ ] New MCP tools are documented in Section 5 of CLAUDIA_5GC_MANUAL.md.
+- [ ] New 5GC procedures are documented in Section 3 of CLAUDIA_5GC_MANUAL.md.
+- [ ] Changelog entry appended to CLAUDIA_5GC_MANUAL.md.
+- [ ] No TODO markers left in production code paths without a GitHub issue reference.

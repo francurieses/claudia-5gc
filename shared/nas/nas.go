@@ -272,6 +272,24 @@ func decodeBody(msg *Message, b []byte) (*Message, error) {
 			return nil, err
 		}
 		msg.Body = body
+	case MsgTypeNetworkSliceSpecificAuthCommand:
+		body, err := DecodeNSSAAuthCommand(b)
+		if err != nil {
+			return nil, err
+		}
+		msg.Body = body
+	case MsgTypeNetworkSliceSpecificAuthComplete:
+		body, err := DecodeNSSAAuthComplete(b)
+		if err != nil {
+			return nil, err
+		}
+		msg.Body = body
+	case MsgTypeNetworkSliceSpecificAuthResult:
+		body, err := DecodeNSSAAuthResult(b)
+		if err != nil {
+			return nil, err
+		}
+		msg.Body = body
 	default:
 		msg.Body = &RawBody{Data: b}
 	}
@@ -292,6 +310,12 @@ func encodeBody(msg *Message) ([]byte, error) {
 			return nil, fmt.Errorf("nas: body is not SecurityModeCommand")
 		}
 		return EncodeSecurityModeCommand(b)
+	case MsgTypeRegistrationReject:
+		b, ok := msg.Body.(*RegistrationReject)
+		if !ok {
+			return nil, fmt.Errorf("nas: body is not RegistrationReject")
+		}
+		return EncodeRegistrationReject(b)
 	case MsgTypeRegistrationAccept:
 		b, ok := msg.Body.(*RegistrationAccept)
 		if !ok {
@@ -352,6 +376,24 @@ func encodeBody(msg *Message) ([]byte, error) {
 			return nil, fmt.Errorf("nas: body is not ConfigurationUpdateComplete")
 		}
 		return EncodeConfigurationUpdateComplete(c)
+	case MsgTypeNetworkSliceSpecificAuthCommand:
+		c, ok := msg.Body.(*NSSAAuthCommand)
+		if !ok {
+			return nil, fmt.Errorf("nas: body is not NSSAAuthCommand")
+		}
+		return EncodeNSSAAuthCommand(c)
+	case MsgTypeNetworkSliceSpecificAuthComplete:
+		c, ok := msg.Body.(*NSSAAuthComplete)
+		if !ok {
+			return nil, fmt.Errorf("nas: body is not NSSAAuthComplete")
+		}
+		return EncodeNSSAAuthComplete(c)
+	case MsgTypeNetworkSliceSpecificAuthResult:
+		r, ok := msg.Body.(*NSSAAuthResult)
+		if !ok {
+			return nil, fmt.Errorf("nas: body is not NSSAAuthResult")
+		}
+		return EncodeNSSAAuthResult(r)
 	default:
 		if rb, ok := msg.Body.(*RawBody); ok {
 			return rb.Data, nil

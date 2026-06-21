@@ -39,34 +39,34 @@ type ProcedureCode uint8
 
 const (
 	// Elementary Procedures
-	ProcNGSetup                     ProcedureCode = 21
-	ProcInitialContextSetup         ProcedureCode = 14
-	ProcUEContextRelease            ProcedureCode = 41
-	ProcUEContextReleaseRequest     ProcedureCode = 42 // gNB-initiated (TS 38.413 §8.3.4)
-	ProcInitialUEMessage            ProcedureCode = 15
-	ProcUplinkNASTransport          ProcedureCode = 46
-	ProcDownlinkNASTransport        ProcedureCode = 4
-	ProcPDUSessionResourceSetup     ProcedureCode = 29
-	ProcPDUSessionResourceRelease   ProcedureCode = 28
-	ProcPDUSessionResourceModify    ProcedureCode = 26
-	ProcPathSwitchRequest           ProcedureCode = 25
-	ProcHandoverNotification        ProcedureCode = 11 // HandoverNotify (target gNB → AMF, step 5)
-	ProcHandoverPreparation         ProcedureCode = 12 // HandoverRequired (src→AMF) + HandoverCommand (AMF→src)
-	ProcHandoverResourceAllocation  ProcedureCode = 13 // HandoverRequest (AMF→tgt) + HandoverRequestAck (tgt→AMF)
-	ProcUEContextModification       ProcedureCode = 26
-	ProcNGReset                     ProcedureCode = 20
-	ProcNGApplicationIndication     ProcedureCode = 18
+	ProcNGSetup                    ProcedureCode = 21
+	ProcInitialContextSetup        ProcedureCode = 14
+	ProcUEContextRelease           ProcedureCode = 41
+	ProcUEContextReleaseRequest    ProcedureCode = 42 // gNB-initiated (TS 38.413 §8.3.4)
+	ProcInitialUEMessage           ProcedureCode = 15
+	ProcUplinkNASTransport         ProcedureCode = 46
+	ProcDownlinkNASTransport       ProcedureCode = 4
+	ProcPDUSessionResourceSetup    ProcedureCode = 29
+	ProcPDUSessionResourceRelease  ProcedureCode = 28
+	ProcPDUSessionResourceModify   ProcedureCode = 26
+	ProcPathSwitchRequest          ProcedureCode = 25
+	ProcHandoverNotification       ProcedureCode = 11 // HandoverNotify (target gNB → AMF, step 5)
+	ProcHandoverPreparation        ProcedureCode = 12 // HandoverRequired (src→AMF) + HandoverCommand (AMF→src)
+	ProcHandoverResourceAllocation ProcedureCode = 13 // HandoverRequest (AMF→tgt) + HandoverRequestAck (tgt→AMF)
+	ProcUEContextModification      ProcedureCode = 26
+	ProcNGReset                    ProcedureCode = 20
+	ProcNGApplicationIndication    ProcedureCode = 18
 	// TS 38.413 Table 9.1.1-1: ErrorIndication has procedure code 9.
-	ProcErrorIndication             ProcedureCode = 9
+	ProcErrorIndication ProcedureCode = 9
 )
 
 // Criticality per TS 38.413 §9.1.
 type Criticality uint8
 
 const (
-	CriticalityReject  Criticality = 0
-	CriticalityIgnore  Criticality = 1
-	CriticalityNotify  Criticality = 2
+	CriticalityReject Criticality = 0
+	CriticalityIgnore Criticality = 1
+	CriticalityNotify Criticality = 2
 )
 
 // Message is a decoded NGAP PDU.
@@ -76,36 +76,36 @@ type Message struct {
 	ProcedureCode ProcedureCode
 	Criticality   Criticality
 	// Decoded content — type depends on ProcedureCode
-	Value         interface{}
+	Value interface{}
 }
 
 // ---- GNB Context ---------------------------------------------------------
 
 // GNBContext represents a connected gNB.
 type GNBContext struct {
-	mu          sync.Mutex
-	GlobalGNBID []byte
-	Name        string
+	mu           sync.Mutex
+	GlobalGNBID  []byte
+	Name         string
 	SupportedTAs []SupportedTA
-	Conn        *sctp.SCTPConn
+	Conn         *sctp.SCTPConn
 	// CM-CONNECTED UEs indexed by RAN UE NGAP ID.
-	UEs         map[int64]*amfctx.UEContext
+	UEs map[int64]*amfctx.UEContext
 	// CM-IDLE UEs still logically associated with this gNB (went idle via
 	// UEContextRelease but never reconnected or deregistered). When the gNB
 	// SCTP association closes, these UEs are also cleaned up so PDU sessions
 	// do not linger after a container stop.
-	IdleUEs     map[int64]*amfctx.UEContext
+	IdleUEs map[int64]*amfctx.UEContext
 }
 
 // SupportedTA is a Tracking Area supported by the gNB.
 type SupportedTA struct {
-	TAC       uint32
+	TAC            uint32
 	BroadcastPLMNs []PLMNSlice
 }
 
 // PLMNSlice is a PLMN + its slices.
 type PLMNSlice struct {
-	MCC, MNC string
+	MCC, MNC     string
 	SliceSupport []amfctx.SNSSAISubscribed
 }
 
@@ -127,14 +127,16 @@ type AMFConfig struct {
 	SetID    uint16
 	AMFID    byte
 	// SNSSAIs is the list of slices this AMF serves, advertised in NG Setup Response.
-	SNSSAIs  []amfctx.SNSSAISubscribed
+	SNSSAIs []amfctx.SNSSAISubscribed
 }
 
 // ---- Timer Config --------------------------------------------------------
 
 // TimerConfig holds the durations for UE lifecycle timers managed by the NGAP server.
 // Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach),
-//      TS 38.413 §8.3.5 (PendingRemoval watchdog).
+//
+//	TS 38.413 §8.3.5 (PendingRemoval watchdog).
+//
 // To change values: edit nf/amf/config/dev.yaml section "timers:" and restart the AMF.
 type TimerConfig struct {
 	// MobileReachable is the total duration of the Mobile Reachable Timer.
@@ -954,6 +956,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		s.cfg.MCC, s.cfg.MNC,
 		s.cfg.RegionID, s.cfg.SetID, s.cfg.AMFID,
 		ue.AllowedNSSAI,
+		ue.RFSP,
 	)
 	s.logger.Info("Initial Context Setup Request",
 		"procedure", "InitialRegistration",
@@ -962,6 +965,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		"message_type", "InitialContextSetupRequest",
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
+		"rfsp", ue.RFSP,
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
 	_, err := gnb.Conn.Write(pdu)
@@ -1131,6 +1135,85 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 	if pending {
 		s.startPendingRemovalTimer(ue)
 	}
+	return nil
+}
+
+// SendPaging emits an NGAP Paging for a CM-IDLE UE to every connected gNB whose
+// supported Tracking Areas cover the UE's registration TAI. If no connected gNB
+// advertises that TAC, the Paging is broadcast to all connected gNBs as a best
+// effort (the UE may have moved within the registration area).
+// Ref: TS 38.413 §9.2.8, TS 23.502 §4.2.3.3 step 4a.
+func (s *Server) SendPaging(ue *amfctx.UEContext) error {
+	ue.Lock()
+	guti := ue.GUTI
+	tai := ue.TAI
+	supi := ue.SUPI
+	ue.Unlock()
+
+	if guti == nil {
+		return fmt.Errorf("amf: paging %s: no GUTI/5G-TMSI assigned", supi)
+	}
+
+	plmn := plmnFromMCCMNC(tai.MCC, tai.MNC)
+	if tai.MCC == "" {
+		plmn = plmnFromMCCMNC(s.cfg.MCC, s.cfg.MNC)
+	}
+	tais := []TAIForPaging{{PLMN: plmn, TAC: tai.TAC}}
+	pdu := BuildPaging(s.cfg.SetID, s.cfg.AMFID, guti.TMSI, tais)
+	if pdu == nil {
+		return fmt.Errorf("amf: paging %s: encode failed", supi)
+	}
+
+	s.mu.RLock()
+	gnbs := make([]*GNBContext, 0, len(s.gnbs))
+	for _, g := range s.gnbs {
+		gnbs = append(gnbs, g)
+	}
+	s.mu.RUnlock()
+
+	if len(gnbs) == 0 {
+		return fmt.Errorf("amf: paging %s: no gNB connected", supi)
+	}
+
+	// Prefer gNBs that advertise the UE's TAC.
+	var targets []*GNBContext
+	for _, g := range gnbs {
+		for _, ta := range g.SupportedTAs {
+			if ta.TAC == tai.TAC {
+				targets = append(targets, g)
+				break
+			}
+		}
+	}
+	if len(targets) == 0 {
+		targets = gnbs // best-effort broadcast
+	}
+
+	var sent int
+	for _, g := range targets {
+		if _, err := g.Conn.Write(pdu); err != nil {
+			s.logger.Warn("paging write failed",
+				"procedure", "NetworkTriggeredServiceRequest",
+				"interface", "N2", "direction", "OUT",
+				"supi", supi, "gnb", g.Name, "error", err,
+			)
+			continue
+		}
+		sent++
+	}
+	if sent == 0 {
+		return fmt.Errorf("amf: paging %s: no gNB accepted the Paging", supi)
+	}
+
+	s.logger.Info("NGAP Paging sent",
+		"procedure", "NetworkTriggeredServiceRequest",
+		"interface", "N2", "direction", "OUT",
+		"supi", supi,
+		"tmsi", fmt.Sprintf("%08x", guti.TMSI),
+		"tac", tai.TAC,
+		"gnbs_paged", sent,
+		"spec_ref", "TS 38.413 §9.2.8",
+	)
 	return nil
 }
 

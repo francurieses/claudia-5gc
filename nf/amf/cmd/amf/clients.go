@@ -161,6 +161,48 @@ func (c *HTTPAUSFClient) ConfirmAuth(ctx context.Context, authCtxID, resStar str
 	return &procedures.AUSFConfirmResponse{SUPI: result.SUPI, KAUSF: kausf}, nil
 }
 
+// ---- NSSAA Client (Nausf_NSSAA EAP relay) --------------------------------
+
+// HTTPNSSAAClient relays the UE's slice-auth EAP packets to the AAA-S via the AUSF.
+// Ref: TS 23.502 §4.2.9.2, TS 29.526 (mapped onto the AUSF here).
+type HTTPNSSAAClient struct {
+	address string // AUSF SBI address
+	client  *http.Client
+}
+
+func (c *HTTPNSSAAClient) Authenticate(
+	ctx context.Context, supi, gpsi string, sst uint8, sd string, eapPayload []byte,
+) (*procedures.NSSAAAuthResult, error) {
+	body, _ := json.Marshal(map[string]any{
+		"supi":       supi,
+		"gpsi":       gpsi,
+		"snssai":     map[string]any{"sst": sst, "sd": sd},
+		"eapPayload": base64.StdEncoding.EncodeToString(eapPayload),
+	})
+	url := fmt.Sprintf("https://%s/nausf-nssaa/v1/%s/authenticate", c.address, supi)
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ausf: nssaa authenticate: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ausf: nssaa authenticate: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		AuthResult string `json:"authResult"`
+		EAPPayload string `json:"eapPayload"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("ausf: nssaa decode: %w", err)
+	}
+	eapBytes, _ := base64.StdEncoding.DecodeString(result.EAPPayload)
+	return &procedures.NSSAAAuthResult{AuthResult: result.AuthResult, EAPPayload: eapBytes}, nil
+}
+
 func extractAuthCtxID(location string) string {
 	// Location: /nausf-auth/v1/ue-authentications/<authCtxId>
 	for i := len(location) - 1; i >= 0; i-- {
@@ -227,9 +269,10 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 	var result struct {
 		NSSAI struct {
 			DefaultSingleNssais []struct {
-				SST int    `json:"sst"`
-				SD  string `json:"sd,omitempty"`
-				DNN string `json:"dnn,omitempty"` // portal-assigned preferred DNN
+				SST            int    `json:"sst"`
+				SD             string `json:"sd,omitempty"`
+				DNN            string `json:"dnn,omitempty"` // portal-assigned preferred DNN
+				SubjectToNSSAA bool   `json:"subjectToNetworkSliceSpecificAuthenticationAndAuthorization,omitempty"`
 			} `json:"defaultSingleNssais"`
 		} `json:"nssai"`
 		SubscribedUEAMBR struct {
@@ -244,9 +287,10 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 	sub := &procedures.UDMAMSubscription{}
 	for _, s := range result.NSSAI.DefaultSingleNssais {
 		sub.AllowedNSSAI = append(sub.AllowedNSSAI, amfctx.SNSSAISubscribed{
-			SST: uint8(s.SST),
-			SD:  s.SD,
-			DNN: s.DNN,
+			SST:            uint8(s.SST),
+			SD:             s.SD,
+			DNN:            s.DNN,
+			SubjectToNSSAA: s.SubjectToNSSAA,
 		})
 	}
 	return sub, nil
@@ -670,7 +714,7 @@ func (c *HTTPPCFClient) CreateUEPolicyAssociation(ctx context.Context, supi, ser
 	}
 
 	var result struct {
-		PolAssoID     string `json:"polAssoId"`
+		PolAssoID        string `json:"polAssoId"`
 		UEPolicySections map[string]struct {
 			Content string `json:"uePolicySectionContent"`
 		} `json:"uePolicySections"`
@@ -702,5 +746,127 @@ func (c *HTTPPCFClient) DeleteUEPolicyAssociation(ctx context.Context, polAssoID
 		return fmt.Errorf("pcf: DeleteUEPolicyAssociation: %w", err)
 	}
 	defer resp.Body.Close()
+	return nil
+}
+
+// ---- PCF AM Policy Client (Npcf_AMPolicyControl / N15) ----------------------
+
+// HTTPAMPolicyClient calls the PCF over HTTP/2 for AM Policy Association.
+// Ref: TS 29.507 §4.2.2
+type HTTPAMPolicyClient struct {
+	address string
+	client  *http.Client
+}
+
+// CreateAMPolicyAssociation creates an AM Policy Association at registration.
+// Returns the polAssoId, RFSP index, and optional service area restriction (nil = unrestricted).
+// Non-fatal — caller should log and continue if it fails. Ref: TS 29.507 §4.2.2.2
+func (c *HTTPAMPolicyClient) CreateAMPolicyAssociation(ctx context.Context, supi, accessType, mcc, mnc string) (
+	polAssoID string, rfsp int, servAreaRes *amfctx.ServiceAreaRestriction, err error) {
+	body, _ := json.Marshal(map[string]any{
+		"supi":       supi,
+		"accessType": accessType,
+		"plmnId":     map[string]string{"mcc": mcc, "mnc": mnc},
+	})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		"https://"+c.address+"/npcf-ampolicycontrol/v1/policies",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("pcf: CreateAMPolicyAssociation: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		var prob map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&prob)
+		return "", 0, nil, fmt.Errorf("pcf: CreateAMPolicyAssociation: status %d cause=%v",
+			resp.StatusCode, prob["cause"])
+	}
+
+	var result struct {
+		PolAssoID   string  `json:"polAssoId"`
+		RFSP        float64 `json:"rfsp"`
+		ServAreaRes *struct {
+			RestrictionType string `json:"restrictionType"`
+			Areas           []struct {
+				TACs []string `json:"tacs"`
+			} `json:"areas"`
+		} `json:"servAreaRes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", 0, nil, fmt.Errorf("pcf: CreateAMPolicyAssociation: decode: %w", err)
+	}
+
+	var sar *amfctx.ServiceAreaRestriction
+	if result.ServAreaRes != nil && result.ServAreaRes.RestrictionType != "" {
+		sar = &amfctx.ServiceAreaRestriction{
+			RestrictionType: result.ServAreaRes.RestrictionType,
+		}
+		for _, area := range result.ServAreaRes.Areas {
+			if result.ServAreaRes.RestrictionType == "ALLOWED_AREAS" {
+				sar.AllowedTACs = append(sar.AllowedTACs, area.TACs...)
+			} else {
+				sar.NotAllowedTACs = append(sar.NotAllowedTACs, area.TACs...)
+			}
+		}
+	}
+	return result.PolAssoID, int(result.RFSP), sar, nil
+}
+
+// DeleteAMPolicyAssociation releases the AM policy association at deregistration.
+// Ref: TS 29.507 §4.2.2.4
+func (c *HTTPAMPolicyClient) DeleteAMPolicyAssociation(ctx context.Context, polAssoID string) error {
+	req, _ := http.NewRequestWithContext(ctx, "DELETE",
+		"https://"+c.address+"/npcf-ampolicycontrol/v1/policies/"+polAssoID,
+		nil)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("pcf: DeleteAMPolicyAssociation: %w", err)
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+// ---- SMSF Client (Nsmsf_SMService) ---------------------------------------
+
+// HTTPSMSFClient calls the SMSF over mTLS HTTP/2 to relay MO SMS.
+// Implements nasmsg.SMSFClient.
+// Ref: TS 29.540 §5.2.4 (Nsmsf_SMService_UplinkSMS)
+type HTTPSMSFClient struct {
+	address string
+	client  *http.Client
+}
+
+// UplinkSMS forwards an MO SMS payload (base64 SM-CP/RP container from the NAS
+// Payload Container, PCT=0x02) to the SMSF. The AMF is a transparent relay and
+// does not parse the container. A 404 means the SMSF has no active SMS context.
+// Ref: TS 29.540 §5.2.4
+func (c *HTTPSMSFClient) UplinkSMS(ctx context.Context, supi, smsRecordID, smsPayloadBase64 string) error {
+	body, _ := json.Marshal(map[string]string{
+		"smsRecordId": smsRecordID,
+		"smsPayload":  smsPayloadBase64,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://"+c.address+"/nsmsf-sms/v2/ue-contexts/"+url.PathEscape(supi)+"/sendsms",
+		bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("smsf: uplink sms: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("smsf: uplink sms: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		var prob map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&prob)
+		return fmt.Errorf("smsf: uplink sms: status %d cause=%v", resp.StatusCode, prob["cause"])
+	}
 	return nil
 }

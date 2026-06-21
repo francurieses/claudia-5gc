@@ -46,6 +46,10 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Get("/subscribers/{supi}", deps.handleGetSubscriber)
 		r.Put("/subscribers/{supi}", deps.handleUpdateSubscriber)
 		r.Delete("/subscribers/{supi}", deps.handleDeleteSubscriber)
+		// Per-subscriber RFSP (Radio Frequency Selection Priority) — proxies PCF AM policy override
+		r.Get("/subscribers/{supi}/rfsp", deps.handleGetSubscriberRFSP)
+		r.Put("/subscribers/{supi}/rfsp", deps.handleSetSubscriberRFSP)
+		r.Delete("/subscribers/{supi}/rfsp", deps.handleDeleteSubscriberRFSP)
 
 		// Slices
 		r.Get("/slices", deps.handleListSlices)

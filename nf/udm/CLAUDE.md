@@ -36,8 +36,9 @@ UDM manages subscription data and is the entry point for HPLMN authentication. C
 | SUCI Profile A (X25519 ECIES) | ✅ Functional — configure `hn_private_key_x25519` in dev.yaml |
 | SUCI Profile B (secp256r1 ECIES) | ⏳ TODO |
 | GenerateAuthData (5G-AKA via Milenage) | ✅ Functional |
+| GenerateAuthData (EAP-AKA' transformed AV, CK'/IK') | ✅ Functional — when subscriber `authenticationMethod=EAP_AKA_PRIME` |
 | SQN increment and update in UDR | ✅ Functional |
-| Get AM subscription data | ✅ Functional |
+| Get AM subscription data | ✅ Functional — incl. `subjectToNetworkSliceSpecificAuthenticationAndAuthorization` per S-NSSAI (NSSAA, TS 23.501 §5.15.10) |
 | Get SM subscription data (defaultQos per slice/DNN) | ✅ Functional |
 | AMF UECM registration | ✅ Functional |
 

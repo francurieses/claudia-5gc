@@ -1,4 +1,4 @@
-.PHONY: build test lint docker run clean
+.PHONY: build test test-functional lint docker run clean
 NF      := udm
 BIN     := bin/$(NF)
 ROOT    := ../..
@@ -9,6 +9,9 @@ build:
 
 test:
 	cd $(ROOT) && go test -race ./nf/$(NF)/...
+
+test-functional:
+	cd $(ROOT) && go test -tags=functional -v ./nf/$(NF)/tests/features/...
 
 lint:
 	cd $(ROOT) && golangci-lint run ./nf/$(NF)/...

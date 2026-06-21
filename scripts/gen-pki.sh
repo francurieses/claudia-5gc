@@ -11,7 +11,7 @@ PKI="$(cd "$(dirname "$0")/.." && pwd)/pki"
 DAYS=825
 KEY_BITS=4096
 
-NFS=(nrf amf smf upf ausf udm udr pcf nssf scp nef chf bsf mcp mgmt-portal)
+NFS=(nrf amf smf upf ausf udm udr pcf nssf smsf scp nef chf bsf mcp mgmt-portal)
 
 mkdir -p "$PKI"
 cd "$PKI"

@@ -49,6 +49,10 @@ tools/mgmt-portal/
 # Subscribers
 GET/POST /api/v1/subscribers
 GET/PUT/DELETE /api/v1/subscribers/{supi}
+# Per-subscriber RFSP (proxies PCF AM policy override — TS 38.413 §9.3.1.27)
+GET    /api/v1/subscribers/{supi}/rfsp     # {"supi","rfsp","source":"override"|"default"}
+PUT    /api/v1/subscribers/{supi}/rfsp     # body {"rfsp":1-256} → PCF override + NW dereg to re-apply
+DELETE /api/v1/subscribers/{supi}/rfsp     # clear override → revert to operator default + NW dereg
 
 # Slices  (body: {sst, sd, restart:bool})
 GET /api/v1/slices
@@ -132,7 +136,7 @@ GET /api/v1/health
 | Page | Functionality |
 |--------|--------------|
 | Dashboard `/` | 4 KPI cards + grid of 9 NF cards (NRF/healthz/metrics) + table of latest 8 active PDU sessions |
-| Subscribers `/subscribers` | CRUD from `subscription_auth` JOIN `subscription_am`; create/edit form with per-slice DNN picker (only DNNs configured in operator.yaml shown); DNN stored in `subscription_am.snssais` JSONB as `{sst, sd, dnn}`; cascade delete |
+| Subscribers `/subscribers` | CRUD from `subscription_auth` JOIN `subscription_am`; create/edit form with per-slice DNN picker (only DNNs configured in operator.yaml shown); DNN stored in `subscription_am.snssais` JSONB as `{sst, sd, dnn}`; cascade delete. **RFSP column**: per-subscriber inline box (1-256) — sets a PCF AM-policy override and triggers NW-initiated re-registration so the new IndexToRFSP reaches the gNB; "(default)" badge when no override, purple when overridden; reset button reverts to operator default. |
 | Slices `/slices` | Two sections: (1) S-NSSAI list from AMF/SMF/NSSF YAML; add SST+SD with restart checkbox. (2) DNN management — add/edit description/delete DNNs with auto-assigned UE IP pool, N6 Docker network, UPF TUN device; restart SMF+UPF after changes; next_ue_pool/next_n6_network auto-suggested. |
 | Services `/services` | Start/Stop/Restart per container; status and uptime (polling 5 s) |
 | Sessions `/sessions` | PDU sessions (`smf_sessions WHERE ue_ip != ''`) + UE contexts (`amf_ue_contexts`) |

@@ -99,6 +99,23 @@ export const updateSubscriber = (supi: string, sub: Partial<Subscriber>) =>
 export const deleteSubscriber = (supi: string) =>
   request<void>('DELETE', `/subscribers/${encodeURIComponent(supi)}`)
 
+// ---- Per-subscriber RFSP (Radio Frequency Selection Priority) -------------
+// RFSP index (1-256) sent to the gNB in the NGAP InitialContextSetupRequest
+// (TS 38.413 §9.3.1.27). "override" = per-subscriber value set here; "default" = operator default.
+export interface SubscriberRFSP {
+  supi: string
+  rfsp: number
+  source: 'override' | 'default'
+  deregistered?: boolean
+}
+
+export const getSubscriberRFSP = (supi: string) =>
+  request<SubscriberRFSP>('GET', `/subscribers/${encodeURIComponent(supi)}/rfsp`)
+export const setSubscriberRFSP = (supi: string, rfsp: number) =>
+  request<SubscriberRFSP>('PUT', `/subscribers/${encodeURIComponent(supi)}/rfsp`, { rfsp })
+export const resetSubscriberRFSP = (supi: string) =>
+  request<SubscriberRFSP>('DELETE', `/subscribers/${encodeURIComponent(supi)}/rfsp`)
+
 // ---- Slices --------------------------------------------------------------
 
 export interface AddSliceResult { slice: SNSSAI; restarted: string[] }

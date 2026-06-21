@@ -262,9 +262,35 @@ func EncodePDUSessionEstablishmentAcceptBodyWithQoS(
 	qfi, fiveQI uint8, dlMbps, ulMbps int,
 	snssai ...SNSSAI,
 ) ([]byte, error) {
+	// IPv4 path delegates to the typed encoder; output is byte-identical to the
+	// historical encoding (octet 3 = 0x01 followed by the 4 IPv4 octets).
+	return EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
+		PDUAddressInfo{SessionType: selectedPDUType, IPv4: ip},
+		sscMode, dnn, qfi, fiveQI, dlMbps, ulMbps, snssai...)
+}
+
+// PDUAddressInfo carries the address material for the PDU Address IE
+// (TS 24.501 §9.11.4.10). For IPv6 and IPv4v6 the IE conveys ONLY the 64-bit
+// interface identifier — never the /64 prefix, which reaches the UE via a
+// Router Advertisement on the user plane (UPF). Ref: TS 23.501 §5.8.2.2.
+type PDUAddressInfo struct {
+	SessionType uint8  // PDUSessionTypeIPv4 | PDUSessionTypeIPv6 | PDUSessionTypeIPv4v6
+	IPv4        net.IP // IPv4 / IPv4v6
+	IPv6IID     []byte // 8-octet interface identifier — IPv6 / IPv4v6
+}
+
+// EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr is the type-aware variant of
+// EncodePDUSessionEstablishmentAcceptBodyWithQoS: it encodes the granted PDU
+// session type and the matching PDU Address IE (IPv4, IPv6 IID, or IPv4v6
+// IID+IPv4) per TS 24.501 §9.11.4.10. Ref: TS 24.501 §8.3.2, TS 29.512 §5.2.2.2.
+func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
+	addr PDUAddressInfo, sscMode uint8, dnn string,
+	qfi, fiveQI uint8, dlMbps, ulMbps int,
+	snssai ...SNSSAI,
+) ([]byte, error) {
 	out := make([]byte, 0, 120)
 
-	out = append(out, ((sscMode&0x0F)<<4)|(selectedPDUType&0x0F))
+	out = append(out, ((sscMode&0x0F)<<4)|(addr.SessionType&0x0F))
 
 	qosRules := BuildDefaultQoSRules(qfi)
 	out = append(out, byte(len(qosRules)>>8), byte(len(qosRules)&0xFF))
@@ -274,8 +300,7 @@ func EncodePDUSessionEstablishmentAcceptBodyWithQoS(
 	out = append(out, byte(len(ambr)))
 	out = append(out, ambr...)
 
-	if ip != nil {
-		pdnAddr := buildPDUAddress(ip)
+	if pdnAddr := buildPDUAddressIE(addr); pdnAddr != nil {
 		out = append(out, IEIPDUAddress)
 		out = append(out, byte(len(pdnAddr)))
 		out = append(out, pdnAddr...)
@@ -559,4 +584,42 @@ func buildPDUAddress(ip net.IP) []byte {
 	}
 	// Fallback: IPv4 zeros
 	return []byte{0x01, 0, 0, 0, 0}
+}
+
+// buildPDUAddressIE encodes the PDU Address IE value (octet 3 onwards) for a
+// granted PDU session type. Octet 3 bits 1-3 carry the PDU session type value;
+// the address octets are the IPv4 address, the 8-octet IPv6 interface
+// identifier, or the IID followed by the IPv4 address. Returns nil when there
+// is no address material (so the caller omits the optional IE entirely).
+// Ref: TS 24.501 §9.11.4.10, Table 9.11.4.10.1.
+func buildPDUAddressIE(addr PDUAddressInfo) []byte {
+	switch addr.SessionType {
+	case PDUSessionTypeIPv6:
+		return append([]byte{0x02}, normalizeIID(addr.IPv6IID)...)
+	case PDUSessionTypeIPv4v6:
+		out := append([]byte{0x03}, normalizeIID(addr.IPv6IID)...)
+		return append(out, normalizeIPv4(addr.IPv4)...)
+	default: // IPv4 (001)
+		if addr.IPv4 == nil {
+			return nil
+		}
+		return append([]byte{0x01}, normalizeIPv4(addr.IPv4)...)
+	}
+}
+
+// normalizeIID returns an 8-octet IPv6 interface identifier, zero-padding or
+// truncating the input as needed.
+func normalizeIID(iid []byte) []byte {
+	out := make([]byte, 8)
+	copy(out, iid)
+	return out
+}
+
+// normalizeIPv4 returns the 4-octet form of an IPv4 address (zeros if absent).
+func normalizeIPv4(ip net.IP) []byte {
+	out := make([]byte, 4)
+	if ip4 := ip.To4(); ip4 != nil {
+		copy(out, ip4)
+	}
+	return out
 }

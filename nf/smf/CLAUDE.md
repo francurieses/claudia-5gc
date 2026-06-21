@@ -28,6 +28,7 @@ PDU Session manager. Orchestrates creation/modification/deletion coordinating wi
 | SM Policy Association Delete | TS 29.512 §5.2.2.4 | ✅ |
 | PDU Session Modification (NW-initiated, QoS) | TS 23.502 §4.3.3.2 | ✅ |
 | SDM subscription fetch (N10, subscribed default QoS) | TS 29.503 §6.1.6.2.7 | ✅ |
+| DL-data notification → AMF N1N2MessageTransfer (CN paging trigger) | TS 23.502 §4.2.3.3 | 🟡 |
 
 ## 3b. QoS / Management API (internal, not 3GPP)
 
@@ -40,10 +41,19 @@ and waits for the UPF ack before N1/N2 signalling.
 GET  /nsmf-management/v1/sessions                 # session list (supi, psi, dnn, snssai, 5qi, source, ambr, state)
 GET  /nsmf-management/v1/sessions/{psi}[?supi=]   # one session + qosFlows + SMF-side QER view
 POST /nsmf-management/v1/sessions/{psi}/qos       # {"5qi":7,"reason":"...","supi":...} → full §4.3.3.2 flow
+POST /nsmf-management/v1/sessions/{psi}/dl-data-notification[?supi=]  # simulate UPF DDN → CN paging
 ```
 The QoS endpoint delegates N1/N2 delivery to the AMF management API (`peers.amf_mgmt`, plain HTTP :9002);
 the AMF calls back into `UpdateSMContext` (policyUpdate) which updates the session, pushes the QER to the
 UPF and returns the 5GSM Modification Command (0xCB with IEs 0x2A/0x7A/0x79) + N2SM Modify Transfer.
+
+**DL-data notification (CN paging trigger, `internal/server/paging.go`)** simulates the UPF Downlink
+Data Report (PFCP Session Report) for a session and calls **Namf_Communication_N1N2MessageTransfer**
+on the AMF over **mTLS SBI** (`peers.amf` = `amf:8001`, not the plain-HTTP mgmt API). The AMF pages the
+UE if CM-IDLE (202 `ATTEMPTING_TO_REACH_UE`) or delivers directly if CM-CONNECTED (200
+`N1_N2_TRANSFER_INITIATED`). The real N4 PFCP DDN is UPF-001 (PFCP session-management path = hard stop).
+The SMF SBI client (`server.go`) uses `sbi.NewMTLSClient` when cert/key are configured so it can reach
+the AMF's `RequireAndVerifyClientCert` server. Ref: TS 23.502 §4.2.3.3.
 
 ## 4. Architecture
 

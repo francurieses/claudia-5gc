@@ -21,6 +21,9 @@ type TrafficDescriptor = types.TrafficDescriptor
 type PortRange = types.PortRange
 type RouteSelectionDescriptor = types.RouteSelectionDescriptor
 type PolicySubscription = types.PolicySubscription
+type SmPolicyData = types.SmPolicyData
+type SmPolicySnssaiData = types.SmPolicySnssaiData
+type SmPolicyDnnData = types.SmPolicyDnnData
 
 // ---- Subscriber Data (TS 29.505 §5) ------------------------------------
 
@@ -178,7 +181,19 @@ type Store interface {
 	PutPolicySubscription(sub *PolicySubscription) error
 	DeletePolicySubscription(supi string) error
 	ListPolicySubscriptions() ([]*PolicySubscription, error)
+
+	// SM policy data (TS 29.519 §5.6.2.4) — per-S-NSSAI/per-DNN authorized QoS.
+	// GetSmPolicyData returns nil, nil when no SM policy data is provisioned.
+	// PatchSmPolicyData merges the provided smPolicySnssaiData entries into the
+	// existing record (per-S-NSSAI-key replace); it returns ErrNotFound when no
+	// record exists yet.
+	GetSmPolicyData(supi string) (*SmPolicyData, error)
+	PutSmPolicyData(data *SmPolicyData) error
+	PatchSmPolicyData(supi string, patch *SmPolicyData) error
 }
+
+// ErrNotFound is returned by PatchSmPolicyData when the target record is absent.
+var ErrNotFound = fmt.Errorf("udr: record not found")
 
 // ---- InMemory Store ---------------------------------------------------
 
@@ -190,6 +205,7 @@ type InMemory struct {
 	smfSubs    map[string]*SMFSelectionSubscriptionData
 	smSubs     map[string][]SessionManagementSubscriptionData
 	policySubs map[string]*PolicySubscription // keyed by SUPI; "" = operator default
+	smPolicy   map[string]*SmPolicyData       // keyed by SUPI
 }
 
 func NewInMemory() *InMemory {
@@ -199,6 +215,7 @@ func NewInMemory() *InMemory {
 		smfSubs:    make(map[string]*SMFSelectionSubscriptionData),
 		smSubs:     make(map[string][]SessionManagementSubscriptionData),
 		policySubs: make(map[string]*PolicySubscription),
+		smPolicy:   make(map[string]*SmPolicyData),
 	}
 }
 
@@ -309,6 +326,39 @@ func (s *InMemory) ListPolicySubscriptions() ([]*PolicySubscription, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+func (s *InMemory) GetSmPolicyData(supi string) (*SmPolicyData, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, ok := s.smPolicy[supi]
+	if !ok {
+		return nil, nil
+	}
+	return data, nil
+}
+
+func (s *InMemory) PutSmPolicyData(data *SmPolicyData) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.smPolicy[data.SUPI] = data
+	return nil
+}
+
+func (s *InMemory) PatchSmPolicyData(supi string, patch *SmPolicyData) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.smPolicy[supi]
+	if !ok || cur == nil {
+		return ErrNotFound
+	}
+	if cur.SmPolicySnssaiData == nil {
+		cur.SmPolicySnssaiData = make(map[string]SmPolicySnssaiData)
+	}
+	for k, v := range patch.SmPolicySnssaiData {
+		cur.SmPolicySnssaiData[k] = v
+	}
+	return nil
 }
 
 // ---- Seed helpers for dev/test ----------------------------------------

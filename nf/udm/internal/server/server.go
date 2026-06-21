@@ -3,7 +3,8 @@
 // Services implemented:
 //
 //	Nudm_UEAuthentication — GetAuthData (POST): generates 5G HE AV for AUSF
-//	Nudm_SDM              — Get (GET): returns AM data to AMF
+//	Nudm_SDM              — Get (GET): returns AM data / SM data to AMF
+//	Nudm_SDM              — Subscribe/Notify: subscription CRUD + data-change callbacks
 //	Nudm_UECM             — Registration (PUT): AMF registers serving network
 //
 // Ref: 3GPP TS 29.503 v17.x
@@ -18,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -34,6 +37,31 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
+
+// SdmSubscription is the request/response body for Nudm_SDM_Subscribe.
+// Ref: TS 29.503 §6.1.6.2.11
+type SdmSubscription struct {
+	NfInstanceID    string `json:"nfInstanceId,omitempty"`
+	CallbackRef     string `json:"callbackReference"`
+	MonitoredResURI string `json:"monitoredResourceUri,omitempty"`
+	SubscriptionID  string `json:"subscriptionId,omitempty"`
+	ImplicitUnsub   bool   `json:"implicitUnsubscribe,omitempty"`
+}
+
+// ModificationNotification is the body POSTed to the callback URI.
+// Ref: TS 29.503 §6.1.6.2.13
+type ModificationNotification struct {
+	ResourceChanges []ChangeItem `json:"resourceChanges"`
+}
+
+// ChangeItem describes a single field change.
+// Ref: TS 29.503 §6.1.6.2.14
+type ChangeItem struct {
+	ChangeType    string `json:"changeType"`              // ADD | REMOVE | REPLACE
+	ResourcePath  string `json:"resourcePath"`            // JSON Pointer
+	NewValue      any    `json:"newValue,omitempty"`      // value after change
+	OriginalValue any    `json:"originalValue,omitempty"` // value before change
+}
 
 // UDRClient calls the UDR for subscription data.
 type UDRClient interface {
@@ -65,6 +93,9 @@ type SNSSAIEntry struct {
 	SST int
 	SD  string
 	DNN string // portal-assigned preferred DNN (empty = no preference)
+	// SubjectToNSSAA mirrors the subscription flag
+	// subjectToNetworkSliceSpecificAuthenticationAndAuthorization (TS 23.501 §5.15.10).
+	SubjectToNSSAA bool
 }
 
 // TLSConfig holds TLS configuration for the server.
@@ -87,6 +118,13 @@ type Server struct {
 	// Ref: TS 33.501 §6.12, Annex C.3
 	homeNetPrivKeyA    [32]byte
 	homeNetPrivKeyASet bool
+
+	// SDM subscription store — keyed by SUPI.
+	// Value type: []*SdmSubscription.
+	// Ref: TS 29.503 §5.3.2
+	subscriptions   sync.Map
+	subscriptionIdx sync.Map // subscriptionId → supi
+	notifyClient    *http.Client
 }
 
 func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
@@ -108,12 +146,20 @@ func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 // New builds the UDM server.
 func New(addr, snName string, tlsCfg TLSConfig, udr UDRClient, logger *slog.Logger) (*Server, error) {
 	s := &Server{
-		udr:    udr,
-		logger: logger.With("nf", "UDM"),
-		addr:   addr,
-		snName: snName,
+		udr:          udr,
+		logger:       logger.With("nf", "UDM"),
+		addr:         addr,
+		snName:       snName,
+		notifyClient: &http.Client{Timeout: 5 * time.Second},
 	}
 	return newWithServer(s, tlsCfg)
+}
+
+// WithNotifyClient replaces the HTTP client used for SDM notification callbacks.
+// Useful in tests to inject a plain-HTTP client when TLS is not available.
+func (s *Server) WithNotifyClient(c *http.Client) *Server {
+	s.notifyClient = c
+	return s
 }
 
 // WithHomeNetPrivKeyA loads the Home Network X25519 private key (hex-encoded) for
@@ -153,11 +199,23 @@ func newWithServer(s *Server, tlsCfg TLSConfig) (*Server, error) {
 	mux.HandleFunc("GET /nudm-sdm/v2/{supi}/sm-data",
 		s.handleGetSMData)
 
+	// Nudm_SDM: Subscribe / Unsubscribe (TS 29.503 §5.3.2)
+	mux.HandleFunc("POST /nudm-sdm/v2/{supi}/sdm-subscriptions",
+		s.handleSDMSubscribe)
+	mux.HandleFunc("DELETE /nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}",
+		s.handleSDMUnsubscribe)
+
 	// Nudm_UECM: AMF registration / deregistration
 	mux.HandleFunc("PUT /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access",
 		s.handleAMFRegistration)
 	mux.HandleFunc("DELETE /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access",
 		s.handleAMFDeregistration)
+
+	// Internal: data-change trigger — called by UDR or management tools to fan
+	// out Nudm_SDM_Notify to all active subscribers for a SUPI.
+	// Ref: TS 29.503 §5.3.3
+	mux.HandleFunc("POST /nudm-mgmt/v1/{supi}/data-change",
+		s.handleDataChangeTrigger)
 
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
@@ -368,6 +426,41 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 	if snName == "" {
 		snName = s.snName
 	}
+
+	// EAP-AKA' branch (TS 33.501 §6.1.3.1): when the subscriber's authentication
+	// method is EAP_AKA_PRIME, the UDM/ARPF returns the transformed AV (CK'/IK')
+	// and the AUSF runs the EAP method. Ref: TS 33.402 Annex A.2.
+	if authSub.AuthMethod == "EAP_AKA_PRIME" {
+		eapAV, err := aka.GenerateEAPAKAPrime(aka.HEAVInput{
+			SUPI: actualSUPI, K: k, OPc: opc, AMF: amf, SQN: sqn,
+		}, snName)
+		if err != nil {
+			log.Error("GenerateEAPAKAPrime failed", "error", err)
+			s.problem(w, http.StatusInternalServerError, "NF_FAILURE", err.Error())
+			return
+		}
+		newSQN := aka.IncrementSQN(sqn)
+		if err := s.udr.UpdateSQN(r.Context(), actualSUPI, hex.EncodeToString(newSQN[:])); err != nil {
+			log.Warn("SQN update failed (non-fatal)", "error", err)
+		}
+		span.SetStatus(codes.Ok, "")
+		log.Info("EAP-AKA' transformed AV generated, returning to AUSF",
+			"direction", "OUT", "supi", actualSUPI, "auth_type", "EAP_AKA_PRIME",
+			"spec_ref", "TS 33.501 §6.1.3.1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"authType": "EAP_AKA_PRIME",
+			"rand":     hex.EncodeToString(eapAV.RAND[:]),
+			"autn":     hex.EncodeToString(eapAV.AUTN[:]),
+			"xres":     hex.EncodeToString(eapAV.XRES[:]),
+			"ckPrime":  hex.EncodeToString(eapAV.CKPrime[:]),
+			"ikPrime":  hex.EncodeToString(eapAV.IKPrime[:]),
+			"supi":     actualSUPI,
+		})
+		return
+	}
+
 	heav, err := aka.GenerateFull(aka.HEAVInput{
 		SUPI: actualSUPI,
 		K:    k,
@@ -428,6 +521,10 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.DNN != "" {
 			entry["dnn"] = s.DNN
+		}
+		if s.SubjectToNSSAA {
+			// TS 23.501 §5.15.10 — slice requires Network Slice-Specific Auth & Authz.
+			entry["subjectToNetworkSliceSpecificAuthenticationAndAuthorization"] = true
 		}
 		snssais = append(snssais, entry)
 	}
@@ -549,6 +646,194 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"UP"}`))
 }
 
+// ServeH2C binds to ln with cleartext HTTP/2 (H2C) — for in-process tests only.
+func (s *Server) ServeH2C(ln net.Listener) error {
+	s.httpSrv.Handler = h2c.NewHandler(s.httpSrv.Handler, &http2.Server{})
+	err := s.httpSrv.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// ---- Nudm_SDM Subscribe / Notify (TS 29.503 §5.3.2 / §5.3.3) --------------
+
+// handleSDMSubscribe processes POST /nudm-sdm/v2/{supi}/sdm-subscriptions.
+// Ref: TS 29.503 §5.3.2.2
+func (s *Server) handleSDMSubscribe(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.logger.With(
+		"procedure", "SDMSubscribe",
+		"interface", "Nudm",
+		"direction", "IN",
+		"supi", supi,
+		"correlation_id", r.Header.Get("X-Correlation-Id"),
+		"spec_ref", "TS 29.503 §5.3.2.2",
+	)
+
+	var sub SdmSubscription
+	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "request body: "+err.Error())
+		return
+	}
+	if sub.CallbackRef == "" {
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "callbackReference is mandatory")
+		return
+	}
+
+	sub.SubscriptionID = ulid.Make().String()
+	log.Info("SDM subscription created",
+		"subscription_id", sub.SubscriptionID,
+		"callback_ref", sub.CallbackRef,
+		"monitored_resource", sub.MonitoredResURI,
+	)
+
+	s.addSubscription(supi, &sub)
+	s.subscriptionIdx.Store(sub.SubscriptionID, supi)
+
+	location := fmt.Sprintf("/nudm-sdm/v2/%s/sdm-subscriptions/%s", supi, sub.SubscriptionID)
+	w.Header().Set("Location", location)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(sub)
+}
+
+// handleSDMUnsubscribe processes DELETE /nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}.
+// Ref: TS 29.503 §5.3.2.7
+func (s *Server) handleSDMUnsubscribe(w http.ResponseWriter, r *http.Request) {
+	subscriptionID := r.PathValue("subscriptionId")
+	log := s.logger.With(
+		"procedure", "SDMUnsubscribe",
+		"interface", "Nudm",
+		"direction", "IN",
+		"subscription_id", subscriptionID,
+		"spec_ref", "TS 29.503 §5.3.2.7",
+	)
+
+	supiVal, ok := s.subscriptionIdx.LoadAndDelete(subscriptionID)
+	if !ok {
+		s.problem(w, http.StatusNotFound, "SUBSCRIPTION_NOT_FOUND",
+			"subscription "+subscriptionID+" not found")
+		return
+	}
+	supi := supiVal.(string)
+	s.removeSubscription(supi, subscriptionID)
+	log.Info("SDM subscription deleted", "supi", supi)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDataChangeTrigger processes POST /nudm-mgmt/v1/{supi}/data-change.
+// Called internally (by UDR or management tools) to fan out SDM notifications.
+// Ref: TS 29.503 §5.3.3
+func (s *Server) handleDataChangeTrigger(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+
+	var changes []ChangeItem
+	if err := json.NewDecoder(r.Body).Decode(&changes); err != nil || len(changes) == 0 {
+		// default: generic AM data change
+		changes = []ChangeItem{{
+			ChangeType:   "REPLACE",
+			ResourcePath: "/nudm-sdm/v2/" + supi + "/am-data",
+		}}
+	}
+
+	subs := s.listSubscriptions(supi)
+	if len(subs) == 0 {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	notif := ModificationNotification{ResourceChanges: changes}
+	body, _ := json.Marshal(notif)
+
+	for _, sub := range subs {
+		sub := sub
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, "POST", sub.CallbackRef, bytes.NewReader(body))
+			if err != nil {
+				s.logger.Warn("SDM notify: bad callback URI",
+					"subscription_id", sub.SubscriptionID,
+					"callback_ref", sub.CallbackRef,
+					"error", err)
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := s.notifyClient.Do(req)
+			if err != nil {
+				s.logger.Warn("SDM notify: callback failed",
+					"subscription_id", sub.SubscriptionID,
+					"error", err)
+				return
+			}
+			resp.Body.Close()
+			s.logger.Info("SDM notify: callback delivered",
+				"procedure", "SDMNotify",
+				"interface", "Nudm",
+				"direction", "OUT",
+				"supi", supi,
+				"subscription_id", sub.SubscriptionID,
+				"callback_status", resp.StatusCode,
+				"spec_ref", "TS 29.503 §5.3.3.2",
+			)
+		}()
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// subscriptionList is the per-SUPI subscription store (pointer → comparable for sync.Map).
+type subscriptionList struct {
+	mu   sync.Mutex
+	subs []*SdmSubscription
+}
+
+func (s *Server) getOrCreateSubList(supi string) *subscriptionList {
+	v, _ := s.subscriptions.LoadOrStore(supi, &subscriptionList{})
+	return v.(*subscriptionList)
+}
+
+// addSubscription appends sub to the per-supi list (thread-safe).
+func (s *Server) addSubscription(supi string, sub *SdmSubscription) {
+	list := s.getOrCreateSubList(supi)
+	list.mu.Lock()
+	list.subs = append(list.subs, sub)
+	list.mu.Unlock()
+}
+
+// removeSubscription deletes the entry with subscriptionId from the per-supi list.
+func (s *Server) removeSubscription(supi, subscriptionID string) {
+	v, ok := s.subscriptions.Load(supi)
+	if !ok {
+		return
+	}
+	list := v.(*subscriptionList)
+	list.mu.Lock()
+	newSubs := make([]*SdmSubscription, 0, len(list.subs))
+	for _, sub := range list.subs {
+		if sub.SubscriptionID != subscriptionID {
+			newSubs = append(newSubs, sub)
+		}
+	}
+	list.subs = newSubs
+	list.mu.Unlock()
+}
+
+// listSubscriptions returns a copy of all subscriptions for supi (thread-safe).
+func (s *Server) listSubscriptions(supi string) []*SdmSubscription {
+	v, ok := s.subscriptions.Load(supi)
+	if !ok {
+		return nil
+	}
+	list := v.(*subscriptionList)
+	list.mu.Lock()
+	out := make([]*SdmSubscription, len(list.subs))
+	copy(out, list.subs)
+	list.mu.Unlock()
+	return out
+}
+
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		corr := r.Header.Get("X-Correlation-Id")
@@ -659,9 +944,10 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 	var result struct {
 		NSSAI struct {
 			DefaultSingleNssais []struct {
-				SST int    `json:"sst"`
-				SD  string `json:"sd,omitempty"`
-				DNN string `json:"dnn,omitempty"` // portal-assigned preferred DNN
+				SST            int    `json:"sst"`
+				SD             string `json:"sd,omitempty"`
+				DNN            string `json:"dnn,omitempty"` // portal-assigned preferred DNN
+				SubjectToNSSAA bool   `json:"subjectToNetworkSliceSpecificAuthenticationAndAuthorization,omitempty"`
 			} `json:"defaultSingleNssais"`
 		} `json:"nssai"`
 	}
@@ -670,7 +956,7 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 	}
 	amData := &UDRAMData{AMBRUplink: 100000, AMBRDownlink: 100000}
 	for _, s := range result.NSSAI.DefaultSingleNssais {
-		amData.SNSSAIs = append(amData.SNSSAIs, SNSSAIEntry{SST: s.SST, SD: s.SD, DNN: s.DNN})
+		amData.SNSSAIs = append(amData.SNSSAIs, SNSSAIEntry{SST: s.SST, SD: s.SD, DNN: s.DNN, SubjectToNSSAA: s.SubjectToNSSAA})
 	}
 	return amData, nil
 }

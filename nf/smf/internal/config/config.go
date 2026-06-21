@@ -31,6 +31,10 @@ type Config struct {
 		// AMFMgmt is the AMF management API (plain HTTP) used to trigger
 		// NW-initiated PDU session procedures towards the UE (N1/N2 delivery).
 		AMFMgmt string `yaml:"amf_mgmt"`
+		// AMF is the AMF SBI (namf-comm, mTLS HTTP/2) endpoint used for
+		// Namf_Communication_N1N2MessageTransfer (CN paging of CM-IDLE UEs).
+		// Ref: TS 29.518 §5.2.2.3, TS 23.502 §4.2.3.3.
+		AMF string `yaml:"amf"`
 	} `yaml:"peers"`
 	Metrics struct {
 		Address string `yaml:"address"`
@@ -52,10 +56,15 @@ type Config struct {
 }
 
 // DNNConfig holds the per-DNN IP pool configuration for the SMF.
-// Ref: TS 23.501 §5.6.5
+// Ref: TS 23.501 §5.6.5, §5.8.2.2
 type DNNConfig struct {
 	Name     string `yaml:"name"`
 	UEIPPool string `yaml:"ue_ip_pool"`
+	// UEIPv6Prefix is the base IPv6 prefix (e.g. "2001:db8:61::/56") from which
+	// per-session /64 prefixes are delegated for IPv6 / IPv4v6 PDU sessions.
+	// Empty = the DNN is IPv4-only (IPv6 requests are downgraded to IPv4).
+	// Ref: TS 23.501 §5.8.2.2.
+	UEIPv6Prefix string `yaml:"ue_ipv6_prefix"`
 }
 
 func Load() (*Config, error) {
@@ -74,6 +83,7 @@ func Load() (*Config, error) {
 	cfg.Metrics.Address = "0.0.0.0:9105"
 	cfg.Peers.PCF, cfg.Peers.UDM, cfg.Peers.UPF = "pcf:8006", "udm:8003", "upf:8805"
 	cfg.Peers.AMFMgmt = "amf:9002"
+	cfg.Peers.AMF = "amf:8001"
 	cfg.SBI.TLS.CAFile = "/etc/5gc/pki/ca.crt"
 	cfg.SBI.TLS.CertFile, cfg.SBI.TLS.KeyFile = "/etc/5gc/pki/smf.crt", "/etc/5gc/pki/smf.key"
 	cfg.Peers.NRF = "nrf:8000"

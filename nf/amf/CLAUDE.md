@@ -17,8 +17,12 @@ Control plane entry point for the UE. Manages mobility, access, and NAS signalin
 | N8 | UDM | Nudm SBI | TS 29.503 |
 | N11 | SMF | Nsmf SBI | TS 29.502 |
 | N12 | AUSF | Nausf SBI | TS 29.509 |
+| N14 | AMF (peer) | Namf_Communication SBI | TS 29.518 |
 | N15 | PCF | Npcf SBI | TS 29.507 |
 | N22 | NSSF | Nnssf SBI | TS 29.531 |
+
+The AMF runs **one inbound SBI server** (`namf-comm`, mTLS + HTTP/2, port 8001) in
+addition to its outbound clients — see §15.
 
 ## 3. Implemented Procedures
 
@@ -36,6 +40,15 @@ Control plane entry point for the UE. Manages mobility, access, and NAS signalin
 | NW-initiated PDU Session Release | TS 23.502 §4.3.4.3 | ✅ |
 | Xn Handover | TS 23.502 §4.9.1.2 | ✅ |
 | N2 Handover | TS 23.502 §4.9.1.3 | ✅ |
+| Namf_Communication UEContextTransfer (producer) | TS 29.518 §5.3.2 | 🟡 |
+| Namf_Communication N1N2MessageTransfer (producer) | TS 29.518 §5.2.2.3 | 🟡 |
+| CN Paging + NW-Triggered Service Request | TS 23.502 §4.2.3.3 | 🟡 |
+| NGAP Paging | TS 38.413 §9.2.8 | ✅ |
+| Network Slice-Specific Auth & Authz (NSSAA) | TS 23.502 §4.2.9 | 🟡 |
+| SMS over NAS — UL relay to SMSF (PCT=0x02) | TS 23.502 §4.13.3 / TS 29.540 §5.2.4 | 🟡 |
+
+> 🟡 producer-side / control-plane only — see §15 (Inbound SBI server) and
+> `docs/compliance-matrix.md` for the documented gaps.
 
 ## 4. Internal Architecture
 
@@ -46,8 +59,10 @@ cmd/amf/
 internal/
   context/        UEContext, Manager, GMM5State, GUTI5G, SecurityContext
   procedures/     Registration handler (3 phases)
-  ngap/           NGAP SCTP server + message handlers
+  ngap/           NGAP SCTP server + message handlers (incl. Paging)
   nas/            NAS dispatcher → procedures
+  sbi/            Inbound SBI server (namf-comm, mTLS+h2 :8001) —
+                  UEContextTransfer + N1N2MessageTransfer producers
 ```
 
 Initial Registration flow:
@@ -161,3 +176,43 @@ make -C nf/amf test
 make -C nf/amf docker
 docker logs -f amf | jq '.procedure, .result, .cause'
 ```
+
+## 15. Inbound SBI Server (`internal/sbi`) — namf-comm
+
+The AMF's **first and only inbound SBI server**: mTLS + HTTP/2 (h2 ALPN), port 8001,
+`RequireAndVerifyClientCert`. Wired in `cmd/amf/main.go` (`amfsbi.New` + `SetPager(ngapSrv)`).
+Follows the ALPN rule — `TLSConfig` (with `NextProtos: ["h2"]`) set **before**
+`http2.ConfigureServer`. Mirrors the NRF server.
+
+| Operation | Method + path | Spec |
+|---|---|---|
+| UEContextTransfer | `POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer` | TS 29.518 §5.3.2 |
+| N1N2MessageTransfer | `POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages` | TS 29.518 §5.2.2.3 |
+| Health | `GET /healthz` | — |
+
+**UEContextTransfer (producer / old-AMF side, TS 23.502 §4.2.2.2.3):** resolves the UE by the
+`ueContextId` (`imsi-…` → SUPI, `5g-guti-…` → trailing 8 hex = 5G-TMSI), returns
+`UeContextTransferRspData` (`mmContextList`: `NasSecurityMode` NIAx/NEAx + `kamf` +
+`ueSecurityCapability`; `sessionContextList`), and sets `UEContext.Transferred`. Causes
+`CONTEXT_NOT_FOUND` (404), `MANDATORY_IE_MISSING` (400). Gap: no `regRequest` integrity replay,
+no `RegistrationStatusUpdate` consumer (old context released by implicit-detach timers).
+
+**N1N2MessageTransfer + CN Paging (TS 23.502 §4.2.3.3):** if the UE is **CM-IDLE** → triggers
+NGAP **Paging** via the `Pager` interface (`ngap.SendPaging`) and returns 202
+`ATTEMPTING_TO_REACH_UE` (`UEContext.PendingN1N2` set, cleared on the UE's Service Request);
+if **CM-CONNECTED** → 200 `N1_N2_TRANSFER_INITIATED`; unknown UE → 404. The SMF drives this
+over mTLS SBI from its internal `dl-data-notification` endpoint (simulated UPF DDN; the real
+N4 PFCP Session Report is UPF-001). Gap: N1/N2 payload not yet forwarded on the CM-CONNECTED path.
+
+**NGAP Paging** (`internal/ngap`, `BuildPaging` / `SendPaging`): non-UE-associated,
+ProcedureCode 24 (TS 38.413 §9.2.8). UE Paging Identity = 5G-S-TMSI (AMFSetID 10b + AMFPointer
+6b + 5G-TMSI 32b) + TAIListForPaging. `SendPaging` writes to every connected gNB whose
+SupportedTAs cover the UE's TAC (else best-effort broadcast).
+
+```bash
+# Unit + functional (in-process, no UERANSIM):
+go test ./nf/amf/internal/sbi/... ./nf/amf/internal/ngap/... -run "Paging|UEContextTransfer|N1N2"
+go test -tags=functional ./nf/amf/tests/features/...
+```
+Live E2E recipe (force CM-IDLE via gNB `ue-release`, then page): see root `CLAUDE.md`
+**Feature Validation → CN Paging / Network-Triggered Service Request**.
