@@ -23,8 +23,10 @@ AUSF performs UE authentication on behalf of the HPLMN. Coordinates with UDM to 
 | Operation | Route | Spec |
 |---|---|---|
 | UEAuthenticationPost | `POST /nausf-auth/v1/ue-authentications` | §5.7 |
-| EAPAuthMethod | `PUT /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation` | §5.8 |
+| 5gAkaConfirmation | `PUT /nausf-auth/v1/ue-authentications/{authCtxId}/5g-aka-confirmation` | §5.8 |
+| EapAuthMethod (EAP-AKA') | `PUT /nausf-auth/v1/ue-authentications/{authCtxId}/eap-session` | §5.7 |
 | DeleteAuthentication | `DELETE /nausf-auth/v1/ue-authentications/{authCtxId}` | §5.9 |
+| NSSAA EAP relay (simulated AAA-S) | `POST /nausf-nssaa/v1/{supi}/authenticate` | TS 23.502 §4.2.9 |
 
 ## 4. Implementation Status
 
@@ -32,7 +34,8 @@ AUSF performs UE authentication on behalf of the HPLMN. Coordinates with UDM to 
 |---|---|
 | 5G-AKA initiation (→ UDM) | ✅ Functional |
 | RES* verification + KAUSF derivation | ✅ Functional |
-| EAP-AKA' | ⏳ |
+| EAP-AKA' | ✅ Functional — `PUT …/eap-session`; key hierarchy + codec in `shared/crypto/eapaka` (RFC 5448) |
+| NSSAA EAP relay | 🟡 `POST /nausf-nssaa/v1/{supi}/authenticate` — relays UE EAP-Response to a simulated AAA-S (single round: Identity→Success/Failure; rejects identity containing "reject"). Generic EAP framing in `shared/crypto/eap`. No standalone NSSAAF / real AAA-S |
 
 ## 5. 5G-AKA Flow
 

@@ -1,5 +1,5 @@
 # nf/nrf/Makefile
-.PHONY: build test test-functional lint docker run clean
+.PHONY: build test test-cover test-functional lint docker run clean
 
 NF := nrf
 BIN := bin/$(NF)
@@ -9,7 +9,13 @@ build:
 	@mkdir -p bin
 	go build -o $(BIN) ./cmd/$(NF)
 
+# Gate de CI: solo correctness. No usa -coverprofile porque el toolchain
+# modular de Go 1.26 no trae el binario covdata (necesario para escribir
+# cobertura de paquetes sin tests). Para cobertura local: make test-cover.
 test:
+	go test -race $(PKG)
+
+test-cover:
 	go test -race -cover -coverprofile=coverage.out $(PKG)
 
 test-functional:

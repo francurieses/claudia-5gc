@@ -14,6 +14,7 @@ peers:
     nssf: nssf:8007
     pcf: pcf:8006
     smf: smf:8004
+    smsf: smsf:8009
     udm: udm:8003
 sbi:
     address: 0.0.0.0:8001
@@ -38,3 +39,5 @@ timers:
     mobile_reachable_guard_secs: 120
     pending_removal_watchdog_secs: 30
     t3512_secs: 60
+operator:
+    default_rfsp: 1

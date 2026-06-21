@@ -60,6 +60,13 @@ type Session struct {
 	QoSSource    string  // where the 5QI came from (see QoSSource* constants in qos.go)
 	State        string  // ACTIVE | IDLE (user plane deactivated)
 	CreatedAt    time.Time
+	// PDUSessionType is the granted type (PDUSessionTypeIPv4|IPv6|IPv4v6).
+	// Ref: TS 24.501 §9.11.4.11.
+	PDUSessionType uint8
+	// UEIPv6Prefix is the delegated /64 (CIDR string) for IPv6/IPv4v6 sessions;
+	// the prefix is advertised to the UE via RA on the UPF TUN (escalated,
+	// UPF-001). Empty for IPv4-only sessions. Ref: TS 23.501 §5.8.2.2.
+	UEIPv6Prefix string
 }
 
 // smPolicyQoS carries the QoS parameters extracted from the PCF SM Policy response.
@@ -82,10 +89,13 @@ type Server struct {
 	sessionMu  sync.Mutex
 	// ipPools holds one IP pool per DNN; keyed by DNN name.
 	// Ref: TS 23.501 §5.6.5 — each DNN has an isolated UE address space.
-	ipPools    map[string]*IPPool
-	nextSEID   atomic.Uint64 // monotonic counter for PFCP CP-SEID
-	nextTEID   atomic.Uint32 // monotonic counter for UL GTP-U TEIDs
-	pfcpSeq    atomic.Uint32 // PFCP sequence number
+	ipPools map[string]*IPPool
+	// ipv6Pools holds one /64-delegating IPv6 pool per IPv6-capable DNN, keyed
+	// by DNN name. A DNN absent here is IPv4-only. Ref: TS 23.501 §5.8.2.2.
+	ipv6Pools map[string]*IPv6Pool
+	nextSEID  atomic.Uint64 // monotonic counter for PFCP CP-SEID
+	nextTEID  atomic.Uint32 // monotonic counter for UL GTP-U TEIDs
+	pfcpSeq   atomic.Uint32 // PFCP sequence number
 	// db is optional; nil = in-memory only (dev without Docker / unit tests).
 	db store.Store
 }
@@ -155,7 +165,33 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		ipPools["internet"] = pool
 	}
 
-	httpClient, err := sbi.NewHTTP2Client(cfg.SBI.TLS.CAFile)
+	// IPv6 /64-delegating pools for DNNs that configure an IPv6 prefix. A DNN
+	// without ue_ipv6_prefix is IPv4-only. Ref: TS 23.501 §5.8.2.2.
+	ipv6Pools := make(map[string]*IPv6Pool)
+	for _, dnn := range cfg.DNNs {
+		if dnn.UEIPv6Prefix == "" {
+			continue
+		}
+		pool, err := NewIPv6Pool(dnn.UEIPv6Prefix)
+		if err != nil {
+			return nil, fmt.Errorf("smf: DNN %q IPv6 prefix (%s): %w", dnn.Name, dnn.UEIPv6Prefix, err)
+		}
+		ipv6Pools[dnn.Name] = pool
+		logger.Info("SMF: DNN IPv6 prefix pool initialised", "dnn", dnn.Name, "prefix", dnn.UEIPv6Prefix)
+	}
+
+	// Use an mTLS client when cert/key are configured so the SMF can call peer NF
+	// SBI servers that require client certificates (e.g. the AMF namf-comm server
+	// for N1N2MessageTransfer). Falls back to TLS-only, then H2C. Presenting a
+	// client cert to a peer that does not request one is harmless.
+	// Ref: TS 29.500 §4.4.1, TS 33.501 §13.
+	var httpClient *http.Client
+	var err error
+	if cfg.SBI.TLS.CertFile != "" && cfg.SBI.TLS.KeyFile != "" && cfg.SBI.TLS.CAFile != "" {
+		httpClient, err = sbi.NewMTLSClient(cfg.SBI.TLS.CAFile, cfg.SBI.TLS.CertFile, cfg.SBI.TLS.KeyFile)
+	} else {
+		httpClient, err = sbi.NewHTTP2Client(cfg.SBI.TLS.CAFile)
+	}
 	if err != nil {
 		logger.Warn("SMF: could not build SBI HTTP/2 client, using H2C fallback", "error", err)
 		httpClient = sbi.NewH2CClient()
@@ -168,6 +204,7 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		mgmtHTTP:   &http.Client{Timeout: 15 * time.Second},
 		sessions:   make(map[string]*Session),
 		ipPools:    ipPools,
+		ipv6Pools:  ipv6Pools,
 		db:         db,
 	}
 	if db != nil {
@@ -185,6 +222,11 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 	mux.HandleFunc("GET /nsmf-management/v1/sessions", s.handleMgmtListSessions)
 	mux.HandleFunc("GET /nsmf-management/v1/sessions/{pduSessionId}", s.handleMgmtGetSession)
 	mux.HandleFunc("POST /nsmf-management/v1/sessions/{pduSessionId}/qos", s.handleMgmtSetQoS)
+	// DL-data notification — simulates the UPF Downlink Data Report (PFCP Session
+	// Report) for a session whose user plane is deactivated, driving CN paging via
+	// Namf_Communication_N1N2MessageTransfer. The real N4 PFCP DDN is UPF-001
+	// (PFCP session-management path). Ref: TS 23.502 §4.2.3.3.
+	mux.HandleFunc("POST /nsmf-management/v1/sessions/{pduSessionId}/dl-data-notification", s.handleDLDataNotification)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	var tlsCfg *tls.Config
@@ -339,10 +381,13 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 
 	n1SmMsg, _ := base64.StdEncoding.DecodeString(n1SmMsgB64)
 	// n1SmMsg is the full 5GSM message (EPD|PSI|PTI|MT|body); the decoder
-	// expects the body only. Decoded fields are informational for now.
+	// expects the body only. We extract the requested PDU session type to drive
+	// IPv6/IPv4v6 prefix delegation (TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11).
+	var requestedType *uint8
 	if len(n1SmMsg) > 4 {
-		pduReq, _ := nas.DecodePDUSessionEstablishmentRequest(n1SmMsg[4:])
-		_ = pduReq
+		if pduReq, err := nas.DecodePDUSessionEstablishmentRequest(n1SmMsg[4:]); err == nil {
+			requestedType = pduReq.PDUSessionType
+		}
 	}
 
 	// Extract S-NSSAI if provided (passed by AMF per TS 29.502 §6.1.6.2.2)
@@ -375,14 +420,42 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("DNN %q not served by this SMF", dnn))
 		return
 	}
-	ip, err := dnnPool.Allocate()
-	if err != nil {
-		log.Error("IP allocation failed", "error", err, "dnn", dnn)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "IP pool exhausted")
-		metrics.PDUSessionTotal.WithLabelValues("SMF", dnn, "FAILURE").Inc()
-		problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
-		return
+
+	// Resolve the granted PDU session type from the UE request + the DNN's IPv6
+	// capability, then allocate the required address family/families.
+	// Ref: TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11.
+	v6Pool := s.ipv6Pools[dnn]
+	grantedType := selectPDUSessionType(requestedType, v6Pool != nil)
+
+	var ip net.IP // IPv4 (nil for an IPv6-only session)
+	var err error
+	if pduTypeNeedsIPv4(grantedType) {
+		ip, err = dnnPool.Allocate()
+		if err != nil {
+			log.Error("IP allocation failed", "error", err, "dnn", dnn)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "IP pool exhausted")
+			metrics.PDUSessionTotal.WithLabelValues("SMF", dnn, "FAILURE").Inc()
+			problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+			return
+		}
+	}
+
+	var v6Prefix *net.IPNet
+	var v6IID []byte
+	if pduTypeNeedsIPv6(grantedType) {
+		v6Prefix, v6IID, err = v6Pool.Allocate()
+		if err != nil {
+			if ip != nil {
+				dnnPool.Release(ip)
+			}
+			log.Error("IPv6 prefix allocation failed", "error", err, "dnn", dnn)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "IPv6 pool exhausted")
+			metrics.PDUSessionTotal.WithLabelValues("SMF", dnn, "FAILURE").Inc()
+			problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+			return
+		}
 	}
 
 	smContextRef := uuid.NewString()
@@ -404,8 +477,9 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	// N1SM: PDU Session Establishment Accept body (AMF wraps in DL NAS Transport).
 	// Carries the QoS rules (QFI=1 default flow) and the QoS flow descriptions
 	// with the authorized 5QI (TS 24.501 §9.11.4.12/§9.11.4.13).
-	n1SmResp, _ := nas.EncodePDUSessionEstablishmentAcceptBodyWithQoS(
-		nas.PDUSessionTypeIPv4, nas.SSCMode1, ip, dnn,
+	n1SmResp, _ := nas.EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
+		nas.PDUAddressInfo{SessionType: grantedType, IPv4: ip, IPv6IID: v6IID},
+		nas.SSCMode1, dnn,
 		1 /* QFI=1 for default flow */, policyQoS.FiveQI,
 		policyQoS.AMBRDLMbps, policyQoS.AMBRULMbps,
 		nas.SNSSAI{SST: slice.SST, SD: nas.SDFromString(slice.SD)},
@@ -416,6 +490,7 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	n2SmInfo, err := buildPDUSessionResourceSetupRequestTransfer(
 		net.ParseIP(s.cfg.UPFN3Addr), ulTEID, 1 /* QFI */, int64(policyQoS.FiveQI),
 		int64(policyQoS.AMBRULMbps)*1_000_000, int64(policyQoS.AMBRDLMbps)*1_000_000,
+		ngapPDUSessionType(grantedType),
 	)
 	if err != nil {
 		log.Error("N2SM Transfer encoding failed", "error", err)
@@ -428,23 +503,30 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		"5qi", policyQoS.FiveQI)
 	n2SmInfoB64 := base64.StdEncoding.EncodeToString(n2SmInfo)
 
+	var v6PrefixStr string
+	if v6Prefix != nil {
+		v6PrefixStr = v6Prefix.String()
+	}
+
 	// Store typed session
 	sess := &Session{
-		SUPI:         supi,
-		PDUSessionID: uint8(pduSessionID),
-		DNN:          dnn,
-		UEIP:         ip,
-		ULTEID:       ulTEID,
-		SEID:         seid,
-		SliceID:      slice,
-		SmPolicyID:   smPolicyID,
-		FiveQI:       policyQoS.FiveQI,
-		ARPPriority:  policyQoS.ARPPriority,
-		AMBRULMbps:   policyQoS.AMBRULMbps,
-		AMBRDLMbps:   policyQoS.AMBRDLMbps,
-		QoSSource:    policyQoS.Source,
-		State:        "ACTIVE",
-		CreatedAt:    time.Now(),
+		SUPI:           supi,
+		PDUSessionID:   uint8(pduSessionID),
+		DNN:            dnn,
+		UEIP:           ip,
+		ULTEID:         ulTEID,
+		SEID:           seid,
+		SliceID:        slice,
+		SmPolicyID:     smPolicyID,
+		FiveQI:         policyQoS.FiveQI,
+		ARPPriority:    policyQoS.ARPPriority,
+		AMBRULMbps:     policyQoS.AMBRULMbps,
+		AMBRDLMbps:     policyQoS.AMBRDLMbps,
+		QoSSource:      policyQoS.Source,
+		State:          "ACTIVE",
+		CreatedAt:      time.Now(),
+		PDUSessionType: grantedType,
+		UEIPv6Prefix:   v6PrefixStr,
 	}
 	s.sessionMu.Lock()
 	s.sessions[smContextRef] = sess
@@ -453,18 +535,44 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	metrics.PDUSessionTotal.WithLabelValues("SMF", dnn, "OK").Inc()
 	metrics.PDUSessionsActive.WithLabelValues("SMF", dnn).Inc()
 
-	// Establish PFCP session with UPF asynchronously
-	go s.sendPFCPSessionEstablishment(context.Background(), sess)
+	if pduTypeNeedsIPv6(grantedType) {
+		// The /64 delivery (Router Advertisement on the per-DNN TUN) and the IPv6
+		// UE-IP in the PFCP PDR are on the hard-stop UPF data-plane / PFCP
+		// session-management path (escalated, UPF-001). Until that lands the IPv6
+		// leg has no user-plane forwarding. Ref: TS 23.501 §5.8.2.2.
+		log.Warn("IPv6 user plane pending UPF data-plane work",
+			"pdu_session_type", grantedType, "ipv6_prefix", v6PrefixStr,
+			"dataplane", "pending-upf-001", "spec_ref", "TS 23.501 §5.8.2.2")
+	}
+
+	// Establish the PFCP session with the UPF (IPv4 user plane) asynchronously.
+	// IPv6-only sessions have no IPv4 PDR to install and their v6 user plane is
+	// escalated (UPF-001), so the PFCP path is left untouched in that case.
+	if ip != nil {
+		go s.sendPFCPSessionEstablishment(context.Background(), sess)
+	}
+
+	allocatedIP := "" // IPv4 address, or the delegated /64 for IPv6-only sessions
+	switch {
+	case ip != nil:
+		allocatedIP = ip.String()
+	case v6PrefixStr != "":
+		allocatedIP = v6PrefixStr
+	}
 
 	span.SetAttributes(
 		attribute.String("sm_context_ref", smContextRef),
-		attribute.String("allocated_ip", ip.String()),
+		attribute.String("allocated_ip", allocatedIP),
+		attribute.String("ipv6_prefix", v6PrefixStr),
+		attribute.Int("pdu_session_type", int(grantedType)),
 		attribute.Int("5qi", int(policyQoS.FiveQI)),
 	)
 	span.SetStatus(codes.Ok, "")
 	log.Info("Nsmf_PDUSession_CreateSMContext responded",
 		"smContextRef", smContextRef,
-		"allocatedIP", ip.String(),
+		"allocatedIP", allocatedIP,
+		"ipv6Prefix", v6PrefixStr,
+		"pduSessionType", grantedType,
 		"snssai_sst", slice.SST,
 		"snssai_sd", slice.SD,
 		"5qi", policyQoS.FiveQI,
@@ -562,6 +670,23 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			ambrUL = int(v)
 		}
 
+		// Consult PCF to authorize the requested QoS change before applying it
+		// (SM Policy Association Update). On rejection no N4/N1/N2 change is made.
+		// Ref: TS 29.512 §5.2.2.3, TS 23.502 §4.3.3.2 step 1b.
+		granted, authorized := s.updateSMPolicy(r.Context(), sess, fiveQI, ambrUL, ambrDL)
+		if !authorized {
+			log.Info("NW-initiated QoS modification rejected by PCF",
+				"smContextRef", smContextRef, "requested_5qi", fiveQI,
+				"interface", "Nsmf", "direction", "OUT", "result", "REJECT",
+				"spec_ref", "TS 29.512 §5.2.2.3")
+			problem(w, http.StatusForbidden, "REQUESTED_QOS_NOT_AUTHORIZED",
+				"PCF rejected the requested QoS change")
+			return
+		}
+		fiveQI = granted.FiveQI
+		ambrDL = granted.AMBRDLMbps
+		ambrUL = granted.AMBRULMbps
+
 		// Update session QoS state.
 		s.sessionMu.Lock()
 		sess.FiveQI = fiveQI
@@ -617,7 +742,36 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			pduSessionID := n1SmMsgBytes[1]
 			pti := n1SmMsgBytes[2]
 
+			// Consult PCF to authorize the UE-requested modification (SM Policy
+			// Association Update). With no per-subscriber override the PCF echoes
+			// the current QoS (no change → byte-identical empty command body); an
+			// override is applied as a real QoS modification (N4 QER + QoS IEs).
+			// Ref: TS 29.512 §5.2.2.3, TS 23.502 §4.3.3.1 step 1b.
 			cmdBody := nas.EncodePDUSessionModificationCommandBody()
+			s.sessionMu.Lock()
+			sess := s.sessions[smContextRef]
+			s.sessionMu.Unlock()
+			if sess != nil {
+				curFiveQI, curUL, curDL := sess.FiveQI, sess.AMBRULMbps, sess.AMBRDLMbps
+				granted, authorized := s.updateSMPolicy(r.Context(), sess, curFiveQI, curUL, curDL)
+				if authorized && (granted.FiveQI != curFiveQI || granted.AMBRULMbps != curUL || granted.AMBRDLMbps != curDL) {
+					s.sessionMu.Lock()
+					sess.FiveQI = granted.FiveQI
+					sess.AMBRULMbps = granted.AMBRULMbps
+					sess.AMBRDLMbps = granted.AMBRDLMbps
+					sess.QoSSource = granted.Source
+					s.sessionMu.Unlock()
+					if upfAck := s.sendPFCPQoSModification(r.Context(), sess); !upfAck {
+						log.Warn("PFCP QER modification not acknowledged by UPF (UE-requested)",
+							"seid", sess.SEID, "spec_ref", "TS 29.244 §7.5.4")
+					}
+					cmdBody = nas.EncodePDUSessionModificationCommandBodyWithQoS(
+						1 /* QFI=1 */, granted.FiveQI, granted.AMBRDLMbps, granted.AMBRULMbps)
+					log.Info("UE-requested modification: PCF applied policy decision",
+						"5qi", granted.FiveQI, "qos_source", granted.Source,
+						"spec_ref", "TS 29.512 §5.2.2.3")
+				}
+			}
 			n1SmCmd := nas.WrapPDUSessionModificationCommandBody(pduSessionID, pti, cmdBody)
 
 			n2SmInfo, err := buildPDUSessionResourceModifyRequestTransfer()
@@ -704,8 +858,13 @@ func (s *Server) handleDeleteSMContext(w http.ResponseWriter, r *http.Request) {
 		if pool == nil {
 			pool = s.ipPools["internet"]
 		}
-		if pool != nil {
+		if pool != nil && sess.UEIP != nil {
 			pool.Release(sess.UEIP)
+		}
+		if v6pool := s.ipv6Pools[sess.DNN]; v6pool != nil && sess.UEIPv6Prefix != "" {
+			if _, prefix, perr := net.ParseCIDR(sess.UEIPv6Prefix); perr == nil {
+				v6pool.Release(prefix)
+			}
 		}
 	}
 	delete(s.sessions, smContextRef)
@@ -1004,6 +1163,112 @@ func (s *Server) deleteSMPolicy(ctx context.Context, smPolicyID string) {
 	)
 }
 
+// updateSMPolicy consults PCF to authorize a QoS modification on an existing SM
+// Policy Association (TS 29.512 §5.2.2.3). reqFiveQI / reqAMBR*Mbps are the
+// requested values. Returns the granted QoS and whether the PCF authorized the
+// change (false ⇒ the SMF must not apply it).
+//
+// Fail-open: when the PCF peer is not configured, the session has no SmPolicyId,
+// or the PCF is unreachable, it returns the requested values with authorized=true
+// — consistent with createSMPolicy's establishment-time fallback (no regression
+// when the PCF is absent). Ref: TS 29.512 §5.2.2.3 (Npcf_SMPolicyControl_Update).
+func (s *Server) updateSMPolicy(ctx context.Context, sess *Session, reqFiveQI uint8, reqAMBRULMbps, reqAMBRDLMbps int) (smPolicyQoS, bool) {
+	requested := smPolicyQoS{
+		FiveQI:      reqFiveQI,
+		ARPPriority: sess.ARPPriority,
+		AMBRULMbps:  reqAMBRULMbps,
+		AMBRDLMbps:  reqAMBRDLMbps,
+		Source:      QoSSourceNWModification,
+	}
+	if s.cfg.Peers.PCF == "" || sess.SmPolicyID == "" {
+		return requested, true // fail-open: nothing to consult
+	}
+
+	reqBody := map[string]interface{}{
+		"repPolicyCtrlReqTriggers": []string{"RES_MO_RE"},
+		"reqQos": map[string]interface{}{
+			"5qi": int(reqFiveQI),
+			"ambr": map[string]string{
+				"uplink":   fmt.Sprintf("%d Mbps", reqAMBRULMbps),
+				"downlink": fmt.Sprintf("%d Mbps", reqAMBRDLMbps),
+			},
+		},
+		"supi": sess.SUPI,
+		"dnn":  sess.DNN,
+	}
+	body, _ := json.Marshal(reqBody)
+	pcfURL := "https://" + s.cfg.Peers.PCF + "/npcf-smpolicycontrol/v1/sm-policies/" + sess.SmPolicyID + "/update"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, pcfURL, bytes.NewReader(body))
+	if err != nil {
+		s.logger.Warn("PCF: update SM policy request build failed — failing open", "error", err)
+		return requested, true
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.logger.Warn("PCF: update SM policy call failed — failing open", "error", err,
+			"spec_ref", "TS 29.512 §5.2.2.3")
+		return requested, true
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		s.logger.Info("PCF: SM Policy update rejected",
+			"smPolicyId", sess.SmPolicyID, "requested_5qi", reqFiveQI,
+			"result", "REJECT", "spec_ref", "TS 29.512 §5.2.2.3")
+		return requested, false
+	}
+	if resp.StatusCode != http.StatusOK {
+		s.logger.Warn("PCF: unexpected status on SM policy update — failing open",
+			"status", resp.StatusCode)
+		return requested, true
+	}
+
+	granted := requested
+	var respBody map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err == nil {
+		if src, ok := respBody["x5gcQosSource"].(string); ok && src != "" {
+			granted.Source = src
+		}
+		if qosDecs, ok := respBody["qosDecs"].(map[string]interface{}); ok {
+			for _, v := range qosDecs {
+				if dec, ok := v.(map[string]interface{}); ok {
+					if fiveQI, ok := dec["5qi"].(float64); ok && fiveQI > 0 {
+						granted.FiveQI = uint8(fiveQI)
+					}
+					if arp, ok := dec["arp"].(map[string]interface{}); ok {
+						if pl, ok := arp["priorityLevel"].(float64); ok && pl > 0 {
+							granted.ARPPriority = int(pl)
+						}
+					}
+					break
+				}
+			}
+		}
+		if sessRules, ok := respBody["sessRules"].(map[string]interface{}); ok {
+			for _, v := range sessRules {
+				if rule, ok := v.(map[string]interface{}); ok {
+					if ambr, ok := rule["sessAmbr"].(map[string]interface{}); ok {
+						if ul, ok := ambr["uplink"].(string); ok {
+							granted.AMBRULMbps = parseMbps(ul, reqAMBRULMbps)
+						}
+						if dl, ok := ambr["downlink"].(string); ok {
+							granted.AMBRDLMbps = parseMbps(dl, reqAMBRDLMbps)
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+	s.logger.Info("PCF: SM Policy update authorised",
+		"smPolicyId", sess.SmPolicyID,
+		"5qi", granted.FiveQI, "ambr_ul_mbps", granted.AMBRULMbps, "ambr_dl_mbps", granted.AMBRDLMbps,
+		"qos_source", granted.Source, "spec_ref", "TS 29.512 §5.2.2.3")
+	return granted, true
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"UP"}`))
@@ -1039,7 +1304,20 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 // ambrULBps and ambrDLBps are bit rates in bits per second.
 // fiveQI is the 5QI value to include in the QoS Flow Setup Request List.
 // Ref: TS 38.413 §9.3.4.5 — PDU Session Resource Setup Request Transfer
-func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qfi uint8, fiveQI, ambrULBps, ambrDLBps int64) ([]byte, error) {
+// ngapPDUSessionType maps a 5GSM PDU session type value (TS 24.501 §9.11.4.11)
+// to the NGAP PDUSessionType enumeration (TS 38.413 §9.3.1.51).
+func ngapPDUSessionType(t uint8) aper.Enumerated {
+	switch t {
+	case nas.PDUSessionTypeIPv6:
+		return ngapType.PDUSessionTypePresentIpv6
+	case nas.PDUSessionTypeIPv4v6:
+		return ngapType.PDUSessionTypePresentIpv4v6
+	default:
+		return ngapType.PDUSessionTypePresentIpv4
+	}
+}
+
+func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qfi uint8, fiveQI, ambrULBps, ambrDLBps int64, pduType aper.Enumerated) ([]byte, error) {
 	transfer := ngapType.PDUSessionResourceSetupRequestTransfer{
 		ProtocolIEs: ngapType.ProtocolIEContainerPDUSessionResourceSetupRequestTransferIEs{
 			List: []ngapType.PDUSessionResourceSetupRequestTransferIEs{
@@ -1079,7 +1357,7 @@ func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qf
 					Value: ngapType.PDUSessionResourceSetupRequestTransferIEsValue{
 						Present: ngapType.PDUSessionResourceSetupRequestTransferIEsPresentPDUSessionType,
 						PDUSessionType: &ngapType.PDUSessionType{
-							Value: ngapType.PDUSessionTypePresentIpv4,
+							Value: pduType,
 						},
 					},
 				},

@@ -33,6 +33,12 @@ const nfName = "AMF"
 // must respond with an Identity Request (type = SUCI) and call
 // Phase1_AuthenticateWithSUCI once the UE's SUCI arrives.
 // Ref: TS 24.501 §5.5.1.2.2 step 1b
+
+// ErrServiceAreaRestricted is returned by Phase3_ProcessSMCComplete when the
+// PCF service area restriction forbids the UE from registering in its current TA.
+// The NAS handler must respond with a Registration Reject (5GMM cause #73).
+// Ref: TS 23.501 §5.3.4, TS 24.501 §8.2.8.2 cause 0x49
+var ErrServiceAreaRestricted = errors.New("service area restriction: TAC not allowed (cause #73)")
 var ErrNeedSUCI = errors.New("UE presented GUTI not resolvable — need SUCI")
 
 // NRFClient discovers NFs from the NRF.
@@ -108,6 +114,20 @@ type PCFClient interface {
 	DeleteUEPolicyAssociation(ctx context.Context, polAssoID string) error
 }
 
+// AMPolicyClient calls PCF for access-and-mobility policy (N15, Npcf_AMPolicyControl).
+// Optional: when nil, no AM policy association is created at registration.
+// Ref: TS 29.507 §4.2.2
+type AMPolicyClient interface {
+	// CreateAMPolicyAssociation creates an AM policy association at UE registration.
+	// Returns the polAssoId, RFSP index (0 if not provided), and optional service area
+	// restriction (nil if PCF returned none = unrestricted).
+	// Ref: TS 29.507 §4.2.2.2
+	CreateAMPolicyAssociation(ctx context.Context, supi, accessType, mcc, mnc string) (
+		polAssoID string, rfsp int, servAreaRes *amfctx.ServiceAreaRestriction, err error)
+	// DeleteAMPolicyAssociation releases the AM policy association at deregistration.
+	DeleteAMPolicyAssociation(ctx context.Context, polAssoID string) error
+}
+
 // RegistrationHandler orchestrates the Initial Registration procedure.
 // Ref: TS 23.502 §4.2.2.2.2
 type RegistrationHandler struct {
@@ -115,8 +135,10 @@ type RegistrationHandler struct {
 	ausf         AUSFClient
 	udm          UDMClient
 	nrf          NRFClient
-	nssf         NSSFClient // optional; when nil, local UDM-subscription filter is used
-	pcf          PCFClient  // optional; when nil, no N15 call is made
+	nssf         NSSFClient    // optional; when nil, local UDM-subscription filter is used
+	pcf          PCFClient     // optional; when nil, no UE policy (URSP) N15 call is made
+	amPolicy     AMPolicyClient // optional; when nil, no AM policy association is created
+	nssaa        NSSAAClient    // optional; when nil, no slice-specific auth is run
 	logger       *slog.Logger
 	nfInstanceID string
 	plmnMCC      string
@@ -136,6 +158,11 @@ type RegistrationHandler struct {
 	// Set via nf/amf/config/dev.yaml "security.null_ciphering: true".
 	// TS 33.501 §6.7.2: NEA0/NIA0 MUST NOT be used in production.
 	nullSecurity bool
+	// defaultRFSP is the operator-configured Radio Frequency Selection Priority
+	// index (1-256) sent in NGAP InitialContextSetupRequest (IE id=31) when PCF
+	// does not provide one. 0 means "omit the IE entirely".
+	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
+	defaultRFSP int
 }
 
 // NewRegistrationHandler builds a handler wired to the AMF's NF clients.
@@ -175,6 +202,33 @@ func (h *RegistrationHandler) WithNSSF(nssf NSSFClient) {
 // Ref: TS 29.525 §4.2.2.2, TS 23.502 §4.2.2.2.2 step 17b
 func (h *RegistrationHandler) WithPCF(pcf PCFClient) {
 	h.pcf = pcf
+}
+
+// WithAMPolicy enables AM Policy Association (Npcf_AMPolicyControl). When set,
+// Phase3 calls PCF to create an AM policy association and stores the polAssoId +
+// RFSP in the UE context. Non-fatal. Ref: TS 29.507 §4.2.2, TS 23.502 §4.2.2.2.2 step 14c
+func (h *RegistrationHandler) WithAMPolicy(c AMPolicyClient) {
+	h.amPolicy = c
+}
+
+// WithDefaultRFSP sets the operator default RFSP index (1-256) included in every
+// NGAP InitialContextSetupRequest (IE id=31). It is applied before the PCF call so
+// the IE is always present on the wire; PCF can override it per-subscriber.
+// Pass 0 to omit the IE when PCF is also not configured.
+// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
+func (h *RegistrationHandler) WithDefaultRFSP(rfsp int) {
+	h.defaultRFSP = rfsp
+}
+
+// rfspSource returns a log-friendly label for where the final RFSP came from.
+func rfspSource(pcfRFSP, defaultRFSP int) string {
+	if pcfRFSP > 0 {
+		return "PCF"
+	}
+	if defaultRFSP > 0 {
+		return "OPERATOR_DEFAULT"
+	}
+	return "NONE"
 }
 
 // WithT3512 sets the T3512 Periodic Registration Timer value (seconds) sent to the UE
@@ -431,8 +485,13 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 // Phase2_ProcessAuthResponse handles the UE's Authentication Response (RES*).
 // Steps 10-15 of TS 23.502 §4.2.2.2.2.
 // Returns the Security Mode Command to send next.
+// Phase2_ProcessAuthResponse verifies the UE's RES* with AUSF, derives NAS keys, and
+// builds the Security Mode Command. The second return value is the stale UEContext that
+// was previously registered for the same SUPI (if any); the caller must release its PDU
+// sessions and call RemoveContext on it before proceeding.
+// Ref: TS 23.502 §4.2.2.2.2 steps 10-14
 func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
-	ctx context.Context, ue *amfctx.UEContext, authResp *nas.AuthenticationResponse) (*nas.SecurityModeCommand, error) {
+	ctx context.Context, ue *amfctx.UEContext, authResp *nas.AuthenticationResponse) (*nas.SecurityModeCommand, *amfctx.UEContext, error) {
 
 	ctx, span := tracing.Tracer(nfName, "procedures").Start(ctx, "InitialRegistration/Phase2")
 	defer span.End()
@@ -455,7 +514,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	if len(authResp.RES) == 0 {
 		metrics.NASMessagesTotal.WithLabelValues(nfName, "AuthenticationResponse", "IN", "FAILURE").Inc()
 		span.SetStatus(codes.Error, "missing RES*")
-		return nil, fmt.Errorf("amf: auth response missing RES*")
+		return nil, nil, fmt.Errorf("amf: auth response missing RES*")
 	}
 
 	// Step 11: forward RES* to AUSF for verification
@@ -469,10 +528,15 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "RES* verification failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
-		return nil, fmt.Errorf("ausf: confirm auth: %w", err)
+		return nil, nil, fmt.Errorf("ausf: confirm auth: %w", err)
 	}
 
-	h.mgr.SetSUPI(ue, confirmResp.SUPI)
+	// Atomically bind the SUPI to this new context. SetSUPI returns any prior context
+	// that held the same SUPI — this happens when a UE reconnects (Docker restart,
+	// abrupt disconnect) without having sent a Deregistration NAS message, so its old
+	// context was never cleaned up. The caller receives it and releases it async.
+	// Ref: TS 23.502 §4.2.2.2.2 step 3b
+	displaced := h.mgr.SetSUPI(ue, confirmResp.SUPI)
 	ue.KAUSF = confirmResp.KAUSF
 	log = log.With("supi", ue.SUPI)
 	span.SetAttributes(attribute.String("supi", ue.SUPI))
@@ -534,7 +598,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 			IA2: ue.UESecCapIA[2], IA3: ue.UESecCapIA[3],
 			Raw: ue.RawUESecCap, // replay verbatim to satisfy UERANSIM byte comparison
 		},
-	}, nil
+	}, displaced, nil
 }
 
 // Phase3_ProcessSMCComplete handles Security Mode Complete and finishes registration.
@@ -611,6 +675,10 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 			"requested_count", len(ue.RequestedNSSAI),
 		)
 	}
+	// Withhold slices subject to NSSAA from the initial Allowed NSSAI; they are
+	// granted only after slice-level EAP auth succeeds (run after RegistrationComplete).
+	// No-op when NSSAA is unconfigured or no slice is flagged. Ref: TS 23.502 §4.2.9.2.
+	h.SplitPendingNSSAA(ue)
 	ue.SubscribedAMBR.UL = amSub.AMBRUplink
 	ue.SubscribedAMBR.DL = amSub.AMBRDownlink
 
@@ -630,6 +698,61 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		"direction", "OUT",
 		"message_type", "RegistrationAccept",
 		"spec_ref", "TS 23.502 §4.2.2.2.2 step 20",
+	)
+
+	// Operator default RFSP — always set before the PCF call so the IE is
+	// guaranteed to be present in InitialContextSetupRequest even when PCF is
+	// unavailable. PCF overrides this if it returns a non-zero value.
+	// Ref: TS 38.413 §9.3.1.27 (IndexToRFSP, range 1-256), TS 23.501 §5.3.4.2
+	ue.RFSP = h.defaultRFSP
+
+	// Step 14c (optional): create AM Policy Association with PCF (Npcf_AMPolicyControl).
+	// PCF may return servAreaRes (Service Area Restriction); if so, enforce it:
+	// reject the registration with 5GMM cause #73 if the UE's TAC is not allowed.
+	// Non-fatal when PCF is unavailable — operator default RFSP is used instead.
+	// Ref: TS 23.502 §4.2.2.2.2 step 14c; TS 23.501 §5.3.4; TS 29.507 §4.2.2.2
+	if h.amPolicy != nil {
+		amPolID, rfsp, servAreaRes, amPolErr := h.amPolicy.CreateAMPolicyAssociation(
+			ctx, ue.SUPI, "3GPP_ACCESS", h.plmnMCC, h.plmnMNC)
+		if amPolErr != nil {
+			log.Warn("PCF AM policy association failed — using operator default RFSP",
+				"error", amPolErr,
+				"rfsp_default", ue.RFSP,
+				"interface", "N15",
+				"spec_ref", "TS 29.507 §4.2.2.2")
+		} else {
+			ue.AMPolicyAssocID = amPolID
+			if rfsp > 0 {
+				ue.RFSP = rfsp // PCF-provided value takes precedence
+			}
+			ue.ServAreaRes = servAreaRes
+			log.Info("PCF AM policy association created",
+				"am_pol_asso_id", amPolID,
+				"rfsp", ue.RFSP,
+				"rfsp_source", rfspSource(rfsp, h.defaultRFSP),
+				"has_serv_area_res", servAreaRes != nil,
+				"interface", "N15", "direction", "OUT",
+				"spec_ref", "TS 29.507 §4.2.2.2")
+		}
+
+		// Enforce service area restriction (TS 23.501 §5.3.4, TS 24.501 §8.2.8.2).
+		// cause 0x49 = 73 = "Serving network not authorized"
+		if ue.ServAreaRes != nil && !h.isAllowedTA(ue.TAI.TAC, ue.ServAreaRes) {
+			log.Warn("UE TAC not allowed by PCF service area restriction — rejecting",
+				"tac", fmt.Sprintf("%06X", ue.TAI.TAC),
+				"restriction_type", ue.ServAreaRes.RestrictionType,
+				"cause", "73",
+				"spec_ref", "TS 23.501 §5.3.4, TS 24.501 §8.2.8.2",
+			)
+			metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+			return nil, ErrServiceAreaRestricted
+		}
+	}
+
+	log.Info("RFSP assigned",
+		"rfsp", ue.RFSP,
+		"supi", ue.SUPI,
+		"spec_ref", "TS 38.413 §9.3.1.27",
 	)
 
 	// Step 17b (optional): fetch URSP policy from PCF (N15 interface).
@@ -833,6 +956,26 @@ func (h *RegistrationHandler) DeregisterUECM(ctx context.Context, supi string) e
 	return h.udm.DeregisterUECM(ctx, supi)
 }
 
+// ReleaseAMPolicy releases the AM policy association at PCF.
+// Non-fatal: caller logs and continues on error.
+// Ref: TS 29.507 §4.2.2.4, TS 23.502 §4.2.2.3.2 step 3
+func (h *RegistrationHandler) ReleaseAMPolicy(ctx context.Context, polAssoID string) error {
+	if h.amPolicy == nil {
+		return nil
+	}
+	return h.amPolicy.DeleteAMPolicyAssociation(ctx, polAssoID)
+}
+
+// ReleasePCFPolicy releases the UE policy association at PCF (URSP/Npcf_UEPolicyControl).
+// Non-fatal: caller logs and continues on error.
+// Ref: TS 29.525 §4.2.2.3, TS 23.502 §4.2.2.3.2 step 3
+func (h *RegistrationHandler) ReleasePCFPolicy(ctx context.Context, polAssoID string) error {
+	if h.pcf == nil {
+		return nil
+	}
+	return h.pcf.DeleteUEPolicyAssociation(ctx, polAssoID)
+}
+
 // RemoveUEContext removes the UE context from all AMF indexes after deregistration.
 // Ref: TS 23.502 §4.2.2.3.2 step 4
 func (h *RegistrationHandler) RemoveUEContext(ctx context.Context, ue *amfctx.UEContext) {
@@ -842,6 +985,34 @@ func (h *RegistrationHandler) RemoveUEContext(ctx context.Context, ue *amfctx.UE
 // PersistUE writes the UE context to PostgreSQL. No-op when no store is configured.
 func (h *RegistrationHandler) PersistUE(ctx context.Context, ue *amfctx.UEContext) {
 	h.mgr.PersistUE(ctx, ue)
+}
+
+// isAllowedTA returns true when the UE's TAC is permitted by the PCF service area restriction.
+// Empty allowed-area list is treated as unrestricted.
+// Ref: TS 23.501 §5.3.4, TS 29.507 §6.1.1.2.5
+func (h *RegistrationHandler) isAllowedTA(tac uint32, sar *amfctx.ServiceAreaRestriction) bool {
+	tacHex := fmt.Sprintf("%06x", tac)
+	switch sar.RestrictionType {
+	case "ALLOWED_AREAS":
+		if len(sar.AllowedTACs) == 0 {
+			return true // empty = unrestricted
+		}
+		for _, allowed := range sar.AllowedTACs {
+			if strings.EqualFold(allowed, tacHex) {
+				return true
+			}
+		}
+		return false
+	case "NOT_ALLOWED_AREAS":
+		for _, blocked := range sar.NotAllowedTACs {
+			if strings.EqualFold(blocked, tacHex) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true // unknown restriction type — treat as unrestricted
+	}
 }
 
 func zeroPad(s string, n int) string {

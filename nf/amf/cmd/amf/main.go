@@ -25,6 +25,7 @@ import (
 	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
+	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/oauth2"
@@ -40,8 +41,8 @@ const nfName = "AMF"
 // NGAPSenderWithSMF wraps NGAP server and SMF client to implement the Sender interface
 // while providing access to SMF for PDU session handling.
 type NGAPSenderWithSMF struct {
-	ngap    *ngap.Server
-	smf     *HTTPSMFClient
+	ngap *ngap.Server
+	smf  *HTTPSMFClient
 	// nrfDisc is optional: when set, SMF is discovered per slice via NRF.
 	nrfDisc *HTTPNRFClient
 }
@@ -297,6 +298,51 @@ func main() {
 		)
 	}
 
+	// AM Policy Association (Npcf_AMPolicyControl, TS 29.507 §4.2.2).
+	// Created at UE registration (step 14c); non-fatal if PCF unavailable.
+	if cfg.Peers.PCFAddress != "" {
+		amPolicyClient := &HTTPAMPolicyClient{
+			address: cfg.Peers.PCFAddress,
+			client:  sbiClient,
+		}
+		regHandler.WithAMPolicy(amPolicyClient)
+		logger.Info("PCF AM policy association enabled",
+			"pcf_addr", cfg.Peers.PCFAddress,
+			"spec_ref", "TS 29.507 §4.2.2",
+		)
+	}
+
+	// NSSAA (Network Slice-Specific Authentication and Authorization, TS 23.502 §4.2.9).
+	// Slices flagged subjectToNssaa in the subscription are EAP-authenticated with the
+	// AAA-S, relayed through the AUSF, before being added to the Allowed NSSAI. Enabled
+	// whenever the AUSF peer is configured (the AUSF fronts the simulated AAA-S).
+	if cfg.Peers.AUSFAddress != "" {
+		regHandler.WithNSSAA(&HTTPNSSAAClient{
+			address: cfg.Peers.AUSFAddress,
+			client:  sbiClient,
+		})
+		logger.Info("NSSAA slice authentication enabled",
+			"ausf_addr", cfg.Peers.AUSFAddress,
+			"spec_ref", "TS 23.502 §4.2.9",
+		)
+	}
+
+	// Operator default RFSP index included in every NGAP InitialContextSetupRequest.
+	// PCF AM policy overrides this per-subscriber when available.
+	// Configure via operator.default_rfsp in nf/amf/config/dev.yaml (default 1).
+	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
+	defaultRFSP := cfg.Operator.DefaultRFSP
+	if defaultRFSP == 0 {
+		defaultRFSP = 1 // always send RFSP=1 unless explicitly disabled (set to -1 in config)
+	}
+	if defaultRFSP > 0 {
+		regHandler.WithDefaultRFSP(defaultRFSP)
+		logger.Info("operator default RFSP configured",
+			"rfsp", defaultRFSP,
+			"spec_ref", "TS 38.413 §9.3.1.27",
+		)
+	}
+
 	// T3512 Periodic Registration Timer sent to UE in Registration Accept.
 	// Configure via timers.t3512_secs in nf/amf/config/dev.yaml.
 	// Ref: TS 24.501 §8.2.7.1 (IEI 0x5E), §10.2
@@ -346,6 +392,24 @@ func main() {
 	}
 	nasHandler := nasmsg.NewHandler(sender, regHandler, logger)
 
+	// SMS over NAS: forward UL NAS Transport SMS containers (PCT=0x02) to the SMSF
+	// via Nsmsf_SMService_UplinkSMS. Enabled when the SMSF peer is configured.
+	// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4
+	if cfg.Peers.SMSFAddress != "" {
+		nasHandler.WithSMSFClient(&HTTPSMSFClient{
+			address: cfg.Peers.SMSFAddress,
+			client:  sbiClient,
+		})
+		logger.Info("SMS over NAS enabled — UL NAS Transport SMS routed to SMSF",
+			"smsf_addr", cfg.Peers.SMSFAddress,
+			"spec_ref", "TS 29.540 §5.2.4",
+		)
+	} else {
+		logger.Warn("SMSF peer not configured — UL NAS Transport SMS will be dropped (fail-open)",
+			"spec_ref", "TS 29.540 §5.2.4",
+		)
+	}
+
 	// Wire NAS handler back into NGAP server (circular dep resolved via interface)
 	ngapSrv.SetNASHandler(nasHandler)
 
@@ -355,6 +419,22 @@ func main() {
 	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7
 	nasHandler.SetUEReachableHandler(func(ue *amfctx.UEContext) {
 		ngapSrv.StopUETimers(ue)
+		// If the UE was paged for mobile-terminated data, the Service Request that
+		// brought it back to CM-CONNECTED re-activates the user plane: clear the flag.
+		// Ref: TS 23.502 §4.2.3.3
+		ue.Lock()
+		paged := ue.PendingN1N2
+		ue.PendingN1N2 = false
+		supi := ue.SUPI
+		ue.Unlock()
+		if paged {
+			logger.Info("paged UE returned via Service Request — user plane re-activated",
+				"procedure", "NetworkTriggeredServiceRequest",
+				"supi", supi,
+				"result", "OK",
+				"spec_ref", "TS 23.502 §4.2.3.3",
+			)
+		}
 	})
 
 	// When gNB confirms PDU session resources, forward the N2SM response transfer
@@ -523,7 +603,7 @@ func main() {
 				ServiceName:       "namf-comm",
 				Scheme:            "https",
 				NFServiceStatus:   "REGISTERED",
-				Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
+				Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
 			}},
 		}
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
@@ -532,6 +612,31 @@ func main() {
 				"spec_ref", "TS 29.510 §5.2.2.2.2",
 			)
 		}
+	}
+
+	// ---- Inbound SBI server (namf-comm — UEContextTransfer) ----------------
+	// First AMF inbound SBI server. Serves Namf_Communication_UEContextTransfer
+	// so a new AMF can retrieve the UE MM/security context + PDU sessions during
+	// Registration with AMF change. Ref: TS 29.518 §5.3.2, TS 23.502 §4.2.2.2.3.
+	if cfg.SBI.Address != "" {
+		sbiSrv, err := amfsbi.New(amfsbi.Config{
+			Address:  cfg.SBI.Address,
+			CertFile: cfg.SBI.TLSCert,
+			KeyFile:  cfg.SBI.TLSKey,
+			CAFile:   cfg.SBI.TLSCa,
+		}, mgr, logger)
+		if err != nil {
+			logger.Error("building AMF inbound SBI server", "error", err)
+			os.Exit(1)
+		}
+		// Wire NGAP paging trigger for N1N2MessageTransfer (CN paging of CM-IDLE UEs).
+		// Ref: TS 23.502 §4.2.3.3, TS 38.413 §9.2.8.
+		sbiSrv.SetPager(ngapSrv)
+		go func() {
+			if err := sbiSrv.Start(ctx); err != nil {
+				logger.Error("AMF inbound SBI server", "error", err)
+			}
+		}()
 	}
 
 	// ---- Management HTTP server (NW-initiated operations) -------------------
@@ -623,6 +728,43 @@ func main() {
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+	// POST /amf/v1/ue-contexts/{supi}/nssaa/{reauth|revoke} — AAA-initiated NSSAA.
+	// Simulates the Nnssaaf re-auth / revocation notification from the AAA-S. Body:
+	// {"sst": int, "sd": "hexstr"}. Ref: TS 23.502 §4.2.9.3 (re-auth) / §4.2.9.4 (revoke).
+	nssaaTrigger := func(w http.ResponseWriter, r *http.Request, revoke bool) {
+		supi := r.PathValue("supi")
+		var req struct {
+			SST uint8  `json:"sst"`
+			SD  string `json:"sd"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		ue, found := mgr.GetBySUPI(supi)
+		if !found {
+			http.Error(w, "UE not found", http.StatusNotFound)
+			return
+		}
+		var ok bool
+		if revoke {
+			ok = nasHandler.RevokeNSSAASlice(r.Context(), ue, req.SST, req.SD)
+		} else {
+			ok = nasHandler.ReauthNSSAASlice(r.Context(), ue, req.SST, req.SD)
+		}
+		if !ok {
+			http.Error(w, "slice not in Allowed NSSAI for this UE", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+	mgmtMux.HandleFunc("POST /amf/v1/ue-contexts/{supi}/nssaa/revoke", func(w http.ResponseWriter, r *http.Request) {
+		nssaaTrigger(w, r, true)
+	})
+	mgmtMux.HandleFunc("POST /amf/v1/ue-contexts/{supi}/nssaa/reauth", func(w http.ResponseWriter, r *http.Request) {
+		nssaaTrigger(w, r, false)
+	})
+
 	// PATCH /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}/qos — NW-initiated QoS modification.
 	// Body: {"5qi": int, "ambr_dl_mbps": int, "ambr_ul_mbps": int}
 	// Flow: PCF override already set by caller → trigger SMF policy-update → forward N1SM+N2SM to gNB.
@@ -642,7 +784,7 @@ func main() {
 		psi := uint8(psi64)
 
 		var req struct {
-			FiveQI    int `json:"5qi"`
+			FiveQI     int `json:"5qi"`
 			AMBRDLMbps int `json:"ambr_dl_mbps"`
 			AMBRULMbps int `json:"ambr_ul_mbps"`
 		}
@@ -680,12 +822,12 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"accepted":    true,
-			"supi":        supi,
+			"accepted":       true,
+			"supi":           supi,
 			"pdu_session_id": psi,
-			"5qi":         req.FiveQI,
-			"ambr_dl_mbps": req.AMBRDLMbps,
-			"ambr_ul_mbps": req.AMBRULMbps,
+			"5qi":            req.FiveQI,
+			"ambr_dl_mbps":   req.AMBRDLMbps,
+			"ambr_ul_mbps":   req.AMBRULMbps,
 		})
 	})
 
@@ -786,7 +928,7 @@ func main() {
 		}
 		algNames := map[byte]string{0: "NEA0 (null)", 1: "NEA1 (SNOW3G)", 2: "NEA2 (AES-CTR)", 3: "NEA3 (ZUC)"}
 		resp := map[string]any{
-			"supi":             supi,
+			"supi":            supi,
 			"cipher_alg_id":   sc.CipheringAlgID,
 			"cipher_alg_name": algNames[sc.CipheringAlgID],
 			"k_nasenc_hex":    hex.EncodeToString(sc.KNASenc),
@@ -889,6 +1031,7 @@ type Config struct {
 		SMFAddress  string `yaml:"smf"`
 		NSSFAddress string `yaml:"nssf"`
 		PCFAddress  string `yaml:"pcf"`
+		SMSFAddress string `yaml:"smsf"`
 	} `yaml:"peers"`
 	// SNSSAIs is the list of slices served by this AMF (advertised in NG Setup Response).
 	SNSSAIs []struct {
@@ -921,6 +1064,15 @@ type Config struct {
 		// Overridden by the URSP_ENABLED environment variable.
 		URSPEnabled *bool `yaml:"ursp_enabled"`
 	} `yaml:"features"`
+	// Operator holds operator-wide policy defaults applied to every UE.
+	Operator struct {
+		// DefaultRFSP is the Radio Frequency Selection Priority index (1-256)
+		// included in every NGAP InitialContextSetupRequest (IE id=31) when PCF
+		// does not provide a per-subscriber value. 0 = use built-in default (1).
+		// Set to -1 to omit the IE entirely (not recommended).
+		// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
+		DefaultRFSP int `yaml:"default_rfsp"`
+	} `yaml:"operator"`
 }
 
 // urspEnabledFromEnv resolves the effective URSP toggle. Precedence:

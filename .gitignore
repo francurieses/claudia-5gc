@@ -27,6 +27,9 @@ Thumbs.db
 # Docker local overrides
 docker-compose.override.yml
 
+# Agentic development — session state (ephemeral, do not commit)
+dev/SESSION_LOG.md
+
 # UERANSIM dev fork (throwaway source tree — the patch set is the committed artifact)
 tools/ueransim/.fork/
 graphify-out/

@@ -430,6 +430,49 @@ services:
       - ./pcaps/nssf:/pcaps
     command: sleep infinity
 
+  smsf:
+    image: 5gc/smsf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/smsf/Dockerfile
+    container_name: smsf
+    hostname: smsf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [smsf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8009:8009"   # SBI Nsmsf_SMService
+      - "9110:9110"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/smsf.crt:/etc/5gc/pki/smsf.crt:ro
+      - ./pki/smsf.key:/etc/5gc/pki/smsf.key:ro
+      - ./nf/smsf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "SMSF"
+    depends_on: [nrf, udm]
+
+  # SMSF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  smsf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: smsf-pcap
+    network_mode: "service:smsf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [smsf]
+    volumes:
+      - ./pcaps/smsf:/pcaps
+    command: sleep infinity
+
   # ============================================================
   # OBSERVABILIDAD
   # ============================================================

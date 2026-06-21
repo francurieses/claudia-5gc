@@ -14,7 +14,7 @@ import (
 // decodes it. Ref: TS 38.413 §9.3.4.5.
 func TestN2SMTransferRoundTrip(t *testing.T) {
 	upfIP := net.ParseIP("10.100.0.10")
-	encoded, err := buildPDUSessionResourceSetupRequestTransfer(upfIP, 0x01020304, 1, 9, 100_000_000, 100_000_000)
+	encoded, err := buildPDUSessionResourceSetupRequestTransfer(upfIP, 0x01020304, 1, 9, 100_000_000, 100_000_000, ngapType.PDUSessionTypePresentIpv4)
 	if err != nil {
 		t.Fatalf("encode failed: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestN2SMModifyTransferRoundTrip(t *testing.T) {
 // producing a message that decoders (Wireshark / UERANSIM) reject.
 func TestN2SMExtensionPrefix(t *testing.T) {
 	upfIP := net.ParseIP("10.100.0.10")
-	withExt, err := buildPDUSessionResourceSetupRequestTransfer(upfIP, 1, 1, 9, 100_000_000, 100_000_000)
+	withExt, err := buildPDUSessionResourceSetupRequestTransfer(upfIP, 1, 1, 9, 100_000_000, 100_000_000, ngapType.PDUSessionTypePresentIpv4)
 	if err != nil {
 		t.Fatalf("encode failed: %v", err)
 	}

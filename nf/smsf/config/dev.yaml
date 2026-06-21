@@ -1,0 +1,20 @@
+nf_instance_id: "00000000-0000-4010-8000-000000000001"
+
+plmn:
+  mcc: "001"
+  mnc: "01"
+
+sbi:
+  address: "0.0.0.0:8009"
+  tls:
+    cert_file: /etc/5gc/pki/smsf.crt
+    key_file: /etc/5gc/pki/smsf.key
+    ca_file: /etc/5gc/pki/ca.crt
+
+peers:
+  nrf: "nrf:8000"
+  udm: "udm:8003"
+  amf: "amf:8001"
+
+metrics:
+  address: "0.0.0.0:9110"

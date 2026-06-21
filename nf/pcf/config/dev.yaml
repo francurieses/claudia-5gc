@@ -26,6 +26,14 @@ default_sm_policy:
   arp_preempt_vuln: "NOT_PREEMPTABLE"
   flow_description: "permit out ip from any to assigned"
   flow_precedence: 100
+  # SM Policy Association Update authorization (TS 29.512 §5.2.2.3).
+  # authorized_5qi: 5QI values the PCF permits on a QoS modification; empty ⇒ any
+  # valid 5QI. max_session_ambr_mbps: Session-AMBR ceiling (Mbps); 0 ⇒ no ceiling.
+  # The dev set authorizes the standardised non-GBR + common GBR 5QIs but excludes
+  # the highest-priority signalling 5QIs (1=conversational voice) so a rejection is
+  # demonstrable end-to-end. Ref: TS 23.501 Table 5.7.4-1.
+  authorized_5qi: [2, 3, 4, 5, 6, 7, 8, 9]
+  max_session_ambr_mbps: 1000
 
 # Default URSP rules delivered to all UEs at registration.
 # Per-subscriber overrides are stored in UDR (subscription_policy table).

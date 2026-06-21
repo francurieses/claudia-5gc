@@ -4,23 +4,26 @@
 // routes them to the appropriate 5GMM procedure handler.
 //
 // NAS message flow during Initial Registration:
-//   UE → AMF: RegistrationRequest      (step 1)
-//   AMF → UE: AuthenticationRequest    (step 9)   — plain NAS via DownlinkNASTransport
-//   UE → AMF: AuthenticationResponse   (step 10)
-//   AMF → UE: SecurityModeCommand      (step 14)  — plain NAS via DownlinkNASTransport
-//   UE → AMF: SecurityModeComplete     (step 15)
-//   AMF → gNB: InitialContextSetupRequest           — carries integrity-protected RegistrationAccept
-//   UE → AMF: RegistrationComplete     (step 21)
+//
+//	UE → AMF: RegistrationRequest      (step 1)
+//	AMF → UE: AuthenticationRequest    (step 9)   — plain NAS via DownlinkNASTransport
+//	UE → AMF: AuthenticationResponse   (step 10)
+//	AMF → UE: SecurityModeCommand      (step 14)  — plain NAS via DownlinkNASTransport
+//	UE → AMF: SecurityModeComplete     (step 15)
+//	AMF → gNB: InitialContextSetupRequest           — carries integrity-protected RegistrationAccept
+//	UE → AMF: RegistrationComplete     (step 21)
 //
 // Ref: 3GPP TS 23.502 §4.2.2.2.2, TS 24.501 §5.5.1, TS 38.413 §8.3.1
 package nasmsg
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
@@ -45,11 +48,25 @@ type Sender interface {
 	SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePresent int, causeValue int64) error
 }
 
+// SMSFClient is the interface the AMF NAS handler uses to forward MO SMS to the SMSF.
+// Ref: TS 29.540 §5.2.4 (Nsmsf_SMService_UplinkSMS)
+type SMSFClient interface {
+	// UplinkSMS forwards the MO SMS payload (base64-encoded SM-CP/RP bytes from the
+	// NAS Payload Container) to the SMSF. smsRecordID is a unique correlation ID.
+	// Returns an error if the SMSF rejects the message (e.g., 404 CONTEXT_NOT_FOUND).
+	// Ref: TS 29.540 §5.2.4
+	UplinkSMS(ctx context.Context, supi, smsRecordID, smsPayloadBase64 string) error
+}
+
 // Handler is the AMF NAS message handler.
 type Handler struct {
 	sender Sender
 	reg    *procedures.RegistrationHandler
 	logger *slog.Logger
+	// smsfClient forwards UL NAS Transport SMS containers to the SMSF.
+	// Nil = no SMSF configured (UL SMS is dropped with a warning; fail-open).
+	// Ref: TS 29.540 §5.2.4, TS 23.502 §4.13.3
+	smsfClient SMSFClient
 
 	// onUEReachable is called when the UE enters CM-CONNECTED (Initial
 	// Registration complete, Service Request, Periodic/Mobility Registration
@@ -74,6 +91,13 @@ func NewHandler(sender Sender, reg *procedures.RegistrationHandler, logger *slog
 // update). Wire this to ngapSrv.StopUETimers in main.go.
 func (h *Handler) SetUEReachableHandler(fn func(ue *amfctx.UEContext)) {
 	h.onUEReachable = fn
+}
+
+// WithSMSFClient wires the SMSF client for UL NAS Transport SMS routing.
+// If never called the SMS container type (0x02) is dropped with a warning.
+// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4
+func (h *Handler) WithSMSFClient(c SMSFClient) {
+	h.smsfClient = c
 }
 
 // HandleNASMessage is called by the NGAP layer when a NAS PDU arrives.
@@ -130,6 +154,8 @@ func (h *Handler) HandleNASMessage(ctx context.Context, ue *amfctx.UEContext, pd
 		return h.handleServiceRequest(ctx, ue, msg)
 	case nas.MsgTypeConfigurationUpdateComplete:
 		return h.handleConfigurationUpdateComplete(ctx, ue)
+	case nas.MsgTypeNetworkSliceSpecificAuthComplete:
+		return h.handleNSSAAComplete(ctx, ue, msg)
 	default:
 		log.Warn("unhandled NAS message type", "msg_type", msg.Header.MessageType)
 		return nil
@@ -260,11 +286,17 @@ func (h *Handler) handleAuthenticationResponse(
 		return fmt.Errorf("nas: AuthenticationResponse body decode failed")
 	}
 
-	// Phase 2: verify RES* with AUSF, derive keys, build Security Mode Command
-	smcReq, err := h.reg.Phase2_ProcessAuthResponse(ctx, ue, authResp)
+	// Phase 2: verify RES* with AUSF, derive keys, build Security Mode Command.
+	// displaced is the prior UEContext for the same SUPI (non-nil when the UE
+	// reconnected without deregistering — e.g. Docker restart). Release it async
+	// so we don't block the new registration path.
+	smcReq, displaced, err := h.reg.Phase2_ProcessAuthResponse(ctx, ue, authResp)
 	if err != nil {
 		// TODO: send Registration Reject
 		return fmt.Errorf("registration phase2: %w", err)
+	}
+	if displaced != nil {
+		go h.releaseDisplacedContext(context.Background(), displaced)
 	}
 
 	// Security Mode Command: integrity-protected with NEW security context (SHT=0x03).
@@ -377,6 +409,16 @@ func (h *Handler) handleSecurityModeComplete(
 	// Phase 3: fetch subscription data, assign GUTI, build RegistrationAccept
 	regAccept, err := h.reg.Phase3_ProcessSMCComplete(ctx, ue)
 	if err != nil {
+		// Service Area Restriction: PCF forbids this TA.
+		// Send Registration Reject (5GMM cause #73 = 0x49) and abort.
+		// Ref: TS 23.501 §5.3.4, TS 24.501 §8.2.8.2
+		if errors.Is(err, procedures.ErrServiceAreaRestricted) {
+			const cause73 = byte(0x49) // "Serving network not authorized"
+			_, _ = h.sendNASSecured(ue, nas.PDMobilityManagement,
+				nas.MsgTypeRegistrationReject,
+				&nas.RegistrationReject{Cause5GMM: cause73})
+			return nil // reject is a handled outcome, not a fatal error
+		}
 		return fmt.Errorf("registration phase3: %w", err)
 	}
 
@@ -484,7 +526,124 @@ func (h *Handler) handleRegistrationComplete(
 			)
 		}
 	}
+
+	// Network Slice-Specific Authentication: kick off the first slice's EAP exchange
+	// for any S-NSSAI withheld in Phase3 (subjectToNssaa). No-op when none are pending.
+	// Ref: TS 23.502 §4.2.9.2, TS 24.501 §5.4.7.
+	h.StartNSSAA(ctx, ue)
 	return nil
+}
+
+// StartNSSAA sends the NETWORK SLICE-SPECIFIC AUTHENTICATION COMMAND for the first
+// slice withheld for NSSAA, if any. Safe to call when no slice is pending.
+// Ref: TS 23.502 §4.2.9.2, TS 24.501 §8.2.31.
+func (h *Handler) StartNSSAA(ctx context.Context, ue *amfctx.UEContext) {
+	cmd, started := h.reg.StartNSSAA(ctx, ue)
+	if !started {
+		return
+	}
+	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+		nas.MsgTypeNetworkSliceSpecificAuthCommand, cmd); err != nil {
+		h.logger.Warn("NSSAA COMMAND send failed",
+			"procedure", "NSSAA", "supi", ue.SUPI, "error", err,
+			"spec_ref", "TS 24.501 §8.2.31")
+	}
+}
+
+// handleNSSAAComplete processes a NETWORK SLICE-SPECIFIC AUTHENTICATION COMPLETE:
+// relays the EAP-Response to the AAA-S via AUSF, sends the RESULT, advances to the
+// next pending slice, and issues a Configuration Update Command if the Allowed NSSAI
+// changed. Ref: TS 23.502 §4.2.9.2 step 5-9, TS 24.501 §5.4.7.3.
+func (h *Handler) handleNSSAAComplete(ctx context.Context, ue *amfctx.UEContext, msg *nas.Message) error {
+	complete, ok := msg.Body.(*nas.NSSAAuthComplete)
+	if !ok {
+		return fmt.Errorf("nas: NSSAAuthComplete body decode failed")
+	}
+	h.logger.Info("NSSAA COMPLETE received",
+		"procedure", "NSSAA", "supi", ue.SUPI,
+		"sst", complete.SNSSAI.SST,
+		"interface", "N1", "direction", "IN",
+		"message_type", "NetworkSliceSpecificAuthComplete",
+		"spec_ref", "TS 24.501 §8.2.32",
+	)
+
+	out, err := h.reg.ProcessNSSAAComplete(ctx, ue, complete)
+	if err != nil {
+		h.logger.Warn("NSSAA COMPLETE processing failed",
+			"procedure", "NSSAA", "supi", ue.SUPI, "error", err)
+		return nil
+	}
+
+	// Send the RESULT (EAP-Success / EAP-Failure) for the resolved slice.
+	if sendErr := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+		nas.MsgTypeNetworkSliceSpecificAuthResult, out.Result); sendErr != nil {
+		h.logger.Warn("NSSAA RESULT send failed",
+			"procedure", "NSSAA", "supi", ue.SUPI, "error", sendErr)
+	}
+
+	// Start the next pending slice, if any.
+	if out.NextCommand != nil {
+		if sendErr := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+			nas.MsgTypeNetworkSliceSpecificAuthCommand, out.NextCommand); sendErr != nil {
+			h.logger.Warn("NSSAA next COMMAND send failed",
+				"procedure", "NSSAA", "supi", ue.SUPI, "error", sendErr)
+		}
+		return nil
+	}
+
+	// Queue drained. If the Allowed NSSAI changed and no more slices are pending,
+	// deliver the new Allowed NSSAI via a Configuration Update Command.
+	if out.AllowedChanged {
+		h.sendNSSAAConfigUpdate(ctx, ue)
+	}
+	h.reg.PersistUE(ctx, ue)
+	return nil
+}
+
+// RevokeNSSAASlice handles an AAA-initiated NSSAA revocation (TS 23.502 §4.2.9.4):
+// removes the slice from the Allowed NSSAI and delivers the updated Allowed NSSAI to
+// the UE via a Configuration Update Command. Returns true if the slice was allowed.
+func (h *Handler) RevokeNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) bool {
+	if !h.reg.RevokeNSSAA(ue, sst, sd) {
+		return false
+	}
+	h.sendNSSAAConfigUpdate(ctx, ue)
+	h.reg.PersistUE(ctx, ue)
+	return true
+}
+
+// ReauthNSSAASlice handles an AAA-initiated NSSAA re-authentication (TS 23.502
+// §4.2.9.3): re-queues an allowed slice and starts a fresh EAP exchange. Returns true
+// if the slice was allowed and a COMMAND was emitted.
+func (h *Handler) ReauthNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) bool {
+	if !h.reg.ReauthNSSAA(ue, sst, sd) {
+		return false
+	}
+	h.StartNSSAA(ctx, ue)
+	return true
+}
+
+// sendNSSAAConfigUpdate delivers the post-NSSAA Allowed NSSAI to the UE via a
+// Configuration Update Command (ACK requested). Ref: TS 23.502 §4.2.9.2 step 9,
+// TS 24.501 §8.2.19.
+func (h *Handler) sendNSSAAConfigUpdate(_ context.Context, ue *amfctx.UEContext) {
+	allowed := procedures.NASAllowedNSSAI(ue.AllowedNSSAI)
+	ackBit := byte(0xD1) // IEI 0xD high nibble, ACKS bit set — request ConfigurationUpdateComplete
+	cmd := &nas.ConfigurationUpdateCommand{
+		ConfigUpdateIndication: &ackBit,
+		AllowedNSSAI:           &allowed,
+	}
+	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+		nas.MsgTypeConfigurationUpdateCommand, cmd); err != nil {
+		h.logger.Warn("NSSAA Configuration Update Command send failed",
+			"procedure", "NSSAA", "supi", ue.SUPI, "error", err)
+		return
+	}
+	h.logger.Info("Configuration Update Command sent with post-NSSAA Allowed NSSAI",
+		"procedure", "NSSAA", "supi", ue.SUPI,
+		"allowed_count", len(ue.AllowedNSSAI),
+		"interface", "N1", "direction", "OUT",
+		"spec_ref", "TS 23.502 §4.2.9.2")
 }
 
 // ---- NAS encoding helpers -----------------------------------------------
@@ -965,6 +1124,26 @@ func (h *Handler) handleDeregistration(
 		}
 	}
 
+	// Step 3b: release AM policy association at PCF (Npcf_AMPolicyControl).
+	// Non-fatal. Ref: TS 29.507 §4.2.2.4, TS 23.502 §4.2.2.3.2 step 3
+	if ue.AMPolicyAssocID != "" {
+		if err := h.reg.ReleaseAMPolicy(ctx, ue.AMPolicyAssocID); err != nil {
+			log.Warn("PCF AM policy release failed (non-fatal)", "error", err,
+				"am_pol_asso_id", ue.AMPolicyAssocID)
+		}
+		ue.AMPolicyAssocID = ""
+	}
+
+	// Step 3c: release UE policy association at PCF (Npcf_UEPolicyControl / URSP).
+	// Non-fatal. Ref: TS 29.525 §4.2.2.3, TS 23.502 §4.2.2.3.2 step 3
+	if ue.PolicyAssociationID != "" {
+		if err := h.reg.ReleasePCFPolicy(ctx, ue.PolicyAssociationID); err != nil {
+			log.Warn("PCF UE policy release failed (non-fatal)", "error", err,
+				"pol_asso_id", ue.PolicyAssociationID)
+		}
+		ue.PolicyAssociationID = ""
+	}
+
 	// Step 4: mark context for deferred removal and release the N2 UE context at the gNB.
 	// PendingRemoval must be set BEFORE SendUEContextReleaseCommandForUE so that:
 	//   (a) the PendingRemoval watchdog timer is armed immediately (TS 38.413 §8.3.5), and
@@ -996,7 +1175,9 @@ func (h *Handler) handleDeregistration(
 // Accept (handled by handleNWDeregistrationAccept) and then cleans up locally.
 //
 // cause5GMM: optional 5GMM Cause (0 = omit). Common values:
-//   0x06 = illegal UE, 0x09 = UE identity not derived, 0x48 = NW failure.
+//
+//	0x06 = illegal UE, 0x09 = UE identity not derived, 0x48 = NW failure.
+//
 // accessType: 1=3GPP, 2=non-3GPP, 3=both.
 //
 // Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §8.2.13.1
@@ -1076,6 +1257,24 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 		}
 	}
 
+	// Release PCF AM policy association (Npcf_AMPolicyControl, TS 29.507 §4.2.2.4)
+	if ue.AMPolicyAssocID != "" {
+		if err := h.reg.ReleaseAMPolicy(ctx, ue.AMPolicyAssocID); err != nil {
+			log.Warn("PCF AM policy release failed (non-fatal)", "error", err,
+				"am_pol_asso_id", ue.AMPolicyAssocID)
+		}
+		ue.AMPolicyAssocID = ""
+	}
+
+	// Release PCF UE policy association (Npcf_UEPolicyControl / URSP, TS 29.525 §4.2.2.3)
+	if ue.PolicyAssociationID != "" {
+		if err := h.reg.ReleasePCFPolicy(ctx, ue.PolicyAssociationID); err != nil {
+			log.Warn("PCF UE policy release failed (non-fatal)", "error", err,
+				"pol_asso_id", ue.PolicyAssociationID)
+		}
+		ue.PolicyAssociationID = ""
+	}
+
 	// Mark context for deferred removal BEFORE releasing N2, so the watchdog timer
 	// in SendUEContextReleaseCommandForUE is armed correctly. Ref: TS 38.413 §8.3.5
 	ue.TransitionTo(amfctx.GMMDeregistered)
@@ -1122,6 +1321,14 @@ func (h *Handler) handleULNASTransport(
 	// never sends this; the modified UERANSIM (tools/ueransim) does.
 	if transport.PayloadContainerType == nas.PayloadContainerTypeUEPolicy {
 		return h.handleUEPolicyDelivery(ctx, ue, transport.PayloadContainer)
+	}
+
+	// SMS over NAS (TS 24.501 §8.2.10): Payload Container Type 0x02 = SMS.
+	// The AMF is a transparent relay — it never parses SM-CP/SM-RP content.
+	// Forward the container to the SMSF via Nsmsf_SMService_UplinkSMS.
+	// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4, TS 24.501 §9.11.3.40
+	if transport.PayloadContainerType == nas.PayloadContainerTypeSMS {
+		return h.handleULSMS(ctx, ue, transport.PayloadContainer, log)
 	}
 
 	// 5GSM header: EPD | PDU session identity | PTI | Message type | body
@@ -1382,6 +1589,78 @@ func (h *Handler) handleUEPolicyDelivery(
 			"msg_type", fmt.Sprintf("0x%02X", msgType),
 		)
 	}
+	return nil
+}
+
+// ---- SMS over NAS (UL path) ------------------------------------------------
+
+// handleULSMS handles a UL NAS Transport with Payload Container Type = SMS (0x02).
+// The AMF is a transparent relay: it never parses SM-CP/SM-RP content; it just
+// forwards the opaque container to the SMSF via Nsmsf_SMService_UplinkSMS.
+// Fail-open: if no SMSF client is configured the container is dropped with a warning.
+// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4, TS 24.501 §9.11.3.40
+func (h *Handler) handleULSMS(
+	ctx context.Context, ue *amfctx.UEContext, smsContainer []byte, log *slog.Logger,
+) error {
+	log = log.With(
+		"procedure", "SmsOverNas",
+		"interface", "N1",
+		"direction", "IN",
+		"spec_ref", "TS 23.502 §4.13.3",
+		"supi", ue.SUPI,
+	)
+	log.Info("UL NAS Transport SMS received — forwarding to SMSF",
+		"container_len", len(smsContainer),
+		"payload_container_type", "SMS (0x02)",
+		"spec_ref", "TS 24.501 §9.11.3.40",
+	)
+
+	if h.smsfClient == nil {
+		log.Warn("UL SMS: no SMSF client configured — dropping MO SMS (fail-open)",
+			"result", "FAILURE",
+			"spec_ref", "TS 29.540 §5.2.4",
+		)
+		return nil
+	}
+
+	// Generate a unique SMS record ID for ack correlation.
+	// Use time-based ID for simplicity; production should use a proper sequence.
+	smsRecordID := fmt.Sprintf("mo-%s-%d", ue.SUPI, time.Now().UnixNano())
+
+	// base64-encode the opaque SM-CP/RP container for the Nsmsf API.
+	// Ref: TS 29.540 §6.1.6.2.3 (SmsRecordData.smsPayload)
+	smsPayloadB64 := base64.StdEncoding.EncodeToString(smsContainer)
+
+	log.Info("UL SMS: calling Nsmsf UplinkSMS",
+		"supi", ue.SUPI,
+		"sms_record_id", smsRecordID,
+		"interface", "Nsmsf",
+		"direction", "OUT",
+		"spec_ref", "TS 29.540 §5.2.4",
+	)
+
+	if err := h.smsfClient.UplinkSMS(ctx, ue.SUPI, smsRecordID, smsPayloadB64); err != nil {
+		// 404 CONTEXT_NOT_FOUND: SMSF has no context. Per spec (TS 29.540 §5.2.4),
+		// AMF should re-trigger Activate then retry. For this increment we log and
+		// absorb (the BDD scenarios exercise the happy path with a pre-existing context).
+		log.Warn("UL SMS: Nsmsf UplinkSMS failed",
+			"supi", ue.SUPI,
+			"sms_record_id", smsRecordID,
+			"error", err,
+			"result", "FAILURE",
+			"interface", "Nsmsf",
+			"direction", "OUT",
+			"spec_ref", "TS 29.540 §5.2.4",
+		)
+		return nil // fail-open — do not propagate error to the NAS handler
+	}
+
+	log.Info("UL SMS: Nsmsf UplinkSMS accepted",
+		"supi", ue.SUPI,
+		"sms_record_id", smsRecordID,
+		"result", "OK",
+		"spec_ref", "TS 29.540 §5.2.4",
+	)
 	return nil
 }
 
@@ -1804,3 +2083,47 @@ func (h *Handler) SendUEPolicyContainer(
 	return h.sender.SendDownlinkNASTransport(ue, nasPDU)
 }
 
+// releaseDisplacedContext cleans up a UEContext that was superseded by a fresh
+// registration for the same SUPI (e.g. UERANSIM UE container restarted without
+// sending Deregistration). It releases all PDU sessions at the SMF so IP pools
+// are returned and PFCP entries are removed, then removes the stale AMF context.
+// Called asynchronously from handleAuthenticationResponse.
+// Ref: TS 23.502 §4.2.2.2.2 — new registration supersedes an existing context
+func (h *Handler) releaseDisplacedContext(ctx context.Context, stale *amfctx.UEContext) {
+	stale.Lock()
+	stale.StopAllTimers()
+	sessions := make(map[uint8]*amfctx.PDUSession, len(stale.PDUSessions))
+	for k, v := range stale.PDUSessions {
+		sessions[k] = v
+	}
+	supi := stale.SUPI
+	stale.Unlock()
+
+	h.logger.Info("releasing stale UE context displaced by fresh registration",
+		"supi", supi,
+		"amf_ue_ngap_id", stale.AMFUENGAPId,
+		"pdu_sessions", len(sessions),
+		"spec_ref", "TS 23.502 §4.2.2.2.2",
+	)
+
+	smfDel, canDel := h.sender.(interface {
+		DeleteSMContext(ctx context.Context, smContextRef string) error
+	})
+	for _, sess := range sessions {
+		if sess.SMFInstanceID == "" || !canDel {
+			continue
+		}
+		if err := smfDel.DeleteSMContext(ctx, sess.SMFInstanceID); err != nil {
+			h.logger.Warn("SMF DeleteSMContext failed for displaced context",
+				"supi", supi,
+				"smContextRef", sess.SMFInstanceID,
+				"pdu_session_id", sess.PDUSessionID,
+				"error", err,
+			)
+		}
+	}
+
+	// Remove the stale context from AMF indexes. mgr.Remove guards against
+	// accidentally removing the SUPI/DB record that already belongs to the new context.
+	h.reg.RemoveUEContext(ctx, stale)
+}

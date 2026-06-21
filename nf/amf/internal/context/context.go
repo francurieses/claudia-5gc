@@ -80,8 +80,8 @@ type SecurityContext struct {
 	// Key set identifier assigned by AMF
 	NGKSI byte
 	// Selected algorithms
-	IntegrityAlgID  byte // 0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3
-	CipheringAlgID  byte // 0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3
+	IntegrityAlgID byte // 0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3
+	CipheringAlgID byte // 0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3
 	// Keys (256-bit each)
 	KAMF    []byte
 	KNASint []byte // 128-bit NAS integrity key
@@ -118,10 +118,10 @@ type UEContext struct {
 	mu sync.Mutex
 
 	// Identifiers
-	SUPI   string // Permanent identifier (available after authentication)
-	SUCI   string // Concealed identifier (from Registration Request)
-	GUTI   *GUTI5G
-	PEI    string // Permanent Equipment Identifier (IMEISV)
+	SUPI string // Permanent identifier (available after authentication)
+	SUCI string // Concealed identifier (from Registration Request)
+	GUTI *GUTI5G
+	PEI  string // Permanent Equipment Identifier (IMEISV)
 
 	// NGAP IDs (TS 38.413 §9.3.3)
 	AMFUENGAPId int64  // assigned by AMF
@@ -129,20 +129,20 @@ type UEContext struct {
 	RANUEID     string // for logging
 
 	// gNB association
-	RANNID  string   // RAN Node ID (gNB ID)
-	TAI     TAI      // Tracking Area Identity where UE is located
-	GNBAddr string   // remote addr of the serving gNB SCTP connection (used for CM-IDLE tracking)
+	RANNID  string // RAN Node ID (gNB ID)
+	TAI     TAI    // Tracking Area Identity where UE is located
+	GNBAddr string // remote addr of the serving gNB SCTP connection (used for CM-IDLE tracking)
 	// KgNB is the current AS base key shared with the serving gNB.
 	// Stored after each Initial Context Setup or Service Request so that
 	// the N2 handover handler can derive NH for the target gNB.
 	// Ref: TS 33.501 §A.9, §A.11
-	KgNB    [32]byte
+	KgNB [32]byte
 
 	// CM state (TS 23.501 §5.3.2)
 	CMState CMState
 
 	// 5GMM state machine
-	State  GMM5State
+	State GMM5State
 	// Registration type of ongoing procedure
 	RegistrationType byte
 
@@ -162,12 +162,23 @@ type UEContext struct {
 	KSEAF       []byte
 
 	// Subscription data (from UDM)
-	AllowedNSSAI   []SNSSAISubscribed
+	AllowedNSSAI []SNSSAISubscribed
 	// RequestedNSSAI stores the slices the UE requested at registration,
 	// used to compute the intersection with AllowedNSSAI.
 	// Ref: TS 23.502 §4.2.2.2.2 step 1
 	RequestedNSSAI []SNSSAISubscribed
-	SubscribedAMBR struct {
+
+	// NSSAA (Network Slice-Specific Authentication and Authorization, TS 23.502 §4.2.9).
+	// Slices flagged subjectToNssaa are held in PendingNSSAA (excluded from the initial
+	// Allowed NSSAI) until slice-level EAP auth succeeds. NSSAAInProgress is the slice
+	// currently awaiting a NETWORK SLICE-SPECIFIC AUTHENTICATION COMPLETE; NSSAAEAPID is
+	// the EAP identifier of its in-flight exchange. RejectedNSSAI collects slices that
+	// failed NSSAA (5GMM cause #3).
+	PendingNSSAA    []SNSSAISubscribed
+	NSSAAInProgress *SNSSAISubscribed
+	NSSAAEAPID      byte
+	RejectedNSSAI   []SNSSAISubscribed
+	SubscribedAMBR  struct {
 		UL, DL uint64 // kbps
 	}
 
@@ -179,14 +190,37 @@ type UEContext struct {
 	// gnb.UEs can be cleaned up atomically.
 	PendingRemoval bool
 
+	// Transferred is set when this (old) AMF has handed the UE context to a new
+	// AMF via Namf_Communication_UEContextTransfer. The context is kept until the
+	// new AMF confirms success (RegistrationStatusUpdate) or the implicit-detach
+	// timers expire. Ref: TS 23.502 §4.2.2.2.3, TS 29.518 §5.3.2
+	Transferred bool
+
+	// PendingN1N2 is set when the AMF has paged a CM-IDLE UE in response to a
+	// Namf_Communication_N1N2MessageTransfer (mobile-terminated data). It is cleared
+	// once the UE returns to CM-CONNECTED via Service Request and the user plane is
+	// re-activated. Ref: TS 23.502 §4.2.3.3
+	PendingN1N2 bool
+
 	// Timestamps
 	RegistrationTime time.Time
 	LastActivity     time.Time
 
 	// Policy state (N15 interface, Npcf_UEPolicyControl)
-	// PolicyAssociationID is the PCF policy association identifier assigned at registration.
+	// PolicyAssociationID is the PCF UE policy association identifier (URSP, npcf-ue-policy-control).
 	// Empty when no N15 call was made or when PCF is unavailable.
 	PolicyAssociationID string
+	// AMPolicyAssocID is the PCF AM policy association identifier (npcf-ampolicycontrol, TS 29.507).
+	// Empty when PCF AM policy association was not created.
+	AMPolicyAssocID string
+	// RFSP is the Radio Frequency Selection Priority index returned by PCF (1-256).
+	// Zero means PCF did not provide one.
+	// Ref: TS 23.501 §5.3.4.2, TS 29.507 §6.1.1.2.4
+	RFSP int
+	// ServAreaRes holds the service area restriction from PCF AM policy.
+	// Nil when PCF returned no restriction (UE is unrestricted).
+	// Ref: TS 23.501 §5.3.4, TS 29.507 §6.1.1.2.5
+	ServAreaRes *ServiceAreaRestriction
 	// PendingPolicyContainer holds the UE Policy Container bytes fetched from PCF
 	// during Phase3 (registration) that must be delivered via UCU after the UE sends
 	// RegistrationComplete. Cleared once the UCU is sent.
@@ -219,9 +253,22 @@ type UEContext struct {
 
 // TAI is a Tracking Area Identity.
 type TAI struct {
-	MCC    string
-	MNC    string
-	TAC    uint32 // Tracking Area Code (24 bits)
+	MCC string
+	MNC string
+	TAC uint32 // Tracking Area Code (24 bits)
+}
+
+// ServiceAreaRestriction is the access restriction policy returned by PCF.
+// Ref: TS 29.507 §6.1.1.2.5, TS 23.501 §5.3.4
+type ServiceAreaRestriction struct {
+	// RestrictionType is "ALLOWED_AREAS" or "NOT_ALLOWED_AREAS".
+	RestrictionType string
+	// AllowedTACs lists the allowed TAC hex strings (e.g., "000001") when
+	// RestrictionType == "ALLOWED_AREAS".
+	AllowedTACs []string
+	// NotAllowedTACs lists the restricted TAC hex strings when
+	// RestrictionType == "NOT_ALLOWED_AREAS".
+	NotAllowedTACs []string
 }
 
 // SNSSAISubscribed mirrors the UDR subscription type.
@@ -231,22 +278,26 @@ type SNSSAISubscribed struct {
 	SST uint8
 	SD  string
 	DNN string // preferred DNN (empty = no preference, use UE-requested DNN)
+	// SubjectToNSSAA mirrors the subscription flag
+	// subjectToNetworkSliceSpecificAuthenticationAndAuthorization (TS 29.503 / TS 23.501
+	// §5.15.10). When true, the slice requires NSSAA before being added to Allowed NSSAI.
+	SubjectToNSSAA bool
 }
 
 // PDUSession represents an established PDU session in the AMF.
 type PDUSession struct {
-	PDUSessionID    uint8
-	SMFInstanceID   string
-	SMFAddress      string
-	SNSSAI          SNSSAISubscribed
-	DNN             string
-	PDUSessionType  string
-	QFIs            []uint8
+	PDUSessionID   uint8
+	SMFInstanceID  string
+	SMFAddress     string
+	SNSSAI         SNSSAISubscribed
+	DNN            string
+	PDUSessionType string
+	QFIs           []uint8
 	// N2SmTransfer is the APER-encoded PDUSessionResourceSetupRequestTransfer from
 	// the SMF at session establishment. Cached here so the AMF can populate the
 	// HandoverRequestTransfer during N2 handover without re-querying the SMF.
 	// Ref: TS 38.413 §9.3.4.1, §9.3.4.2
-	N2SmTransfer    []byte
+	N2SmTransfer []byte
 }
 
 // Lock/Unlock expose the mutex for procedures that need to hold state across steps.
@@ -389,10 +440,10 @@ func (m *Manager) PersistUE(ctx context.Context, ue *UEContext) {
 func (m *Manager) AllocateUEContext(ranID int64) *UEContext {
 	amfID := m.ngapIDCounter.Add(1)
 	ue := &UEContext{
-		AMFUENGAPId: amfID,
-		RANUENGAPId: ranID,
-		State:       GMMDeregistered,
-		PDUSessions: make(map[uint8]*PDUSession),
+		AMFUENGAPId:  amfID,
+		RANUENGAPId:  ranID,
+		State:        GMMDeregistered,
+		PDUSessions:  make(map[uint8]*PDUSession),
 		LastActivity: time.Now(),
 	}
 	m.mu.Lock()
@@ -428,11 +479,21 @@ func (m *Manager) GetByTMSI(tmsi uint32) (*UEContext, bool) {
 }
 
 // SetSUPI associates a SUPI with a UE context after successful authentication.
-func (m *Manager) SetSUPI(ue *UEContext, supi string) {
+// Returns any UEContext that previously held the same SUPI (the "displaced" stale
+// context). The caller must release that context's PDU sessions and remove it from
+// the manager. Returns nil when there is no prior context for that SUPI.
+// Ref: TS 23.502 §4.2.2.2.2 — new registration supersedes a stale one for same SUPI.
+func (m *Manager) SetSUPI(ue *UEContext, supi string) *UEContext {
 	ue.SUPI = supi
 	m.mu.Lock()
+	old := m.uesBySUPI[supi]
+	if old == ue {
+		m.mu.Unlock()
+		return nil
+	}
 	m.uesBySUPI[supi] = ue
 	m.mu.Unlock()
+	return old
 }
 
 // AssignGUTI creates and assigns a new 5G-GUTI to the UE.
@@ -574,6 +635,9 @@ func (m *Manager) ListContexts() []UESnapshot {
 }
 
 // Remove removes a UE context from all indexes and deletes it from PostgreSQL.
+// When called on a context that was displaced by a newer registration for the same
+// SUPI, it safely skips the SUPI map and DB deletion (the new context already owns
+// those). This prevents accidental erasure of the live registration record.
 func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 	// Cancel any running lifecycle timers before removing the context so that
 	// callbacks cannot fire on a context that no longer exists in the manager.
@@ -583,7 +647,11 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 
 	m.mu.Lock()
 	delete(m.uesByNGAPId, ue.AMFUENGAPId)
-	if ue.SUPI != "" {
+	// Guard: only remove the SUPI slot if this context still owns it. If a new
+	// registration for the same SUPI has already replaced it, leave the new entry
+	// intact and skip the DB deletion — the new context will upsert its own record.
+	ownsSUPI := ue.SUPI != "" && m.uesBySUPI[ue.SUPI] == ue
+	if ownsSUPI {
 		delete(m.uesBySUPI, ue.SUPI)
 	}
 	if ue.GUTI != nil {
@@ -591,7 +659,7 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 	}
 	m.mu.Unlock()
 
-	if m.db != nil && ue.SUPI != "" {
+	if m.db != nil && ownsSUPI {
 		if err := m.db.DeleteUE(ctx, ue.SUPI); err != nil {
 			m.logger.Error("amf: Remove DeleteUE failed", "supi", ue.SUPI, "error", err)
 		}

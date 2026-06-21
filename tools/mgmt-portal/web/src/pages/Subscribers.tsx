@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Pencil, Trash2, X, Check, RefreshCw, AlertCircle, RotateCcw } from 'lucide-react'
+import { Plus, Pencil, Trash2, X, Check, RefreshCw, AlertCircle, RotateCcw, Signal } from 'lucide-react'
 import {
   getSubscribers, createSubscriber, updateSubscriber, deleteSubscriber, getSlices, getDNNs,
+  getSubscriberRFSP, setSubscriberRFSP, resetSubscriberRFSP,
   type Subscriber, type SNSSAI,
 } from '../lib/api'
 import PageHeader from '../components/PageHeader'
@@ -48,7 +49,7 @@ export default function Subscribers() {
   const [editSUPI, setEditSUPI] = useState<string | null>(null)
   const [form, setForm] = useState<FormData>(emptyForm())
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
-  const [updateNotice, setUpdateNotice] = useState<{ supi: string; deregistered: boolean } | null>(null)
+  const [updateNotice, setUpdateNotice] = useState<{ supi: string; deregistered: boolean; what?: string } | null>(null)
 
   const { data: subscribers = [], isLoading, isError, refetch } = useQuery({
     queryKey: ['subscribers'],
@@ -161,8 +162,8 @@ export default function Subscribers() {
             : 'bg-yellow-950/40 border-yellow-800 text-yellow-300'
         }`}>
           {updateNotice.deregistered
-            ? <><RotateCcw size={14} /> <span><strong>{updateNotice.supi}</strong> updated. UE has been deregistered and will re-register with the new slices.</span></>
-            : <><AlertCircle size={14} /> <span><strong>{updateNotice.supi}</strong> updated. UE is not currently registered — new slices will apply on next registration.</span></>
+            ? <><RotateCcw size={14} /> <span><strong>{updateNotice.supi}</strong> updated. UE has been deregistered and will re-register with the new {updateNotice.what ?? 'slices'}.</span></>
+            : <><AlertCircle size={14} /> <span><strong>{updateNotice.supi}</strong> updated. UE is not currently registered — new {updateNotice.what ?? 'slices'} will apply on next registration.</span></>
           }
         </div>
       )}
@@ -282,15 +283,16 @@ export default function Subscribers() {
               <th className="px-4 py-3 text-left">K (partial)</th>
               <th className="px-4 py-3 text-left">Slices / DNN</th>
               <th className="px-4 py-3 text-left">AMBR UL/DL</th>
+              <th className="px-4 py-3 text-left">RFSP</th>
               <th className="px-4 py-3 text-right">Actions</th>
             </tr>
           </thead>
           <tbody>
             {isLoading ? (
-              <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
+              <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
             ) : isError ? (
               <tr>
-                <td colSpan={5} className="px-4 py-6 text-center">
+                <td colSpan={6} className="px-4 py-6 text-center">
                   <div className="flex items-center justify-center gap-3 text-red-400">
                     <AlertCircle size={16} />
                     <span className="text-sm">Failed to load subscribers</span>
@@ -304,7 +306,7 @@ export default function Subscribers() {
                 </td>
               </tr>
             ) : subscribers.length === 0 ? (
-              <tr><td colSpan={5} className="px-4 py-6 text-center text-gray-500">No subscribers provisioned</td></tr>
+              <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">No subscribers provisioned</td></tr>
             ) : (
               subscribers.map(sub => (
                 <tr key={sub.supi} className="border-b border-gray-800/50 hover:bg-gray-800/30">
@@ -329,6 +331,15 @@ export default function Subscribers() {
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-300">
                     {(sub.ambr_ul / 1000).toFixed(0)} / {(sub.ambr_dl / 1000).toFixed(0)} Mbps
+                  </td>
+                  <td className="px-4 py-3">
+                    <RFSPCell
+                      supi={sub.supi}
+                      onApplied={(deregistered) => {
+                        setUpdateNotice({ supi: sub.supi, deregistered, what: 'RFSP' })
+                        setTimeout(() => setUpdateNotice(null), 6_000)
+                      }}
+                    />
                   </td>
                   <td className="px-4 py-3 text-right">
                     <div className="flex items-center justify-end gap-2">
@@ -386,6 +397,117 @@ function Field({
         className={`w-full bg-gray-800 border border-gray-700 rounded px-2 py-1.5 text-sm text-white
           disabled:opacity-50 ${mono ? 'font-mono text-xs' : ''}`}
       />
+    </div>
+  )
+}
+
+// RFSPCell renders the per-subscriber RFSP (Radio Frequency Selection Priority) box.
+// It reads the effective value (per-subscriber override or operator default) and lets
+// the operator set a value (1-256) or reset to default. Both actions trigger a
+// NW-initiated re-registration so the new RFSP reaches the gNB in the next
+// InitialContextSetupRequest (TS 38.413 §9.3.1.27).
+function RFSPCell({ supi, onApplied }: { supi: string; onApplied: (deregistered: boolean) => void }) {
+  const qc = useQueryClient()
+  const [editing, setEditing] = useState(false)
+  const [val, setVal] = useState(1)
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['rfsp', supi],
+    queryFn: () => getSubscriberRFSP(supi),
+    staleTime: 15_000,
+  })
+
+  const setMut = useMutation({
+    mutationFn: (rfsp: number) => setSubscriberRFSP(supi, rfsp),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['rfsp', supi] })
+      setEditing(false)
+      onApplied(!!r.deregistered)
+    },
+  })
+
+  const resetMut = useMutation({
+    mutationFn: () => resetSubscriberRFSP(supi),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ['rfsp', supi] })
+      setEditing(false)
+      onApplied(!!r.deregistered)
+    },
+  })
+
+  const isOverride = data?.source === 'override'
+  const busy = setMut.isPending || resetMut.isPending
+  const invalid = val < 1 || val > 256
+
+  if (isLoading) {
+    return <span className="text-xs text-gray-500">…</span>
+  }
+
+  if (!editing) {
+    return (
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => { setVal(data?.rfsp ?? 1); setEditing(true) }}
+          title="Change RFSP for this subscriber"
+          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs font-medium border transition-colors ${
+            isOverride
+              ? 'bg-purple-600/20 border-purple-500 text-purple-200 hover:bg-purple-600/30'
+              : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-500'
+          }`}
+        >
+          <Signal size={12} />
+          {data?.rfsp ?? 1}
+          {!isOverride && <span className="text-gray-500">(default)</span>}
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <input
+        type="number"
+        min={1}
+        max={256}
+        value={val}
+        autoFocus
+        onChange={e => setVal(+e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter' && !invalid) setMut.mutate(val); if (e.key === 'Escape') setEditing(false) }}
+        className={`w-16 bg-gray-800 border rounded px-2 py-1 text-xs text-white ${
+          invalid ? 'border-red-500' : 'border-gray-600'
+        }`}
+      />
+      <button
+        onClick={() => setMut.mutate(val)}
+        disabled={busy || invalid}
+        title="Save (1-256) — UE re-registers to apply"
+        className="p-1 text-green-400 hover:bg-gray-700 rounded disabled:opacity-40"
+      >
+        <Check size={13} />
+      </button>
+      {isOverride && (
+        <button
+          onClick={() => resetMut.mutate()}
+          disabled={busy}
+          title="Reset to operator default"
+          className="p-1 text-gray-400 hover:text-yellow-300 hover:bg-gray-700 rounded disabled:opacity-40"
+        >
+          <RotateCcw size={13} />
+        </button>
+      )}
+      <button
+        onClick={() => setEditing(false)}
+        disabled={busy}
+        title="Cancel"
+        className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+      >
+        <X size={13} />
+      </button>
+      {(setMut.error || resetMut.error) && (
+        <span className="text-red-400 text-[10px] max-w-[120px] truncate">
+          {(setMut.error || resetMut.error)?.message}
+        </span>
+      )}
     </div>
   )
 }

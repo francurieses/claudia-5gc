@@ -241,3 +241,18 @@ full: ## Build + start NFs + obs + portal + UERANSIM multi-slice (complete stack
 
 full-down: ## Stop and clean volumes from complete stack
 	$(COMPOSE) --profile core --profile observability --profile multi-slice --profile integration-ueransim --profile suci-profile-a down -v
+
+## docs-check: warn if CLAUDIA_5GC_MANUAL.md is older than the newest Go source file
+.PHONY: docs-check
+docs-check:
+	@MANUAL=docs/CLAUDIA_5GC_MANUAL.md; \
+	NEWEST_GO=$$(find . -name '*.go' -not -path './vendor/*' -printf '%T@ %p\n' 2>/dev/null \
+	             | sort -n | tail -1 | awk '{print $$2}'); \
+	if [ -z "$$NEWEST_GO" ]; then echo "docs-check: no Go files found, skipping."; exit 0; fi; \
+	if [ "$$MANUAL" -ot "$$NEWEST_GO" ]; then \
+	  echo "⚠️  WARNING: $$MANUAL is older than $$NEWEST_GO — manual may be out of date."; \
+	  echo "   Run 'make docs-update' or update the manual manually."; \
+	  exit 1; \
+	else \
+	  echo "✅  docs-check passed: CLAUDIA_5GC_MANUAL.md is up to date."; \
+	fi

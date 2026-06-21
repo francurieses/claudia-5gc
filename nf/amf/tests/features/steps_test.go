@@ -7,9 +7,10 @@
 // When run without E2E_TEST=1 they report as pending — this is expected.
 //
 // E2E validation:
-//   make ueransim
-//   ./scripts/test-pdu-session-modification.sh
-//   # Check AMF logs: docker logs -f amf | grep PDUSessionModification
+//
+//	make ueransim
+//	./scripts/test-pdu-session-modification.sh
+//	# Check AMF logs: docker logs -f amf | grep PDUSessionModification
 //
 // Ref: TS 23.502 §4.3.3.1 (PDU Session Modification UE-requested)
 package features_test
@@ -32,23 +33,23 @@ func pendingIfNoE2E() error {
 	return godog.ErrPending
 }
 
-func aRunning5GCWithAMFSMFUPFAndNRF() error    { return pendingIfNoE2E() }
-func aUERANSIMGNBIsConnectedToTheAMF() error    { return pendingIfNoE2E() }
-func ueIsMMRegistered(_, _ string) error        { return pendingIfNoE2E() }
-func ueHasNoActivePDUSession(_ string) error    { return pendingIfNoE2E() }
+func aRunning5GCWithAMFSMFUPFAndNRF() error         { return pendingIfNoE2E() }
+func aUERANSIMGNBIsConnectedToTheAMF() error        { return pendingIfNoE2E() }
+func ueIsMMRegistered(_, _ string) error            { return pendingIfNoE2E() }
+func ueHasNoActivePDUSession(_ string) error        { return pendingIfNoE2E() }
 func ueSendsPDUSessionModRequest(_, _ string) error { return pendingIfNoE2E() }
-func amfForwardsModificationToSMF() error       { return pendingIfNoE2E() }
-func smfRespondsWith5GSMModCommand(_ string) error { return pendingIfNoE2E() }
-func smfResponseIncludesN2SM() error            { return pendingIfNoE2E() }
-func amfWrapsInSecuredDLNAS() error             { return pendingIfNoE2E() }
-func amfSendsNGAPPDUSessionResourceModify() error { return pendingIfNoE2E() }
-func gnbRespondsWithModifyResponse() error      { return pendingIfNoE2E() }
-func ueReceivesModCommandAndSendsComplete() error { return pendingIfNoE2E() }
-func pduSessionRemainsActive() error            { return pendingIfNoE2E() }
-func amfRespondsWithErrorOrIgnores() error      { return pendingIfNoE2E() }
-func noNsmfCallIsMade() error                   { return pendingIfNoE2E() }
-func modificationProcedureCompletes() error     { return pendingIfNoE2E() }
-func pingingSucceedsWithZeroPacketLoss() error  { return pendingIfNoE2E() }
+func amfForwardsModificationToSMF() error           { return pendingIfNoE2E() }
+func smfRespondsWith5GSMModCommand(_ string) error  { return pendingIfNoE2E() }
+func smfResponseIncludesN2SM() error                { return pendingIfNoE2E() }
+func amfWrapsInSecuredDLNAS() error                 { return pendingIfNoE2E() }
+func amfSendsNGAPPDUSessionResourceModify() error   { return pendingIfNoE2E() }
+func gnbRespondsWithModifyResponse() error          { return pendingIfNoE2E() }
+func ueReceivesModCommandAndSendsComplete() error   { return pendingIfNoE2E() }
+func pduSessionRemainsActive() error                { return pendingIfNoE2E() }
+func amfRespondsWithErrorOrIgnores() error          { return pendingIfNoE2E() }
+func noNsmfCallIsMade() error                       { return pendingIfNoE2E() }
+func modificationProcedureCompletes() error         { return pendingIfNoE2E() }
+func pingingSucceedsWithZeroPacketLoss() error      { return pendingIfNoE2E() }
 
 func InitializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a running 5GC with AMF, SMF, UPF, and NRF$`, aRunning5GCWithAMFSMFUPFAndNRF)
@@ -68,6 +69,13 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^no Nsmf_PDUSession_UpdateSMContext call is made$`, noNsmfCallIsMade)
 	sc.Step(`^the modification procedure completes successfully$`, modificationProcedureCompletes)
 	sc.Step(`^pinging 8\.8\.8\.8 via the UE tunnel interface still succeeds with zero packet loss$`, pingingSucceedsWithZeroPacketLoss)
+
+	// AMF inbound SBI features — real in-process steps:
+	//   UEContextTransfer (TS 29.518 §5.3.2) + Network-Triggered Service Request (TS 23.502 §4.2.3.3).
+	initAMFSBISteps(sc)
+
+	// NSSAA (TS 23.502 §4.2.9) — real in-process steps driving the NSSAA state machine.
+	initNSSAASteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

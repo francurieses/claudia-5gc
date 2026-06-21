@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +20,14 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/pcf/internal/config"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/types"
 )
+
+// udrSmPolicyBucketKey is the S-NSSAI map key the PCF uses when persisting its
+// (DNN-scoped) SM policy overrides as UDR SmPolicyData. The overrides are not
+// slice-scoped, so they live in a single "unspecified slice" bucket; the read
+// path (resolveSmPolicyDnnData) resolves by DNN regardless of the slice key.
+const udrSmPolicyBucketKey = "0"
 
 // SMPolicyOverride holds per-subscriber QoS parameters that override the default SM policy.
 // DNN scopes the override to one Data Network Name (empty = all DNNs of the SUPI); a
@@ -43,6 +51,89 @@ func overrideKey(supi, dnn string) string {
 	return supi + "|" + dnn
 }
 
+// resolveSmPolicyDnnData finds the authorized QoS for a DNN in UDR SM policy
+// data. An exact DNN match (across any S-NSSAI bucket) wins; otherwise a
+// subscriber-wide entry (DNN "") is used. The S-NSSAI key is not matched —
+// the PCF stores its overrides under a single bucket and resolves by DNN.
+func resolveSmPolicyDnnData(data *types.SmPolicyData, dnn string) (types.SmPolicyDnnData, bool) {
+	if data == nil {
+		return types.SmPolicyDnnData{}, false
+	}
+	var wide types.SmPolicyDnnData
+	var haveWide bool
+	for _, e := range data.SmPolicySnssaiData {
+		if dnn != "" {
+			if d, ok := e.SmPolicyDnnData[dnn]; ok {
+				return d, true
+			}
+		}
+		if d, ok := e.SmPolicyDnnData[""]; ok {
+			wide, haveWide = d, true
+		}
+	}
+	return wide, haveWide
+}
+
+// buildOverrideDnnData assembles the per-DNN policy data for a subscriber from
+// all of its in-memory SM policy overrides. The caller must hold policiesMu.
+func (s *Server) buildOverrideDnnData(supi string) map[string]types.SmPolicyDnnData {
+	dnnData := make(map[string]types.SmPolicyDnnData)
+	prefix := supi + "|"
+	for key, ov := range s.smPolicyOverrides {
+		if key != supi && !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		dnnData[ov.DNN] = types.SmPolicyDnnData{
+			DNN:          ov.DNN,
+			FiveQI:       ov.FiveQI,
+			ARPPriority:  ov.ARPPriorityLevel,
+			AMBRUplink:   ov.AMBRUplink,
+			AMBRDownlink: ov.AMBRDownlink,
+		}
+	}
+	return dnnData
+}
+
+// persistSmPolicyToUDR write-throughs the subscriber's current overrides to the
+// UDR over Nudr_DR (best-effort, non-fatal). No-op when no UDR client is wired.
+//
+// It is read-modify-write: the PCF reads the current SmPolicyData, replaces only
+// its own bucket (udrSmPolicyBucketKey) with the rebuilt overrides — or removes
+// that bucket when no overrides remain — and writes the result back. This keeps
+// directly-provisioned per-S-NSSAI slices intact (the PCF only manages its own
+// bucket, it does not own the whole document).
+func (s *Server) persistSmPolicyToUDR(ctx context.Context, supi string) {
+	if s.udrClient == nil {
+		return
+	}
+	s.policiesMu.Lock()
+	dnnData := s.buildOverrideDnnData(supi)
+	s.policiesMu.Unlock()
+
+	cur, err := s.udrClient.GetSmPolicyData(ctx, supi)
+	if err != nil {
+		s.logger.Warn("UDR read before write-through failed (override applied in-memory only)",
+			"supi", supi, "error", err)
+		return
+	}
+	if cur == nil {
+		cur = &types.SmPolicyData{}
+	}
+	cur.SUPI = supi
+	if cur.SmPolicySnssaiData == nil {
+		cur.SmPolicySnssaiData = map[string]types.SmPolicySnssaiData{}
+	}
+	if len(dnnData) == 0 {
+		delete(cur.SmPolicySnssaiData, udrSmPolicyBucketKey)
+	} else {
+		cur.SmPolicySnssaiData[udrSmPolicyBucketKey] = types.SmPolicySnssaiData{SmPolicyDnnData: dnnData}
+	}
+	if err := s.udrClient.PutSmPolicyData(ctx, cur); err != nil {
+		s.logger.Warn("UDR PutSmPolicyData failed (override applied in-memory only)",
+			"supi", supi, "error", err)
+	}
+}
+
 type Server struct {
 	cfg               *config.Config
 	logger            *slog.Logger
@@ -51,6 +142,26 @@ type Server struct {
 	policiesMu        sync.Mutex
 	smPolicyOverrides map[string]SMPolicyOverride // key: overrideKey(supi, dnn)
 	udrClient         UDRClient                   // optional; nil disables UDR lookup (config defaults used)
+
+	// AM policy associations (Npcf_AMPolicyControl, TS 29.507).
+	// key: polAssoId → AMPolicyAssociation
+	amPolicies   map[string]AMPolicyAssociation
+	amPoliciesMu sync.Mutex
+
+	// rfspOverrides holds per-subscriber RFSP overrides (key: supi → rfsp 1-256).
+	// Set via the internal management API; consulted in handleCreateAMPolicy so the
+	// AMF receives a subscriber-specific RFSP instead of the operator default.
+	// In-memory only (reset on PCF restart) — mirrors smPolicyOverrides.
+	rfspOverrides map[string]int
+}
+
+// AMPolicyAssociation holds an AMF AM policy association record.
+// Ref: TS 29.507 §6.1.1.2.4
+type AMPolicyAssociation struct {
+	PolAssoID  string `json:"polAssoId"`
+	SUPI       string `json:"supi,omitempty"`
+	RFSP       int    `json:"rfsp,omitempty"` // 1-256; 0 = not set
+	AccessType string `json:"accessType,omitempty"`
 }
 
 // WithUDRClient attaches a UDR client for per-subscriber URSP rule lookup (N36 interface).
@@ -64,19 +175,31 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		logger:            logger.With("nf", "PCF"),
 		policies:          make(map[string]map[string]interface{}),
 		smPolicyOverrides: make(map[string]SMPolicyOverride),
+		amPolicies:        make(map[string]AMPolicyAssociation),
+		rfspOverrides:     make(map[string]int),
 	}
 
 	mux := http.NewServeMux()
 	// N7 — Npcf_SMPolicyControl
 	mux.HandleFunc("POST /npcf-smpolicycontrol/v1/sm-policies", s.handleCreateSmPolicy)
+	// SM Policy Association Update — custom "update" operation (TS 29.512 §5.2.2.3).
+	mux.HandleFunc("POST /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}/update", s.handleUpdateSmPolicy)
 	mux.HandleFunc("DELETE /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}", s.handleDeleteSmPolicy)
-	// N15 — Npcf_UEPolicyControl
+	// N15 — Npcf_UEPolicyControl (URSP)
 	mux.HandleFunc("POST /npcf-ue-policy-control/v1/ue-policies", s.handleCreateUEPolicy)
 	mux.HandleFunc("DELETE /npcf-ue-policy-control/v1/ue-policies/{polAssoId}", s.handleDeleteUEPolicy)
+	// N15 — Npcf_AMPolicyControl (AM policy: RFSP + service area restrictions)
+	// Ref: TS 29.507 §4.2.2
+	mux.HandleFunc("POST /npcf-ampolicycontrol/v1/policies", s.handleCreateAMPolicy)
+	mux.HandleFunc("DELETE /npcf-ampolicycontrol/v1/policies/{polAssoId}", s.handleDeleteAMPolicy)
 	// Internal management — per-subscriber SM policy QoS overrides (not a 3GPP SBI)
 	mux.HandleFunc("PUT /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleSetQoSOverride)
 	mux.HandleFunc("GET /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleGetQoSOverride)
 	mux.HandleFunc("DELETE /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleDeleteQoSOverride)
+	// Internal management — per-subscriber AM policy (RFSP) overrides (not a 3GPP SBI)
+	mux.HandleFunc("PUT /pcf-internal/v1/subscribers/{supi}/am-policy-override", s.handleSetRFSPOverride)
+	mux.HandleFunc("GET /pcf-internal/v1/subscribers/{supi}/am-policy-override", s.handleGetRFSPOverride)
+	mux.HandleFunc("DELETE /pcf-internal/v1/subscribers/{supi}/am-policy-override", s.handleDeleteRFSPOverride)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	var tlsCfg *tls.Config
@@ -181,6 +304,34 @@ func (s *Server) handleCreateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		ov, ok = s.smPolicyOverrides[supi] // then subscriber-wide
 	}
+	s.policiesMu.Unlock()
+
+	// Tier 3 — SM Policy Data from the UDR (N36, TS 29.519 §5.6.2.4). Consulted
+	// only when no in-memory override matches; it is authoritative repository
+	// policy and beats the UDM subscription default. Fail-open on any error so
+	// the decision is unchanged when the UDR is absent/unreachable.
+	if !ok && s.udrClient != nil {
+		if data, err := s.udrClient.GetSmPolicyData(r.Context(), supi); err != nil {
+			log.Warn("UDR GetSmPolicyData failed (using subscription/defaults)", "error", err)
+		} else if d, found := resolveSmPolicyDnnData(data, dnn); found {
+			if d.FiveQI != 0 {
+				fiveQI = d.FiveQI
+			}
+			if d.ARPPriority != 0 {
+				arpPriority = d.ARPPriority
+			}
+			if d.AMBRUplink != "" {
+				ambrUL = d.AMBRUplink
+			}
+			if d.AMBRDownlink != "" {
+				ambrDL = d.AMBRDownlink
+			}
+			qosSource = "UDR_POLICY_DATA"
+			log.Info("SmPolicyCreate: applying UDR SM policy data",
+				"supi", supi, "dnn", dnn, "5qi", fiveQI)
+		}
+	}
+
 	if ok {
 		fiveQI = ov.FiveQI
 		qosSource = "PCF_OVERRIDE"
@@ -196,7 +347,6 @@ func (s *Server) handleCreateSmPolicy(w http.ResponseWriter, r *http.Request) {
 		log.Info("SmPolicyCreate: applying per-subscriber override",
 			"supi", supi, "dnn", dnn, "override_dnn", ov.DNN, "5qi", fiveQI)
 	}
-	s.policiesMu.Unlock()
 
 	p := s.cfg.DefaultSMPolicy
 	response := map[string]interface{}{
@@ -281,6 +431,8 @@ func (s *Server) handleSetQoSOverride(w http.ResponseWriter, r *http.Request) {
 	s.policiesMu.Lock()
 	s.smPolicyOverrides[overrideKey(supi, ov.DNN)] = ov
 	s.policiesMu.Unlock()
+	// Write-through to the UDR (N36) so the policy is repository-backed.
+	s.persistSmPolicyToUDR(r.Context(), supi)
 	s.logger.Info("QoS override set", "supi", supi, "dnn", ov.DNN, "5qi", ov.FiveQI,
 		"ambr_uplink", ov.AMBRUplink, "ambr_downlink", ov.AMBRDownlink)
 	w.Header().Set("Content-Type", "application/json")
@@ -317,7 +469,170 @@ func (s *Server) handleDeleteQoSOverride(w http.ResponseWriter, r *http.Request)
 		problem(w, http.StatusNotFound, "NOT_FOUND", "no override for "+supi)
 		return
 	}
+	// Reflect the removal in the UDR (N36).
+	s.persistSmPolicyToUDR(r.Context(), supi)
 	s.logger.Info("QoS override deleted", "key", key)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSetRFSPOverride stores a per-subscriber RFSP override consulted at AM policy
+// creation. PUT /pcf-internal/v1/subscribers/{supi}/am-policy-override
+// Body: {"rfsp": <1-256>}. The new value takes effect on the UE's next registration.
+// Ref: TS 38.413 §9.3.1.27 (IndexToRFSP), TS 23.501 §5.3.4.2.
+func (s *Server) handleSetRFSPOverride(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	var body struct {
+		RFSP int `json:"rfsp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		problem(w, http.StatusBadRequest, "INVALID_BODY", err.Error())
+		return
+	}
+	if body.RFSP < 1 || body.RFSP > 256 {
+		problem(w, http.StatusBadRequest, "INVALID_VALUE", "rfsp must be in range 1-256")
+		return
+	}
+	s.amPoliciesMu.Lock()
+	s.rfspOverrides[supi] = body.RFSP
+	s.amPoliciesMu.Unlock()
+	s.logger.Info("RFSP override set",
+		"procedure", "AMPolicyOverride", "supi", supi, "rfsp", body.RFSP,
+		"spec_ref", "TS 38.413 §9.3.1.27")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{"supi": supi, "rfsp": body.RFSP})
+}
+
+// handleGetRFSPOverride returns the active per-subscriber RFSP override, or 404 if none.
+// GET /pcf-internal/v1/subscribers/{supi}/am-policy-override
+func (s *Server) handleGetRFSPOverride(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	s.amPoliciesMu.Lock()
+	rfsp, ok := s.rfspOverrides[supi]
+	s.amPoliciesMu.Unlock()
+	if !ok {
+		problem(w, http.StatusNotFound, "NOT_FOUND", "no RFSP override for "+supi)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"supi": supi, "rfsp": rfsp})
+}
+
+// handleDeleteRFSPOverride removes a per-subscriber RFSP override; the subscriber reverts
+// to the operator default on its next registration.
+// DELETE /pcf-internal/v1/subscribers/{supi}/am-policy-override
+func (s *Server) handleDeleteRFSPOverride(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	s.amPoliciesMu.Lock()
+	_, existed := s.rfspOverrides[supi]
+	delete(s.rfspOverrides, supi)
+	s.amPoliciesMu.Unlock()
+	if !existed {
+		problem(w, http.StatusNotFound, "NOT_FOUND", "no RFSP override for "+supi)
+		return
+	}
+	s.logger.Info("RFSP override deleted", "procedure", "AMPolicyOverride", "supi", supi)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- Npcf_AMPolicyControl (TS 29.507) ---------------------------------------
+
+// handleCreateAMPolicy processes POST /npcf-ampolicycontrol/v1/policies.
+// AMF calls this at Initial Registration (TS 23.502 §4.2.2.2.2 step 14c).
+// Ref: TS 29.507 §4.2.2.2
+func (s *Server) handleCreateAMPolicy(w http.ResponseWriter, r *http.Request) {
+	log := s.logger.With(
+		"procedure", "AMPolicyCreate",
+		"interface", "Npcf",
+		"direction", "IN",
+		"correlation_id", r.Header.Get("X-Correlation-Id"),
+		"spec_ref", "TS 29.507 §4.2.2.2",
+	)
+
+	var req struct {
+		SUPI       string `json:"supi"`
+		AccessType string `json:"accessType"`
+		PEI        string `json:"pei,omitempty"`
+		GPSI       string `json:"gpsi,omitempty"`
+		PLMNId     any    `json:"plmnId,omitempty"`
+		NotifURI   string `json:"notificationUri,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "request body: "+err.Error())
+		return
+	}
+	if req.SUPI == "" {
+		problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "supi is mandatory")
+		return
+	}
+	if req.AccessType == "" {
+		problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "accessType is mandatory")
+		return
+	}
+
+	// RFSP resolution: per-subscriber override (set via the internal management API,
+	// e.g. by the mgmt portal) takes precedence over the operator default of 1.
+	// Ref: TS 29.507 §4.2.2.2, TS 23.501 §5.3.4.2
+	rfsp := 1
+	s.amPoliciesMu.Lock()
+	if ov, ok := s.rfspOverrides[req.SUPI]; ok && ov > 0 {
+		rfsp = ov
+	}
+	s.amPoliciesMu.Unlock()
+
+	polAssoID := ulid.Make().String()
+	assoc := AMPolicyAssociation{
+		PolAssoID:  polAssoID,
+		SUPI:       req.SUPI,
+		RFSP:       rfsp,
+		AccessType: req.AccessType,
+	}
+
+	s.amPoliciesMu.Lock()
+	s.amPolicies[polAssoID] = assoc
+	s.amPoliciesMu.Unlock()
+
+	log.Info("AM policy association created",
+		"pol_asso_id", polAssoID,
+		"supi", req.SUPI,
+		"access_type", req.AccessType,
+		"rfsp", assoc.RFSP,
+		"direction", "OUT",
+		"result", "OK",
+	)
+
+	location := "/npcf-ampolicycontrol/v1/policies/" + polAssoID
+	w.Header().Set("Location", location)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"polAssoId": polAssoID,
+		"rfsp":      assoc.RFSP,
+		"triggers":  []string{},
+	})
+}
+
+// handleDeleteAMPolicy processes DELETE /npcf-ampolicycontrol/v1/policies/{polAssoId}.
+// AMF calls this at UE Deregistration. Ref: TS 29.507 §4.2.2.4
+func (s *Server) handleDeleteAMPolicy(w http.ResponseWriter, r *http.Request) {
+	polAssoID := r.PathValue("polAssoId")
+	log := s.logger.With(
+		"procedure", "AMPolicyDelete",
+		"pol_asso_id", polAssoID,
+		"spec_ref", "TS 29.507 §4.2.2.4",
+	)
+
+	s.amPoliciesMu.Lock()
+	_, ok := s.amPolicies[polAssoID]
+	delete(s.amPolicies, polAssoID)
+	s.amPoliciesMu.Unlock()
+
+	if !ok {
+		problem(w, http.StatusNotFound, "POLICY_ASSOCIATION_NOT_FOUND",
+			"AM policy association "+polAssoID+" not found")
+		return
+	}
+	log.Info("AM policy association deleted")
 	w.WriteHeader(http.StatusNoContent)
 }
 

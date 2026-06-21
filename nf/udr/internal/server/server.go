@@ -98,10 +98,20 @@ func New(addr string, tlsCfg TLSConfig, st store.Store, logger *slog.Logger) (*S
 		s.handleGetUEPolicySet)
 	mux.HandleFunc("PUT /nudr-dr/v2/policy-data/{supi}/ue-policy-set",
 		s.handlePutUEPolicySet)
+	mux.HandleFunc("PATCH /nudr-dr/v2/policy-data/{supi}/ue-policy-set",
+		s.handlePatchUEPolicySet)
 	mux.HandleFunc("DELETE /nudr-dr/v2/policy-data/{supi}/ue-policy-set",
 		s.handleDeleteUEPolicySet)
 	mux.HandleFunc("GET /nudr-dr/v2/policy-data/default-policies",
 		s.handleListDefaultPolicies)
+
+	// SM policy data — per-S-NSSAI/per-DNN authorized QoS (TS 29.519 §5.6.2.4)
+	mux.HandleFunc("GET /nudr-dr/v2/policy-data/{supi}/sm-data",
+		s.handleGetSmPolicyData)
+	mux.HandleFunc("PUT /nudr-dr/v2/policy-data/{supi}/sm-data",
+		s.handlePutSmPolicyData)
+	mux.HandleFunc("PATCH /nudr-dr/v2/policy-data/{supi}/sm-data",
+		s.handlePatchSmPolicyData)
 
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
@@ -317,6 +327,111 @@ func (s *Server) handleDeleteUEPolicySet(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// PATCH /nudr-dr/v2/policy-data/{supi}/ue-policy-set — partial update of the
+// UE policy set (e.g. precedence or rules). Ref: TS 29.504 §5.2.13.
+func (s *Server) handlePatchUEPolicySet(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.procedureLog(r, "PatchUEPolicySet", supi)
+
+	cur, err := s.store.GetPolicySubscription(supi)
+	if err != nil {
+		log.Error("GetPolicySubscription failed", "error", err)
+		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	if cur == nil {
+		s.problem(w, http.StatusNotFound, "DATA_NOT_FOUND", "no policy subscription for "+supi)
+		return
+	}
+
+	// Decode into a sparse view so absent fields leave the current value intact.
+	var patch struct {
+		Precedence *int              `json:"precedence"`
+		Rules      *[]store.URSPRule `json:"rules"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
+		return
+	}
+	if patch.Precedence != nil {
+		cur.Precedence = *patch.Precedence
+	}
+	if patch.Rules != nil {
+		cur.Rules = *patch.Rules
+	}
+	cur.SUPI = supi
+	if err := s.store.PutPolicySubscription(cur); err != nil {
+		log.Error("PutPolicySubscription failed", "error", err)
+		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	log.Info("UE policy set patched", "direction", "IN", "precedence", cur.Precedence, "rule_count", len(cur.Rules))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// GET /nudr-dr/v2/policy-data/{supi}/sm-data — SM policy data (TS 29.519 §5.6.2.4)
+func (s *Server) handleGetSmPolicyData(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.procedureLog(r, "GetSmPolicyData", supi)
+
+	data, err := s.store.GetSmPolicyData(supi)
+	if err != nil {
+		log.Error("GetSmPolicyData failed", "error", err)
+		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	if data == nil {
+		s.problem(w, http.StatusNotFound, "DATA_NOT_FOUND", "no SM policy data for "+supi)
+		return
+	}
+	log.Info("SM policy data returned", "direction", "OUT", "slice_count", len(data.SmPolicySnssaiData))
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+// PUT /nudr-dr/v2/policy-data/{supi}/sm-data — replace SM policy data
+func (s *Server) handlePutSmPolicyData(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.procedureLog(r, "PutSmPolicyData", supi)
+
+	var data store.SmPolicyData
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
+		return
+	}
+	data.SUPI = supi
+	if err := s.store.PutSmPolicyData(&data); err != nil {
+		log.Error("PutSmPolicyData failed", "error", err)
+		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	log.Info("SM policy data stored", "direction", "IN", "slice_count", len(data.SmPolicySnssaiData))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// PATCH /nudr-dr/v2/policy-data/{supi}/sm-data — merge SM policy data per S-NSSAI key
+func (s *Server) handlePatchSmPolicyData(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.procedureLog(r, "PatchSmPolicyData", supi)
+
+	var patch store.SmPolicyData
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
+		return
+	}
+	if err := s.store.PatchSmPolicyData(supi, &patch); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.problem(w, http.StatusNotFound, "DATA_NOT_FOUND", "no SM policy data for "+supi)
+			return
+		}
+		log.Error("PatchSmPolicyData failed", "error", err)
+		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	log.Info("SM policy data patched", "direction", "IN", "slice_count", len(patch.SmPolicySnssaiData))
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // GET /nudr-dr/v2/policy-data/default-policies
 func (s *Server) handleListDefaultPolicies(w http.ResponseWriter, r *http.Request) {
 	subs, err := s.store.ListPolicySubscriptions()
@@ -332,6 +447,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"UP"}`))
 }
+
+// Handler returns the server's root HTTP handler (middleware + routes) for
+// in-process testing over HTTP/1.1 (httptest). Not used in production.
+func (s *Server) Handler() http.Handler { return s.httpSrv.Handler }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

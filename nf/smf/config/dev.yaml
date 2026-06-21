@@ -3,6 +3,12 @@ dnns:
       ue_ip_pool: 10.60.0.0/24
     - name: ims
       ue_ip_pool: 10.61.0.0/24
+      # IPv6 / IPv4v6 prefix delegation (TS 23.501 §5.8.2.2). The SMF carves a
+      # per-session /64 out of this base and returns the interface identifier in
+      # the PDU Address IE; the /64 itself reaches the UE via Router Advertisement
+      # on the UPF TUN (escalated, UPF-001). DNNs without ue_ipv6_prefix are
+      # IPv4-only and v6 requests are downgraded to IPv4.
+      ue_ipv6_prefix: "2001:db8:61::/56"
     - name: gaming
       ue_ip_pool: 10.62.0.0/24
     - name: gold
@@ -12,6 +18,7 @@ metrics:
 nf_instance_id: 00000000-0000-4004-8000-000000000001
 peers:
     amf_mgmt: amf:9002
+    amf: amf:8001          # AMF SBI (namf-comm) — N1N2MessageTransfer / CN paging
     nrf: nrf:8000
     pcf: pcf:8006
     udm: udm:8003
