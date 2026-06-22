@@ -17,10 +17,23 @@ import (
 )
 
 // pcapSidecars maps NF name → sidecar container name.
+// "core" is special: network_mode:host so it sees ALL Docker bridge interfaces
+// and captures every inter-NF packet with a 172.30.0.0/16 BPF filter.
 var pcapSidecars = map[string]string{
+	"core": "core-pcap",
+	// Control-plane
 	"nrf":  "nrf-pcap",
 	"amf":  "amf-pcap",
+	"ausf": "ausf-pcap",
+	"udm":  "udm-pcap",
+	"udr":  "udr-pcap",
+	"smf":  "smf-pcap",
+	"pcf":  "pcf-pcap",
+	"upf":  "upf-pcap",
 	"nssf": "nssf-pcap",
+	"smsf": "smsf-pcap",
+	"bsf":  "bsf-pcap",
+	"nef":  "nef-pcap",
 }
 
 // PCAPStatus describes the state of a PCAP sidecar.
@@ -82,7 +95,7 @@ func (d Deps) handlePCAPStart(w http.ResponseWriter, r *http.Request) {
 	nf := chi.URLParam(r, "nf")
 	ctr, ok := pcapSidecars[nf]
 	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown nf: %s (valid: nrf, amf, nssf)", nf))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown nf: %s", nf))
 		return
 	}
 	if d.Docker == nil {
@@ -92,13 +105,22 @@ func (d Deps) handlePCAPStart(w http.ResponseWriter, r *http.Request) {
 	// Idempotent: only start tcpdump if not already running or paused.
 	// Explicitly excludes zombies (state Z) so that a previously stopped capture
 	// does not block a new one from starting.
+	//
+	// core-pcap runs with network_mode:host so it sees all Docker bridge
+	// interfaces. We add a BPF filter to limit capture to the 5GC subnets
+	// (172.30.0.0/16 covers sbi/n2/n4/n3/n6). Per-NF sidecars run inside the
+	// NF's network namespace and need no filter — they only see that NF's traffic.
+	bpfFilter := ""
+	if nf == "core" {
+		bpfFilter = `'net 172.30.0.0/16' `
+	}
 	cmd := fmt.Sprintf(
 		`pid=$(pgrep -o tcpdump 2>/dev/null); `+
 			`state=; [ -n "$pid" ] && state=$(awk '/^State:/{print $2}' /proc/$pid/status 2>/dev/null); `+
 			`if [ -z "$pid" ] || [ "$state" = "Z" ] || [ -z "$state" ]; then `+
-			`tcpdump -i any -n -w '/pcaps/%s-%%Y%%m%%d-%%H%%M%%S.pcap' -G 300 -W 12 `+
+			`tcpdump -i any -n -w '/pcaps/%s-%%Y%%m%%d-%%H%%M%%S.pcap' -G 300 -W 12 %s`+
 			`</dev/null >/dev/null 2>&1 & echo $! > /tmp/tcpdump.pid; fi`,
-		nf,
+		nf, bpfFilter,
 	)
 	res, err := d.Docker.Exec(r.Context(), ctr, []string{"sh", "-c", cmd})
 	if err != nil {
@@ -116,7 +138,7 @@ func (d Deps) handlePCAPStop(w http.ResponseWriter, r *http.Request) {
 	nf := chi.URLParam(r, "nf")
 	ctr, ok := pcapSidecars[nf]
 	if !ok {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown nf: %s (valid: nrf, amf, nssf)", nf))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown nf: %s", nf))
 		return
 	}
 	if d.Docker == nil {
@@ -173,7 +195,7 @@ func (d Deps) handlePCAPRotate(w http.ResponseWriter, r *http.Request) {
 func execPCAPSignal(d Deps, r *http.Request, nf, signal string) error {
 	ctr, ok := pcapSidecars[nf]
 	if !ok {
-		return fmt.Errorf("unknown pcap nf: %s (valid: nrf, amf, nssf)", nf)
+		return fmt.Errorf("unknown pcap nf: %s", nf)
 	}
 	if d.Docker == nil {
 		return fmt.Errorf("docker not available")

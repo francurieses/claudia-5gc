@@ -63,7 +63,11 @@ type Config struct {
 	} `yaml:"plmn"`
 	SBI struct {
 		Address string `yaml:"address"`
-		TLS     struct {
+		// FQDN is the PCF's own SBI FQDN reported in PcfBinding to the BSF so that
+		// consumers (NEF/AF) can reach this PCF by name. Optional; defaults to "".
+		// Ref: TS 29.521 §6.2.6 (pcfFqdn).
+		FQDN string `yaml:"fqdn"`
+		TLS  struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
 			CAFile   string `yaml:"ca_file"`
@@ -72,6 +76,10 @@ type Config struct {
 	Peers struct {
 		NRF string `yaml:"nrf"`
 		UDR string `yaml:"udr"`
+		// BSF is the host:port of the Binding Support Function (Nbsf_Management).
+		// Empty string disables BSF integration (fail-open behaviour).
+		// Ref: TS 29.521 §5, TS 23.501 §6.2.16.
+		BSF string `yaml:"bsf"`
 	} `yaml:"peers"`
 	Metrics struct {
 		Address string `yaml:"address"`

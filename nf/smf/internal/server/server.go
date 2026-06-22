@@ -472,7 +472,13 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	// Create SM Policy association with PCF — QoS parameters must be known
 	// before encoding N1SM/N2SM. The PCF-authorized values take precedence over
 	// the UDM subscription. Ref: TS 23.502 §4.3.2.2.1 step 6, TS 29.512 §5.2.2.2.
-	smPolicyID, policyQoS := s.createSMPolicy(r.Context(), supi, dnn, slice, subQoS)
+	// Pass the allocated UE IPv4 address (nil-safe: "" for IPv6-only sessions) so
+	// the PCF can register a PCF binding with the BSF. Ref: TS 29.512 §5.6.2.3.
+	ueIPv4Str := ""
+	if ip != nil {
+		ueIPv4Str = ip.String()
+	}
+	smPolicyID, policyQoS := s.createSMPolicy(r.Context(), supi, dnn, ueIPv4Str, slice, subQoS)
 
 	// N1SM: PDU Session Establishment Accept body (AMF wraps in DL NAS Transport).
 	// Carries the QoS rules (QFI=1 default flow) and the QoS flow descriptions
@@ -992,13 +998,18 @@ func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session)
 // createSMPolicy calls PCF to create an SM Policy association.
 // Returns the smPolicyId and QoS parameters assigned by PCF.
 //
+// ueIPv4 is the allocated UE IPv4 address (e.g. "10.60.0.1"). When non-empty it is
+// sent to the PCF as SmPolicyContextData.ipv4Address (TS 29.512 §5.6.2.3) so the PCF
+// can register a PCF binding with the BSF (TS 29.521 §5.2.2.2). Pass "" for IPv6-only
+// sessions or when the address is not yet known; the field is omitted from the body.
+//
 // The subscribed default QoS fetched from UDM (subQoS, may be nil) is reported
 // to the PCF as subsDefQos/subsSessAmbr (TS 29.512 §5.6.2.3 SmPolicyContextData);
 // the PCF-authorized decision takes precedence over the subscription. When the
 // PCF is unreachable, the UDM subscription applies; failing that, operator
 // defaults (non-fatal; session proceeds).
-// Ref: TS 29.512 §5.2.2.2 (Npcf_SMPolicyControl_Create)
-func (s *Server) createSMPolicy(ctx context.Context, supi, dnn string, slice SliceID, subQoS *subscribedQoS) (string, smPolicyQoS) {
+// Ref: TS 29.512 §5.2.2.2 (Npcf_SMPolicyControl_Create), §5.6.2.3 (SmPolicyContextData)
+func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, slice SliceID, subQoS *subscribedQoS) (string, smPolicyQoS) {
 	fallback := smPolicyQoS{FiveQI: 9, ARPPriority: 8, AMBRULMbps: 100, AMBRDLMbps: 100, Source: QoSSourceOperatorDefault}
 	if subQoS != nil {
 		fallback = smPolicyQoS{
@@ -1020,6 +1031,12 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn string, slice Sli
 			"sst": int(slice.SST),
 			"sd":  slice.SD,
 		},
+	}
+	// Include the UE IPv4 address so the PCF can register a PCF binding with the BSF.
+	// Field name: SmPolicyContextData.ipv4Address (TS 29.512 §5.6.2.3).
+	// Omitted when empty to preserve byte-identical behaviour for IPv6-only sessions.
+	if ueIPv4 != "" {
+		reqBody["ipv4Address"] = ueIPv4
 	}
 	if subQoS != nil {
 		reqBody["subsDefQos"] = map[string]interface{}{

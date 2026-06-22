@@ -83,6 +83,23 @@ func main() {
 			sbiSrv.WithUDRClient(server.NewHTTPUDRClient(udrBaseURL, httpClient))
 			logger.Info("UDR client configured", "udr", udrBaseURL, "interface", "N36")
 		}
+		// ---- BSF client (Nbsf_Management — PCF binding register/deregister) ---
+		// Only constructed when cfg.Peers.BSF is configured; absent = fail-open (disabled).
+		// Ref: TS 29.521 §5, TS 23.501 §6.2.16
+		if cfg.Peers.BSF != "" {
+			bsfBaseURL := "https://" + cfg.Peers.BSF
+			sbiSrv.WithBSFClient(&server.HTTPBSFClient{
+				BaseURL: bsfBaseURL,
+				Client:  httpClient,
+				Logger:  logger,
+				PcfFqdn: cfg.SBI.FQDN,
+				PcfId:   cfg.NFInstanceID,
+			})
+			logger.Info("BSF client configured",
+				"bsf", bsfBaseURL, "interface", "Nbsf",
+				"spec_ref", "TS 29.521 §5",
+			)
+		}
 	}
 
 	go func() {
@@ -114,14 +131,14 @@ func main() {
 						ServiceName:       "npcf-smpolicycontrol",
 						Scheme:            "https",
 						NFServiceStatus:   "REGISTERED",
-						Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
+						Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
 					},
 					{
 						ServiceInstanceID: cfg.NFInstanceID + "-npcf-ue-policy-control",
 						ServiceName:       "npcf-ue-policy-control",
 						Scheme:            "https",
 						NFServiceStatus:   "REGISTERED",
-						Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
+						Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
 					},
 				},
 			}

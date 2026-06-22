@@ -1401,20 +1401,37 @@ func (h *Handler) handleULNASTransport(
 	}
 
 	// PDU Session Establishment Request handler.
-	// Guard: if a session with this PDU session ID is already active, the UE is
-	// retransmitting (T3580). Per TS 24.501 §6.3.2.2.3, the network should release
-	// the existing session and accept the new one. Here we silently drop the
-	// retransmit to avoid creating duplicate SMF contexts; UERANSIM will eventually
-	// re-establish after the old session times out.
+	// TS 24.501 §6.3.2.2.3: if the PSI is already active (e.g. a stale AMF entry
+	// left when NGAP failed after the SMF context was created, or a genuine T3580
+	// retransmit after the UERANSIM UAC race), release the existing session first
+	// then accept the new one. Silently dropping is non-compliant and permanently
+	// blocks re-establishment of that PSI.
 	ue.Lock()
-	_, alreadyActive := ue.PDUSessions[pduSessionID]
+	existingSession, alreadyActive := ue.PDUSessions[pduSessionID]
 	ue.Unlock()
 	if alreadyActive {
-		log.Warn("PDU Session Establishment Request for active PSI — dropping retransmit",
+		log.Warn("PDU Session Establishment Request for already-active PSI — releasing existing context per TS 24.501 §6.3.2.2.3",
 			"pdu_session_id", pduSessionID,
+			"smContextRef", existingSession.SMFInstanceID,
 			"spec_ref", "TS 24.501 §6.3.2.2.3",
 		)
-		return nil
+		if existingSession.SMFInstanceID != "" {
+			if smfDel, ok := h.sender.(interface {
+				DeleteSMContext(ctx context.Context, smContextRef string) error
+			}); ok {
+				if err := smfDel.DeleteSMContext(ctx, existingSession.SMFInstanceID); err != nil {
+					log.Warn("failed to delete displaced SMF context",
+						"pdu_session_id", pduSessionID,
+						"smContextRef", existingSession.SMFInstanceID,
+						"error", err,
+					)
+				}
+			}
+		}
+		ue.Lock()
+		delete(ue.PDUSessions, pduSessionID)
+		ue.Unlock()
+		// Fall through to establish the new session below.
 	}
 
 	// Decode PDU Session Establishment Request (5GSM body after the 4-octet

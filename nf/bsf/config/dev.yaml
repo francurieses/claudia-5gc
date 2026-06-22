@@ -1,0 +1,19 @@
+nf_instance_id: "00000000-0000-4010-8000-000000000002"
+
+plmn:
+  mcc: "001"
+  mnc: "01"
+
+sbi:
+  address: "0.0.0.0:8010"
+  fqdn: "bsf.5gc.mnc001.mcc001.3gppnetwork.org"
+  tls:
+    cert_file: /etc/5gc/pki/bsf.crt
+    key_file: /etc/5gc/pki/bsf.key
+    ca_file: /etc/5gc/pki/ca.crt
+
+peers:
+  nrf: "nrf:8000"
+
+metrics:
+  address: "0.0.0.0:9111"

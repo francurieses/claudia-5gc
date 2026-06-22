@@ -126,6 +126,8 @@ func (c *Client) Inspect(ctx context.Context, name string) (types.ContainerJSON,
 }
 
 // Exec runs a command inside a running container and returns its combined stdout+stderr.
+// It respects context cancellation: if ctx is cancelled while the command is running,
+// Exec closes the hijacked connection and returns ctx.Err() promptly.
 func (c *Client) Exec(ctx context.Context, containerName string, cmd []string) (ExecResult, error) {
 	id, err := c.cli.ContainerExecCreate(ctx, containerName, container.ExecOptions{
 		Cmd:          cmd,
@@ -142,21 +144,38 @@ func (c *Client) Exec(ctx context.Context, containerName string, cmd []string) (
 	}
 	defer resp.Close()
 
-	var stdout, stderr bytes.Buffer
-	if _, err = stdcopy.StdCopy(&stdout, &stderr, resp.Reader); err != nil {
-		return ExecResult{}, err
+	type copyResult struct {
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+		err    error
 	}
+	ch := make(chan copyResult, 1)
+	go func() {
+		var r copyResult
+		_, r.err = stdcopy.StdCopy(&r.stdout, &r.stderr, resp.Reader)
+		ch <- r
+	}()
 
-	insp, err := c.cli.ContainerExecInspect(ctx, id.ID)
-	if err != nil {
-		return ExecResult{}, err
+	select {
+	case <-ctx.Done():
+		// Close the hijacked connection to unblock the reader goroutine.
+		resp.Close()
+		return ExecResult{}, ctx.Err()
+	case r := <-ch:
+		if r.err != nil {
+			return ExecResult{}, r.err
+		}
+		// Use a fresh context for the inspect call — the original may be cancelled.
+		insp, err := c.cli.ContainerExecInspect(context.Background(), id.ID)
+		if err != nil {
+			return ExecResult{}, err
+		}
+		combined := r.stdout.String()
+		if s := r.stderr.String(); s != "" {
+			combined += s
+		}
+		return ExecResult{ExitCode: insp.ExitCode, Output: combined}, nil
 	}
-
-	combined := stdout.String()
-	if s := stderr.String(); s != "" {
-		combined += s
-	}
-	return ExecResult{ExitCode: insp.ExitCode, Output: combined}, nil
 }
 
 // CreateNetwork creates a Docker bridge network with the given name and subnet CIDR.

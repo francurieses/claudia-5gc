@@ -166,6 +166,7 @@ function NRCLIDialog({
 }) {
   const [customCmd, setCustomCmd] = useState('')
   const [output, setOutput] = useState('')
+  const [exitCode, setExitCode] = useState<number | null>(null)
   // ps-modify state — PSI is UERANSIM's sequential 1-based index per session
   const [psModifyPsi, setPsModifyPsi] = useState<number>(1)
   const [psModify5qi, setPsModify5qi] = useState('')
@@ -176,12 +177,22 @@ function NRCLIDialog({
 
   const execMut = useMutation({
     mutationFn: ({ cmd }: { cmd: string }) => nrCLI(ue.container, ue.supi, cmd),
-    onSuccess: r => setOutput(r.output || '(no output)'),
-    onError: (e: Error) => setOutput(`Error: ${e.message}`),
+    onSuccess: r => {
+      setExitCode(r.exit_code)
+      setOutput(r.output || '(no output)')
+    },
+    onError: (e: Error) => {
+      setExitCode(-1)
+      setOutput(`Error: ${e.message}`)
+    },
   })
 
   const busy = execMut.isPending || !ue.container
-  const quick = (cmd: string) => execMut.mutate({ cmd })
+  const quick = (cmd: string) => {
+    setOutput('')
+    setExitCode(null)
+    execMut.mutate({ cmd })
+  }
 
   // UERANSIM allocates PSIs sequentially from 1 for each UE.
   // Use index+1 as PSI; this matches the UE's allocation in the overwhelming majority of cases.
@@ -369,17 +380,31 @@ function NRCLIDialog({
         </div>
 
         {/* ── Output ── */}
-        {output && (
+        {(execMut.isPending || output) && (
           <div>
             <div className="flex items-center justify-between mb-1">
-              <SectionLabel>Output</SectionLabel>
-              <button onClick={() => setOutput('')} className="text-[0.6rem] text-gray-600 hover:text-gray-400">
+              <div className="flex items-center gap-2">
+                <SectionLabel>Output</SectionLabel>
+                {exitCode !== null && exitCode !== 0 && (
+                  <span className="text-[0.6rem] text-red-400 font-mono">(exit {exitCode})</span>
+                )}
+              </div>
+              <button
+                onClick={() => { setOutput(''); setExitCode(null) }}
+                className="text-[0.6rem] text-gray-600 hover:text-gray-400"
+              >
                 clear
               </button>
             </div>
-            <pre className="bg-gray-950 rounded p-3 text-xs font-mono text-green-300 whitespace-pre-wrap max-h-64 overflow-y-auto">
-              {output}
-            </pre>
+            {execMut.isPending ? (
+              <div className="bg-gray-950 rounded p-3 text-xs font-mono text-gray-500 flex items-center gap-2">
+                <RefreshCw size={10} className="animate-spin" /> Running…
+              </div>
+            ) : (
+              <pre className={`bg-gray-950 rounded p-3 text-xs font-mono whitespace-pre-wrap max-h-64 overflow-y-auto ${exitCode !== null && exitCode !== 0 ? 'text-red-300' : 'text-green-300'}`}>
+                {output}
+              </pre>
+            )}
           </div>
         )}
       </div>

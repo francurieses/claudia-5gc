@@ -189,6 +189,19 @@ services:
       redis:
         condition: service_healthy
 
+  ausf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: ausf-pcap
+    network_mode: "service:ausf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [ausf]
+    volumes:
+      - ./pcaps/ausf:/pcaps
+    command: sleep infinity
+
   udm:
     image: 5gc/udm:dev
     profiles: [core]
@@ -217,6 +230,19 @@ services:
     labels:
       logging.5gc/nf: "UDM"
     depends_on: [udr]
+
+  udm-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: udm-pcap
+    network_mode: "service:udm"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [udm]
+    volumes:
+      - ./pcaps/udm:/pcaps
+    command: sleep infinity
 
   udr:
     image: 5gc/udr:dev
@@ -250,6 +276,19 @@ services:
       DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
     labels:
       logging.5gc/nf: "UDR"
+
+  udr-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: udr-pcap
+    network_mode: "service:udr"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [udr]
+    volumes:
+      - ./pcaps/udr:/pcaps
+    command: sleep infinity
 
   smf:
     image: 5gc/smf:dev
@@ -291,6 +330,19 @@ services:
       upf:
         condition: service_started
 
+  smf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: smf-pcap
+    network_mode: "service:smf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [smf]
+    volumes:
+      - ./pcaps/smf:/pcaps
+    command: sleep infinity
+
   pcf:
     image: 5gc/pcf:dev
     profiles: [core]
@@ -319,6 +371,19 @@ services:
     labels:
       logging.5gc/nf: "PCF"
     depends_on: [nrf]
+
+  pcf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: pcf-pcap
+    network_mode: "service:pcf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [pcf]
+    volumes:
+      - ./pcaps/pcf:/pcaps
+    command: sleep infinity
 
   upf:
     image: 5gc/upf:dev
@@ -358,6 +423,19 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
       logging.5gc/nf: "UPF"
+
+  upf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: upf-pcap
+    network_mode: "service:upf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [upf]
+    volumes:
+      - ./pcaps/upf:/pcaps
+    command: sleep infinity
 
   # NRF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
   nrf-pcap:
@@ -471,6 +549,112 @@ services:
     depends_on: [smsf]
     volumes:
       - ./pcaps/smsf:/pcaps
+    command: sleep infinity
+
+  bsf:
+    image: 5gc/bsf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/bsf/Dockerfile
+    container_name: bsf
+    hostname: bsf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [bsf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8010:8010"   # SBI Nbsf_Management
+      - "9111:9111"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/bsf.crt:/etc/5gc/pki/bsf.crt:ro
+      - ./pki/bsf.key:/etc/5gc/pki/bsf.key:ro
+      - ./nf/bsf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "BSF"
+    depends_on: [nrf]
+
+  # BSF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  bsf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: bsf-pcap
+    network_mode: "service:bsf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [bsf]
+    volumes:
+      - ./pcaps/bsf:/pcaps
+    command: sleep infinity
+
+  nef:
+    image: 5gc/nef:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/nef/Dockerfile
+    container_name: nef
+    hostname: nef.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [nef.5gc.local]
+      obs-net: {}
+    ports:
+      - "8011:8011"   # SBI Nnef_AFSessionWithQoS
+      - "9112:9112"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/nef.crt:/etc/5gc/pki/nef.crt:ro
+      - ./pki/nef.key:/etc/5gc/pki/nef.key:ro
+      - ./nf/nef/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "NEF"
+    depends_on: [nrf, bsf]
+
+  # NEF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  nef-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: nef-pcap
+    network_mode: "service:nef"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [nef]
+    volumes:
+      - ./pcaps/nef:/pcaps
+    command: sleep infinity
+
+  # core-pcap — host-network sidecar that captures ALL inter-NF traffic.
+  # Root cause of empty capture with bridge attachment: Docker bridges are L2
+  # switches — unicast frames only reach their destination port, not every peer.
+  # Fix: network_mode:host gives access to the br-xxxxx interfaces on the host,
+  # which act as the "trunk" port and see every frame on every 5GC network.
+  # BPF filter 'net 172.30.0.0/16' scopes the capture to all 5GC subnets
+  # (sbi 172.30.0/24, n2 172.30.1/24, n4 172.30.2/24, n3 172.30.3/24, n6 172.30.6/24).
+  core-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: core-pcap
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [nrf, amf, smf, upf]
+    volumes:
+      - ./pcaps/core:/pcaps
     command: sleep infinity
 
   # ============================================================

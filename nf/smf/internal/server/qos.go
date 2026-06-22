@@ -157,6 +157,10 @@ type sessionView struct {
 }
 
 func (s *Server) sessionToView(ref string, sess *Session) sessionView {
+	ueIP := ""
+	if sess.UEIP != nil {
+		ueIP = sess.UEIP.String()
+	}
 	v := sessionView{
 		SmContextRef: ref,
 		SUPI:         sess.SUPI,
@@ -167,7 +171,7 @@ func (s *Server) sessionToView(ref string, sess *Session) sessionView {
 		QoSSource:    sess.QoSSource,
 		AMBRULMbps:   sess.AMBRULMbps,
 		AMBRDLMbps:   sess.AMBRDLMbps,
-		UEIP:         sess.UEIP.String(),
+		UEIP:         ueIP,
 		UPFTeid:      sess.ULTEID,
 		SEID:         sess.SEID,
 		State:        sess.State,

@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -112,6 +114,7 @@ type nrCLIRequest struct {
 
 // handleNRCLI executes an nr-cli command inside a UERANSIM UE container.
 // nr-cli talks to the nr-ue process socket, so both must live in the same container.
+// A 20 s timeout prevents hanging when the nr-ue process is not yet ready.
 func (d Deps) handleNRCLI(w http.ResponseWriter, r *http.Request) {
 	var req nrCLIRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -131,7 +134,10 @@ func (d Deps) handleNRCLI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := d.Docker.Exec(r.Context(), req.Container, []string{
+	execCtx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	result, err := d.Docker.Exec(execCtx, req.Container, []string{
 		"nr-cli", req.SUPI, "-e", req.Command,
 	})
 	if err != nil {
@@ -177,7 +183,12 @@ func (d Deps) handleUERANSIMPing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := d.Docker.Exec(r.Context(), req.Container, []string{
+	// Allow each packet its 2 s wait plus a 10 s margin for command startup/teardown.
+	pingTimeout := time.Duration(req.Count*2+10) * time.Second
+	execCtx, cancel := context.WithTimeout(r.Context(), pingTimeout)
+	defer cancel()
+
+	result, err := d.Docker.Exec(execCtx, req.Container, []string{
 		"ping", "-c", strconv.Itoa(req.Count), "-W", "2", "-I", req.UEIP, req.Target,
 	})
 	if err != nil {
@@ -387,9 +398,17 @@ func resolveScenario(name string) *scenarioDef {
 //
 // Priority:
 //  1. Named multi-slice containers (ueransim-ue-internet/gold/silver/bronze)
-//  2. Generic ueransim-ue (single-UE or multi-UE mode)
+//  2. Generic ueransim-ue (standard single-UE / multi-UE mode)
+//  3. ueransim-ue-profile-a (SUCI Profile A / X25519 scenario)
+//  4. First running UE container (catch-all for future scenarios)
 func guessUEContainer(supi string, running []string) string {
 	imsi := strings.TrimPrefix(supi, "imsi-")
+
+	// Index running containers for O(1) lookup.
+	runningSet := make(map[string]bool, len(running))
+	for _, r := range running {
+		runningSet[r] = true
+	}
 
 	// Multi-slice fixed mapping (docker-compose.yml multi-slice profile)
 	named := map[string]string{
@@ -398,21 +417,22 @@ func guessUEContainer(supi string, running []string) string {
 		"001010000000003": "ueransim-ue-silver",
 		"001010000000004": "ueransim-ue-bronze",
 	}
-	if ctr, ok := named[imsi]; ok {
-		for _, r := range running {
-			if r == ctr {
-				return ctr
-			}
-		}
+	if ctr, ok := named[imsi]; ok && runningSet[ctr] {
+		return ctr
 	}
 
-	// Fall back: first running generic UE container
-	for _, r := range running {
-		if r == "ueransim-ue" {
-			return r
-		}
+	// Standard single-UE / multi-UE mode.
+	if runningSet["ueransim-ue"] {
+		return "ueransim-ue"
 	}
-	// Last resort: first running UE container of any kind
+
+	// SUCI Profile A (X25519) scenario — explicit check before catch-all so
+	// IMSI 001 is not routed to a wrong container when only profile-a is running.
+	if runningSet["ueransim-ue-profile-a"] {
+		return "ueransim-ue-profile-a"
+	}
+
+	// Catch-all for future scenarios (e.g. additional named compose services).
 	if len(running) > 0 {
 		return running[0]
 	}

@@ -392,6 +392,149 @@ See Section 6. Metrics (`fivegc_*`), Jaeger traces per procedure, Grafana dashbo
   AMF-initiated SMS Management Activation at registration (vs. the manual Activate above) and
   real SMS-GMSC/SMS-IWMSC forwarding are follow-ups (SMSF-002+).
 
+### 3.17 Binding Support Function (BSF) — Nbsf_Management
+
+- **Description**: New **BSF** NF that serves as the 5GC registry of PCF-for-a-PDU-session
+  bindings. When the PCF creates an SM policy association it registers a binding
+  `(UE IP, DNN, S-NSSAI) → serving PCF` with the BSF; on deletion it deregisters. Consumers
+  (typically NEF/AF) query the BSF with the UE IP to discover the serving PCF — the
+  prerequisite for AF session with required QoS (NEF-001). The BSF is SBA-only: no N1/N2/N4
+  path is touched.
+- **3GPP spec**: TS 23.501 §6.2.16 (BSF description), **TS 29.521 §5** (Nbsf_Management —
+  Register / Deregister / Discovery), TS 29.521 §6.2.6 (PcfBinding data type),
+  TS 29.510 §6.1.6.2.2 (NRF registration, NFType BSF). `docs/procedures/binding-support.md`.
+- **NFs involved**: BSF (new, SBI port **8010** / metrics **9111**), NRF (registration).
+- **How to trigger** (stack running — docker-compose wiring is a follow-up):
+  ```bash
+  # Register a PCF binding (PCF-side, TS 29.521 §5.2.2.2):
+  curl -sk -X POST https://bsf:8010/nbsf-management/v1/pcfBindings \
+    -H 'Content-Type: application/json' \
+    -d '{"supi":"imsi-001010000000001","ipv4Addr":"10.60.0.1","dnn":"internet",
+         "snssai":{"sst":1,"sd":"000001"},
+         "pcfFqdn":"pcf.5gc.mnc001.mcc001.3gppnetwork.org","pcfId":"pcf-instance-001"}'
+  # → 201 Created + Location: …/pcfBindings/{bindingId} + PcfBinding body
+
+  # Discover serving PCF by UE IP (consumer-side, TS 29.521 §5.2.2.4):
+  curl -sk "https://bsf:8010/nbsf-management/v1/pcfBindings?ipv4Addr=10.60.0.1"
+  # → 200 OK PcfBinding{pcfFqdn, pcfId, …}
+
+  # Deregister (PCF teardown, TS 29.521 §5.2.2.3):
+  curl -sk -X DELETE "https://bsf:8010/nbsf-management/v1/pcfBindings/{bindingId}"
+  # → 204 No Content
+  ```
+- **Expected outcome**: BSF logs `register: PCF binding created` (result=OK), bindingId in
+  Location header; `discover: binding found` (result=OK) with pcfFqdn + pcfId; `deregister:
+  PCF binding removed` (result=OK); 403 `EXISTING_BINDING_INFO_FOUND` on duplicate;
+  400 `MANDATORY_IE_MISSING` on missing dnn/snssai/IP key or empty GET query.
+- **Validation (no stack needed)**:
+  ```bash
+  go test -race ./nf/bsf/...    # 14 unit tests (Register/Deregister/Discovery/errors)
+  ```
+- **Known limitations**:
+  - **docker-compose wiring** (service + PCAP sidecar) and **PKI cert generation**
+    (`pki/bsf.crt`, `pki/bsf.key`) are follow-up orchestrator tasks (BSF-004).
+  - **PCF client integration** — registering/deregistering from the PCF SM policy lifecycle
+    (`nf/pcf/`) is a separate pass (BSF-002) to maintain scope isolation.
+  - **PostgreSQL persistence** — in-memory only for this increment; BSF-003 adds the
+    `pcf_binding` table and Redis O(1) discovery cache.
+  - **NEF-001** — the Discovery route is built and tested; NEF-001 consumes it unchanged.
+
+### 3.18 PCF Policy Authorization — Npcf_PolicyAuthorization thin endpoint (NEF-001 AC2)
+
+- **Description**: The PCF gains two new `npcf-policyauthorization` endpoints that allow the
+  NEF to map an AF `AsSessionWithQoS` Create/Delete request onto a PCF policy operation.
+  On Create the PCF mints an `appSessionId`, stores the `AppSessionContext` in-memory, logs
+  the authorized `qosReference`, and returns `201 Created` with a `Location` header and the
+  `appSessionId` in the JSON body. On Delete the PCF removes the session and returns `204`.
+  Full UE-IP→SUPI resolution and DNN-scoped SM-policy binding are deferred (baseline scope).
+- **3GPP spec**: **TS 29.514 §5.2.2.2** (Create), **§5.2.2.4** (Delete), **§5.6.2.3**
+  (AppSessionContextReqData data type). `docs/procedures/network-exposure.md`.
+- **NFs involved**: PCF (additive — new routes on existing SBI server, port **8006**).
+- **How to trigger** (requires PCF running):
+  ```bash
+  # Create an app-session (NEF-side call, TS 29.514 §5.2.2.2):
+  APP_SESSION=$(curl -sk --cert pki/pcf.crt --key pki/pcf.key --cacert pki/ca.crt \
+    -X POST https://pcf:8006/npcf-policyauthorization/v1/app-sessions \
+    -H 'Content-Type: application/json' \
+    -d '{"ascReqData":{"aspId":"af-test","ueIpv4":"10.60.0.1",
+         "qosReference":"qos-gold","dnn":"internet"}}' \
+    -D - | grep -i location | awk -F/ '{print $NF}' | tr -d '\r')
+  echo "appSessionId: $APP_SESSION"
+  docker logs pcf | grep "app-session created"
+
+  # Delete the app-session (TS 29.514 §5.2.2.4):
+  curl -sk --cert pki/pcf.crt --key pki/pcf.key --cacert pki/ca.crt \
+    -X DELETE "https://pcf:8006/npcf-policyauthorization/v1/app-sessions/$APP_SESSION"
+  docker logs pcf | grep "app-session deleted"
+  ```
+- **Expected outcome**: PCF logs `procedure=PolicyAuthorizationCreate result=OK` with
+  `app_session_id`, `ue_ipv4`, `qos_reference`; `201 Created` + `Location` header on create;
+  `204 No Content` on delete; `400 MANDATORY_IE_MISSING` if `ascReqData` or UE address
+  absent; `400 MANDATORY_IE_INCORRECT` on malformed JSON; `404 APP_SESSION_NOT_FOUND` on
+  delete of unknown session.
+- **Validation (no stack needed)**:
+  ```bash
+  go test -race ./nf/pcf/internal/server/... -run "TestCreateAppSession|TestDeleteAppSession"
+  # 8 new unit tests (happy path, IPv6-only, dual-session, no-ascReqData,
+  #   no-UE-address, malformed JSON, delete-not-found, create-then-delete)
+  ```
+- **Known limitations**:
+  - **UE-IP→SUPI resolution**: the PCF receives only the UE IP from the NEF (the BSF binding
+    carries the SUPI but the PCF does not query the BSF here). A precise DNN-scoped
+    `smPolicyOverride` binding is therefore deferred. The authorized `qosReference` is stored
+    and logged; a future increment will wire in the BSF/UDR lookup to apply the override.
+  - **Full TS 29.514 lifecycle** (Update / Subscribe / Notify / Patch on app-sessions) is out
+    of scope for the baseline increment.
+
+### 3.19 Network Exposure Function (NEF) — Nnef_AFsessionWithQoS (NEF-001)
+
+- **Description**: New **NEF** NF — the 5GC's secure northbound gateway between the trusted
+  core and external **Application Functions (AFs)**. It exposes one baseline northbound API,
+  **AsSessionWithQoS** (`Nnef_AFsessionWithQoS`): an AF requests a guaranteed QoS for an
+  application flow toward a UE by supplying the **UE IP** + a `qosReference`. The AF does not
+  know which PCF serves that UE; the NEF resolves it by calling **BSF Discovery**
+  (`GET /nbsf-management/v1/pcfBindings?ipv4Addr=`, the §3.17 BSF) to find the serving PCF,
+  then maps the request onto that PCF's **Npcf_PolicyAuthorization** Create (the §3.18 thin
+  endpoint). The northbound API is **OAuth2-protected** (bearer token, scope
+  `nnef-afsessionwithqos`) on top of the always-on SBA mTLS. The NEF is SBA-only: no
+  N1/N2/N4 path. There is no AF in UERANSIM, so this is validated in-process (mock BSF + PCF),
+  not live — the same posture as the BSF/SMSF baselines.
+- **3GPP spec**: TS 23.501 §6.2.5 (NEF description), **TS 29.522 §4.4.13** (Nnef_AFsessionWithQoS
+  Stage 3) + §5.14.2.1.2 (AsSessionWithQoSSubscription) + §6 (OAuth2), TS 29.521 §5.2.2.4
+  (BSF Discovery consumption), TS 29.514 §5.2.2.2 (PCF leg), TS 29.510 §6.1.6.2.2 (NRF
+  registration, NFType NEF). `docs/procedures/network-exposure.md`.
+- **NFs involved**: NEF (new, SBI port **8011** / metrics **9112**), BSF (Discovery),
+  PCF (Npcf_PolicyAuthorization), NRF (registration).
+- **How to trigger** (in-process; docker-compose wiring deferred — NEF-005):
+  ```bash
+  # The northbound flow needs an OAuth2 bearer token (scope nnef-afsessionwithqos)
+  # and a registered PCF binding in the BSF for the UE IP. Exercised end-to-end by the
+  # 12-scenario BDD suite (mock BSF + recording PCF client):
+  go test -tags=functional ./nf/nef/tests/features/...   # 12 scenarios / 124 steps
+
+  # Unit tests (NEF server + PCF leg, no stack needed):
+  go test ./nf/nef/internal/server/...
+  go test ./nf/pcf/internal/server/... -run "TestCreateAppSession|TestDeleteAppSession"
+  ```
+- **Expected outcome**: NEF logs `procedure=AsSessionWithQoSCreate result=OK` with `scs_as_id`,
+  `ue_ipv4`, `qos_reference`, `pcf_id`, `app_session_id`; `201 Created` + `Location:
+  …/subscriptions/{subscriptionId}` on create; `200` on get; `204` on delete (relays PCF
+  app-session delete). Errors: `401 UNAUTHORIZED` (no/invalid token), `403 UNAUTHORIZED_AF`
+  (wrong scope, or PCF rejects authorization), `400 MANDATORY_IE_MISSING` (no UE addr / no
+  `qosReference`), `404 PCF_BINDING_NOT_FOUND` (no BSF binding for the UE IP). Metrics:
+  `fivegc_procedure_total{nf="NEF",procedure="AsSessionWithQoS…",result=…}` +
+  `fivegc_nef_subscriptions_active`; Grafana **"NEF — Network Exposure Function"** row.
+- **Known limitations**:
+  - **No live AF / docker-compose wiring** (NEF-005): the NEF is not yet a compose service and
+    has no PKI cert; validated in-process only.
+  - **BSF Discovery 404 mapping** (B-1): TS 29.521 §5.2.2.4 strictly returns 200 with a
+    `PcfBinding` array; the BSF here returns 404 on a miss and the NEF surfaces `404
+    PCF_BINDING_NOT_FOUND` (the exact Rel-17 cause string is unverified).
+  - **Authorized QoS not yet applied to the UE**: the PCF leg stores/logs the `qosReference`
+    but does not bind it to an SM-policy override (see §3.18 limitation).
+  - **No QoS Notification Control** callbacks to the AF (NEF-002); single `flowInfo`/`DATA`
+    media component only.
+
 ---
 
 ## 4. UERANSIM Integration
@@ -637,6 +780,9 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`; operator-wide topology (D
 
 Compose **profiles**: `core`, `obs`, `tools`, `multi-slice`, `suci-profile-a`, `handover`, plus PCAP sidecars.
 
+**Reserved ports (NF built + tested in-process; docker-compose wiring deferred):**
+`bsf` — 8010 (SBI Nbsf) / 9111 (metrics) (BSF-004); `nef` — 8011 (SBI Nnef) / 9112 (metrics) (NEF-005).
+
 ### TLS / PKI
 mTLS everywhere on SBI (TS 33.501 §13). Certs in `pki/`, mounted as `/etc/5gc/pki/<nf>.crt|.key`;
 CA `pki/ca.crt`. Regenerate dev certs with `make pki`. OAuth2 tokens issued by NRF (HS256 JWT).
@@ -704,3 +850,6 @@ agent roles in `AGENTS.md`. After big changes run `/graphify . --update` (knowle
 - [2026-06-21] docs: initial CLAUDIA_5GC_MANUAL generated from full codebase audit (all 9 NFs + MCP + portal + observability).
 - [2026-06-21] smsf,amf: SMS over NAS — new SMSF NF (Nsmsf_SMService Activate/Deactivate/UplinkSMS + loopback DTE MT echo, NRF reg, UDM UECM); AMF UL NAS Transport (PCT=0x02) → Nsmsf UplinkSMS relay; docker-compose service + PCAP sidecar + PKI; 11 unit + 7 BDD scenarios [TS 23.502 §4.13 / TS 29.540].
 - [2026-06-21] amf: fix stale PDU session leak on UE reconnect — when a UE reconnects (Docker restart, abrupt disconnect) without sending Deregistration, the new registration now atomically displaces the old UEContext and asynchronously releases its PDU sessions at the SMF (IP pool freed, PFCP deleted). `Manager.Remove` now guards against accidentally erasing a SUPI/DB slot already claimed by the new context.
+- [2026-06-21] bsf: new BSF NF (BSF-001) — Nbsf_Management Register/Deregister/Discovery (TS 29.521 §5), in-memory binding store with ipv4/supi indices, NRF registration (NFType BSF), mTLS+HTTP/2 SBI server on port 8010, Prometheus metrics on port 9111, 14 unit tests [TS 23.501 §6.2.16 / TS 29.521 §5]. docker-compose wiring + PCF client integration are follow-up passes (BSF-002, BSF-004).
+- [2026-06-22] pcf: NEF-001 AC2 — thin Npcf_PolicyAuthorization Create+Delete (POST/DELETE /npcf-policyauthorization/v1/app-sessions) added to PCF SBI server; AppSessionContext+AppSessionContextReqData types; in-memory appSessions map; 8 new unit tests; pre-existing bsf_client_test.go stale module-path import fixed [TS 29.514 §5.2.2.2, §5.2.2.4].
+- [2026-06-22] nef: new NEF NF (NEF-001) — Nnef_AFsessionWithQoS Create/Get/Delete (TS 29.522 §4.4.13) on mTLS+HTTP/2 SBI port 8011 / metrics 9112; OAuth2 northbound (scope nnef-afsessionwithqos; 401/403); BSF Discovery (Nbsf §5.2.2.4) → Npcf_PolicyAuthorization_Create (TS 29.514) on the serving PCF; NRF registration (NFType NEF); in-memory subscription store + fivegc_nef_subscriptions_active gauge + Grafana NEF row; 8 unit + 12 BDD scenarios. Fixed create-reject cause MODIFICATION_NOT_ALLOWED→UNAUTHORIZED_AF (spec-verifier) and a pre-existing BSF-001 build break (4 nf/bsf/*.go files used the claudia-5gc module path instead of 5gc-rel17). docker-compose wiring + PKI deferred (NEF-005) [TS 23.501 §6.2.5 / TS 29.522 §4.4.13].
