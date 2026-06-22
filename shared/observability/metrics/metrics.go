@@ -148,6 +148,28 @@ var (
 		Name: "fivegc_authentication_total",
 		Help: "Total UE authentication procedure completions.",
 	}, []string{"nf", "result"})
+
+	// --- BSF Binding Support Function ---
+
+	// BSFBindingsActive is the number of PCF bindings currently registered in the BSF.
+	// A binding maps (UE IP, DNN, S-NSSAI) → serving PCF and is created by the PCF at
+	// SM policy association creation and removed at deletion.
+	// Ref: TS 29.521 §5, TS 23.501 §6.2.16
+	BSFBindingsActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fivegc_bsf_bindings_active",
+		Help: "Number of PCF bindings currently registered in the BSF (TS 29.521).",
+	})
+
+	// --- NEF Network Exposure Function ---
+
+	// NEFSubscriptionsActive is the number of Nnef_AFsessionWithQoS subscriptions
+	// currently active in the NEF. Incremented on successful Create; decremented on
+	// successful Delete.
+	// Ref: TS 29.522 §4.4.13, TS 23.501 §6.2.5
+	NEFSubscriptionsActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fivegc_nef_subscriptions_active",
+		Help: "Number of active Nnef_AFsessionWithQoS subscriptions in the NEF (TS 29.522).",
+	})
 )
 
 // MetricsServer builds a standalone HTTP server for the /metrics endpoint.

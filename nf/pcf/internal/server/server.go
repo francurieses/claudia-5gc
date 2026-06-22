@@ -142,6 +142,13 @@ type Server struct {
 	policiesMu        sync.Mutex
 	smPolicyOverrides map[string]SMPolicyOverride // key: overrideKey(supi, dnn)
 	udrClient         UDRClient                   // optional; nil disables UDR lookup (config defaults used)
+	bsfClient         BSFClient                   // optional; nil when BSF not configured (fail-open)
+
+	// bsfBindingIDs maps smPolicyId → BSF bindingId so handleDeleteSmPolicy can
+	// issue the correct Nbsf_Management_DeRegister call.
+	// Protected by policiesMu (same lock as policies for simplicity).
+	// Ref: TS 29.521 §5.2.2.3
+	bsfBindingIDs map[string]string
 
 	// AM policy associations (Npcf_AMPolicyControl, TS 29.507).
 	// key: polAssoId → AMPolicyAssociation
@@ -153,6 +160,14 @@ type Server struct {
 	// AMF receives a subscriber-specific RFSP instead of the operator default.
 	// In-memory only (reset on PCF restart) — mirrors smPolicyOverrides.
 	rfspOverrides map[string]int
+
+	// appSessions holds Npcf_PolicyAuthorization app-session contexts indexed by
+	// appSessionId (UUID minted by the PCF on Create). Used by the NEF to map an
+	// AF AsSessionWithQoS request onto a PCF policy-authorization operation.
+	// In-memory only (reset on PCF restart).
+	// Ref: TS 29.514 §5.2.2.2 (Create), §5.2.2.4 (Delete)
+	appSessions   map[string]AppSessionContext
+	appSessionsMu sync.Mutex
 }
 
 // AMPolicyAssociation holds an AMF AM policy association record.
@@ -169,14 +184,23 @@ func (s *Server) WithUDRClient(c UDRClient) {
 	s.udrClient = c
 }
 
+// WithBSFClient attaches a BSF client for PCF binding registration/deregistration
+// (Nbsf_Management interface). When nil, BSF integration is disabled (fail-open).
+// Ref: TS 29.521 §5, TS 23.501 §6.2.16
+func (s *Server) WithBSFClient(c BSFClient) {
+	s.bsfClient = c
+}
+
 func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	s := &Server{
 		cfg:               cfg,
 		logger:            logger.With("nf", "PCF"),
 		policies:          make(map[string]map[string]interface{}),
 		smPolicyOverrides: make(map[string]SMPolicyOverride),
+		bsfBindingIDs:     make(map[string]string),
 		amPolicies:        make(map[string]AMPolicyAssociation),
 		rfspOverrides:     make(map[string]int),
+		appSessions:       make(map[string]AppSessionContext),
 	}
 
 	mux := http.NewServeMux()
@@ -192,6 +216,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	// Ref: TS 29.507 §4.2.2
 	mux.HandleFunc("POST /npcf-ampolicycontrol/v1/policies", s.handleCreateAMPolicy)
 	mux.HandleFunc("DELETE /npcf-ampolicycontrol/v1/policies/{polAssoId}", s.handleDeleteAMPolicy)
+	// Npcf_PolicyAuthorization (TS 29.514) — consumed by the NEF to map AF
+	// AsSessionWithQoS requests onto PCF policy operations.
+	// Ref: TS 29.514 §5.2.2.2 (Create), §5.2.2.4 (Delete)
+	mux.HandleFunc("POST /npcf-policyauthorization/v1/app-sessions", s.handleCreateAppSession)
+	mux.HandleFunc("DELETE /npcf-policyauthorization/v1/app-sessions/{appSessionId}", s.handleDeleteAppSession)
 	// Internal management — per-subscriber SM policy QoS overrides (not a 3GPP SBI)
 	mux.HandleFunc("PUT /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleSetQoSOverride)
 	mux.HandleFunc("GET /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleGetQoSOverride)
@@ -393,6 +422,76 @@ func (s *Server) handleCreateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", "/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyId)
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(response)
+
+	// ---- BSF binding registration (Nbsf_Management_Register) -------------------
+	// Best-effort, fail-open: register the PCF binding with the BSF so that NEF/AF
+	// consumers can discover the serving PCF by UE IP. Run in a detached goroutine
+	// so that a slow or absent BSF never delays the SM policy create response.
+	// Ref: TS 29.521 §5.2.2.2, TS 23.501 §6.2.16
+	if s.bsfClient != nil {
+		// Extract the UE IPv4 address from the SM policy context data.
+		// The SMF sends it as "ipv4Address" (TS 29.512 §5.6.2.3).
+		ueIPv4, _ := req["ipv4Address"].(string)
+		if ueIPv4 == "" {
+			// Tolerate alternative field name used by some consumers.
+			ueIPv4, _ = req["ipv4Addr"].(string)
+		}
+		if ueIPv4 != "" {
+			// Extract S-NSSAI from the request body.
+			var snssai PcfBindingSnssai
+			if snssaiRaw, ok := req["snssai"].(map[string]interface{}); ok {
+				if sst, ok := snssaiRaw["sst"].(float64); ok {
+					snssai.Sst = int(sst)
+				}
+				if sd, ok := snssaiRaw["sd"].(string); ok {
+					snssai.Sd = sd
+				}
+			}
+			bindingReq := &PcfBindingRequest{
+				Supi:     supi,
+				Ipv4Addr: ueIPv4,
+				Dnn:      dnn,
+				Snssai:   snssai,
+				PcfFqdn:  s.cfg.SBI.FQDN,
+				PcfId:    s.cfg.NFInstanceID,
+			}
+			bsfLog := log.With(
+				"interface", "Nbsf",
+				"direction", "OUT",
+				"spec_ref", "TS 29.521 §5.2.2.2",
+				"supi", supi,
+				"dnn", dnn,
+				"ipv4_addr", ueIPv4,
+			)
+			policyIDCopy := smPolicyId
+			go func() {
+				bsfCtx := context.Background()
+				bindingID, err := s.bsfClient.RegisterBinding(bsfCtx, bindingReq)
+				if err != nil {
+					// 403 EXISTING_BINDING_INFO_FOUND is idempotent — log at Info.
+					if strings.Contains(err.Error(), "403") {
+						bsfLog.Info("BSF binding already exists (idempotent)",
+							"binding_id", bindingID, "result", "OK", "cause", "EXISTING_BINDING_INFO_FOUND")
+					} else {
+						bsfLog.Warn("BSF RegisterBinding failed (fail-open)",
+							"error", err, "result", "FAILURE")
+					}
+					// Store whatever bindingId was extracted from the 403 body (may be "").
+					if bindingID != "" {
+						s.policiesMu.Lock()
+						s.bsfBindingIDs[policyIDCopy] = bindingID
+						s.policiesMu.Unlock()
+					}
+					return
+				}
+				bsfLog.Info("BSF binding registered",
+					"binding_id", bindingID, "result", "OK")
+				s.policiesMu.Lock()
+				s.bsfBindingIDs[policyIDCopy] = bindingID
+				s.policiesMu.Unlock()
+			}()
+		}
+	}
 }
 
 func (s *Server) handleDeleteSmPolicy(w http.ResponseWriter, r *http.Request) {
@@ -400,9 +499,30 @@ func (s *Server) handleDeleteSmPolicy(w http.ResponseWriter, r *http.Request) {
 	corrID := r.Header.Get("X-Correlation-Id")
 	log := s.logger.With("procedure", "SmPolicyDelete", "interface", "Npcf", "direction", "IN", "correlation_id", corrID, "smPolicyId", smPolicyId)
 
+	// Retrieve and remove the associated BSF bindingId before deleting the policy record.
 	s.policiesMu.Lock()
+	bindingID := s.bsfBindingIDs[smPolicyId]
+	delete(s.bsfBindingIDs, smPolicyId)
 	delete(s.policies, smPolicyId)
 	s.policiesMu.Unlock()
+
+	// ---- BSF binding deregistration (Nbsf_Management_DeRegister) ---------------
+	// Best-effort, fail-open: deregister the PCF binding so the BSF's registry stays
+	// accurate. A missing or unreachable BSF must not block the SM policy delete.
+	// Ref: TS 29.521 §5.2.2.3, TS 23.501 §6.2.16
+	if s.bsfClient != nil && bindingID != "" {
+		bsfLog := log.With(
+			"interface", "Nbsf",
+			"direction", "OUT",
+			"spec_ref", "TS 29.521 §5.2.2.3",
+			"binding_id", bindingID,
+		)
+		if err := s.bsfClient.DeregisterBinding(r.Context(), bindingID); err != nil {
+			bsfLog.Warn("BSF DeregisterBinding failed (fail-open)", "error", err, "result", "FAILURE")
+		} else {
+			bsfLog.Info("BSF binding deregistered", "result", "OK")
+		}
+	}
 
 	log.Info("SmPolicyControl_Delete", "result", "OK")
 	w.WriteHeader(http.StatusNoContent)

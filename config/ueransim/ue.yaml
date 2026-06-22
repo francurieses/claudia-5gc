@@ -1,7 +1,7 @@
 supi: 'imsi-001010000000001'
 mcc: '001'
 mnc: '01'
-# protectionScheme: 0
+#protectionScheme: 0
 # Profile A: X25519 ECIES concealment
 protectionScheme: 1
 # Home Network public key (X25519, derived from UDM's hn_private_key_x25519)
@@ -33,7 +33,7 @@ sessions:
       sst: 1
       sd: 0x000001
   - type: 'IPv4'
-    apn: 'gaming'
+    apn: 'ims'
     slice:
       sst: 1
       sd: 0x001234

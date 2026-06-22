@@ -1,0 +1,23 @@
+nf_instance_id: "00000000-0000-4011-8000-000000000001"
+
+plmn:
+  mcc: "001"
+  mnc: "01"
+
+sbi:
+  address: "0.0.0.0:8011"
+  fqdn: "nef.5gc.mnc001.mcc001.3gppnetwork.org"
+  tls:
+    cert_file: /etc/5gc/pki/nef.crt
+    key_file: /etc/5gc/pki/nef.key
+    ca_file: /etc/5gc/pki/ca.crt
+
+peers:
+  nrf: "nrf:8000"
+  bsf: "bsf:8010"
+
+oauth2:
+  secret: "5gc-dev-secret"
+
+metrics:
+  address: "0.0.0.0:9112"

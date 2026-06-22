@@ -3,7 +3,7 @@
 
 .PHONY: help all build test lint up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down handover-test handover-down handover-n2-test handover-n2-down portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down
 
-NFS := nrf amf ausf udm udr
+NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef
 COMPOSE := docker compose
 PKI_DIR := pki
 
@@ -220,8 +220,8 @@ full: ## Build + start NFs + obs + portal + UERANSIM multi-slice (complete stack
 	@echo "==> Starting complete stack (core + obs + multi-slice)"
 	UE_COUNT=4 $(COMPOSE) --profile core --profile observability --profile multi-slice up -d --remove-orphans
 	@echo "==> Create profile-a containers (not started; launch from portal UERANSIM → Scenarios)"
-	$(COMPOSE) --profile integration-ueransim up --no-start ueransim-gnb
-	$(COMPOSE) --profile suci-profile-a up --no-start
+	$(COMPOSE) --profile integration-ueransim up --no-start --force-recreate ueransim-gnb
+	$(COMPOSE) --profile suci-profile-a up --no-start --force-recreate
 	@echo ""
 	@echo "Complete stack started:"
 	@echo "  Management portal : http://localhost:8080"

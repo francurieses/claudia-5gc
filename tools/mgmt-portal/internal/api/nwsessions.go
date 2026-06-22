@@ -328,7 +328,9 @@ func (d Deps) stepUEEstablish(ctx context.Context, req nwSessionRequest) nwSessi
 	}
 	cmd += " --dnn " + req.DNN
 
-	res, err := d.Docker.Exec(ctx, container, []string{"nr-cli", req.SUPI, "-e", cmd})
+	execCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	res, err := d.Docker.Exec(execCtx, container, []string{"nr-cli", req.SUPI, "-e", cmd})
 	step.DurationMs = time.Since(start).Milliseconds()
 	if err != nil {
 		step.Detail = fmt.Sprintf("exec in %s: %v", container, err)
@@ -352,8 +354,9 @@ func (d Deps) stepVerify(ctx context.Context, req nwSessionRequest, known map[st
 
 	// UERANSIM quirk: an nr-cli ps-establish is often locally barred by a UAC
 	// timing race ("No response from RRC from UAC checks") and only goes out on
-	// the T3580 retransmission 16 s later. 30 s covers retransmit + N1/N2/N4 setup.
-	deadline := time.Now().Add(30 * time.Second)
+	// the T3580 retransmission 16 s later. 45 s covers retransmit + N1/N2/N4 setup
+	// with margin for slow hosts (was 30 s, which was too tight under load).
+	deadline := time.Now().Add(45 * time.Second)
 	for {
 		sessions, err := d.fetchSMFSessions(ctx)
 		if err == nil {
@@ -380,7 +383,7 @@ func (d Deps) stepVerify(ctx context.Context, req nwSessionRequest, known map[st
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			step.DurationMs = time.Since(start).Milliseconds()
-			step.Detail = "no additional session appeared in the SMF within 30s — check SMF/AMF logs"
+			step.Detail = "no additional session appeared in the SMF within 45s — check SMF/AMF logs"
 			return step, nil
 		}
 		select {

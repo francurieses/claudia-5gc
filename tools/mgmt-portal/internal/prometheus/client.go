@@ -82,6 +82,9 @@ func (c *Client) Summary(ctx context.Context) MetricsSummary {
 		"pcf":  "9106",
 		"upf":  "9107",
 		"nssf": "9109",
+		"smsf": "9110",
+		"bsf":  "9111",
+		"nef":  "9112",
 	}
 
 	for nf, port := range nfPorts {

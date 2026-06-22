@@ -4,6 +4,9 @@ nf_instance_id: "00000000-0000-4006-8000-000000000001"
 
 sbi:
   address: "0.0.0.0:8006"
+  # fqdn is reported as pcfFqdn in PcfBinding registrations with the BSF so that
+  # NEF/AF consumers can reach this PCF by name. Ref: TS 29.521 §6.2.6.
+  fqdn: "pcf"
   cert_file: /etc/5gc/pki/pcf.crt
   key_file: /etc/5gc/pki/pcf.key
   ca_file: /etc/5gc/pki/ca.crt
@@ -11,6 +14,10 @@ sbi:
 peers:
   nrf: "nrf:8000"
   udr: "udr:8005"
+  # bsf: host:port of the Binding Support Function (Nbsf_Management).
+  # Absent/empty → BSF integration disabled (fail-open, no regression).
+  # Ref: TS 29.521 §5, TS 23.501 §6.2.16
+  bsf: "bsf:8010"
 
 metrics:
   address: "0.0.0.0:9106"

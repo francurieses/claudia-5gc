@@ -46,7 +46,7 @@ func TestCreateSMPolicyFallbackUsesSubscription(t *testing.T) {
 	s := newTestSMFServer(t) // cfg.Peers.PCF == "" → no PCF
 	sub := &subscribedQoS{FiveQI: 7, ARPPriority: 5, AMBRULMbps: 200, AMBRDLMbps: 500}
 
-	_, qos := s.createSMPolicy(t.Context(), "imsi-001010000000001", "internet", SliceID{SST: 1}, sub)
+	_, qos := s.createSMPolicy(t.Context(), "imsi-001010000000001", "internet", "", SliceID{SST: 1}, sub)
 	if qos.FiveQI != 7 || qos.Source != QoSSourceUDMSubscription {
 		t.Errorf("with subscription: got 5qi=%d source=%s, want 5qi=7 source=UDM_SUBSCRIPTION", qos.FiveQI, qos.Source)
 	}
@@ -54,7 +54,7 @@ func TestCreateSMPolicyFallbackUsesSubscription(t *testing.T) {
 		t.Errorf("AMBR DL: got %d want 500", qos.AMBRDLMbps)
 	}
 
-	_, qos = s.createSMPolicy(t.Context(), "imsi-001010000000001", "internet", SliceID{SST: 1}, nil)
+	_, qos = s.createSMPolicy(t.Context(), "imsi-001010000000001", "internet", "", SliceID{SST: 1}, nil)
 	if qos.FiveQI != 9 || qos.Source != QoSSourceOperatorDefault {
 		t.Errorf("without subscription: got 5qi=%d source=%s, want 5qi=9 source=OPERATOR_DEFAULT", qos.FiveQI, qos.Source)
 	}

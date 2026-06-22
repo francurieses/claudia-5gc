@@ -427,8 +427,32 @@ adjacent — see AGENTS.md).
     - Request mapped to a PCF SM policy / npcf operation
     - OAuth2-protected; AF identified
   depends_on: [BSF-001]
-  status: TODO
+  status: DONE
   priority: P2
+  notes: >
+    DONE (Session 12, 2026-06-22). New NEF NF (nf/nef): Nnef_AFsessionWithQoS
+    Create/Get/Delete (POST/GET/DELETE /3gpp-as-session-with-qos/v1/{scsAsId}/subscriptions,
+    TS 29.522 §4.4.13) over mTLS+HTTP/2 (port 8011, metrics 9112). Northbound OAuth2 bearer
+    verification (scope nnef-afsessionwithqos; 401 UNAUTHORIZED / 403 UNAUTHORIZED_AF, reusing
+    shared/oauth2 HS256). AC1: registered in NRF as nfType=NEF (NFTypeNEF enum already present).
+    AC2: AF request mapped to a PCF npcf operation — NEF consumes BSF-001 Discovery
+    (GET /nbsf-management/v1/pcfBindings?ipv4Addr=) to find the serving PCF by UE IP, then POSTs
+    Npcf_PolicyAuthorization_Create (TS 29.514 §5.2.2.2) to that PCF; new thin PCF endpoints
+    POST/DELETE /npcf-policyauthorization/v1/app-sessions store the AppSessionContext + mint
+    appSessionId. AC3: OAuth2-protected, AF identified by scsAsId + token subject. Cross-NF
+    (NEF producer + PCF consumer), fail-open. Tests: 8 NEF unit + 12 BDD scenarios (124 steps,
+    in-process mock BSF + recording PCF client) + 8 PCF app-session unit. SPEC-VERIFIER: CONFORMANT
+    baseline, no blockers; fixed finding 2 (create-reject cause MODIFICATION_NOT_ALLOWED →
+    UNAUTHORIZED_AF). Observability: ProcedureTotal{NEF,AsSessionWithQoS{Create|Get|Delete},
+    result} + fivegc_nef_subscriptions_active gauge + Grafana NEF row. make build PASS; full
+    go test ./... PASS; NEF/PCF/BSF race-clean. make ueransim NOT run — Nnef/Nbsf/Npcf SBA-only,
+    no N1/N2/N4 path and no AF in UERANSIM (same posture as BSF-001/SMSF-001). Follow-ups: PCF
+    UE-IP→SUPI resolution to bind the authorized qosReference to a DNN-scoped SM-policy override
+    (currently logged only); QoS Notification Control callbacks (NEF-002); docker-compose wiring +
+    PKI nef.* (NEF-005); reconcile BSF Discovery to spec'd 200+array (B-1).
+    NOTE: also fixed a pre-existing build break from the BSF-001 commit (49adfe7) — 4 nf/bsf/*.go
+    files used module path github.com/francurieses/claudia-5gc instead of .../5gc-rel17, breaking
+    go build ./...; corrected to the dev-branch module path.
 
 - id: UPF-001
   nf: UPF

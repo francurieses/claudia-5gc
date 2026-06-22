@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         make \
         libsctp-dev \
         lksctp-tools \
+        libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
