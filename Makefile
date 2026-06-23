@@ -1,7 +1,7 @@
 # 5GC Rel-17 — Root Makefile
 # Conventions in CLAUDE.md §7
 
-.PHONY: help all build test lint up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down handover-test handover-down handover-n2-test handover-n2-down portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down
+.PHONY: help all build test lint up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down handover-test handover-down handover-n2-test handover-n2-down portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public
 
 NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef
 COMPOSE := docker compose
@@ -81,6 +81,10 @@ down: ## Stop everything and clean volumes
 
 logs: ## Tail logs from all NFs
 	$(COMPOSE) logs -f $(NFS)
+
+release-public: ## Publish snapshot release to claudia-5gc. Usage: make release-public VERSION=v2.0.2
+	@test -n "$(VERSION)" || (echo "ERROR: VERSION is required. Usage: make release-public VERSION=v2.0.2" && exit 1)
+	./scripts/release-public.sh $(VERSION)
 
 pki: ## Generate development PKI (CA + cert per NF)
 	./scripts/gen-pki.sh
