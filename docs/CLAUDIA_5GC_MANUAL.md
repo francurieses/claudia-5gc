@@ -535,6 +535,62 @@ See Section 6. Metrics (`fivegc_*`), Jaeger traces per procedure, Grafana dashbo
   - **No QoS Notification Control** callbacks to the AF (NEF-002); single `flowInfo`/`DATA`
     media component only.
 
+### 3.20 Location Management Function (LMF) — Nlmf_Location DetermineLocation (LMF-001)
+
+- **Description**: New **LMF** NF — the 5GC NF that handles **UE positioning**. This baseline
+  implements **Cell-ID positioning** (MVP, no LPP/NRPPa, no GMLC). The LMF is core-only: it
+  never has a direct N2 to the gNB and reaches the RAN exclusively through the **AMF as an NGAP
+  relay**. Flow: an LCS consumer POSTs a **DetermineLocation** request to the LMF
+  (`Nlmf_Location`, `POST /nlmf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info`); the LMF
+  calls the AMF's new **Namf_Location** producer (`POST /namf-loc/v1/ue-contexts/{id}/provide-loc-info`
+  on the existing inbound SBI :8001); the AMF sends an **NGAP LocationReportingControl**
+  (ProcCode=16, EventType=Direct, ReportArea=Cell) to the UE's gNB, correlates the async
+  **LocationReport** (ProcCode=18) back via a `sync.Map` keyed by AMF-UE-NGAP-ID (10 s timeout),
+  decodes `UserLocationInformationNR` → **NRCGI + TAI**, and returns it; the LMF wraps it as
+  **LocationData** (`shape=POINT`, `nrCellId`, `tai`, `ageOfLocationEstimate`).
+- **3GPP spec**: TS 23.273 §6/§7.2 (LMF architecture + UE positioning), **TS 29.572 §5.2.2.2**
+  (Nlmf_Location DetermineLocation) + §6.1.6.2.2 (LocationData), TS 29.518 §5.2.2.6
+  (Namf_Location AMF producer), **TS 38.413 §8.17.1** (NGAP LocationReportingControl ProcCode=16
+  / LocationReport ProcCode=18), TS 23.501 §6.2.18 (LMF description), TS 29.510 §6.1.6.3.3 (NRF
+  NFType=LMF). `docs/procedures/DetermineLocation.md`.
+- **NFs involved**: LMF (new, SBI port **8012** / metrics **9113**), AMF (new Namf_Location
+  producer + NGAP LocationReportingControl/LocationReport on N2), NRF (registration), gNB (RAN).
+- **How to trigger** (live, full stack):
+  ```bash
+  make ueransim                       # core (incl. lmf) + obs + gNB + 1 UE
+  SUPI=imsi-001010000000001
+  curl -sk --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt \
+    -X POST "https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info" \
+    -H 'Content-Type: application/json' \
+    -d "{\"supi\":\"$SUPI\",\"req5gsLoc\":true,\"reqCurrentLoc\":true,\"supportedGADShapes\":[\"POINT\"]}"
+  docker logs amf | grep "NGAP LocationReportingControl sent"   # ProcCode=16 emitted to gNB
+  docker logs lmf | grep DetermineLocation
+  # Unit + functional (no stack):
+  go test ./nf/lmf/... ./nf/amf/internal/ngap/... ./nf/amf/internal/sbi/...
+  go test -tags=functional ./nf/lmf/tests/...                   # 6 scenarios
+  ```
+- **Expected outcome**: LMF logs `procedure=DetermineLocation` with `interface=Nlmf` (IN) and
+  `Namf`/`N2` (OUT), `correlation_id`, `supi`, `result`, `cause`, `duration_ms`. AMF logs
+  `procedure=ProvideLocationInfo` + `NGAP LocationReportingControl sent` (`amf_ue_ngap_id`,
+  `ran_ue_ngap_id`, `spec_ref=TS 38.413 §8.17.1`). On a successful fix → `200` LocationData with
+  `nrCellId` (NRCGI hex) + `tai`. Errors: `400 MANDATORY_IE_MISSING` (no `supi`/`gpsi`),
+  `404 CONTEXT_NOT_FOUND` (UE unknown in AMF), `504 LOCATION_FAILURE` / `UE_NOT_REACHABLE`
+  (no LocationReport before timeout / CM-IDLE). Metrics:
+  `fivegc_lmf_locate_total{result="OK"|"REJECT"|"FAILURE"}` on :9113 +
+  `fivegc_procedure_total{nf="AMF",procedure="ProvideLocationInfo"}`; Grafana **"LMF — Location
+  Management Function"** row (success/reject rate + rate-by-result).
+- **Known limitations**:
+  - **UERANSIM v3.2.8 has no LocationReport handler**: the gNB receives our LocationReportingControl
+    but logs `Unhandled NGAP initiating-message` and never replies, so a live fix times out
+    (`504`). The AMF→gNB control emit is validated **live**; the RAN→AMF LocationReport decode
+    (NRCGI/TAI extraction) is covered by **unit tests** (codec round-trip) + functional BDD — the
+    same posture as URSP/NSSAA.
+  - **Cell-ID only** (LMF-002+): no LPP/NRPPa relay (E-CID/OTDOA/NR-ECID/GNSS), no
+    EventSubscription/periodic/area-of-interest, no CancelLocation, no GMLC/N56 (TS 29.515), no
+    UDM location-privacy check, no LocationContextTransfer during handover.
+  - **Placeholder lat/lon**: `locationEstimate.point` is `lat=0,lon=0` unless an optional
+    plmn→cell→coordinate map is configured; the authoritative result is the `nrCellId`.
+
 ---
 
 ## 4. UERANSIM Integration
@@ -768,6 +824,8 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`; operator-wide topology (D
 | upf | upf | 8805/udp (N4), 2152/udp (N3), 9107 |
 | nssf | nssf | 8007, 9109 |
 | smsf | smsf | 8009 (SBI Nsmsf), 9110 (metrics) |
+| nef | nef | 8011 (SBI Nnef), 9112 (metrics) |
+| lmf | lmf | 8012 (SBI Nlmf), 9113 (metrics) |
 | mcp | mcp | 9300 (SSE) |
 | mgmt-portal | mgmt-portal | 8080 |
 | loki | loki | 3100 |
@@ -853,3 +911,6 @@ agent roles in `AGENTS.md`. After big changes run `/graphify . --update` (knowle
 - [2026-06-21] bsf: new BSF NF (BSF-001) — Nbsf_Management Register/Deregister/Discovery (TS 29.521 §5), in-memory binding store with ipv4/supi indices, NRF registration (NFType BSF), mTLS+HTTP/2 SBI server on port 8010, Prometheus metrics on port 9111, 14 unit tests [TS 23.501 §6.2.16 / TS 29.521 §5]. docker-compose wiring + PCF client integration are follow-up passes (BSF-002, BSF-004).
 - [2026-06-22] pcf: NEF-001 AC2 — thin Npcf_PolicyAuthorization Create+Delete (POST/DELETE /npcf-policyauthorization/v1/app-sessions) added to PCF SBI server; AppSessionContext+AppSessionContextReqData types; in-memory appSessions map; 8 new unit tests; pre-existing bsf_client_test.go stale module-path import fixed [TS 29.514 §5.2.2.2, §5.2.2.4].
 - [2026-06-22] nef: new NEF NF (NEF-001) — Nnef_AFsessionWithQoS Create/Get/Delete (TS 29.522 §4.4.13) on mTLS+HTTP/2 SBI port 8011 / metrics 9112; OAuth2 northbound (scope nnef-afsessionwithqos; 401/403); BSF Discovery (Nbsf §5.2.2.4) → Npcf_PolicyAuthorization_Create (TS 29.514) on the serving PCF; NRF registration (NFType NEF); in-memory subscription store + fivegc_nef_subscriptions_active gauge + Grafana NEF row; 8 unit + 12 BDD scenarios. Fixed create-reject cause MODIFICATION_NOT_ALLOWED→UNAUTHORIZED_AF (spec-verifier) and a pre-existing BSF-001 build break (4 nf/bsf/*.go files used the claudia-5gc module path instead of 5gc-rel17). docker-compose wiring + PKI deferred (NEF-005) [TS 23.501 §6.2.5 / TS 29.522 §4.4.13].
+- [2026-06-23] ci,build: catch all-NF build failures before compose-up — new `go-build` CI job (`GOWORK=off go build ./nf/... ./shared/...`) + docker matrix expanded to all 12 core NFs; root cause of the bsf/nef CI break was main's module path (claudia-5gc) vs merged-in 5gc-rel17 import paths. Fixed the stragglers on main and made `scripts/release-public.sh` auto-rewrite `5gc-rel17`→`claudia-5gc` + compile-gate before publishing.
+- [2026-06-23] docs,template: aligned `nf/_template/` with the real root-module build (Dockerfile `GO_VERSION=1.26.2` + `COPY go.mod go.sum*`+`shared/`; added the missing Makefile) and added a §0 New NF Checklist (no per-NF go.mod, root-module import paths, `GOWORK=off go mod tidy`, wire into CI matrix + docker-compose + Makefile, verify with go build + make docker). Root CLAUDE.md "New NF" rule expanded accordingly.
+- [2026-06-23] lmf,amf: new **LMF** NF (LMF-001) — Nlmf_Location DetermineLocation (Cell-ID MVP, TS 29.572 §5.2.2.2) on mTLS+HTTP/2 SBI :8012 / metrics :9113, NRF registration (NFType=LMF, service nlmf-loc), `fivegc_lmf_locate_total{result}` + Grafana LMF row. AMF additions: Namf_Location producer (`POST /namf-loc/v1/ue-contexts/{id}/provide-loc-info` on :8001, TS 29.518 §5.2.2.6) + NGAP **LocationReportingControl** builder (ProcCode=16) & **LocationReport** decoder (ProcCode=18, UserLocationInformationNR→NRCGI+TAI, TS 38.413 §8.17.1) with a `sync.Map` AMF-UE-NGAP-ID→chan correlation (10 s timeout). Wired into docker-compose (lmf + lmf-pcap, profile core), CI docker matrix, Makefile NFS, PKI (pki/lmf.crt/key). 9 AMF unit + 6 LMF unit + 6 LMF BDD scenarios. Live: AMF→gNB control emit verified; UERANSIM v3.2.8 has no LocationReport handler so the RAN→AMF leg is unit/functional-tested (codec round-trip). Also fixed a pre-existing Prometheus scrape gap (8 NFs incl. smf/pcf/upf/nssf/smsf/bsf/nef were not scraped) [TS 23.273 / TS 29.572 / TS 29.518 / TS 38.413].

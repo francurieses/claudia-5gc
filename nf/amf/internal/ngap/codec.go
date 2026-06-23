@@ -68,6 +68,11 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 			if im.Value.ErrorIndication != nil {
 				msg.Value = extractErrorIndication(im.Value.ErrorIndication)
 			}
+		case ngapType.ProcedureCodeLocationReport: // proc=18 (gNB→AMF)
+			// Ref: TS 38.413 §8.17.1 (Location Report, Cell-ID positioning)
+			if im.Value.LocationReport != nil {
+				msg.Value = extractLocationReport(im.Value.LocationReport)
+			}
 		}
 	case ngapType.NGAPPDUPresentSuccessfulOutcome:
 		so := pdu.SuccessfulOutcome
@@ -1186,6 +1191,155 @@ func buildCause(causePresent int, causeValue int64) ngapType.Cause {
 
 // ensure hex import is used
 var _ = hex.EncodeToString
+
+// ---- Location Reporting Control (AMF→gNB, InitiatingMessage, ProcCode=16) ---
+// Ref: TS 38.413 §8.17.1 (Location Reporting)
+
+// BuildLocationReportingControl builds an NGAP LocationReportingControl PDU.
+// It requests a single immediate (Direct) cell-level location report for the UE
+// identified by amfUENGAPID / ranUENGAPID.
+//
+// IE ordering matches TS 38.413 Table 9.2.x:
+//   - AMF-UE-NGAP-ID (id=10) — Mandatory
+//   - RAN-UE-NGAP-ID (id=85) — Mandatory
+//   - LocationReportingRequestType (id=33): EventType=Direct(0), ReportArea=Cell(0) — Mandatory
+//
+// Ref: TS 38.413 §8.17.1, §9.2.x; TS 23.273 §7.2 (Cell-ID positioning MVP).
+func BuildLocationReportingControl(amfUENGAPID, ranUENGAPID int64) []byte {
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentInitiatingMessage,
+		InitiatingMessage: &ngapType.InitiatingMessage{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeLocationReportingControl},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitiatingMessageValue{
+				Present: ngapType.InitiatingMessagePresentLocationReportingControl,
+				LocationReportingControl: &ngapType.LocationReportingControl{
+					ProtocolIEs: ngapType.ProtocolIEContainerLocationReportingControlIEs{
+						List: []ngapType.LocationReportingControlIEs{
+							// AMF-UE-NGAP-ID (id=10) — Mandatory
+							{
+								Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAMFUENGAPID},
+								Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+								Value: ngapType.LocationReportingControlIEsValue{
+									Present:     ngapType.LocationReportingControlIEsPresentAMFUENGAPID,
+									AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUENGAPID},
+								},
+							},
+							// RAN-UE-NGAP-ID (id=85) — Mandatory
+							{
+								Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRANUENGAPID},
+								Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+								Value: ngapType.LocationReportingControlIEsValue{
+									Present:     ngapType.LocationReportingControlIEsPresentRANUENGAPID,
+									RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUENGAPID},
+								},
+							},
+							// LocationReportingRequestType (id=33) — Mandatory
+							// EventType=Direct(0): report once immediately.
+							// ReportArea=Cell(0): serving cell granularity.
+							// Ref: TS 38.413 §9.3.1.x, §8.17.1; TS 23.273 §7.2.
+							{
+								Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDLocationReportingRequestType},
+								Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+								Value: ngapType.LocationReportingControlIEsValue{
+									Present: ngapType.LocationReportingControlIEsPresentLocationReportingRequestType,
+									LocationReportingRequestType: &ngapType.LocationReportingRequestType{
+										EventType:  ngapType.EventType{Value: ngapType.EventTypePresentDirect},
+										ReportArea: ngapType.ReportArea{Value: ngapType.ReportAreaPresentCell},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	b, err := libngap.Encoder(pdu)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ---- Location Report (gNB→AMF, InitiatingMessage, ProcCode=18) ----------------
+// Ref: TS 38.413 §8.17.1 (Location Report)
+
+// LocationReportMsg holds the decoded fields from an NGAP LocationReport.
+// The NRCGI is rendered as a hex string (36-bit cell id zero-padded to 9 hex digits).
+// Ref: TS 38.413 §9.3.1.x; TS 29.572 §6.1.6.2.2 (LocationData).
+type LocationReportMsg struct {
+	AMFUENGAPId int64
+	RANUENGAPId int64
+	// NRCellID is the NR Cell Global Identifier rendered as a hex string.
+	// 36 bits from aper.BitString, zero-extended to 9 hex digits (38.413 §9.3.1.x).
+	NRCellID string
+	TAI      *TAI
+}
+
+// extractLocationReport decodes the IEs from an NGAP LocationReport.
+func extractLocationReport(msg *ngapType.LocationReport) *LocationReportMsg {
+	out := &LocationReportMsg{}
+	for _, ie := range msg.ProtocolIEs.List {
+		switch ie.Value.Present {
+		case ngapType.LocationReportIEsPresentAMFUENGAPID:
+			if ie.Value.AMFUENGAPID != nil {
+				out.AMFUENGAPId = ie.Value.AMFUENGAPID.Value
+			}
+		case ngapType.LocationReportIEsPresentRANUENGAPID:
+			if ie.Value.RANUENGAPID != nil {
+				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.LocationReportIEsPresentUserLocationInformation:
+			if ie.Value.UserLocationInformation != nil {
+				uli := ie.Value.UserLocationInformation
+				if uli.Present == ngapType.UserLocationInformationPresentUserLocationInformationNR &&
+					uli.UserLocationInformationNR != nil {
+					nr := uli.UserLocationInformationNR
+					// Encode NRCellIdentity (36-bit BitString) as hex string.
+					// The bytes array holds ≥5 bytes (36 bits packed big-endian with
+					// trailing zero-padding); render as 9-char hex for portability.
+					// Ref: TS 38.413 §9.3.1.x, TS 29.572 §6.1.6.2.2 nrCellId field.
+					bs := nr.NRCGI.NRCellIdentity.Value
+					cellID := nrCellIdentityToHex(bs.Bytes, bs.BitLength)
+					out.NRCellID = cellID
+					// Decode TAI from PLMN + TAC.
+					tai := &TAI{
+						MCC: plmnToMCC(nr.TAI.PLMNIdentity.Value),
+						MNC: plmnToMNC(nr.TAI.PLMNIdentity.Value),
+						TAC: tacToUint32(nr.TAI.TAC.Value),
+					}
+					out.TAI = tai
+				}
+			}
+		}
+	}
+	return out
+}
+
+// nrCellIdentityToHex converts a BitString (36 bits, aper big-endian) to a
+// 9-character lowercase hex string. The 36-bit value occupies 5 bytes with
+// the top 4 bits of the last byte unused (zero-filled by the encoder).
+// Example: bytes=[0x00,0x00,0x00,0x01,0x00], bitLen=36 → "000000010"
+// Ref: TS 38.413 §9.3.1.x (NRCellIdentity, 36-bit BIT STRING).
+func nrCellIdentityToHex(b []byte, bitLen uint64) string {
+	// Reconstruct a uint64 from up to 5 bytes, big-endian.
+	// The 36-bit value is packed into the most-significant bits of the byte array.
+	var v uint64
+	for i, byteVal := range b {
+		if i >= 5 {
+			break
+		}
+		v = (v << 8) | uint64(byteVal)
+	}
+	// Shift right to remove the trailing (8*len(b) - bitLen) padding bits.
+	if len(b) > 0 {
+		shift := uint64(len(b))*8 - bitLen
+		v >>= shift
+	}
+	return fmt.Sprintf("%09x", v)
+}
 
 // ---- N2 Handover — HandoverRequired (source gNB → AMF, ProcCode=12) --------
 // Ref: TS 38.413 §8.4.1 (Handover Preparation), TS 23.502 §4.9.1.3

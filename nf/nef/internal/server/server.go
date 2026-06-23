@@ -35,10 +35,10 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/francurieses/5gc-rel17/nf/nef/internal/config"
-	"github.com/francurieses/5gc-rel17/shared/logging"
-	oauth2pkg "github.com/francurieses/5gc-rel17/shared/oauth2"
-	"github.com/francurieses/5gc-rel17/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
+	"github.com/francurieses/claudia-5gc/shared/logging"
+	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
 
 // requiredScope is the OAuth2 scope required on all northbound Nnef requests.

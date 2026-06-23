@@ -28,8 +28,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/config"
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/server"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/server"
 )
 
 // ---- helpers ----------------------------------------------------------------

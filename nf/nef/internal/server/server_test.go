@@ -23,8 +23,8 @@ import (
 
 	"log/slog"
 
-	"github.com/francurieses/5gc-rel17/nf/nef/internal/config"
-	oauth2pkg "github.com/francurieses/5gc-rel17/shared/oauth2"
+	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
+	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
 )
 
 // ---- test constants ----------------------------------------------------------

@@ -170,6 +170,18 @@ var (
 		Name: "fivegc_nef_subscriptions_active",
 		Help: "Number of active Nnef_AFsessionWithQoS subscriptions in the NEF (TS 29.522).",
 	})
+
+	// --- LMF Location Management Function ---
+
+	// LMFLocateTotal counts Nlmf_Location DetermineLocation requests by outcome.
+	// Label: result ("OK" | "REJECT" | "FAILURE"). Incremented by the LMF on every
+	// DetermineLocation request: OK on a successful Cell-ID fix, REJECT on a client
+	// error (missing IE / unknown UE), FAILURE on a downstream/positioning failure.
+	// Ref: TS 29.572 §5.2.2.2, TS 23.273 §7.2, TS 23.501 §6.2.18
+	LMFLocateTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_lmf_locate_total",
+		Help: "Total Nlmf_Location DetermineLocation requests by result (TS 29.572).",
+	}, []string{"result"})
 )
 
 // MetricsServer builds a standalone HTTP server for the /metrics endpoint.

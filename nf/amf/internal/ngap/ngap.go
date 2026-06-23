@@ -32,6 +32,20 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/logging"
 )
 
+// LocationResult is the result of an NGAP LocationReportingControl/LocationReport
+// exchange. Delivered to the Namf_Location handler via a channel keyed by
+// AMF-UE-NGAP-ID in the Server's pendingLoc map.
+// Ref: TS 38.413 §8.17.1; TS 29.518 §5.2.2.6.
+type LocationResult struct {
+	// NRCellID is the serving NR cell rendered as a 9-char hex string (36-bit cell id).
+	// Ref: TS 38.413 §9.3.1.x, TS 29.572 §6.1.6.2.2.
+	NRCellID string
+	// TAI is the Tracking Area Identity reported by the gNB.
+	TAI *TAI
+	// Err is non-nil when the gNB could not provide a location (failure or timeout).
+	Err error
+}
+
 // ---- NGAP Message Types (subset) (TS 38.413 §9.1) -----------------------
 
 // ProcedureCode identifies the NGAP procedure.
@@ -55,7 +69,12 @@ const (
 	ProcHandoverResourceAllocation ProcedureCode = 13 // HandoverRequest (AMF→tgt) + HandoverRequestAck (tgt→AMF)
 	ProcUEContextModification      ProcedureCode = 26
 	ProcNGReset                    ProcedureCode = 20
-	ProcNGApplicationIndication    ProcedureCode = 18
+	// ProcLocationReportingControl is the procedure code for LocationReportingControl
+	// (AMF→gNB, InitiatingMessage). Ref: TS 38.413 Table 9.1-1, §8.17.1.
+	ProcLocationReportingControl ProcedureCode = 16
+	// ProcLocationReport is the procedure code for LocationReport
+	// (gNB→AMF, InitiatingMessage). Ref: TS 38.413 Table 9.1-1, §8.17.1.
+	ProcLocationReport ProcedureCode = 18
 	// TS 38.413 Table 9.1.1-1: ErrorIndication has procedure code 9.
 	ProcErrorIndication ProcedureCode = 9
 )
@@ -206,6 +225,12 @@ type Server struct {
 	// Created on HandoverRequired (step 1), consumed on HandoverNotify (step 5).
 	pendingN2HO   map[int64]*n2HandoverState
 	pendingN2HOMu sync.Mutex
+
+	// pendingLoc holds one pending LocationResult channel per AMF-UE-NGAP-ID.
+	// Inserted by SendLocationReportingControl; resolved (and deleted) by
+	// handleLocationReport when the matching LocationReport arrives.
+	// Ref: TS 38.413 §8.17.1; TS 29.518 §5.2.2.6.
+	pendingLoc sync.Map // map[int64]chan LocationResult
 
 	// timerCfg holds the timer durations for UE lifecycle management.
 	timerCfg TimerConfig
@@ -596,6 +621,11 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 	case ProcHandoverNotification:
 		if msg.Type == 0 { // InitiatingMessage: HandoverNotify from target gNB
 			s.handleHandoverNotify(ctx, gnb, msg)
+		}
+	case ProcLocationReport:
+		if msg.Type == 0 { // InitiatingMessage: LocationReport from gNB
+			// Ref: TS 38.413 §8.17.1 (Location Report)
+			s.handleLocationReport(ctx, gnb, msg)
 		}
 	default:
 		log.Warn("unhandled NGAP procedure", "proc", msg.ProcedureCode)
@@ -1365,6 +1395,93 @@ func (s *Server) SendUEContextReleaseCommand(gnb *GNBContext, amfUEID, ranUEID i
 	)
 	_, err := gnb.Conn.Write(pdu)
 	return err
+}
+
+// ---- Location Reporting Control / Location Report (TS 38.413 §8.17.1) ------
+
+// SendLocationReportingControl sends an NGAP LocationReportingControl PDU to the
+// gNB serving ue, then returns a channel on which the caller can block for the
+// matching LocationReport. The caller is responsible for cleaning up the pending
+// map entry on timeout (see LocateUE).
+//
+// Ref: TS 38.413 §8.17.1; TS 23.273 §7.2 (Cell-ID positioning).
+func (s *Server) SendLocationReportingControl(ue *amfctx.UEContext) (<-chan LocationResult, error) {
+	gnb := s.findGNBForUE(ue)
+	if gnb == nil {
+		return nil, fmt.Errorf("amf: send location reporting control: no gNB for UE %d",
+			ue.AMFUENGAPId)
+	}
+
+	pdu := BuildLocationReportingControl(ue.AMFUENGAPId, ue.RANUENGAPId)
+	if pdu == nil {
+		return nil, fmt.Errorf("amf: send location reporting control: encode failed")
+	}
+
+	// Buffer of 1: the LocationReport handler sends and moves on even if the
+	// caller has already timed out (avoids goroutine leak in the handler).
+	ch := make(chan LocationResult, 1)
+	s.pendingLoc.Store(ue.AMFUENGAPId, ch)
+
+	s.logger.Info("NGAP LocationReportingControl sent",
+		"procedure", "ProvideLocationInfo",
+		"interface", "N2",
+		"direction", "OUT",
+		"message_type", "LocationReportingControl",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"ran_ue_ngap_id", ue.RANUENGAPId,
+		"supi", ue.SUPI,
+		"spec_ref", "TS 38.413 §8.17.1",
+	)
+
+	if _, err := gnb.Conn.Write(pdu); err != nil {
+		s.pendingLoc.Delete(ue.AMFUENGAPId)
+		return nil, fmt.Errorf("amf: send location reporting control: write: %w", err)
+	}
+	return ch, nil
+}
+
+// handleLocationReport processes an NGAP LocationReport received from the gNB.
+// It resolves the pending channel keyed by AMF-UE-NGAP-ID and delivers the result.
+// Ref: TS 38.413 §8.17.1; TS 23.273 §7.2.
+func (s *Server) handleLocationReport(ctx context.Context, gnb *GNBContext, msg *Message) {
+	rep, ok := msg.Value.(*LocationReportMsg)
+	if !ok || rep == nil {
+		s.logger.Error("LocationReport body decode failed",
+			"procedure", "ProvideLocationInfo",
+			"interface", "N2",
+			"direction", "IN",
+			"spec_ref", "TS 38.413 §8.17.1",
+		)
+		return
+	}
+
+	s.logger.Info("NGAP LocationReport received",
+		"procedure", "ProvideLocationInfo",
+		"interface", "N2",
+		"direction", "IN",
+		"message_type", "LocationReport",
+		"amf_ue_ngap_id", rep.AMFUENGAPId,
+		"ran_ue_ngap_id", rep.RANUENGAPId,
+		"nr_cell_id", rep.NRCellID,
+		"spec_ref", "TS 38.413 §8.17.1",
+	)
+
+	val, loaded := s.pendingLoc.LoadAndDelete(rep.AMFUENGAPId)
+	if !loaded {
+		// Late or spurious LocationReport — no waiting caller.
+		s.logger.Warn("LocationReport: no pending locate request",
+			"amf_ue_ngap_id", rep.AMFUENGAPId,
+			"spec_ref", "TS 38.413 §8.17.1",
+		)
+		return
+	}
+	ch, ok := val.(chan LocationResult)
+	if !ok {
+		return
+	}
+	// Non-blocking send: ch is buffered(1). If the caller already timed out the
+	// send simply succeeds into the buffer and the channel is GC'd.
+	ch <- LocationResult{NRCellID: rep.NRCellID, TAI: rep.TAI}
 }
 
 // ---- Stub message types (kept for handler interface compatibility) ------

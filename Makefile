@@ -3,7 +3,7 @@
 
 .PHONY: help all build test lint up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down handover-test handover-down handover-n2-test handover-n2-down portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public
 
-NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef
+NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef lmf
 COMPOSE := docker compose
 PKI_DIR := pki
 

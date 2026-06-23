@@ -2,7 +2,7 @@ ARG GO_VERSION=1.26.2
 FROM golang:${GO_VERSION} AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y libsctp-dev lksctp-tools
-COPY go.mod go.sum ./
+COPY go.mod go.sum* ./
 RUN go mod download
 COPY shared/ ./shared/
 COPY nf/amf/ ./nf/amf/

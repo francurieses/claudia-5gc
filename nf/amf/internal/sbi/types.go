@@ -1,12 +1,14 @@
 // Package sbi implements the AMF's inbound Service Based Interface server.
 //
-// This is the first inbound SBI server on the AMF. It serves the
-// Namf_Communication service (namf-comm) — currently the UEContextTransfer
-// operation used when the UE changes AMF during (Mobility) Registration.
+// This is the inbound SBI server on the AMF. It serves:
+//   - Namf_Communication (namf-comm): UEContextTransfer, N1N2MessageTransfer
+//   - Namf_Location (namf-loc): ProvideLocationInfo (Cell-ID positioning relay)
 //
 // Ref: TS 29.518 §5.3.2 (Namf_Communication_UEContextTransfer),
 //
-//	TS 23.502 §4.2.2.2.3 (Registration with AMF change).
+//	TS 29.518 §5.2.2.6 (Namf_Location_ProvideLocationInfo),
+//	TS 23.502 §4.2.2.2.3 (Registration with AMF change),
+//	TS 23.273 §7.2 (Cell-ID positioning).
 package sbi
 
 // TransferReason enumerates why the new AMF is requesting the UE context.
@@ -151,6 +153,65 @@ type ProblemDetails struct {
 	Detail string `json:"detail,omitempty"`
 	Cause  string `json:"cause,omitempty"`
 }
+
+// ---- Namf_Location (TS 29.518 §5.2.2.6) -------------------------------------
+
+// RequestLocInfo is the body of Namf_Location_ProvideLocationInfo (LMF → AMF).
+// Ref: TS 29.518 §6.1.6.2.x; TS 23.273 §7.2.
+type RequestLocInfo struct {
+	// Req5gsLoc requests the current 5GS location (TAI + NRCGI of serving cell).
+	// Mandatory for the Cell-ID positioning MVP.
+	// Ref: TS 29.518 §6.1.6.2.x.
+	Req5gsLoc bool `json:"req5gsLoc"`
+	// ReqCurrentLoc requests a fresh measurement (triggers NGAP LocationReportingControl).
+	// When false the AMF may return last-known location.
+	ReqCurrentLoc bool `json:"reqCurrentLoc,omitempty"`
+	// SupportedGADShapes is the list of GAD shapes the consumer can decode.
+	SupportedGADShapes []string `json:"supportedGADShapes,omitempty"`
+}
+
+// LocationData is the Namf_Location response body (AMF → LMF).
+// Carries the serving cell NRCGI and TAI from the NGAP LocationReport.
+// Ref: TS 29.518 §6.1.6.2.x; TS 29.572 §6.1.6.2.2.
+type LocationData struct {
+	// LocationEstimate is a minimal GAD POINT shape. For Cell-ID positioning the
+	// lat/lon are derived from a config map; absent entry → 0,0 placeholder.
+	// Ref: TS 29.572 §6.1.6.2.2 (locationEstimate, GeographicArea shape=POINT).
+	LocationEstimate *GeographicArea `json:"locationEstimate,omitempty"`
+	// NRCellId is the serving NR cell rendered as a hex string (36-bit cell id).
+	// Ref: TS 29.572 §6.1.6.2.2; TS 38.413 §9.3.1.x (NRCellIdentity).
+	NRCellId string `json:"nrCellId,omitempty"`
+	// Tai is the Tracking Area Identity of the serving cell.
+	Tai *TaiLoc `json:"tai,omitempty"`
+	// AgeOfLocationEstimate is minutes since the estimate (0 = fresh report).
+	AgeOfLocationEstimate int `json:"ageOfLocationEstimate"`
+}
+
+// GeographicArea holds a minimal GAD POINT shape (lat/lon).
+// Ref: TS 29.572 §6.1.6.2.x; TS 29.571 §5.4.4.x.
+type GeographicArea struct {
+	Shape string  `json:"shape"` // "POINT" for Cell-ID MVP
+	Point *LatLon `json:"point,omitempty"`
+}
+
+// LatLon is a WGS84 coordinate pair.
+type LatLon struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
+}
+
+// TaiLoc is the Tracking Area Identity carried in LocationData.
+// Ref: TS 29.571 §5.4.4.3; TS 38.413 §9.3.1.x.
+type TaiLoc struct {
+	PlmnId PlmnID `json:"plmnId"`
+	Tac    string `json:"tac"` // 3-byte hex, e.g. "000001"
+}
+
+// ---- Cause constants for Namf_Location errors ----
+
+// CauseLocationFailure is returned when the NGAP location exchange fails or times out.
+// Ref: TS 29.572 §6.1.x; TS 29.518 §5.2.2.6.
+const CauseLocationFailure = "LOCATION_FAILURE"
 
 // nasAlgName maps a NAS algorithm identifier (0..3) to its 3GPP short name.
 // Ref: TS 24.501 §9.11.3.34.

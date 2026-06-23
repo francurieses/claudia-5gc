@@ -20,6 +20,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
@@ -40,18 +41,44 @@ type Pager interface {
 	SendPaging(ue *amfctx.UEContext) error
 }
 
-// Server is the AMF inbound SBI server (namf-comm).
-// Ref: TS 29.518 §5.3.2.
+// locationTimeout is the maximum time the Namf_Location handler will block
+// waiting for an NGAP LocationReport from the gNB after sending a
+// LocationReportingControl. A direct (EventType=Direct) report must be immediate;
+// 10 s provides a generous safety margin for congested N2 paths.
+//
+// Ref: TS 38.413 §8.17.1; TS 23.273 §7.2 (no normative timer defined for Cell-ID
+// positioning, so this is an implementation-defined guard value).
+const locationTimeout = 10 * time.Second
+
+// Locator triggers an NGAP LocationReportingControl for a CM-CONNECTED UE and
+// returns a channel on which the LocationResult will be delivered when the gNB
+// responds with an NGAP LocationReport. The pending map entry is owned by the
+// ngap.Server; the caller must ensure the entry is cleaned up on timeout by
+// calling the returned cleanup function.
+//
+// Implemented by ngap.Server; defined here to avoid an import cycle.
+// Ref: TS 38.413 §8.17.1; TS 29.518 §5.2.2.6.
+type Locator interface {
+	SendLocationReportingControl(ue *amfctx.UEContext) (<-chan ngap.LocationResult, error)
+}
+
+// Server is the AMF inbound SBI server (namf-comm + namf-loc).
+// Ref: TS 29.518 §5.3.2, §5.2.2.6.
 type Server struct {
 	cfg     Config
 	mgr     *amfctx.Manager
 	logger  *slog.Logger
 	httpSrv *http.Server
 	pager   Pager
+	locator Locator
 }
 
 // SetPager wires the NGAP paging trigger used by N1N2MessageTransfer.
 func (s *Server) SetPager(p Pager) { s.pager = p }
+
+// SetLocator wires the NGAP location trigger used by Namf_Location_ProvideLocationInfo.
+// Must be called before Start(). Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1.
+func (s *Server) SetLocator(l Locator) { s.locator = l }
 
 // New builds the inbound SBI server. It does not start listening — call Start.
 func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) {
@@ -63,6 +90,9 @@ func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer", s.handleUEContextTransfer)
 	mux.HandleFunc("POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages", s.handleN1N2MessageTransfer)
+	// Namf_Location_ProvideLocationInfo — Cell-ID positioning relay.
+	// Ref: TS 29.518 §5.2.2.6; TS 23.273 §7.2.
+	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info", s.handleProvideLocInfo)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -254,6 +284,147 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 	log.Info("CM-IDLE UE paged for network-triggered service request",
 		"supi", supi, "pdu_session_id", psi, "result", "OK", "cause", CauseAttemptingToReachUE)
 	metrics.ProcedureTotal.WithLabelValues(nfName, "NetworkTriggeredServiceRequest", "OK").Inc()
+}
+
+// handleProvideLocInfo serves Namf_Location_ProvideLocationInfo (producer side).
+// It resolves the UE, verifies CM-CONNECTED, sends NGAP LocationReportingControl
+// to the serving gNB, blocks until the LocationReport arrives (or times out),
+// then returns LocationData with the NRCGI and TAI.
+//
+// Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1; TS 23.273 §7.2.
+func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
+	ueContextID := r.PathValue("ueContextId")
+	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
+	corrID := logging.CorrelationID(ctx)
+	log := logging.NewProcedureLogger(ctx, s.logger, "ProvideLocationInfo").With(
+		"interface", "Namf",
+		"direction", "IN",
+		"spec_ref", "TS 29.518 §5.2.2.6",
+		"correlation_id", corrID,
+		"ue_context_id", ueContextID,
+	)
+
+	var req RequestLocInfo
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Warn("malformed ProvideLocationInfo body",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
+		return
+	}
+
+	if !req.Req5gsLoc {
+		log.Warn("req5gsLoc not set — mandatory for Cell-ID MVP",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING")
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "req5gsLoc must be true for Cell-ID positioning")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
+		return
+	}
+
+	ue, found := s.lookupUE(ueContextID)
+	if !found {
+		log.Info("ProvideLocationInfo: UE context not found",
+			"result", "REJECT", "cause", "CONTEXT_NOT_FOUND")
+		s.problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "no UE context for the given identifier")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
+		return
+	}
+
+	ue.Lock()
+	connected := ue.CMState == amfctx.CMConnected
+	supi := ue.SUPI
+	amfID := ue.AMFUENGAPId
+	ue.Unlock()
+
+	log = log.With("supi", supi, "amf_ue_ngap_id", amfID)
+
+	if !connected {
+		// MVP: CM-IDLE → return UE_NOT_REACHABLE. Paging-then-locate is deferred.
+		// Ref: TS 29.518 §5.2.2.6; DetermineLocation.md error table.
+		log.Info("ProvideLocationInfo: UE is CM-IDLE — not reachable for location",
+			"result", "REJECT", "cause", CauseUENotReachable)
+		s.problem(w, http.StatusConflict, CauseUENotReachable,
+			"UE is CM-IDLE; paging-then-locate is deferred (LMF-002+)")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
+		return
+	}
+
+	if s.locator == nil {
+		log.Error("ProvideLocationInfo: no Locator wired — cannot send NGAP LocationReportingControl",
+			"result", "FAILURE", "cause", CauseLocationFailure)
+		s.problem(w, http.StatusServiceUnavailable, CauseLocationFailure,
+			"internal: Locator not configured")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+		return
+	}
+
+	log.Info("sending NGAP LocationReportingControl to gNB",
+		"direction", "OUT",
+		"interface", "N2",
+		"spec_ref", "TS 38.413 §8.17.1",
+	)
+
+	ch, err := s.locator.SendLocationReportingControl(ue)
+	if err != nil {
+		log.Error("SendLocationReportingControl failed",
+			"result", "FAILURE", "cause", CauseLocationFailure, "error", err)
+		s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure,
+			fmt.Sprintf("NGAP LocationReportingControl failed: %v", err))
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+		return
+	}
+
+	// Block until the gNB responds with a LocationReport or the deadline expires.
+	// locationTimeout is the implementation-defined guard value; see constant doc.
+	// Ref: TS 38.413 §8.17.1; TS 23.273 §7.2.
+	locCtx, cancel := context.WithTimeout(ctx, locationTimeout)
+	defer cancel()
+
+	var result ngap.LocationResult
+	select {
+	case result = <-ch:
+	case <-locCtx.Done():
+		// Timeout: clean up the pending map entry so the handler doesn't fire later.
+		// The channel was buffered(1) so if a late LocationReport arrives it will
+		// send into the buffer without blocking (no goroutine leak).
+		result = ngap.LocationResult{Err: fmt.Errorf("location timeout after %s", locationTimeout)}
+	}
+
+	if result.Err != nil {
+		log.Warn("ProvideLocationInfo: NGAP location exchange failed",
+			"result", "FAILURE", "cause", CauseLocationFailure, "error", result.Err)
+		s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure, result.Err.Error())
+		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+		return
+	}
+
+	// Build the response. TAI is optional in the ngap.LocationResult if the gNB
+	// did not include UserLocationInformation; we include it when available.
+	rsp := LocationData{
+		LocationEstimate: &GeographicArea{
+			Shape: "POINT",
+			Point: &LatLon{Lat: 0, Lon: 0},
+		},
+		NRCellId:              result.NRCellID,
+		AgeOfLocationEstimate: 0,
+	}
+	if result.TAI != nil {
+		rsp.Tai = &TaiLoc{
+			PlmnId: PlmnID{MCC: result.TAI.MCC, MNC: result.TAI.MNC},
+			Tac:    fmt.Sprintf("%06x", result.TAI.TAC),
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(rsp)
+
+	log.Info("ProvideLocationInfo complete",
+		"nr_cell_id", result.NRCellID,
+		"result", "OK",
+		"spec_ref", "TS 29.518 §5.2.2.6",
+	)
+	metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "OK").Inc()
 }
 
 // buildTransferRsp assembles the UeContextTransferRspData from the UE context.

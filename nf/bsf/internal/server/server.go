@@ -33,10 +33,10 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/config"
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/store"
-	"github.com/francurieses/5gc-rel17/shared/logging"
-	"github.com/francurieses/5gc-rel17/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
 
 // Server is the BSF Nbsf_Management SBI server.

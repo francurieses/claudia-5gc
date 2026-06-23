@@ -35,35 +35,37 @@ const (
 	NFTypeNWDAF NFType = "NWDAF"
 	NFTypeSCP   NFType = "SCP"
 	NFTypeEASDF NFType = "EASDF"
+	NFTypeLMF   NFType = "LMF"  // Location Management Function (TS 23.273, TS 29.572)
+	NFTypeGMLC  NFType = "GMLC" // Gateway Mobile Location Centre (TS 23.273, TS 29.515)
 )
 
 // NFStatus per TS 29.510 §6.1.6.3.4.
 type NFStatus string
 
 const (
-	NFStatusRegistered   NFStatus = "REGISTERED"
-	NFStatusSuspended    NFStatus = "SUSPENDED"
+	NFStatusRegistered     NFStatus = "REGISTERED"
+	NFStatusSuspended      NFStatus = "SUSPENDED"
 	NFStatusUndiscoverable NFStatus = "UNDISCOVERABLE"
 )
 
 // NFProfile is a minimal subset of the NFProfile data type (TS 29.510 §6.1.6.2.2).
 // Many optional fields are omitted; expand as new procedures need them.
 type NFProfile struct {
-	NFInstanceID string   `json:"nfInstanceId"`
-	NFType       NFType   `json:"nfType"`
-	NFStatus     NFStatus `json:"nfStatus"`
-	HeartBeatTimer int    `json:"heartBeatTimer,omitempty"`
-	PLMNList     []PLMN   `json:"plmnList,omitempty"`
-	SNSSAIs      []SNSSAI `json:"sNssais,omitempty"`
-	NSIList      []string `json:"nsiList,omitempty"`
-	FQDN         string   `json:"fqdn,omitempty"`
-	IPv4Addresses []string `json:"ipv4Addresses,omitempty"`
-	NFServices   []NFService `json:"nfServices,omitempty"`
+	NFInstanceID   string      `json:"nfInstanceId"`
+	NFType         NFType      `json:"nfType"`
+	NFStatus       NFStatus    `json:"nfStatus"`
+	HeartBeatTimer int         `json:"heartBeatTimer,omitempty"`
+	PLMNList       []PLMN      `json:"plmnList,omitempty"`
+	SNSSAIs        []SNSSAI    `json:"sNssais,omitempty"`
+	NSIList        []string    `json:"nsiList,omitempty"`
+	FQDN           string      `json:"fqdn,omitempty"`
+	IPv4Addresses  []string    `json:"ipv4Addresses,omitempty"`
+	NFServices     []NFService `json:"nfServices,omitempty"`
 	// DNNList is the list of Data Network Names served by this NF (e.g. SMF/UPF).
 	// Ref: TS 29.510 §6.1.6.2.2 (SMFInfo/UPFInfo)
-	DNNList      []string    `json:"dnnList,omitempty"`
-	Capacity     int      `json:"capacity,omitempty"`     // 0..65535
-	Priority     int      `json:"priority,omitempty"`     // 0..65535
+	DNNList  []string `json:"dnnList,omitempty"`
+	Capacity int      `json:"capacity,omitempty"` // 0..65535
+	Priority int      `json:"priority,omitempty"` // 0..65535
 
 	// internal bookkeeping (not serialized to clients)
 	registeredAt time.Time `json:"-"`
@@ -81,14 +83,14 @@ type SNSSAI struct {
 }
 
 type NFService struct {
-	ServiceInstanceID string   `json:"serviceInstanceId"`
-	ServiceName       string   `json:"serviceName"`       // e.g. "namf-comm"
+	ServiceInstanceID string             `json:"serviceInstanceId"`
+	ServiceName       string             `json:"serviceName"` // e.g. "namf-comm"
 	Versions          []NFServiceVersion `json:"versions"`
-	Scheme            string   `json:"scheme"`            // "https"
-	NFServiceStatus   string   `json:"nfServiceStatus"`   // "REGISTERED"
-	FQDN              string   `json:"fqdn,omitempty"`
-	IPEndpoints       []IPEndpoint `json:"ipEndPoints,omitempty"`
-	APIPrefix         string   `json:"apiPrefix,omitempty"`
+	Scheme            string             `json:"scheme"`          // "https"
+	NFServiceStatus   string             `json:"nfServiceStatus"` // "REGISTERED"
+	FQDN              string             `json:"fqdn,omitempty"`
+	IPEndpoints       []IPEndpoint       `json:"ipEndPoints,omitempty"`
+	APIPrefix         string             `json:"apiPrefix,omitempty"`
 }
 
 type NFServiceVersion struct {

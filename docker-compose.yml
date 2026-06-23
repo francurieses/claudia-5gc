@@ -637,6 +637,53 @@ services:
       - ./pcaps/nef:/pcaps
     command: sleep infinity
 
+  # LMF — Location Management Function (TS 23.273 / TS 29.572).
+  # Nlmf_Location DetermineLocation (Cell-ID MVP): receives a location request,
+  # calls the AMF Namf_Location producer (which relays NGAP LocationReportingControl
+  # to the gNB), and returns the serving NRCGI+TAI as LocationData.
+  lmf:
+    image: 5gc/lmf:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/lmf/Dockerfile
+    container_name: lmf
+    hostname: lmf.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [lmf.5gc.local]
+      obs-net: {}
+    ports:
+      - "8012:8012"   # SBI Nlmf_Location
+      - "9113:9113"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/lmf.crt:/etc/5gc/pki/lmf.crt:ro
+      - ./pki/lmf.key:/etc/5gc/pki/lmf.key:ro
+      - ./nf/lmf/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "LMF"
+    depends_on: [nrf, amf]
+
+  # LMF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
+  lmf-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: lmf-pcap
+    network_mode: "service:lmf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [lmf]
+    volumes:
+      - ./pcaps/lmf:/pcaps
+    command: sleep infinity
+
   # core-pcap — host-network sidecar that captures ALL inter-NF traffic.
   # Root cause of empty capture with bridge attachment: Docker bridges are L2
   # switches — unicast frames only reach their destination port, not every peer.

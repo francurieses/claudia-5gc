@@ -15,3 +15,19 @@ scrape_configs:
         labels: {nf: UDM}
       - targets: [udr:9104]
         labels: {nf: UDR}
+      - targets: [smf:9105]
+        labels: {nf: SMF}
+      - targets: [pcf:9106]
+        labels: {nf: PCF}
+      - targets: [upf:9107]
+        labels: {nf: UPF}
+      - targets: [nssf:9109]
+        labels: {nf: NSSF}
+      - targets: [smsf:9110]
+        labels: {nf: SMSF}
+      - targets: [bsf:9111]
+        labels: {nf: BSF}
+      - targets: [nef:9112]
+        labels: {nf: NEF}
+      - targets: [lmf:9113]
+        labels: {nf: LMF}

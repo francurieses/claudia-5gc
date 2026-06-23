@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        nf: [nrf]   # add new NFs here as they gain test/build targets
+        nf: [nrf]   # NRF has its own go.mod; add NFs here only if they have one
         # lint omitted: golangci-lint binary doesn't support Go 1.26.2 yet.
         task: [test, build]
     steps:
@@ -28,13 +28,27 @@ jobs:
       - name: Run task
         run: make -C nf/${{ matrix.nf }} ${{ matrix.task }}
 
+  go-build:
+    name: Go build — all NFs (no workspace)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build all NFs without workspace
+        run: GOWORK=off go build ./nf/... ./shared/...
+
   docker:
     name: Build Docker image — ${{ matrix.nf }}
     runs-on: ubuntu-22.04
-    needs: matrix
+    needs: [matrix, go-build]
     strategy:
+      fail-fast: false
       matrix:
-        nf: [nrf]
+        nf: [nrf, amf, ausf, bsf, lmf, nef, nssf, pcf, smf, smsf, udm, udr, upf]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

@@ -51,8 +51,8 @@ import (
 
 	"github.com/cucumber/godog"
 
-	bsfcfg "github.com/francurieses/5gc-rel17/nf/bsf/internal/config"
-	bsfsrv "github.com/francurieses/5gc-rel17/nf/bsf/internal/server"
+	bsfcfg "github.com/francurieses/claudia-5gc/nf/bsf/internal/config"
+	bsfsrv "github.com/francurieses/claudia-5gc/nf/bsf/internal/server"
 )
 
 // ---- bsfCtx holds per-scenario state ----------------------------------------

@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/francurieses/5gc-rel17/nf/pcf/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/pcf/internal/config"
 )
 
 // newTestPCFWithBSF creates a PCF server with a mock BSF httptest.Server wired in.

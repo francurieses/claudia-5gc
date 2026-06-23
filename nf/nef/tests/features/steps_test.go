@@ -48,9 +48,9 @@ import (
 
 	"github.com/cucumber/godog"
 
-	nefcfg "github.com/francurieses/5gc-rel17/nf/nef/internal/config"
-	nefserver "github.com/francurieses/5gc-rel17/nf/nef/internal/server"
-	oauth2pkg "github.com/francurieses/5gc-rel17/shared/oauth2"
+	nefcfg "github.com/francurieses/claudia-5gc/nf/nef/internal/config"
+	nefserver "github.com/francurieses/claudia-5gc/nf/nef/internal/server"
+	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
 )
 
 // ---- recording fake PCF client -----------------------------------------------

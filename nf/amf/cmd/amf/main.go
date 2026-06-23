@@ -632,6 +632,11 @@ func main() {
 		// Wire NGAP paging trigger for N1N2MessageTransfer (CN paging of CM-IDLE UEs).
 		// Ref: TS 23.502 §4.2.3.3, TS 38.413 §9.2.8.
 		sbiSrv.SetPager(ngapSrv)
+		// Wire NGAP location trigger for Namf_Location_ProvideLocationInfo.
+		// The NGAP server sends LocationReportingControl and delivers the LocationReport
+		// via a channel keyed by AMF-UE-NGAP-ID.
+		// Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1; TS 23.273 §7.2.
+		sbiSrv.SetLocator(ngapSrv)
 		go func() {
 			if err := sbiSrv.Start(ctx); err != nil {
 				logger.Error("AMF inbound SBI server", "error", err)

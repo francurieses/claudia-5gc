@@ -1,16 +1,16 @@
-// Package main is the entry point of the NEF (Network Exposure Function).
+// Package main is the entry point of the LMF (Location Management Function).
 //
-// The NEF is the 5GC's secure gateway between the trusted core and external
-// Application Functions (AFs). It exposes selected core capabilities northbound
-// over the Nnef API surface (TS 29.522) while shielding internal NFs and hiding
-// network topology. AFs know only UE IP addresses; the NEF discovers the serving
-// PCF via the BSF (Nbsf_Management_Discovery) and maps AF requests onto PCF
-// policy operations (Npcf_PolicyAuthorization).
+// The LMF is the 5GC NF responsible for UE positioning (TS 23.501 §6.2.18).
+// It provides the Nlmf_Location service (TS 29.572) and for Cell-ID positioning
+// consumes the Namf_Location service from the AMF (TS 29.518 §5.2.2.6).
+// The AMF acts as the NGAP relay to the gNB; the LMF never has a direct N2
+// (NGAP/SCTP) association.
 //
 // Refs:
-//   - TS 23.501 §6.2.5  — NEF functional description
-//   - TS 29.522 §4.4.13 — Nnef_AFsessionWithQoS (Stage 3)
-//   - TS 29.510 §6.1.6.2.2 — NRF registration (NFType NEF)
+//   - TS 23.501 §6.2.18 — LMF functional description
+//   - TS 23.273 §7.2    — UE positioning procedure (Cell-ID method)
+//   - TS 29.572 §5.2.2.2 — Nlmf_Location DetermineLocation (Stage 3)
+//   - TS 29.510 §6.1.6.3.3 — NRF registration (NFType LMF)
 package main
 
 import (
@@ -23,8 +23,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
-	"github.com/francurieses/claudia-5gc/nf/nef/internal/server"
+	"github.com/francurieses/claudia-5gc/nf/lmf/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/lmf/internal/server"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
@@ -42,7 +42,7 @@ func main() {
 			return a
 		},
 	}))
-	logger = logger.With("nf", "NEF")
+	logger = logger.With("nf", "LMF")
 	slog.SetDefault(logger)
 
 	// ---- Config ---------------------------------------------------------------
@@ -57,7 +57,7 @@ func main() {
 	// ---- Tracing (OTel → Jaeger) ----------------------------------------------
 	// Ref: TS 29.500 §4.4 — SBA observability (OTel / Jaeger)
 	otlpEndpoint := getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318")
-	tp, err := tracing.Init(context.Background(), "NEF", otlpEndpoint)
+	tp, err := tracing.Init(context.Background(), "LMF", otlpEndpoint)
 	if err != nil {
 		logger.Warn("tracing init failed", "error", err)
 	} else if tp != nil {
@@ -77,7 +77,7 @@ func main() {
 		}
 	}()
 
-	// ---- mTLS HTTP/2 client (for outbound NRF, BSF, PCF calls) ---------------
+	// ---- mTLS HTTP/2 client (for outbound NRF + AMF calls) --------------------
 	// Build a TLS-capable client when cert+key are present (prod), else plain h2c
 	// (dev / functional-test mode). Ref: TS 29.500 §4.4.1 — SBA always mTLS.
 	var httpClient *http.Client
@@ -92,43 +92,35 @@ func main() {
 		httpClient = http.DefaultClient
 	}
 
-	// ---- Construct BSF + PCF clients ------------------------------------------
-	// BSF client: discover serving PCF by UE IP via Nbsf_Management_Discovery.
-	// Ref: TS 29.521 §5.2.2.4
-	bsfClient := &server.HTTPBSFClient{
-		BaseURL: "https://" + cfg.Peers.BSF,
+	// ---- Construct AMF location client ----------------------------------------
+	// The AMF provides Namf_Location_ProvideLocationInfo on its SBI server.
+	// Ref: TS 29.518 §5.2.2.6
+	amfClient := &server.HTTPAMFLocationClient{
+		BaseURL: "https://" + cfg.Peers.AMF,
 		Client:  httpClient,
 		Logger:  logger,
 	}
 
-	// PCF client: map AF AsSessionWithQoS → Npcf_PolicyAuthorization.
-	// Target URI comes from the BSF-returned PcfBinding (not NRF discovery).
-	// Ref: TS 29.514 §5.2.2.2 (Create), §5.2.2.4 (Delete)
-	pcfClient := &server.HTTPPolicyAuthClient{
-		Client: httpClient,
-		Logger: logger,
-	}
-
 	// ---- SBI server -----------------------------------------------------------
-	srv := server.New(cfg, logger, bsfClient, pcfClient)
+	srv := server.New(cfg, logger, amfClient)
 
 	// ---- Signal + context -----------------------------------------------------
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	// ---- NRF registration + heartbeat -----------------------------------------
-	// Ref: TS 29.510 §5.2.2.2 (NFRegister), §6.1.6.2.2 (NFType NEF)
+	// Ref: TS 29.510 §5.2.2.2 (NFRegister), §6.1.6.3.3 (NFType LMF)
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
 		profile := &nrf.NFProfile{
 			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "NEF",
+			NFType:       "LMF",
 			NFStatus:     "REGISTERED",
 			FQDN:         cfg.SBI.FQDN,
 			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-nnef-afsessionwithqos",
-				ServiceName:       "nnef-afsessionwithqos",
+				ServiceInstanceID: cfg.NFInstanceID + "-nlmf-loc",
+				ServiceName:       "nlmf-loc",
 				Scheme:            "https",
 				NFServiceStatus:   "REGISTERED",
 				Versions: []nrf.NFServiceVersion{
@@ -140,44 +132,44 @@ func main() {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr,
 				"error", err,
-				"spec_ref", "TS 29.510 §5.2.2.2.2",
+				"spec_ref", "TS 29.510 §5.2.2.2",
 			)
 		} else {
-			logger.Info("NEF registered in NRF",
-				"nf_type", "NEF",
+			logger.Info("LMF registered in NRF",
+				"nf_type", "LMF",
 				"nf_instance_id", cfg.NFInstanceID,
-				"service", "nnef-afsessionwithqos",
-				"spec_ref", "TS 29.510 §6.1.6.2.2",
+				"service", "nlmf-loc",
+				"spec_ref", "TS 29.510 §6.1.6.3.3",
 			)
 		}
 	} else {
-		logger.Warn("NRF peer not configured — NEF will not register")
+		logger.Warn("NRF peer not configured — LMF will not register")
 	}
 
 	// ---- Start SBI server -----------------------------------------------------
 	go func() {
 		if err := srv.Start(ctx); err != nil {
-			logger.Error("NEF SBI server error", "error", err)
+			logger.Error("LMF SBI server error", "error", err)
 		}
 	}()
 
-	logger.Info("NEF ready",
+	logger.Info("LMF ready",
 		"sbi_addr", cfg.SBI.Address,
 		"nf_instance_id", cfg.NFInstanceID,
-		"service", "nnef-afsessionwithqos",
-		"spec_ref", "TS 23.501 §6.2.5",
+		"service", "nlmf-loc",
+		"spec_ref", "TS 23.501 §6.2.18",
 	)
 
 	// ---- Graceful shutdown ----------------------------------------------------
 	<-ctx.Done()
-	logger.Info("NEF shutdown signal received")
+	logger.Info("LMF shutdown signal received")
 
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = metricsSrv.Shutdown(shutCtx)
 	_ = srv.Shutdown(shutCtx)
 
-	logger.Info("NEF stopped cleanly")
+	logger.Info("LMF stopped cleanly")
 }
 
 func getEnv(key, def string) string {

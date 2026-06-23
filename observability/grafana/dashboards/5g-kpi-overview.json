@@ -604,6 +604,113 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 68},
+      "id": 108,
+      "title": "LMF — Location Management Function (TS 23.273 / TS 29.572)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 95}, {"color": "green", "value": 99}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 69},
+      "id": 25,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "LMF DetermineLocation Success Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * sum(rate(fivegc_lmf_locate_total{result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_lmf_locate_total[5m])), 1)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 69},
+      "id": 26,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "LMF DetermineLocation Reject Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * sum(rate(fivegc_lmf_locate_total{result=\"REJECT\"}[5m])) / clamp_min(sum(rate(fivegc_lmf_locate_total[5m])), 1)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of Nlmf_Location DetermineLocation requests per second, broken down by result (OK / REJECT / FAILURE). Sourced from fivegc_lmf_locate_total (TS 29.572 §5.3.2).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byFrameRefID", "options": "A"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "B"},
+            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "C"},
+            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 69},
+      "id": 27,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "LMF Nlmf_Location DetermineLocation Rate by Result",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_locate_total{result=\"OK\"}[2m]))",
+          "legendFormat": "OK",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_locate_total{result=\"REJECT\"}[2m]))",
+          "legendFormat": "REJECT",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_locate_total{result=\"FAILURE\"}[2m]))",
+          "legendFormat": "FAILURE",
+          "refId": "C"
+        }
+      ]
     }
   ],
   "refresh": "10s",

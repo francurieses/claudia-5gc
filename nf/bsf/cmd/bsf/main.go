@@ -14,12 +14,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/config"
-	"github.com/francurieses/5gc-rel17/nf/bsf/internal/server"
-	"github.com/francurieses/5gc-rel17/shared/nrf"
-	"github.com/francurieses/5gc-rel17/shared/observability/metrics"
-	"github.com/francurieses/5gc-rel17/shared/observability/tracing"
-	"github.com/francurieses/5gc-rel17/shared/sbi"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/bsf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/nrf"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
+	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
 
 func main() {
