@@ -312,6 +312,16 @@ under **Feature Validation**. Run `make up-obs` first unless noted.
 - **3GPP spec**: TS 23.502 §4.2.2.3.
 - **How to trigger (NW)**: `curl -X DELETE http://localhost:9002/amf/v1/ue-contexts/$SUPI` (or Portal → Force Deregister).
 - **Expected**: UE `MM-DEREGISTERED`; AMF `NetworkDeregistration`; clean NGAP release in PCAP.
+- **Re-registration (since Jul 2026)**: the mgmt-API/portal-triggered dereg sends de-registration type
+  **"re-registration required"** with **no 5GMM cause** (TS 24.501 §5.5.2.3.2), so the UE automatically
+  performs a fresh Initial Registration and re-establishes its PDU sessions. Never send causes
+  0x03/0x06/0x07 here — they invalidate the USIM on the UE (5U3-ROAMING-NOT-ALLOWED, no recovery until
+  UE restart). UE-side auto re-registration requires the UERANSIM patch `0050-nw-dereg-reregistration.patch`
+  (stock v3.2.8 left it as a TODO). Log check: UE `Initial registration required due to [DUE-TO-DEREGISTRATION]`.
+- **Subscriber edits via portal**: `PUT /api/v1/subscribers/{supi}` upserts auth+AM data but **preserves the
+  DB SQN** (network-managed, incremented by UDM per auth). Writing a stale SQN back rewinds it and UERANSIM
+  then fails the Security Mode Command integrity check on every re-registration (it derives KAUSF from its
+  own higher SQN-MS without sending a sync-failure AUTS). The portal edit form shows SQN read-only.
 
 ### 3.12 UE Context Transfer (inter-AMF)
 
@@ -332,7 +342,33 @@ under **Feature Validation**. Run `make up-obs` first unless noted.
 - **3GPP spec**: TS 23.502 §4.2.3.3; NGAP Paging TS 38.413 §9.2.8. `docs/procedures/network-triggered-service-request.md`.
 - **How to trigger**: force CM-IDLE via `nr-cli ... ue-release`, then SMF `dl-data-notification` (see root CLAUDE.md).
 - **Expected**: AMF `NGAP Paging sent`; gNB `Paging received`.
-- **Limitations**: real UPF PFCP Downlink Data Report is UPF-001 (simulated by SMF); UERANSIM UE does not auto-respond to paging.
+- **Limitations**: real UPF PFCP Downlink Data Report is UPF-001 (simulated by SMF); UERANSIM UE
+  still does not respond to paging — two of its blockers were removed in Jul 2026 (missing TAI
+  list made the UE cancel the paging-triggered Service Request; stock gNB dropped SR initial
+  messages, fixed by patch 0051), but the UE silently ignores the RRC page (suspected 5G-S-TMSI
+  matching in `NasMm::handlePaging`; gNB confirms `Paging received` and relays to RRC).
+
+### 3.13b Service Request with User-Plane Re-activation (UE-triggered)
+
+- **Description**: a CM-IDLE UE with pending uplink data sends a Service Request; the AMF
+  re-activates the flagged PDU sessions per spec: SMF `Nsmf_PDUSession_UpdateSMContext`
+  (`upCnxState=ACTIVATING`) → N2SM info in the InitialContextSetupRequest
+  (`PDUSessionResourceSetupListCxtReq`) → gNB CxtRes DL tunnel forwarded to SMF → PFCP FAR
+  update. Requires the registration area (TAI list, IEI 0x54) in Registration Accept —
+  without it the UE cancels the SR ("current TAI is not in the TAI list").
+- **3GPP spec**: TS 23.502 §4.2.3.2 (steps 4/12), TS 24.501 §9.11.3.9 / §4.4.6, TS 38.413
+  §9.2.2.1/§9.2.2.2. `docs/procedures/service-request.md`.
+- **NFs involved**: AMF, SMF, UPF (via existing SMF PFCP modification), gNB, UE.
+- **How to trigger**: `docs/validation-commands.md` §7 — force CM-IDLE via gNB `ue-release`,
+  then `ping -I uesimtun0` from the UE.
+- **Expected outcome**: AMF `pdu_sessions_cxt_req=1` on the ICS Request and
+  `PDU session re-activated by gNB (ICS Response)`; SMF `UP re-activation` +
+  `PFCP SessionModification`; ping resumes with only the first packet lost (SR latency).
+- **Known limitations**: sessions the SMF fails to activate are skipped (UE may re-establish
+  them itself); the SR's NAS message container (0x71) is decoded as plaintext — correct under
+  the dev NEA0 null-ciphering profile. Requires UERANSIM patch `0051-gnb-amf-selection-no-nssai.patch`
+  (stock v3.2.8 gNB drops initial NAS messages that carry no Requested NSSAI, so Service
+  Request never reached the AMF).
 
 ### 3.14 DNN Subnet Isolation
 
@@ -535,26 +571,23 @@ See Section 6. Metrics (`fivegc_*`), Jaeger traces per procedure, Grafana dashbo
   - **No QoS Notification Control** callbacks to the AF (NEF-002); single `flowInfo`/`DATA`
     media component only.
 
-### 3.20 Location Management Function (LMF) — Nlmf_Location DetermineLocation (LMF-001)
+### 3.20 Location Management Function (LMF) — Nlmf_Location DetermineLocation (LMF-001, LMF-002)
 
-- **Description**: New **LMF** NF — the 5GC NF that handles **UE positioning**. This baseline
-  implements **Cell-ID positioning** (MVP, no LPP/NRPPa, no GMLC). The LMF is core-only: it
-  never has a direct N2 to the gNB and reaches the RAN exclusively through the **AMF as an NGAP
-  relay**. Flow: an LCS consumer POSTs a **DetermineLocation** request to the LMF
-  (`Nlmf_Location`, `POST /nlmf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info`); the LMF
-  calls the AMF's new **Namf_Location** producer (`POST /namf-loc/v1/ue-contexts/{id}/provide-loc-info`
-  on the existing inbound SBI :8001); the AMF sends an **NGAP LocationReportingControl**
-  (ProcCode=16, EventType=Direct, ReportArea=Cell) to the UE's gNB, correlates the async
-  **LocationReport** (ProcCode=18) back via a `sync.Map` keyed by AMF-UE-NGAP-ID (10 s timeout),
-  decodes `UserLocationInformationNR` → **NRCGI + TAI**, and returns it; the LMF wraps it as
-  **LocationData** (`shape=POINT`, `nrCellId`, `tai`, `ageOfLocationEstimate`).
-- **3GPP spec**: TS 23.273 §6/§7.2 (LMF architecture + UE positioning), **TS 29.572 §5.2.2.2**
-  (Nlmf_Location DetermineLocation) + §6.1.6.2.2 (LocationData), TS 29.518 §5.2.2.6
-  (Namf_Location AMF producer), **TS 38.413 §8.17.1** (NGAP LocationReportingControl ProcCode=16
-  / LocationReport ProcCode=18), TS 23.501 §6.2.18 (LMF description), TS 29.510 §6.1.6.3.3 (NRF
-  NFType=LMF). `docs/procedures/DetermineLocation.md`.
-- **NFs involved**: LMF (new, SBI port **8012** / metrics **9113**), AMF (new Namf_Location
-  producer + NGAP LocationReportingControl/LocationReport on N2), NRF (registration), gNB (RAN).
+- **Description**: The **LMF** NF implements **Cell-ID positioning** + **Deferred MT Location**
+  (paging-then-locate for CM-IDLE UEs) + **Location Privacy** (UDM lcsData check). The LMF is
+  core-only: it never has a direct N2 to the gNB and reaches the RAN exclusively through the
+  **AMF as an NGAP relay**. Flow: an LCS consumer POSTs a **DetermineLocation** request to the
+  LMF; the LMF first checks UDM location privacy (`/nudm-sdm/v2/{supi}/lcs-privacy-data`); if
+  allowed, calls the AMF's **Namf_Location** producer; the AMF handles CM-IDLE by paging the UE
+  (NGAP Paging ProcCode=24, T-positioning 15 s guard) before sending
+  **NGAP LocationReportingControl** (ProcCode=16) and correlating the **LocationReport** (ProcCode=18).
+- **3GPP spec**: TS 23.273 §6/§7.2 (LMF architecture + positioning), **§7.2 steps E2–E7**
+  (Deferred MT Location / paging sub-flow), **§9.1** (Location Privacy), **TS 29.572 §5.2.2.2**
+  (Nlmf_Location DetermineLocation), TS 29.518 §5.2.2.6 (Namf_Location AMF producer),
+  **TS 38.413 §8.17.1** (NGAP LocationReportingControl ProcCode=16 / LocationReport ProcCode=18),
+  **TS 29.503 §5.2.2** (Nudm_SDM lcsData). `docs/procedures/DetermineLocation.md`.
+- **NFs involved**: LMF (SBI port **8012** / metrics **9113**), AMF (Namf_Location producer +
+  NGAP relay + paging), UDM (lcsData endpoint), NRF (registration), gNB (RAN).
 - **How to trigger** (live, full stack):
   ```bash
   make ueransim                       # core (incl. lmf) + obs + gNB + 1 UE
@@ -565,31 +598,229 @@ See Section 6. Metrics (`fivegc_*`), Jaeger traces per procedure, Grafana dashbo
     -d "{\"supi\":\"$SUPI\",\"req5gsLoc\":true,\"reqCurrentLoc\":true,\"supportedGADShapes\":[\"POINT\"]}"
   docker logs amf | grep "NGAP LocationReportingControl sent"   # ProcCode=16 emitted to gNB
   docker logs lmf | grep DetermineLocation
+  docker logs udm | grep GetLcsPrivacyData   # privacy check log
+  # Paging-then-locate (force CM-IDLE first):
+  GNB=UERANSIM-gnb-1-1-1
+  UEID=$(docker exec ueransim-gnb nr-cli $GNB --exec "ue-list" | grep -oE 'ue-id: [0-9]+' | head -1 | grep -oE '[0-9]+')
+  docker exec ueransim-gnb nr-cli $GNB --exec "ue-release $UEID"   # → CM-IDLE
+  curl -sk ... POST .../provide-loc-info ...   # LMF pages → UE reconnects → locate succeeds
   # Unit + functional (no stack):
   go test ./nf/lmf/... ./nf/amf/internal/ngap/... ./nf/amf/internal/sbi/...
-  go test -tags=functional ./nf/lmf/tests/...                   # 6 scenarios
+  go test -tags=functional ./nf/lmf/tests/...                   # 8 scenarios
   ```
-- **Expected outcome**: LMF logs `procedure=DetermineLocation` with `interface=Nlmf` (IN) and
-  `Namf`/`N2` (OUT), `correlation_id`, `supi`, `result`, `cause`, `duration_ms`. AMF logs
-  `procedure=ProvideLocationInfo` + `NGAP LocationReportingControl sent` (`amf_ue_ngap_id`,
-  `ran_ue_ngap_id`, `spec_ref=TS 38.413 §8.17.1`). On a successful fix → `200` LocationData with
-  `nrCellId` (NRCGI hex) + `tai`. Errors: `400 MANDATORY_IE_MISSING` (no `supi`/`gpsi`),
-  `404 CONTEXT_NOT_FOUND` (UE unknown in AMF), `504 LOCATION_FAILURE` / `UE_NOT_REACHABLE`
-  (no LocationReport before timeout / CM-IDLE). Metrics:
-  `fivegc_lmf_locate_total{result="OK"|"REJECT"|"FAILURE"}` on :9113 +
-  `fivegc_procedure_total{nf="AMF",procedure="ProvideLocationInfo"}`; Grafana **"LMF — Location
-  Management Function"** row (success/reject rate + rate-by-result).
+- **Expected outcome**: LMF logs `procedure=DetermineLocation` with `interface=Nlmf` (IN),
+  `Namf`/`N2` (OUT), `result`, `cause`, `duration_ms`. UDM logs `GetLcsPrivacyData` per request.
+  On CM-IDLE + paging success: AMF logs `paged UE reconnected` then proceeds to locate. On
+  BLOCK_ALL: `403 PRIVACY_EXCEPTION_DENIED`. Metrics:
+  `fivegc_lmf_locate_total{result="OK"|"REJECT"|"FAILURE"}` on :9113.
 - **Known limitations**:
-  - **UERANSIM v3.2.8 has no LocationReport handler**: the gNB receives our LocationReportingControl
-    but logs `Unhandled NGAP initiating-message` and never replies, so a live fix times out
-    (`504`). The AMF→gNB control emit is validated **live**; the RAN→AMF LocationReport decode
-    (NRCGI/TAI extraction) is covered by **unit tests** (codec round-trip) + functional BDD — the
-    same posture as URSP/NSSAA.
-  - **Cell-ID only** (LMF-002+): no LPP/NRPPa relay (E-CID/OTDOA/NR-ECID/GNSS), no
-    EventSubscription/periodic/area-of-interest, no CancelLocation, no GMLC/N56 (TS 29.515), no
-    UDM location-privacy check, no LocationContextTransfer during handover.
-  - **Placeholder lat/lon**: `locationEstimate.point` is `lat=0,lon=0` unless an optional
-    plmn→cell→coordinate map is configured; the authoritative result is the `nrCellId`.
+  - LPP/NRPPa relay (OTDOA/GNSS): deferred (only E-CID subset implemented — see §3.20.3).
+  - Location privacy: only `ALLOW_ALL` vs `BLOCK_ALL` enforced; `lcsPrivacyExceptionList` (per-service-class) not yet evaluated.
+  - UDM lcsData: dev endpoint always returns `ALLOW_ALL`; no database-backed subscriber policy.
+
+### 3.20.1 Live Cell-ID E2E + UE Location map (LMF-006)
+
+- **Description**: completes the **live** positioning flow and adds monitoring on top of LMF-001.
+  - **UERANSIM gNB patch** `tools/ueransim/patches/0040-location-reporting.patch`: stock v3.2.8 gNB
+    has no `LocationReportingControl` handler (it logs *"Unhandled NGAP initiating-message"* and
+    never replies). The patch adds `receiveLocationReportingControl()`, which answers with a
+    **LocationReport** carrying the serving NR-CGI + TAI (TS 38.413 §8.17). Rebuild:
+    `make ueransim-build-only`.
+  - **LMF mobility model** (`nf/lmf/internal/server/mobility.go`): cell-ID positioning carries no
+    lat/lon on the wire, so the LMF synthesizes coordinates — a deterministic, bounded, per-SUPI
+    walk anchored at the serving cell's configured base coordinate. Artificial values, realistic
+    moving behavior; horizontal accuracy reported in `locationEstimate.uncertainty` (m). The
+    authoritative output remains the serving cell. Configured in `nf/lmf/config/dev.yaml`
+    (`cell_coordinates`, `default_coordinate`, `mobility.{enabled,radius_m,speed_mps}`).
+  - **Portal "UE Location" page**: live Leaflet map (auto-poll 3 s) + table, backed by
+    `GET /api/v1/location/summary` and `/location/ue/{supi}` (LCS-client proxy to the LMF over
+    mTLS). CM-IDLE/unreachable UEs are listed with their 3GPP cause.
+- **How to trigger**:
+  ```bash
+  make ueransim
+  docker exec ueransim-ue nr-cli imsi-001010000000001 -e "ps-establish IPv4 --dnn internet"
+  bash scripts/validate-ueransim-mod.sh location   # NRCGI + moving-coordinate assertions
+  docker logs ueransim-gnb | grep "Location Report sent"
+  make portal   # → http://localhost:8080/location  (moving markers)
+  ```
+- **Expected outcome**: `200` LocationData with the serving `nrCellId`/`tai` and a **non-zero,
+  moving** `lat/lon`; gNB logs `Location Report sent`; two polls a few seconds apart return
+  different coordinates. Unit: `nf/lmf/internal/server/mobility_test.go`.
+- **Known limitations**: only `EventType=Direct` (single report) is honored on the gNB; periodic /
+  change-of-cell reporting is logged-and-single-shot. OSM map tiles need outbound internet.
+
+### 3.20.2 Nlmf_Location EventSubscription + CancelLocation (LMF-003)
+
+- **Description**: Adds a **subscription model** to the LMF so callers receive ongoing location
+  updates instead of repeated one-shot queries. Two event-trigger types:
+  - **PERIODIC_REPORTING**: LMF re-runs DetermineLocation at `reportingInterval` (default 10 s)
+    and POSTs each result to the subscriber's `notificationUri` as a `LocationNotification` body
+    (TS 29.572 §6.1.6.2.4).
+  - **AREA_OF_INTEREST**: LMF samples every `samplingInterval` (default 5 s) and fires a
+    notification **only on polygon enter/exit** (ray-casting state machine: UNKNOWN → IN/OUT).
+    No spurious notifications while the UE is stationary.
+  - **CancelLocation** (one-shot cancel): `POST /nlmf-loc/v1/ue-contexts/{id}/cancel-loc` aborts
+    an in-progress DetermineLocation via a `context.CancelFunc` stored in a `sync.Map`.
+  - **Subscription lifetime**: each subscription drives one goroutine; DELETE or duration expiry
+    stops it. In-memory registry (`sync.RWMutex`); Redis persistence deferred.
+- **3GPP spec**: TS 29.572 §5.2.3 (EventSubscription Create/Get/Delete), §5.2.2.5 (CancelLocation),
+  §6.1.6.2.4 (LocationNotification body), TS 23.273 §7.2 step B2. `docs/procedures/EventSubscription.md`.
+- **NFs involved**: LMF (SBI port **8012**)
+- **How to trigger**:
+  ```bash
+  make ueransim   # LMF and gNB patch in place (LMF-006 prerequisite)
+
+  # Create a periodic subscription (notify every 5 s):
+  curl -sk --cert pki/amf.crt --key pki/amf.key --cacert pki/ca.crt \
+    -X POST https://localhost:8012/nlmf-loc/v1/subscriptions \
+    -H 'Content-Type: application/json' \
+    -d '{"ueContextId":"imsi-001010000000001","supi":"imsi-001010000000001",
+         "eventTrigger":"PERIODIC_REPORTING","reportingInterval":5,
+         "notificationUri":"http://MY-SINK:9100/notify"}' -v
+  # → 201 Created + Location: /nlmf-loc/v1/subscriptions/<subId>
+
+  # List (GET) a subscription:
+  curl -sk --cert pki/amf.crt --key pki/amf.key --cacert pki/ca.crt \
+    https://localhost:8012/nlmf-loc/v1/subscriptions/<subId>
+
+  # Cancel:
+  curl -sk --cert pki/amf.crt --key pki/amf.key --cacert pki/ca.crt \
+    -X DELETE https://localhost:8012/nlmf-loc/v1/subscriptions/<subId>
+
+  # Unit + BDD tests (no stack needed):
+  go test ./nf/lmf/internal/server/...              # 831-line subscription unit tests
+  go test -tags=functional ./nf/lmf/tests/features/ # 20 scenarios (13 s)
+  ```
+- **Expected outcome**: `201` on create with `Location` header; periodic subscription fires
+  `LocationNotification` at the configured interval; AOI subscription fires exactly once per
+  boundary crossing. `DELETE` stops goroutine and returns `204`. Metrics: `fivegc_lmf_subscription_create_total{result}`, `fivegc_lmf_subscriptions_active`.
+- **Known limitations**: notification delivery retries once on 5xx (no exponential backoff); no
+  Redis persistence (in-memory only; subscriptions lost on LMF restart). eventTrigger/AOI enum
+  tokens are LMF-internal — not yet reconciled with the canonical TS 29.572 §6.1.6.3
+  `LocationEventType`/`AreaEventType` names from the 3GPP YAML (see §Conformance Notes in
+  `docs/procedures/EventSubscription.md`).
+
+### 3.20.3 NRPPa Relay — E-CID Positioning (LMF-004)
+
+- **LMF side (PASS 2)**: `nf/lmf/internal/server/ecid.go` adds quality-driven method
+  selection on the DetermineLocation request `lcsQoS.hAccuracy` (TS 23.273 §6.2.9 /
+  TS 29.572): `>200 m` or absent → Cell-ID (LMF-001 path); `50–200 m` → E-CID; `<50 m` →
+  LPP/GNSS desired (LMF-005, MVP downgrades to E-CID). `performECIDOrFallback` runs two
+  synchronous NRPPa rounds via the AMF `SendDLNRPPa` client (`amf_client.go`): a capability
+  query (`PositioningInformationRequest` → `Response.ECIDSupported`) then a measurement round
+  (`E-CIDMeasurementInitiationRequest` → `E-CIDMeasurementReport`). Position comes from the
+  gNB-reported **`NG-RANAccessPointPosition`** (TS 38.455 §9, a real optional IE — TS 38.455's
+  `measuredResults` is E-UTRA-only and cannot carry NR neighbour RSRP, so the E-CID position
+  is the gNB's own WGS84 estimate, not a computed centroid), clamps uncertainty `≤150 m` (or
+  `300 m` falling back to the serving-cell anchor when the gNB reports no AP position), and
+  tags `positioningDataList=["eCID"]`. Any NRPPa failure
+  (capability NONE, error, or timeout) transparently **falls back to Cell-ID — never a 5xx**.
+  The UDM privacy gate (BLOCK_ALL → 403 PRIVACY_EXCEPTION_DENIED) runs **before** any NRPPa.
+  Metric `fivegc_lmf_ecid_total{result=OK|FALLBACK_CELLID|FAILURE}`; 5 godog scenarios
+  (25/25 LMF functional pass). **Live gNB leg (UERANSIM patch 0041) deferred to LMF-008** —
+  stock UERANSIM v3.2.8 has no NRPPa-Transport handler (same posture as LMF-001/LMF-006).
+- **Description (PASS 1)**: Implements the **AMF side** of the NRPPa relay for E-CID positioning.
+  The AMF is a **pure relay** — it does NOT decode NRPPa-PDU content (TS 38.413 §8.17.3 note).
+  Additions in this pass:
+  - **`shared/nrppa/` codec package** — real ASN.1 Aligned PER (APER) codec for the E-CID
+    subset of NRPPa (TS 38.455 §8): PositioningInformationRequest/Response/Failure
+    (ProcedureCode=9), E-CIDMeasurementInitiation{Request/Response/Failure} (ProcedureCode=2),
+    E-CIDMeasurementReport (ProcedureCode=4; serving cell + optional gNB-reported
+    `NG-RANAccessPointPosition`). Encoded via `github.com/free5gc/aper` Marshal/Unmarshal on
+    hand-written structs mirroring the TS 38.455 ASN.1 module (`nrppa_asn1.go`) — free5gc ships
+    no NRPPa module of its own, unlike NGAP. Rewritten 2026-07-01 from an earlier
+    non-conformant hand-rolled TLV format that also used the wrong ProcedureCodes (12/6/8,
+    colliding with real unrelated TS 38.455 procedures); see
+    `docs/procedures/NRPPaRelay.md` §"NRPPa fix — real APER + correct procCodes".
+  - **NGAP NRPPa Transport codec** in `nf/amf/internal/ngap/codec.go`:
+    - `BuildDownlinkUEAssociatedNRPPaTransport` (ProcCode=8, AMF→gNB)
+    - `BuildDownlinkNonUEAssociatedNRPPaTransport` (ProcCode=5, AMF→gNB)
+    - `extractUplinkUEAssociatedNRPPaTransport` (ProcCode=50, gNB→AMF)
+    - `extractUplinkNonUEAssociatedNRPPaTransport` (ProcCode=47, gNB→AMF)
+    - 4 new `ProcedureCode` constants (5, 8, 47, 50) + dispatch cases in `dispatch()`.
+  - **AMF NGAP server** (`nf/amf/internal/ngap/ngap.go`):
+    - `NRPPaResult` struct; `pendingNRPPa sync.Map` (keyed by AMF-UE-NGAP-ID)
+    - `SendDownlinkNRPPa` — inserts pending channel + writes DL NGAP PDU
+    - `handleUplinkUEAssociatedNRPPa` — resolves pending channel; orphan → `nrppa_orphan` warn
+    - `handleUplinkNonUEAssociatedNRPPa` — logs and drops (non-UE relay is pass 2)
+  - **AMF SBI server** (`nf/amf/internal/sbi/`):
+    - `NRPPaRelay` interface; `SetNRPPaRelay(r NRPPaRelay)` wiring method
+    - `handleDLNRPPaInfo` — `POST /namf-loc/v1/ue-contexts/{id}/dl-nrppa-info`
+      Synchronous blocking model (mirrors `handleProvideLocInfo`): relays DL NRPPa to gNB,
+      blocks until UL NRPPa arrives on pendingNRPPa channel (or 10 s timeout → 504).
+      Requires UE CM-CONNECTED (no paging fallback for NRPPa).
+    - New SBI types: `DLNRPPaInfoReq`, `DLNRPPaInfoRsp`, `CauseNRPPaRelayFailure`
+  - **Metric**: `fivegc_amf_nrppa_transport_total{direction="UL|DL",assoc="UE|NON_UE"}`
+    in `shared/observability/metrics/metrics.go`.
+  - **Wiring**: `sbiSrv.SetNRPPaRelay(ngapSrv)` in `nf/amf/cmd/amf/main.go`.
+- **3GPP spec**: TS 38.413 §8.17.3/§8.17.4 (NGAP NRPPa Transport); TS 38.455 §8 (NRPPa
+  procedures); TS 23.273 §7.2 step C; TS 29.518 §5.2.2.6 (Namf_Location extension).
+  `docs/procedures/NRPPaRelay.md`.
+- **NFs involved**: AMF (relay, this pass), LMF (pass 2), gNB / UERANSIM gNB patch (pass 2).
+- **How to trigger** (unit tests only — pass 2 wires the LMF side):
+  ```bash
+  GOWORK=off go test ./shared/nrppa/...               # codec round-trip, RSRP fidelity
+  GOWORK=off go test ./nf/amf/internal/ngap/... -run NRPPa   # NGAP codec + dispatch
+  GOWORK=off go test ./nf/amf/internal/sbi/...  -run NRPPa   # SBI handler 200/404/400/504/503
+  ```
+- **Expected outcome**: all tests green. `fivegc_amf_nrppa_transport_total` counter increments
+  on DL send and UL receive.
+- **Known limitations**: LMF side is now wired (PASS 2 above); the UE-associated E-CID path is
+  complete in-process. Non-UE-associated relay (ProcCode 5/47) is decoded and logged but not yet
+  forwarded to the LMF (cell-level positioning, future). UERANSIM v3.2.8 has no NRPPa handler so
+  the live E-CID leg is deferred to LMF-008 (gNB patch 0041). `fivegc_lmf_ecid_total{FAILURE}`
+  is defined but not incremented (downstream Cell-ID failure is counted by
+  `fivegc_lmf_locate_total{FAILURE}`). LMF has no OTel spans yet (only core NF missing traces).
+
+### 3.20.4 Live GNSS E2E — A-GNSS via LPP (LMF-005 core + LMF-009 live)
+
+- **Description**: UE-assisted A-GNSS positioning over LPP (TS 37.355), carried on N1 NAS with
+  the AMF as a transparent relay. LMF-005 built the core (`shared/lpp` codec, AMF relay, LMF
+  state machine + WLS solver); **LMF-009** made it work end-to-end against a real UE by (a)
+  rewriting `shared/lpp` from `free5gc/aper` **ALIGNED PER** to a hand-rolled X.691 **BASIC-PER
+  UNALIGNED** codec (`shared/lpp/uper.go`) with real TS 37.355 messages — resolving the
+  aligned-vs-unaligned deviation the LMF-005 notes flagged — and (b) adding UERANSIM UE patch
+  `tools/ueransim/patches/0042-lpp-gnss.patch`, an LPP responder for payload container type 3.
+- **3GPP spec**: TS 37.355 §4 (UNALIGNED PER)/§5.2/§6, TS 24.501 §8.7.4/§9.11.3.40 (payload
+  container type 3), TS 38.413 §8.6.2/§8.6.3 (DL/UL NAS Transport), TS 23.273 §6.2.10.
+- **NFs involved**: LMF (drives 3 LPP legs + WLS fix), AMF (transparent N1 relay), gNB (opaque
+  N2 relay), UE (patched UERANSIM LPP responder).
+- **Wire flow (3 legs)**: Leg1 `RequestCapabilities`→`ProvideCapabilities` (sync); Leg2
+  `ProvideAssistanceData` (DL-only, unsolicited — AMF `expectUlResponse=false` → 204, no
+  waiter); Leg3 `RequestLocationInformation`→`ProvideLocationInformation` (sync). LPP
+  transaction echo verified per TS 37.355 §5.2 (TransactionNumber 0..255, initiator=
+  locationServer, UE echoes). The UE derives its synthetic GNSS measurements deterministically
+  from the wire-quantized reference location (quantized-anchor rule) so the LMF's Gauss-Newton
+  WLS converges to a fix near the anchor.
+- **How to trigger**:
+  ```bash
+  make ueransim                        # LPP-patched UE (patch 0042)
+  bash scripts/validate-ueransim-mod.sh gnss
+  # Or directly:
+  SUPI=imsi-001010000000001
+  curl -sk --http2 --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt \
+    -X POST https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info \
+    -H 'Content-Type: application/json' \
+    -d "{\"supi\":\"$SUPI\",\"locationQoS\":{\"hAccuracy\":30}}"
+  ```
+- **Expected outcome**: 200 with `positioningDataList:["gnss"]`, uncertainty ≤ 50 m (typically
+  5 m). UE logs `LPP RequestCapabilities received -> ProvideCapabilities (GNSS supported)`,
+  `LPP ProvideAssistanceData received`, `LPP RequestLocationInformation received ->
+  ProvideLocationInformation (4 satellites)`; AMF logs `DownlinkLPP sent` + `UplinkLPP
+  received` + the DL-only 204 leg; LMF logs `GNSS position calculated` (`lpp_state:FIXED`).
+  Metrics `fivegc_lmf_gnss_total{OK}` + `fivegc_amf_lpp_transport_total{DL,UL}`.
+- **Negative mode**: recreate the UE with env `LPP_GNSS_NONE=1` → UE reports GNSS unsupported →
+  LMF logs `GNSS capability=NONE from UE` → falls back to E-CID (200, `["eCID"]`, no 5xx).
+- **PER conformance**: `shared/lpp` UNALIGNED-PER output is validated byte-correct by the real
+  Wireshark 4.6.4 LPP dissector — both in the `TestTsharkOracle_AllGoldenPDUs` unit test (7
+  golden PDUs, zero malformed) and in a live N2 capture where tshark decoded the three DL legs
+  as valid LPP with zero malformed frames (SCTP PPID 60). The two UL legs are NEA2-ciphered on
+  the live link (correct per TS 33.501); their wire-correctness is proven by the golden oracle.
+- **Known limitations**: A-GNSS (GPS, UE-assisted) subset only — OTDOA/DL-TDOA/DL-AoD/
+  NR-multi-RTT out of scope. The synthetic constellation + pseudoranges are deterministic
+  simulation values (no real GNSS receiver). `positioningDataList` uses the LMF-internal
+  lowercase `"gnss"` label rather than TS 29.572's `PositioningMethodAndUsage`/
+  `gnssPositioningDataList` object shape (reconcile before external LCS interop).
 
 ---
 
@@ -794,6 +1025,7 @@ See `docs/pcap-diagnostics.md` for NGAP/HTTP2 troubleshooting.
 | `SMF_ADDR` / `SMF_URL` | host:port / URL | AMF, portal, MCP | SMF endpoint |
 | `UDM_ADDR` / `UDM_URL` | host:port / URL | AUSF, portal | UDM endpoint |
 | `PCF_URL` | URL | SMF, AMF | PCF endpoint |
+| `LMF_URL` | URL | portal | LMF endpoint for the UE Location page (Nlmf_Location; default `https://lmf:8012`) |
 | `DATABASE_URL` | DSN | AMF, SMF, UDR | PostgreSQL connection |
 | `REDIS_URL` | URL | NRF, AMF, AUSF | Redis connection |
 | `OPERATOR_CONFIG_PATH` / `NF_CONFIGS_PATH` | path | NFs, portal | Path to `config/operator.yaml` / per-NF configs |
@@ -810,6 +1042,12 @@ See `docs/pcap-diagnostics.md` for NGAP/HTTP2 troubleshooting.
 
 Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`; operator-wide topology (DNNs, slices) in
 `config/operator.yaml` (single source of truth).
+
+Notable per-NF YAML keys added recently:
+
+| Key | File | Description |
+|---|---|---|
+| `served_tacs` (list of ints, default `[1]`) | `nf/amf/config/dev.yaml` | Registration area advertised as the TAI list (IEI 0x54) in every Registration Accept. Must cover every TAC the connected gNBs broadcast; the UE's current TAC is always appended if missing. Ref: TS 24.501 §9.11.3.9 |
 
 ### Docker Compose service & port map
 | Service | Container | Published ports |
@@ -914,3 +1152,18 @@ agent roles in `AGENTS.md`. After big changes run `/graphify . --update` (knowle
 - [2026-06-23] ci,build: catch all-NF build failures before compose-up — new `go-build` CI job (`GOWORK=off go build ./nf/... ./shared/...`) + docker matrix expanded to all 12 core NFs; root cause of the bsf/nef CI break was main's module path (claudia-5gc) vs merged-in 5gc-rel17 import paths. Fixed the stragglers on main and made `scripts/release-public.sh` auto-rewrite `5gc-rel17`→`claudia-5gc` + compile-gate before publishing.
 - [2026-06-23] docs,template: aligned `nf/_template/` with the real root-module build (Dockerfile `GO_VERSION=1.26.2` + `COPY go.mod go.sum*`+`shared/`; added the missing Makefile) and added a §0 New NF Checklist (no per-NF go.mod, root-module import paths, `GOWORK=off go mod tidy`, wire into CI matrix + docker-compose + Makefile, verify with go build + make docker). Root CLAUDE.md "New NF" rule expanded accordingly.
 - [2026-06-23] lmf,amf: new **LMF** NF (LMF-001) — Nlmf_Location DetermineLocation (Cell-ID MVP, TS 29.572 §5.2.2.2) on mTLS+HTTP/2 SBI :8012 / metrics :9113, NRF registration (NFType=LMF, service nlmf-loc), `fivegc_lmf_locate_total{result}` + Grafana LMF row. AMF additions: Namf_Location producer (`POST /namf-loc/v1/ue-contexts/{id}/provide-loc-info` on :8001, TS 29.518 §5.2.2.6) + NGAP **LocationReportingControl** builder (ProcCode=16) & **LocationReport** decoder (ProcCode=18, UserLocationInformationNR→NRCGI+TAI, TS 38.413 §8.17.1) with a `sync.Map` AMF-UE-NGAP-ID→chan correlation (10 s timeout). Wired into docker-compose (lmf + lmf-pcap, profile core), CI docker matrix, Makefile NFS, PKI (pki/lmf.crt/key). 9 AMF unit + 6 LMF unit + 6 LMF BDD scenarios. Live: AMF→gNB control emit verified; UERANSIM v3.2.8 has no LocationReport handler so the RAN→AMF leg is unit/functional-tested (codec round-trip). Also fixed a pre-existing Prometheus scrape gap (8 NFs incl. smf/pcf/upf/nssf/smsf/bsf/nef were not scraped) [TS 23.273 / TS 29.572 / TS 29.518 / TS 38.413].
+- [2026-06-23] lmf,ueransim,portal: **live Location Reporting E2E** (LMF-006) — UERANSIM gNB patch `0040-location-reporting.patch` adds the missing NGAP `LocationReportingControl` handler (replies with a `LocationReport` carrying serving NR-CGI+TAI, TS 38.413 §8.17), closing the live LMF Cell-ID flow that previously timed out. LMF gains a synthetic **mobility model** (`internal/server/mobility.go`): deterministic, bounded, per-SUPI walk anchored at the serving cell (`cell_coordinates`/`default_coordinate`/`mobility` in dev.yaml) — artificial but realistically moving lat/lon, accuracy in `locationEstimate.uncertainty`. Management portal adds a **UE Location** page (live Leaflet map + table, auto-poll 3 s) via `GET /api/v1/location/{summary,ue/{supi}}` (mTLS LCS-client proxy) + new `LMF_URL` env. Corrected the stale BACKLOG/doc note that claimed UERANSIM answered LocationReportingControl. Unit: `nf/lmf/.../mobility_test.go`; validation: `scripts/validate-ueransim-mod.sh location`.
+- [2026-06-24] lmf,amf,udm: **Deferred MT Location + Location Privacy** (LMF-002) — (A) AMF `handleProvideLocInfo` no longer immediately rejects CM-IDLE UEs: it pages the UE via NGAP Paging (ProcCode=24) using the existing `Pager` interface, stores a `chan struct{}` in `pendingLocPage` (sync.Map keyed by AMF-UE-NGAP-ID), and blocks up to T-positioning (15 s guard, `pageTimeout` constant); the UE's Service Request fires `onUEReachable` → `sbiSrv.NotifyUEReachable` → channel signal → falls through to NGAP LocationReportingControl. Timeout → 504 UE_NOT_REACHABLE. New public method `NotifyUEReachable` on `amfsbi.Server`; forward declaration in `cmd/amf/main.go` to avoid import cycle. (B) UDM gains `GET /nudm-sdm/v2/{supi}/lcs-privacy-data` (always returns `ALLOW_ALL` in dev). LMF gains `UDMSDMClient` interface + `HTTPUDMSDMClient` (5-min per-SUPI cache, fail-open); before calling AMF, LMF checks `cfg.PrivacyCheck && udmClient.GetLcsPrivacyData` — `BLOCK_ALL` → 403 PRIVACY_EXCEPTION_DENIED, any other value or error → proceed. New `privacy_check: true` in `nf/lmf/config/dev.yaml`; `peers.udm: "udm:8003"`. Tests: 2 new AMF unit (paging timeout + paging success), 2 new LMF unit (privacy denied + privacy allowed), 2 new LMF BDD scenarios (Scenarios 7+8), LMF BDD step defs extended with `fakeUDMClient`. Build gate clean [TS 23.273 §7.2 E2–E7 / §9.1 / TS 29.503 §5.2.2].
+- [2026-06-27] lmf: **Nlmf_Location EventSubscription + CancelLocation** (LMF-003) — LMF gains a subscription model (TS 29.572 §5.2.3) with two event-trigger types: `PERIODIC_REPORTING` (re-locate at `reportingInterval`, notify every sample) and `AREA_OF_INTEREST` (sample at `samplingInterval`, notify only on polygon entry/exit via ray-casting state machine IN/OUT/UNKNOWN). One goroutine per subscription, in-memory registry (`sync.RWMutex`). Privacy gate at Create (BLOCK_ALL→403). **CancelLocation** (one-shot cancel) via `POST /nlmf-loc/v1/ue-contexts/{id}/cancel-loc` fires a stored `context.CancelFunc`. Notification delivery: mTLS HTTP/2 client posting `LocationNotification` body, retry-once on 5xx. New endpoints: `POST/GET/DELETE /nlmf-loc/v1/subscriptions[/{subId}]` + `POST …/cancel-loc`. Config: `location_subscription` block in `dev.yaml`. Metrics: `fivegc_lmf_subscription_create_total{result}` + `fivegc_lmf_subscriptions_active`; 2 Grafana panels. 20 BDD scenarios (12 EventSubscription + 8 DetermineLocation), all pass. `docs/procedures/EventSubscription.md` with Mermaid diagram. Compliance matrix rows: EventSubscription + CancelLocation [TS 29.572 §5.2.3/§5.2.2.5 / TS 23.273 §7.2 step B2].
+- [2026-06-27] amf,shared: **NRPPa Relay E-CID PASS 1** (LMF-004) — AMF-side NRPPa relay: new `shared/nrppa/` codec (7 message types, compact TLV wire format, RSRP fidelity, 13 unit tests); 4 NGAP ProcedureCode constants (DL-NonUE=5, DL-UE=8, UL-NonUE=47, UL-UE=50); BuildDownlink{UE,NonUE}AssociatedNRPPaTransport builders + extractUplink extractors + dispatch cases in AMF ngap package; `NRPPaResult` + `pendingNRPPa sync.Map` + `SendDownlinkNRPPa` + `handleUplink{UE,NonUE}AssociatedNRPPa` in ngap.Server; `NRPPaRelay` interface + `handleDLNRPPaInfo` POST handler on `namf-loc/v1/ue-contexts/{id}/dl-nrppa-info` (synchronous blocking model, 10 s guard, mirrors ProvideLocInfo); `DLNRPPaInfoReq/Rsp` SBI types; `fivegc_amf_nrppa_transport_total{direction,assoc}` metric; wired with `SetNRPPaRelay(ngapSrv)` in main.go. 5 NGAP codec unit tests + 7 SBI handler tests (200/404/400/503/504). AMF build + race-test green [TS 38.413 §8.17.3/§8.17.4 / TS 38.455 §8 / TS 23.273 §7.2 step C / TS 29.518 §5.2.2.6].
+- [2026-06-27] lmf,amf,shared: **NRPPa Relay E-CID positioning COMPLETE** (LMF-004) — LMF side (PASS 2) added on top of the AMF/`shared/nrppa` PASS 1: quality-driven method selection (`lcsQoS.hAccuracy` 50–200 m → E-CID, >200 m → Cell-ID; `nf/lmf/internal/server/ecid.go`), two synchronous NRPPa rounds via the AMF `SendDLNRPPa` client (capability + measurement), weighted-centroid RSRP fix (uncertainty ≤150 m, `positioningDataList=["eCID"]`), transparent Cell-ID fallback on any NRPPa failure (never 5xx), privacy gate before NRPPa. Metric `fivegc_lmf_ecid_total{result}` + 4 Grafana panels. 5 godog scenarios (25/25 LMF functional pass). SPEC-VERIFIER CONFORMANT (ProcCodes 5/8/47/50 confirmed; the backlog's "66–69" was wrong). Live gNB leg (UERANSIM patch 0041) deferred to LMF-008 [TS 38.455 §8 / TS 38.413 §8.17.3 / TS 23.273 §6.2.9 / TS 29.572 §5.2.2.2]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-06-28] lmf,ueransim: **live E-CID E2E** (LMF-008) — UERANSIM gNB patch `0041-nrppa-transport.patch` adds the missing NGAP `DownlinkUEAssociatedNRPPaTransport` handler (ProcCode 8): the gNB decodes the `shared/nrppa` E-CID wire format and replies over `UplinkUEAssociatedNRPPaTransport` (ProcCode 50) with `PositioningInformationResponse{E-CID supported}` then `E-CIDMeasurementReport` carrying synthetic RSRP (serving −70 dBm, 2 neighbours −90 dBm; NRCGI = config PLMN + `nci<<4`, so `nrcgiToHex` matches `cell_coordinates`). `sendNgapUeAssociated` auto-inserts AMF/RAN-UE-NGAP-ID; the patch pushes only the NRPPa-PDU IE (id 46). This closes the live LMF→AMF→gNB→AMF→LMF E-CID flow that LMF-004 left falling back to Cell-ID (stock v3.2.8 had no NRPPa handler). `make ueransim-build-only` compiles `0041` cleanly. New `scripts/validate-ueransim-mod.sh nrppa` scenario, validated live: `DetermineLocation` with `{"locationQoS":{"hAccuracy":100}}` → 200 `positioningDataList:["eCID"]`, uncertainty 150 m ≤150, serving `000000010`; gNB+AMF logs show both NRPPa rounds. No Go code changed (core-side was LMF-004) [TS 38.455 §8 / TS 38.413 §8.17.3 / TS 23.273 §6.2.9]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-01] lmf,amf,ueransim,shared: **NRPPa E-CID fix — real APER + correct ProcedureCodes** (LMF-004 fix) — pcap analysis found `shared/nrppa/` was a hand-rolled TLV format (not real APER despite its doc comment) with `ProcedureCode` constants (12/6/8) colliding with real unrelated TS 38.455 procedures, dissecting as malformed once real IE content was present. Rewrote `shared/nrppa/nrppa_asn1.go` as hand-written Go structs (`aper:"..."` tags) mirroring the TS 38.455 ASN.1 module, encoded via `github.com/free5gc/aper` Marshal/Unmarshal (free5gc has no NRPPa module). Corrected ProcedureCodes: positioningInformationExchange=9, e-CIDMeasurementInitiation=2, e-CIDMeasurementReport=4 (TS 38.455 Table 9.1-1); added the previously-omitted mandatory `NRPPaTransactionID`. Fixed a self-inflicted double extension-bit bug from over-tagging primitive wrappers (both the wrapper struct and its inner field tagged `valueExt`), verified via isolated `aper.MarshalWithParams` byte comparisons. Replaced the RSRP-weighted-centroid position algorithm (which had no spec-legal wire representation — TS 38.455's `measuredResults` IE is E-UTRA-only) with the real, optional `NG-RANAccessPointPosition` IE (TS 38.455 §9, TS 23.032 Ellipsoid-Point-with-Uncertainty-Ellipse shape) that the gNB reports; `nf/lmf/internal/server/ecid.go` `computeECIDPosition` uses it (clamped 50–150 m) or falls back to the serving-cell anchor (300 m). `tools/ueransim/patches/0041-nrppa-transport.patch` regenerated from scratch against the new Go encoder — compiled+linked in a real UERANSIM v3.2.8+patches source tree (`g++ -Wall -Wextra -pedantic`, 0 warnings). New regression tests: `TestGoldenECIDMeasurementReport`, `TestProcedureCodesMatchSpec`, AP-position round-trip tests [TS 38.455 §8/§9, TS 38.413 §8.17.3, TS 23.273 §6.2.9, TS 23.032 §6.2/§6.7]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-01] lmf,ueransim,shared: **NRPPa E-CID fix follow-up — two more bugs found only by live pcap re-capture** — the round-trip unit tests above kept passing throughout both bugs (encode and decode shared the same wrong assumption each time), so only decoding a fresh capture with Wireshark's independent NRPPa ASN.1 dissector caught them. (1) `NGRANCell` CHOICE index (`eUTRA-CellID`/`nR-CellID`/`choice-Extension`, 3 real alternatives) was tagged `valueUB:1` (2 alternatives, 1 bit) instead of `valueUB:2` (3 alternatives, 2 bits) — even though this codec never constructs `choice-Extension`, the wire WIDTH must still reflect all 3 alternatives; Wireshark decoded the branch as `choice-Extension` instead of `nR-CellID` and every downstream bit (the entire `NG-RANAccessPointPosition`) came out as garbage. (2) `Latitude`/`Longitude` had been "fixed" as a 3-octet `aper.OctetString` based on a wrong diagnosis of an unrelated all-zero-value edge case (`"bits value is over capacity"`) — a websearch of X.691 §10.5.7.4 confirmed free5gc/aper's actual behaviour for constrained-INTEGER ranges >64K (an octet-aligned length-determinant + minimal octets for the specific value) IS the correct X.691 procedure, not a library bug; reverted to plain `int64` fields, and the gNB patch's C++ now mirrors the same length-determinant shape. Both fixed, gNB patch 0041 rebuilt+recompiled+recaptured: final live pcap shows zero malformed packets, zero Expert Info warnings, and every `NG-RANAccessPointPosition` field decodes byte-exact (`latitude=3767118`, `longitude=-172609`, `uncertaintySemi-major/minor=25`, `confidence=68`). See `docs/procedures/NRPPaRelay.md` §7 for the full narrative. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-01] lmf,amf,shared: **LPP relay — GNSS positioning via N1** (LMF-005) — LPP (LTE Positioning Protocol, TS 37.355) over the N1 NAS interface with the AMF as a transparent relay. New `shared/lpp/` package: hand-written APER structs (`github.com/free5gc/aper`, same family as NGAP/NRPPa) for the A-GNSS message subset (RequestCapabilities, ProvideCapabilities, ProvideAssistanceData+RequestLocationInformation, ProvideLocationInformation) + WGS84↔ECEF conversions + synthetic ephemeris + Gauss-Newton weighted-least-squares GNSS solver (`SolveWLS`), golden-hex codec tests. AMF: **additive** `PayloadContainerType == 0x03` (LPP) branch in `handleULNASTransport` (existing N1SM/SMS/UEPolicy branches byte-identical), `SendDownlinkLPP` (builds `DLNASTransport{PayloadContainerType: 0x03}`), `pendingLPP sync.Map` correlation keyed by AMF-UE-NGAP-ID, and `POST /namf-loc/v1/ue-contexts/{id}/dl-lpp-info` synchronous relay handler (10 s guard, mirrors `dl-nrppa-info`); `LPPRelay` interface + `SetLPPRelay` wiring. **CRITICAL spec correction:** the backlog descriptor's "payload container type 0x01" is wrong (0x01 = N1 SM information → would misroute to SMF); the spec-correct value is **0x03** (TS 24.501 §9.11.3.40), already defined as `nas.PayloadContainerTypeLPP`. LMF: `methodLPP` selection band (hAccuracy <50 m; 50–200 m stays E-CID, >200 m/absent stays Cell-ID), `performLPPOrFallback` (RequestCapabilities → if GNSS supported: assistance + measurement → WLS fix uncertainty ≤50 m; else transparent fallback GNSS→E-CID→Cell-ID, never 5xx), per-SUPI state machine (IDLE→CAPS_REQUESTED→ASSIST_SENT→MEASURE_RECEIVED→FIXED), `SendDLLPP` AMF client + `SetLPPClient`; `LocationData.positioningDataList:["gnss"]`. Metrics `fivegc_lmf_gnss_total{result}` (OK/FALLBACK_ECID/FALLBACK_CELLID) + `fivegc_amf_lpp_transport_total{direction}` + 4 Grafana panels. 6 BDD scenarios (31/31 LMF functional pass); full AMF `-race` suite + live `validate-ueransim-mod.sh location`+`nrppa` re-run against the LMF-005 images → no regression in the N1/location/NRPPa paths. SPEC-VERIFIER **CONFORMANT-WITH-NOTES** (0x03 confirmed on both legs; aligned-vs-unaligned PER wire-fidelity documented as a known deviation, same posture as `shared/nrppa`). Deferred (follow-up, mirrors LMF-008 after LMF-004): UERANSIM UE patch `0042` + live GNSS E2E [TS 37.355 / TS 24.501 §8.7.4 §9.11.3.40 / TS 38.413 §8.6.2 §8.6.3 / TS 23.273 §6.2.10 §7.2 / TS 29.572 §5.2.2.2 / TS 29.518 §5.2.2.6]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-03] observability: **Grafana dashboard audit + fixes** (branch `fable-grafana-check`, full live-traffic verification — see `FABLE_GRAFANA_AUDIT.md`) — 7 dashboards / 91 panels audited against a running stack; 33 panels fixed in 5 per-dashboard commits: (1) all 15 "Success/Reject/Fallback Rate" stats replaced `clamp_min(denom,1)` (which degenerated percentages at lab traffic rates, e.g. 100% auth success displayed as 0.34%) with `100 * (sum(rate(num)) or vector(0)) / (sum(rate(den)) > 0)`; (2) plain shared-registry gauges (`fivegc_upf_pfcp_sessions_active`, `_bsf_bindings_`, `_nef_subscriptions_`, `_lmf_subscriptions_`) are exported as 0 by all 13 NFs — panels scoped to the owning NF via `{nf="..."}`; (3) dead GC panel (`go_gc_duration_seconds{quantile="0.99"}` doesn't exist → `quantile="1"`); (4) unit fixes (`ops`→`opm` for ×60 queries, `Mbits`→`bps` for throughput, RSS to raw bytes, `round(increase(...))`). Flagged-not-fixed code gaps: `SBIRequestsTotal`/`SBIRequestDurationSeconds`/`NGAPMessagesTotal` defined but never incremented (8 permanently-empty SBI panels; `metrics.SBIMiddleware` has no call sites); `ProcedureTotal` never emitted for ServiceRequest / NetworkDeregistration / any SMSF procedure; `fivegc_handover_total` only counts OK; `fivegc_ue_connected` over-counts stale N2 contexts (read 7 with 1 live UE); no QoS-modification metric exists (NW-initiated 5QI changes are invisible to Prometheus).
+- [2026-07-05] lmf,amf,shared,ueransim: **Live GNSS E2E — LPP UNALIGNED-PER rewrite + UE patch 0042** (LMF-009) — closed the live A-GNSS loop LMF-005 left falling back to E-CID (stock UERANSIM v3.2.8 had no LPP handler). **Resolved the aligned-vs-unaligned PER deviation** LMF-005 flagged: `shared/lpp` no longer uses `github.com/free5gc/aper` (ALIGNED PER); rewritten as a hand-rolled X.691 **BASIC-PER UNALIGNED** bit codec (`shared/lpp/uper.go`) with real TS 37.355 messages — the invented "combined AssistanceDataAndLocationRequest" is gone, replaced by real `ProvideAssistanceData` (DL-only, unsolicited) + `RequestLocationInformation`. Wire flow is now **3 legs**: RequestCapabilities→ProvideCapabilities, ProvideAssistanceData (AMF `expectUlResponse=false` → 204, no waiter), RequestLocationInformation→ProvideLocationInformation; LPP transactions per §5.2 (TransactionNumber 0..255, initiator=locationServer, UE echoes; LMF-005's 0..262143 fixed). UE derives synthetic measurements deterministically from the wire-quantized reference location (quantized-anchor rule) so WLS converges near the anchor. New `tools/ueransim/patches/0042-lpp-gnss.patch` — UE NAS LPP responder for payload container type 3, C++ mirror of the Go codec byte-for-byte (compiles via `make ueransim-build-only`); `LPP_GNSS_NONE=1` negative mode. Vendored TS 37.355 V19.3.0 ASN.1 at `specs/3gpp-asn1/LPP-PDU-Definitions.asn`. **Zero malformed ASN.1** confirmed by the real Wireshark 4.6.4 LPP dissector: `TestTsharkOracle_AllGoldenPDUs` (7 golden PDUs) + a live N2 capture where the 3 DL legs dissect as valid LPP (SCTP PPID 60); UL legs NEA2-ciphered (proven by the oracle). Live: `validate-ueransim-mod.sh gnss` → 200 `positioningDataList:["gnss"]`, uncertainty 5 m; GNSS=NONE → fallback E-CID (200, no 5xx); `location`/`nrppa` no regression. 31/31 LMF + AMF functional pass. SPEC-VERIFIER **CONFORMANT** (all 5 messages verified against the vendored module; payload container type 0x03 both legs) [TS 37.355 §4/§5.2/§6, TS 24.501 §8.7.4/§9.11.3.40, TS 38.413 §8.6.2/§8.6.3, TS 23.273 §6.2.10]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-06] amf,shared,ueransim,portal: **Fix portal subscriber edits bricking UEs** — editing any subscriber in the mgmt portal left that UE unable to ever re-register (stuck 5U3/5U2, "SMC integrity check failed"). Four root causes fixed: (1) AMF mgmt-API NW-dereg sent 5GMM cause 0x06 "Illegal ME" + re-registration-not-required → UE invalidated its USIM (5U3-ROAMING-NOT-ALLOWED) per TS 24.501 §5.5.2.3.4; now sends **no cause + "re-registration required"**. (2) `shared/nas` encoded the re-registration-required flag on bit 4 (0x08 = switch-off) instead of bit 3 (0x04) per TS 24.501 §9.11.3.20 (+ regression test). (3) Stock UERANSIM v3.2.8 never implemented re-registration on NW dereg (`// TODO` in `receiveDeregistrationRequest`) — new patch `0050-nw-dereg-reregistration.patch` enters MM-DEREGISTERED/NORMAL-SERVICE and triggers Initial Registration (DUE-TO-DEREGISTRATION). (4) The portal `PUT /subscribers/{supi}` wrote the form's stale SQN back to `subscription_auth`, rewinding the UDM-incremented counter — UERANSIM derives KAUSF from its own higher SQN-MS (no AUTS resync) so every subsequent Security Mode Command failed integrity; `UpsertSubscriber` now preserves the DB SQN on update (SQN read-only in the edit form) and update rejects empty k/opc. Validated live E2E: portal edit → `{"deregistered":true}` → UE logs `DUE-TO-DEREGISTRATION` → RM-REGISTERED/5U1-UPDATED, PDU sessions re-established, slice change visible in next registration, SQN monotonic. Known pre-existing gaps noted: AMF Registration Accept carries no TAI list (UERANSIM cancels Service Request from CM-IDLE: "current TAI is not in the TAI list"); AMF serial NGAP loop can back up minutes under burst when CreateSMContext is slow [TS 24.501 §5.5.2.3.2/§9.11.3.20, TS 23.502 §4.2.2.3.3, TS 33.501 §6.1.3.2]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-07] amf,shared: **Registration Accept now carries the registration area TAI list (IEI 0x54)** — closes the 2026-07-06 known gap where UERANSIM cancelled Service Request from CM-IDLE ("current TAI is not in the TAI list"). New `nas.EncodeTAIList` (type-00 partial list, TS 24.501 §9.11.3.9) + `served_tacs` config key in `nf/amf/config/dev.yaml` (default `[1]`); the UE's current TAC is always included. Wire-validated: Wireshark dissects the 0x54 IE (PLMN 001/01, TAC 1) in the live Registration Accept; the UE now initiates and completes Service Request. Unit tests: `TestEncodeTAIList_Type00Wire`, `TestRegistrationAccept_TAIList`, `TestBuildTAIList_*` [TS 24.501 §9.11.3.9/§5.5.1.2.4]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-07] amf: **NGAP dispatch no longer serializes all UEs behind one slow SBI call** — closes the 2026-07-06 known gap where the single per-association read loop blocked for minutes under registration/PDU-establishment bursts when `CreateSMContext` was slow. Blocking NAS work (InitialUEMessage, UplinkNASTransport, AN-release SMF notification) now runs on a per-UE serial FIFO (`UEContext.EnqueueSerial`): per-UE arrival order (and `SecurityCtx.UplinkCount`) is preserved, different UEs process concurrently. Regression tests (with `-race`): `TestUplinkNASTransport_SlowUEDoesNotBlockOthers`, `TestEnqueueSerial_PerUEOrdering`; live stack exercises the new path for registration/SR/release [TS 38.412 §7, TS 24.501 §4.4.3]. docs: update CLAUDIA_5GC_MANUAL
+- [2026-07-07] amf,smf,shared,ueransim: **Service Request now re-activates the user plane via N2SM info in InitialContextSetupRequest (TS 23.502 §4.2.3.2 step 12)** — replaces the UERANSIM-side re-establishment workaround noted in docs/validation-commands.md §7.5. AMF fetches the session's `PDUSessionResourceSetupRequestTransfer` from SMF (`upCnxState=ACTIVATING`, new SMF branch) for each PSI in the SR's Uplink Data Status and encodes `PDUSessionResourceSetupListCxtReq` (IE 71, spec position between GUAMI and AllowedNSSAI); the previously-ignored ICS Response is now decoded and its CxtRes DL tunnel forwarded to SMF → PFCP FAR update. En route, fixed two `shared/nas` Service Request decode bugs found by pcap: 5G-S-TMSI read as 1-byte LV instead of LV-E, and the NAS message container (0x71, TLV-E) — where UERANSIM carries the real Uplink Data Status — not parsed. Also new UERANSIM patch `0051-gnb-amf-selection-no-nssai.patch`: stock v3.2.8 gNB dropped any initial NAS message without Requested NSSAI ("AMF selection failed"), so SR never reached the AMF. The old APER suspicion did **not** reproduce: live pcap shows zero malformed frames; Wireshark fully dissects the CxtReq transfer (UL TEID) and CxtRes (DL TEID). Live E2E: ping from CM-IDLE → SR → ICS `pdu_sessions_cxt_req=1` → gNB CxtRes → SMF `PFCP SessionModification` → 0% loss. Unit tests: ICS CxtReq/CxtRes codec round-trips, SMF ACTIVATING handler, UERANSIM-wire SR decode [TS 23.502 §4.2.3.2, TS 29.502 §5.2.2.3.2.2, TS 38.413 §9.2.2.1, TS 24.501 §4.4.6/§9.11.3.33]. docs: update CLAUDIA_5GC_MANUAL

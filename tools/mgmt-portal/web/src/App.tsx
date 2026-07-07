@@ -11,6 +11,7 @@ import {
   Zap,
   ShieldCheck,
   Gauge,
+  MapPin,
 } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Subscribers from './pages/Subscribers'
@@ -23,6 +24,7 @@ import UERANSim from './pages/UERANSim'
 import PacketRusher from './pages/PacketRusher'
 import Policies from './pages/Policies'
 import QoS from './pages/QoS'
+import Location from './pages/Location'
 
 const navItems = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
@@ -33,6 +35,7 @@ const navItems = [
   { to: '/sessions', label: 'Sessions', icon: Activity },
   { to: '/qos', label: 'QoS / PDU Sessions', icon: Gauge },
   { to: '/ueransim', label: 'UERANSIM', icon: Antenna },
+  { to: '/location', label: 'UE Location', icon: MapPin },
   { to: '/packetrusher', label: 'PacketRusher', icon: Zap },
   { to: '/logs', label: 'Logs', icon: FileText },
   { to: '/pcap', label: 'PCAP', icon: Radio },
@@ -83,6 +86,7 @@ export default function App() {
             <Route path="/qos" element={<QoS />} />
             <Route path="/policies" element={<Policies />} />
             <Route path="/ueransim" element={<UERANSim />} />
+            <Route path="/location" element={<Location />} />
             <Route path="/packetrusher" element={<PacketRusher />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/pcap" element={<PCAP />} />

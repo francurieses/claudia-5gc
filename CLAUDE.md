@@ -122,6 +122,31 @@ It captures NF coupling, god nodes, and cross-community bridges across the Go co
   already exists, so questions are answered against the graph first.
 - Do not commit `graphify-out/` build artifacts unless the team decides to track them.
 
+## Protocol Encoding Rules (non-negotiable)
+
+Every `shared/` codec library implementing a 3GPP reference-point protocol **MUST** use the
+encoding mandated by the spec. Bespoke binary formats are **forbidden** — they break Wireshark
+dissection, real-equipment interoperability, and spec conformance.
+
+| Protocol | Spec | Encoding | Go library |
+|---|---|---|---|
+| NGAP (N2) | TS 38.413 | ASN.1 Aligned PER (APER) | `github.com/free5gc/ngap` + `github.com/free5gc/aper` |
+| NRPPa (via N2) | TS 38.455 | ASN.1 Aligned PER (APER) | `github.com/free5gc/aper` (structs hand-written from TS 38.455 ASN.1) |
+| NAS-5GS (N1) | TS 24.501 | TLV/TV/LV per spec §9 | `shared/nas/` (hand-written, spec-faithful IEI encoding) |
+| PFCP (N4) | TS 29.244 | TLV (IE Type + Length + Value) | `shared/pfcp/` |
+| GTP-U (N3/N9) | TS 29.281 | fixed header + extension headers | `shared/gtp/` |
+
+**For NGAP and NRPPa specifically:** use `github.com/free5gc/aper` Marshal/Unmarshal with Go
+structs tagged `aper:"..."`. Follow the pattern in `github.com/free5gc/ngap` for how choice
+types, IE-list sequences, criticality, and procedure code containers are defined.
+
+**SCTP PPID rule:** the AMF must send NGAP DATA chunks with PPID = 60 (0x3C) on every write.
+Required by TS 38.412 §7. Without this, Wireshark cannot auto-decode the DL direction.
+
+**UERANSIM patch rule:** any gNB-side message added by a patch (NRPPa, NGAP extension, etc.)
+must also use the spec encoding. ASN.1 APER for NRPPa is mandatory so Wireshark dissects the
+`NRPPa-PDU` IE contents — not just the NGAP wrapper.
+
 ## Anti-Patterns
 
 - ❌ Business logic in `cmd/`. Everything goes to `internal/`.
@@ -132,6 +157,7 @@ It captures NF coupling, god nodes, and cross-community bridges across the Go co
 - ❌ Order-dependent tests.
 - ❌ Mixing SBI and reference points in the same handler — separate packages.
 - ❌ Service mesh (Istio/Linkerd).
+- ❌ Bespoke binary formats for 3GPP reference-point protocols — always ASN.1/TLV per spec.
 
 ## 3GPP References
 

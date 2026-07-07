@@ -1,14 +1,20 @@
-// Package ueransim wraps docker exec calls to the UERANSIM container.
-// The Client interface keeps tool handlers free of exec details and enables
-// unit testing via MockClient without a running Docker daemon.
+// Package ueransim drives UERANSIM UE containers through mgmt-portal's
+// nr-cli proxy (POST /api/v1/ueransim/nr-cli). MCP never talks to Docker
+// directly: it is reachable over SSE by external LLM clients, so mounting
+// the Docker socket into it would hand out root-equivalent host access to
+// whoever can drive a tool call. mgmt-portal already holds that socket
+// (read-only mount, internal network only) and exposes exec as a narrow,
+// validated HTTP endpoint — this client is a thin wrapper around it.
 package ueransim
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
-	"os/exec"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -16,10 +22,10 @@ import (
 
 // UEStatus captures nr-cli STATUS output for one UE.
 type UEStatus struct {
-	SUPI        string
-	MMState     string // e.g. MM-REGISTERED, MM-DEREGISTERED
-	CMState     string // e.g. CM-CONNECTED, CM-IDLE
-	Registered  bool
+	SUPI       string
+	MMState    string // e.g. MM-REGISTERED, MM-DEREGISTERED
+	CMState    string // e.g. CM-CONNECTED, CM-IDLE
+	Registered bool
 }
 
 // PDUSession carries the result of a PDU session establishment.
@@ -46,45 +52,84 @@ type Client interface {
 	ContainerInfo(ctx context.Context) (*ContainerInfo, error)
 }
 
-// DockerClient calls nr-cli via `docker exec <container> nr-cli …`.
-type DockerClient struct {
+// PortalClient calls nr-cli via mgmt-portal's HTTP proxy, targeting a fixed
+// UERANSIM UE container by name.
+type PortalClient struct {
+	baseURL   string
 	container string
-	timeout   time.Duration
+	http      *http.Client
 	log       *slog.Logger
 }
 
-// NewDockerClient returns a client targeting the named container.
-func NewDockerClient(container string, timeout time.Duration, log *slog.Logger) *DockerClient {
+// NewPortalClient returns a client targeting the named container through
+// mgmt-portal at baseURL (e.g. http://mgmt-portal:8080).
+func NewPortalClient(baseURL, container string, timeout time.Duration, log *slog.Logger) *PortalClient {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &DockerClient{container: container, timeout: timeout, log: log}
+	if container == "" {
+		container = "ueransim-ue"
+	}
+	return &PortalClient{
+		baseURL:   strings.TrimRight(baseURL, "/"),
+		container: container,
+		http:      &http.Client{Timeout: timeout},
+		log:       log,
+	}
 }
 
-func (c *DockerClient) exec(ctx context.Context, args ...string) (string, error) {
-	tCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
+// nrCLIResult mirrors mgmt-portal's docker.ExecResult JSON shape.
+type nrCLIResult struct {
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output"`
+}
+
+func (c *PortalClient) nrCLI(ctx context.Context, supi, command string) (string, error) {
 	start := time.Now()
-	cmd := exec.CommandContext(tCtx, "docker", append([]string{"exec", c.container}, args...)...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	c.log.InfoContext(ctx, "ueransim exec",
-		"container", c.container,
-		"command", strings.Join(args, " "),
-		"duration_ms", time.Since(start).Milliseconds(),
-		"exit_code", exitCode(err),
-	)
+	reqBody, _ := json.Marshal(map[string]string{
+		"container": c.container,
+		"supi":      supi,
+		"command":   command,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/ueransim/nr-cli", bytes.NewReader(reqBody))
 	if err != nil {
-		return "", fmt.Errorf("docker exec %s: %w (stderr: %s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return "", fmt.Errorf("build nr-cli request: %w", err)
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.InfoContext(ctx, "ueransim nr-cli",
+			"container", c.container, "command", command,
+			"duration_ms", time.Since(start).Milliseconds(), "error", err.Error())
+		return "", fmt.Errorf("mgmt-portal nr-cli: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	if resp.StatusCode != http.StatusOK {
+		c.log.InfoContext(ctx, "ueransim nr-cli",
+			"container", c.container, "command", command,
+			"duration_ms", time.Since(start).Milliseconds(), "status", resp.StatusCode)
+		return "", fmt.Errorf("mgmt-portal nr-cli: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var result nrCLIResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", fmt.Errorf("mgmt-portal nr-cli: decode response: %w", err)
+	}
+	c.log.InfoContext(ctx, "ueransim nr-cli",
+		"container", c.container, "command", command,
+		"duration_ms", time.Since(start).Milliseconds(), "exit_code", result.ExitCode)
+	if result.ExitCode != 0 {
+		return "", fmt.Errorf("nr-cli %s: exit %d: %s", command, result.ExitCode, strings.TrimSpace(result.Output))
+	}
+	return strings.TrimSpace(result.Output), nil
 }
 
 // UEStatus returns the current GMM/CM state for a SUPI.
-func (c *DockerClient) UEStatus(ctx context.Context, supi string) (*UEStatus, error) {
-	out, err := c.exec(ctx, "nr-cli", supi, "-e", "STATUS")
+func (c *PortalClient) UEStatus(ctx context.Context, supi string) (*UEStatus, error) {
+	out, err := c.nrCLI(ctx, supi, "STATUS")
 	if err != nil {
 		return nil, fmt.Errorf("ueransim: STATUS %s: %w", supi, err)
 	}
@@ -92,9 +137,9 @@ func (c *DockerClient) UEStatus(ctx context.Context, supi string) (*UEStatus, er
 }
 
 // PDUSessionEstablish triggers a PDU session for the UE.
-func (c *DockerClient) PDUSessionEstablish(ctx context.Context, supi, dnn string) (*PDUSession, error) {
+func (c *PortalClient) PDUSessionEstablish(ctx context.Context, supi, dnn string) (*PDUSession, error) {
 	cmd := fmt.Sprintf("ps-establish default %s", dnn)
-	out, err := c.exec(ctx, "nr-cli", supi, "-e", cmd)
+	out, err := c.nrCLI(ctx, supi, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("ueransim: ps-establish %s %s: %w", supi, dnn, err)
 	}
@@ -102,54 +147,70 @@ func (c *DockerClient) PDUSessionEstablish(ctx context.Context, supi, dnn string
 }
 
 // PDUSessionRelease releases a specific PDU session.
-func (c *DockerClient) PDUSessionRelease(ctx context.Context, supi string, sessionID int) error {
+func (c *PortalClient) PDUSessionRelease(ctx context.Context, supi string, sessionID int) error {
 	cmd := fmt.Sprintf("ps-release %d", sessionID)
-	_, err := c.exec(ctx, "nr-cli", supi, "-e", cmd)
-	if err != nil {
+	if _, err := c.nrCLI(ctx, supi, cmd); err != nil {
 		return fmt.Errorf("ueransim: ps-release %s %d: %w", supi, sessionID, err)
 	}
 	return nil
 }
 
 // Deregister triggers UE-initiated deregistration.
-func (c *DockerClient) Deregister(ctx context.Context, supi string) error {
-	_, err := c.exec(ctx, "nr-cli", supi, "-e", "deregister normal")
-	if err != nil {
+func (c *PortalClient) Deregister(ctx context.Context, supi string) error {
+	if _, err := c.nrCLI(ctx, supi, "deregister normal"); err != nil {
 		return fmt.Errorf("ueransim: deregister %s: %w", supi, err)
 	}
 	return nil
 }
 
-// ContainerInfo checks container status and lists registered UEs via --dump.
-func (c *DockerClient) ContainerInfo(ctx context.Context) (*ContainerInfo, error) {
-	// Check container is running
-	tCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(tCtx, "docker", "inspect", "--format", "{{.State.Running}} {{.State.StartedAt}}", c.container)
-	out, err := cmd.Output()
+// statusResponse mirrors the subset of mgmt-portal's
+// GET /api/v1/ueransim/status this client needs. Kept minimal and local
+// rather than importing tools/mgmt-portal, a separate chi-based module.
+type statusResponse struct {
+	Containers []struct {
+		Name  string `json:"name"`
+		State string `json:"state"`
+	} `json:"containers"`
+	UEs []struct {
+		SUPI      string `json:"supi"`
+		Container string `json:"container"`
+		Sessions  []any  `json:"sessions"`
+	} `json:"ues"`
+}
+
+// ContainerInfo checks container status and lists registered UEs via
+// mgmt-portal's combined status endpoint (container list + AMF-context-backed
+// UE list), which is more reliable than parsing `nr-cli --dump` text.
+func (c *PortalClient) ContainerInfo(ctx context.Context) (*ContainerInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/ueransim/status", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build status request: %w", err)
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return &ContainerInfo{Running: false}, nil
 	}
-	parts := strings.Fields(strings.TrimSpace(string(out)))
-	running := len(parts) > 0 && parts[0] == "true"
-	info := &ContainerInfo{Running: running}
-	if !running {
-		return info, nil
-	}
-	if len(parts) >= 2 {
-		if t, err := time.Parse(time.RFC3339Nano, parts[1]); err == nil {
-			info.UptimeSeconds = int(time.Since(t).Seconds())
-		}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return &ContainerInfo{Running: false}, nil
 	}
 
-	// List UEs via nr-cli --dump
-	dump, err := c.exec(ctx, "nr-cli", "--dump")
-	if err == nil {
-		for _, line := range strings.Split(dump, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "imsi-") {
-				info.RegisteredSUPIs = append(info.RegisteredSUPIs, line)
-			}
+	var sr statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, fmt.Errorf("decode ueransim status: %w", err)
+	}
+
+	info := &ContainerInfo{}
+	for _, ctr := range sr.Containers {
+		if ctr.Name == c.container {
+			info.Running = ctr.State == "running"
+			break
+		}
+	}
+	for _, ue := range sr.UEs {
+		if ue.Container == c.container {
+			info.RegisteredSUPIs = append(info.RegisteredSUPIs, ue.SUPI)
+			info.ActiveSessions += len(ue.Sessions)
 		}
 	}
 	return info, nil
@@ -190,18 +251,6 @@ func parsePDUSession(out string) *PDUSession {
 		}
 	}
 	return s
-}
-
-func exitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	var exitErr *exec.ExitError
-	if ok := false; !ok {
-		return -1
-	}
-	_ = exitErr
-	return -1
 }
 
 // ---- MockClient (for unit tests) -------------------------------------------

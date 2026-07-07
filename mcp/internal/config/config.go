@@ -36,6 +36,14 @@ type Config struct {
 	UDMAddr        string `yaml:"udm_addr"`
 	JaegerAddr     string `yaml:"jaeger_addr"`
 	PrometheusAddr string `yaml:"prometheus_addr"`
+	// PortalAddr is mgmt-portal's plain-HTTP API, used by Group F to reach
+	// UERANSIM containers via POST /api/v1/ueransim/nr-cli. MCP never talks to
+	// Docker directly: it is reachable over SSE by external LLM clients, so
+	// mounting the Docker socket into it would hand out root-equivalent host
+	// access to whoever can drive a tool call. mgmt-portal already holds that
+	// socket (read-only mount, internal network only) and exposes exec as a
+	// narrow, validated HTTP endpoint.
+	PortalAddr string `yaml:"portal_addr"`
 
 	// Upstream TLS material for reaching the NRF SBI (which enforces mTLS).
 	// Empty ⇒ H2C cleartext for dev. CAFile verifies the server; ClientCertFile
@@ -55,7 +63,11 @@ type Config struct {
 type UERANSIMConfig struct {
 	// ContainerName is the docker container running nr-ue (default: ueransim-ue).
 	ContainerName string `yaml:"container_name"`
-	// ExecTimeoutSec is the per-command docker exec timeout in seconds (default: 15).
+	// ExecTimeoutSec is the per-command HTTP timeout to mgmt-portal's nr-cli
+	// proxy, in seconds (default: 25). Must exceed mgmt-portal's own internal
+	// exec timeout (20s, tools/mgmt-portal/internal/api/ueransim.go) — otherwise
+	// this client cancels the request context first, which propagates into
+	// mgmt-portal's handler and kills its in-flight docker exec early.
 	ExecTimeoutSec int `yaml:"exec_timeout_sec"`
 }
 
@@ -148,6 +160,9 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("PROMETHEUS_ADDR"); v != "" {
 		c.PrometheusAddr = v
 	}
+	if v := os.Getenv("PORTAL_ADDR"); v != "" {
+		c.PortalAddr = v
+	}
 }
 
 func (c *Config) applyDefaults() {
@@ -178,11 +193,14 @@ func (c *Config) applyDefaults() {
 	if c.PrometheusAddr == "" {
 		c.PrometheusAddr = "http://prometheus:9090"
 	}
+	if c.PortalAddr == "" {
+		c.PortalAddr = "http://mgmt-portal:8080"
+	}
 	if c.UERANSIM.ContainerName == "" {
 		c.UERANSIM.ContainerName = "ueransim-ue"
 	}
 	if c.UERANSIM.ExecTimeoutSec <= 0 {
-		c.UERANSIM.ExecTimeoutSec = 15
+		c.UERANSIM.ExecTimeoutSec = 25
 	}
 	if c.Prometheus.QueryTimeoutSec <= 0 {
 		c.Prometheus.QueryTimeoutSec = 5

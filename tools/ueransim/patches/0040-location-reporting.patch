@@ -1,0 +1,110 @@
+diff --git a/src/gnb/ngap/radio.cpp b/src/gnb/ngap/radio.cpp
+index 2d9cd61..1405bb4 100644
+--- a/src/gnb/ngap/radio.cpp
++++ b/src/gnb/ngap/radio.cpp
+@@ -13,8 +13,14 @@
+ #include <gnb/gtp/task.hpp>
+ #include <gnb/rrc/task.hpp>
+ 
++#include <asn/ngap/ASN_NGAP_EventType.h>
+ #include <asn/ngap/ASN_NGAP_FiveG-S-TMSI.h>
++#include <asn/ngap/ASN_NGAP_LocationReport.h>
++#include <asn/ngap/ASN_NGAP_LocationReportingControl.h>
++#include <asn/ngap/ASN_NGAP_LocationReportingRequestType.h>
+ #include <asn/ngap/ASN_NGAP_Paging.h>
++#include <asn/ngap/ASN_NGAP_ProtocolIE-Field.h>
++#include <asn/ngap/ASN_NGAP_ReportArea.h>
+ 
+ namespace nr::gnb
+ {
+@@ -56,4 +62,49 @@ void NgapTask::receivePaging(int amfId, ASN_NGAP_Paging *msg)
+     m_base->rrcTask->push(std::move(w));
+ }
+ 
++void NgapTask::receiveLocationReportingControl(int amfId, ASN_NGAP_LocationReportingControl *msg)
++{
++    // 5GC Rel-17 mod: answer an AMF-initiated Location Reporting Control (TS 38.413 §8.17.2)
++    // with a Location Report carrying the serving cell. Stock UERANSIM has no handler for this,
++    // so without this patch the LMF DetermineLocation flow stalls at the gNB.
++    m_logger->debug("Location Reporting Control received");
++
++    auto *ue = findUeByNgapIdPair(amfId, ngap_utils::FindNgapIdPair(msg));
++    if (ue == nullptr)
++        return;
++
++    // Read the requested reporting type. We support EventType=Direct (a single immediate report);
++    // periodic / area-of-interest / change-of-serving-cell are not implemented — we still emit one
++    // report and warn, which keeps the on-demand Cell-ID positioning flow working.
++    long eventType = ASN_NGAP_EventType_direct;
++    long reportArea = ASN_NGAP_ReportArea_cell;
++    auto *ieReqType = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_LocationReportingRequestType);
++    if (ieReqType != nullptr)
++    {
++        eventType = ieReqType->LocationReportingRequestType.eventType;
++        reportArea = ieReqType->LocationReportingRequestType.reportArea;
++        if (eventType != ASN_NGAP_EventType_direct)
++            m_logger->warn("LocationReportingControl event type [%ld] not supported; sending a single report",
++                           eventType);
++    }
++
++    // Build the Location Report. AMF-UE-NGAP-ID, RAN-UE-NGAP-ID and UserLocationInformation
++    // (serving NR-CGI + TAI + timestamp, from the gNB config) are inserted automatically by
++    // sendNgapUeAssociated; we only echo back the LocationReportingRequestType.
++    std::vector<ASN_NGAP_LocationReportIEs *> ies;
++
++    auto *ie = asn::New<ASN_NGAP_LocationReportIEs>();
++    ie->id = ASN_NGAP_ProtocolIE_ID_id_LocationReportingRequestType;
++    ie->criticality = ASN_NGAP_Criticality_ignore;
++    ie->value.present = ASN_NGAP_LocationReportIEs__value_PR_LocationReportingRequestType;
++    ie->value.choice.LocationReportingRequestType.eventType = eventType;
++    ie->value.choice.LocationReportingRequestType.reportArea = reportArea;
++    ies.push_back(ie);
++
++    auto *report = asn::ngap::NewMessagePdu<ASN_NGAP_LocationReport>(ies);
++    sendNgapUeAssociated(ue->ctxId, report);
++
++    m_logger->info("Location Report sent (cell-ID positioning)");
++}
++
+ } // namespace nr::gnb
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+index a6a149c..84c77d8 100644
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -35,6 +35,7 @@ extern "C"
+     struct ASN_NGAP_OverloadStop;
+     struct ASN_NGAP_PDUSessionResourceReleaseCommand;
+     struct ASN_NGAP_Paging;
++    struct ASN_NGAP_LocationReportingControl;
+ }
+ 
+ namespace nr::gnb
+@@ -127,6 +128,9 @@ class NgapTask : public NtsTask
+     /* Radio resource control */
+     void handleRadioLinkFailure(int ueId);
+     void receivePaging(int amfId, ASN_NGAP_Paging *msg);
++
++    /* Location reporting (5GC Rel-17 mod) */
++    void receiveLocationReportingControl(int amfId, ASN_NGAP_LocationReportingControl *msg);
+ };
+ 
+ } // namespace nr::gnb
+\ No newline at end of file
+diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
+index 6058d39..ca1cb4b 100644
+--- a/src/gnb/ngap/transport.cpp
++++ b/src/gnb/ngap/transport.cpp
+@@ -296,6 +296,13 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+         case ASN_NGAP_InitiatingMessage__value_PR_Paging:
+             receivePaging(amf->ctxId, &value.choice.Paging);
+             break;
++        case ASN_NGAP_InitiatingMessage__value_PR_LocationReportingControl:
++            // 5GC Rel-17 mod: stock UERANSIM gNB has no LocationReportingControl handler
++            // (it logs "Unhandled NGAP initiating-message"), so the AMF's Location Reporting
++            // request is dropped and the LMF DetermineLocation flow times out. This answers it
++            // with a LocationReport carrying the serving cell. Ref: TS 38.413 §8.17.
++            receiveLocationReportingControl(amf->ctxId, &value.choice.LocationReportingControl);
++            break;
+         default:
+             m_logger->err("Unhandled NGAP initiating-message received (%d)", value.present);
+             break;

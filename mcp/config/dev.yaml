@@ -24,6 +24,12 @@ amf_addr: "http://amf:9002"
 jaeger_addr: "http://jaeger:16686"
 prometheus_addr: "http://prometheus:9090"
 
+# mgmt-portal's plain-HTTP API — Group F reaches UERANSIM containers via
+# POST /api/v1/ueransim/nr-cli instead of a mounted Docker socket (MCP is
+# reachable over SSE by external LLM clients, so it never touches Docker
+# directly; mgmt-portal already holds that socket, read-only, internal-net-only).
+portal_addr: "http://mgmt-portal:8080"
+
 # Group I: PDU session QoS tools — SMF management API (shares the SBI listener,
 # mTLS) and UDM SDM (mTLS).
 smf_addr: "https://smf:8004"
@@ -35,10 +41,12 @@ ca_file: "/etc/5gc/pki/ca.crt"
 client_cert_file: "/etc/5gc/pki/mcp.crt"
 client_key_file: "/etc/5gc/pki/mcp.key"
 
-# Group F: UERANSIM orchestration tools (docker exec).
+# Group F: UERANSIM orchestration tools (via mgmt-portal, see portal_addr above).
 ueransim:
   container_name: ueransim-ue   # matches docker-compose container_name
-  exec_timeout_sec: 15
+  # Must exceed mgmt-portal's own internal nr-cli exec timeout (20s), or this
+  # client cancels the request first and kills mgmt-portal's exec early.
+  exec_timeout_sec: 25
 
 # Group G: Prometheus metrics tools (supplements prometheus_addr above).
 prometheus:

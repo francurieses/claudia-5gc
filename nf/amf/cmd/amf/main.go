@@ -55,8 +55,16 @@ func (s *NGAPSenderWithSMF) SendDownlinkNASTransport(ue *amfctx.UEContext, nasPD
 // SendInitialContextSetupRequest delegates to NGAP server.
 func (s *NGAPSenderWithSMF) SendInitialContextSetupRequest(ue *amfctx.UEContext, nasPDU []byte,
 	kgnb [32]byte, cipherAlg, integAlg byte,
-	encAlgsBitmap, intAlgsBitmap uint16) error {
-	return s.ngap.SendInitialContextSetupRequest(ue, nasPDU, kgnb, cipherAlg, integAlg, encAlgsBitmap, intAlgsBitmap)
+	encAlgsBitmap, intAlgsBitmap uint16,
+	pduSessions []ngap.PDUSessionSetupItemCxtReq) error {
+	return s.ngap.SendInitialContextSetupRequest(ue, nasPDU, kgnb, cipherAlg, integAlg, encAlgsBitmap, intAlgsBitmap, pduSessions)
+}
+
+// ActivateSMContext asks the SMF for the PDUSessionResourceSetupRequestTransfer
+// of an existing session (upCnxState=ACTIVATING) during Service Request UP
+// re-activation. Ref: TS 29.502 §5.2.2.3.2.2
+func (s *NGAPSenderWithSMF) ActivateSMContext(ctx context.Context, smContextRef string) ([]byte, error) {
+	return s.smf.ActivateSMContext(ctx, smContextRef)
 }
 
 // SendPDUSessionResourceSetupRequest delegates to NGAP server.
@@ -347,6 +355,13 @@ func main() {
 	// Configure via timers.t3512_secs in nf/amf/config/dev.yaml.
 	// Ref: TS 24.501 §8.2.7.1 (IEI 0x5E), §10.2
 	regHandler.WithT3512(cfg.Timers.T3512Secs)
+	// Registration area (TAI list, IEI 0x54) sent in every Registration Accept.
+	// Ref: TS 24.501 §9.11.3.9
+	regHandler.WithServedTACs(cfg.ServedTACs)
+	logger.Info("AMF served TACs configured",
+		"served_tacs", cfg.ServedTACs,
+		"spec_ref", "TS 24.501 §9.11.3.9",
+	)
 	if cfg.Security.NullCiphering {
 		regHandler.WithNullSecurity(true)
 		logger.Warn("NAS null ciphering active: NEA0 (no encryption) + best-available NIA — plain-text NAS — DEBUG ONLY",
@@ -413,12 +428,24 @@ func main() {
 	// Wire NAS handler back into NGAP server (circular dep resolved via interface)
 	ngapSrv.SetNASHandler(nasHandler)
 
+	// sbiSrv is forward-declared here so the onUEReachable closure below can
+	// reference it without a circular init dependency. It is assigned later in
+	// the cfg.SBI.Address block. By the time any Service Request arrives (which
+	// fires onUEReachable), ngapSrv.Start() has been called, guaranteeing that
+	// sbiSrv is already assigned. Ref: TS 23.273 §7.2 steps E2–E7.
+	var sbiSrv *amfsbi.Server
+
 	// A UE entering CM-CONNECTED (registration complete, service request,
 	// registration update) is reachable: cancel the Mobile Reachable / Implicit
 	// Detach watchdogs. The NGAP layer re-arms them on AN Release (CM-IDLE).
-	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7
+	// Also wake any pending paging-then-locate waiter in the SBI server.
+	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7, TS 23.273 §7.2 steps E2–E7.
 	nasHandler.SetUEReachableHandler(func(ue *amfctx.UEContext) {
 		ngapSrv.StopUETimers(ue)
+		// Unblock any Namf_Location paging-then-locate waiter for this UE.
+		if s := sbiSrv; s != nil {
+			s.NotifyUEReachable(ue.AMFUENGAPId)
+		}
 		// If the UE was paged for mobile-terminated data, the Service Request that
 		// brought it back to CM-CONNECTED re-activates the user plane: clear the flag.
 		// Ref: TS 23.502 §4.2.3.3
@@ -619,7 +646,8 @@ func main() {
 	// so a new AMF can retrieve the UE MM/security context + PDU sessions during
 	// Registration with AMF change. Ref: TS 29.518 §5.3.2, TS 23.502 §4.2.2.2.3.
 	if cfg.SBI.Address != "" {
-		sbiSrv, err := amfsbi.New(amfsbi.Config{
+		var err error
+		sbiSrv, err = amfsbi.New(amfsbi.Config{
 			Address:  cfg.SBI.Address,
 			CertFile: cfg.SBI.TLSCert,
 			KeyFile:  cfg.SBI.TLSKey,
@@ -637,6 +665,16 @@ func main() {
 		// via a channel keyed by AMF-UE-NGAP-ID.
 		// Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1; TS 23.273 §7.2.
 		sbiSrv.SetLocator(ngapSrv)
+		// Wire NGAP NRPPa relay for Namf_Location dl-nrppa-info.
+		// The NGAP server sends DownlinkUEAssociatedNRPPaTransport and delivers the
+		// matching UplinkUEAssociatedNRPPaTransport via a channel keyed by AMF-UE-NGAP-ID.
+		// Ref: TS 38.413 §8.17.3; TS 23.273 §7.2 step C.
+		sbiSrv.SetNRPPaRelay(ngapSrv)
+		// Wire the NAS LPP relay for Namf_Location dl-lpp-info (LMF-005).
+		// nasHandler sends the DL NAS Transport (payload container type 0x03) and
+		// delivers the matching UL NAS Transport LPP container via a channel keyed
+		// by AMF-UE-NGAP-ID. Ref: TS 24.501 §8.7.4; TS 23.273 §7.2.
+		sbiSrv.SetLPPRelay(nasHandler)
 		go func() {
 			if err := sbiSrv.Start(ctx); err != nil {
 				logger.Error("AMF inbound SBI server", "error", err)
@@ -900,7 +938,10 @@ func main() {
 			http.Error(w, "UE not found", http.StatusNotFound)
 			return
 		}
-		if err := nasHandler.SendNetworkDeregistration(r.Context(), ue, 0x06, 1); err != nil {
+		// No 5GMM cause + "re-registration required": the UE must come back and
+		// re-fetch its (possibly updated) subscription. A cause like 0x06 (illegal
+		// ME) would invalidate the USIM on the UE (5U3) — TS 24.501 §5.5.2.3.4.
+		if err := nasHandler.SendNetworkDeregistration(r.Context(), ue, 0, 1, true); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1017,6 +1058,11 @@ type Config struct {
 	AMFRegionID uint8  `yaml:"amf_region_id"`
 	AMFSetID    uint16 `yaml:"amf_set_id"`
 	AMFID       uint8  `yaml:"amf_id"`
+	// ServedTACs is the registration area (TAI list) advertised to every UE in
+	// Registration Accept (IEI 0x54). The UE's current TAC is always added even
+	// if missing here. Defaults to [1] (matches config/ueransim/gnb.yaml tac: 1).
+	// Ref: TS 24.501 §9.11.3.9, TS 23.501 §5.3.2.3
+	ServedTACs []uint32 `yaml:"served_tacs"`
 	// Persistence — overridden by DATABASE_URL / REDIS_URL env vars.
 	DatabaseURL string `yaml:"database_url"`
 	RedisURL    string `yaml:"redis_url"`
@@ -1148,6 +1194,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.Timers.PendingRemovalWatchdogSecs == 0 {
 		c.Timers.PendingRemovalWatchdogSecs = 30
+	}
+	if len(c.ServedTACs) == 0 {
+		c.ServedTACs = []uint32{1}
 	}
 	return &c, nil
 }

@@ -25,6 +25,11 @@ sessions:
   - type: 'IPv4'
     apn: 'internet'
     slice:
+      sst: 1
+      sd: 0x000001
+  - type: 'IPv4'
+    apn: 'silver'
+    slice:
       sst: 2
       sd: 0x000001   # silver slice (URLLC)
 configured-nssai:

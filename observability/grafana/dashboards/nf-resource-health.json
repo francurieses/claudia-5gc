@@ -84,7 +84,7 @@
         "defaults": {
           "color": {"mode": "palette-classic"},
           "custom": {"lineWidth": 2},
-          "unit": "decmbytes"
+          "unit": "bytes"
         },
         "overrides": []
       },
@@ -96,7 +96,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "process_resident_memory_bytes{job=\"5gc-nfs\", nf=~\"$nf\"} / 1024 / 1024",
+          "expr": "process_resident_memory_bytes{job=\"5gc-nfs\", nf=~\"$nf\"}",
           "legendFormat": "{{nf}}",
           "refId": "A"
         }
@@ -146,12 +146,12 @@
       "gridPos": {"h": 8, "w": 8, "x": 8, "y": 15},
       "id": 5,
       "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-      "title": "GC Pause P99 per NF",
+      "title": "GC Pause Max per NF",
       "type": "timeseries",
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "go_gc_duration_seconds{job=\"5gc-nfs\", nf=~\"$nf\", quantile=\"0.99\"} * 1000",
+          "expr": "go_gc_duration_seconds{job=\"5gc-nfs\", nf=~\"$nf\", quantile=\"1\"} * 1000",
           "legendFormat": "{{nf}}",
           "refId": "A"
         }

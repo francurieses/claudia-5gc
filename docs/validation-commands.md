@@ -296,7 +296,7 @@ docker exec ueransim-ue nr-cli imsi-001010000000001 -e "status"
 # → cm-state: CM-CONNECTED
 ```
 
-### 7.5 Verify PDU session is reestablished (UERANSIM auto-reestablish)
+### 7.5 Verify PDU session user plane is re-activated (N2SM in InitialContextSetup)
 
 ```bash
 sleep 3
@@ -304,14 +304,23 @@ docker exec ueransim-ue nr-cli imsi-001010000000001 -e "ps-list"
 # → PDU Session1: PS-ACTIVE
 
 # Verify data plane works again
-docker exec ueransim-ue ping -I uesimtun0 172.30.3.100 -c 4
-# → 0% packet loss
+docker exec ueransim-ue ping -I uesimtun0 172.30.6.1 -c 4
+# → 0% packet loss (first packet may be lost to SR latency)
+
+# Verify the spec'd re-activation path (TS 23.502 §4.2.3.2 step 12):
+docker logs amf | grep pdu_sessions_cxt_req       # ICS Request carries the session list
+docker logs amf | grep "re-activated by gNB"      # ICS Response CxtRes forwarded to SMF
+docker logs smf | grep "UP re-activation"         # upCnxState=ACTIVATING transfer rebuilt
+docker logs smf | grep "PFCP SessionModification" # FAR updated with the gNB DL tunnel
 ```
 
-> **Implementation note**: AMF re-establishes the N2 context via InitialContextSetupRequest
-> with Service Accept. PDU sessions are restored by UERANSIM via normal UL NAS Transport.
-> Direct activation of UPF DL forwarding (step 6 of TS 23.502 §4.2.3) requires
-> including N2SM info in InitialContextSetupRequest — pending in next iterations.
+> **Implementation note**: the AMF re-establishes the N2 context via
+> InitialContextSetupRequest carrying Service Accept **and** the
+> PDUSessionResourceSetupListCxtReq (N2SM info fetched from the SMF with
+> `upCnxState=ACTIVATING`) for every PDU session flagged in the SR's Uplink Data
+> Status — direct activation of UPF DL forwarding per TS 23.502 §4.2.3.2 step 12.
+> See `docs/procedures/service-request.md`. Requires UERANSIM patch 0051 (stock
+> v3.2.8 gNB drops initial NAS messages without a Requested NSSAI).
 
 ---
 

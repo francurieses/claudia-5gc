@@ -25,6 +25,11 @@ sessions:
   - type: 'IPv4'
     apn: 'internet'
     slice:
+      sst: 1
+      sd: 0x000001
+  - type: 'IPv4'
+    apn: 'bronze'
+    slice:
       sst: 3
       sd: 0x000001   # bronze slice (MIoT)
 configured-nssai:

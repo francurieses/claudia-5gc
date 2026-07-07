@@ -30,7 +30,38 @@ import (
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
+
+// ngapPPID is the SCTP Payload Protocol Identifier for NGAP.
+// TS 38.412 §7 / IANA: PPID 60 (0x3C) is assigned to NGAP over SCTP.
+// The ishidawataru/sctp library applies htonl internally so we pass 60 in host byte order.
+const ngapPPID uint32 = 60
+
+// writeNGAP sends an NGAP PDU over the SCTP connection with PPID=60 set on the DATA chunk.
+// Using PPID=0 (plain conn.Write) means the gNB/Wireshark cannot identify the protocol;
+// PPID=60 is mandatory per TS 38.412 §7.
+// Ref: TS 38.412 §7; IANA "Stream Control Transmission Protocol (SCTP) Parameters".
+func writeNGAP(conn *sctp.SCTPConn, pdu []byte) (int, error) {
+	return conn.SCTPWrite(pdu, &sctp.SndRcvInfo{PPID: ngapPPID})
+}
+
+// NRPPaResult is the result of an NGAP Downlink/Uplink UE-Associated NRPPa
+// Transport exchange. Delivered to the Namf_Location dl-nrppa-info handler via a
+// channel keyed by AMF-UE-NGAP-ID in the Server's pendingNRPPa map.
+//
+// The AMF is a pure relay: it does NOT decode the NRPPa-PDU bytes.
+// Ref: TS 38.413 §8.17.3; TS 23.273 §7.2 step C; TS 29.518 §5.2.2.6.
+type NRPPaResult struct {
+	// NRPPaPDU is the opaque UL NRPPa PDU bytes received from the gNB.
+	// The LMF decodes this; the AMF never inspects its content.
+	NRPPaPDU []byte
+	// RoutingID is the LMF routing identity extracted from the UL transport message.
+	// Ref: TS 38.413 §9.3.x (Routing ID IE, id=89).
+	RoutingID []byte
+	// Err is non-nil on correlation failure, gNB disconnect, or timeout expiry.
+	Err error
+}
 
 // LocationResult is the result of an NGAP LocationReportingControl/LocationReport
 // exchange. Delivered to the Namf_Location handler via a channel keyed by
@@ -77,6 +108,34 @@ const (
 	ProcLocationReport ProcedureCode = 18
 	// TS 38.413 Table 9.1.1-1: ErrorIndication has procedure code 9.
 	ProcErrorIndication ProcedureCode = 9
+
+	// ProcDownlinkNonUEAssociatedNRPPaTransport is the NGAP procedure code for
+	// Downlink Non-UE-Associated NRPPa Transport (AMF→gNB, InitiatingMessage).
+	// Used for cell-level NRPPa signalling not tied to a specific UE context (e.g.
+	// PositioningInformationRequest in some deployments).
+	// Integer value 5 confirmed from TS 38.413 Table 9.1-1 and free5gc ngapType.
+	// Ref: TS 38.413 §8.17.4.
+	ProcDownlinkNonUEAssociatedNRPPaTransport ProcedureCode = 5
+
+	// ProcDownlinkUEAssociatedNRPPaTransport is the NGAP procedure code for
+	// Downlink UE-Associated NRPPa Transport (AMF→gNB, InitiatingMessage).
+	// Used when the NRPPa exchange is scoped to a specific UE context (E-CID,
+	// PositioningInformationRequest tied to a UE).
+	// Integer value 8 confirmed from TS 38.413 Table 9.1-1 and free5gc ngapType.
+	// Ref: TS 38.413 §8.17.3.
+	ProcDownlinkUEAssociatedNRPPaTransport ProcedureCode = 8
+
+	// ProcUplinkNonUEAssociatedNRPPaTransport is the NGAP procedure code for
+	// Uplink Non-UE-Associated NRPPa Transport (gNB→AMF, InitiatingMessage).
+	// Integer value 47 confirmed from TS 38.413 Table 9.1-1 and free5gc ngapType.
+	// Ref: TS 38.413 §8.17.4.
+	ProcUplinkNonUEAssociatedNRPPaTransport ProcedureCode = 47
+
+	// ProcUplinkUEAssociatedNRPPaTransport is the NGAP procedure code for
+	// Uplink UE-Associated NRPPa Transport (gNB→AMF, InitiatingMessage).
+	// Integer value 50 confirmed from TS 38.413 Table 9.1-1 and free5gc ngapType.
+	// Ref: TS 38.413 §8.17.3.
+	ProcUplinkUEAssociatedNRPPaTransport ProcedureCode = 50
 )
 
 // Criticality per TS 38.413 §9.1.
@@ -231,6 +290,13 @@ type Server struct {
 	// handleLocationReport when the matching LocationReport arrives.
 	// Ref: TS 38.413 §8.17.1; TS 29.518 §5.2.2.6.
 	pendingLoc sync.Map // map[int64]chan LocationResult
+
+	// pendingNRPPa holds one pending NRPPaResult channel per AMF-UE-NGAP-ID.
+	// Inserted by SendDownlinkNRPPa; resolved (and deleted) by handleUplinkNRPPa
+	// when the matching UplinkUEAssociatedNRPPaTransport arrives from the gNB.
+	// Unmatched UL NRPPa PDUs (no pending entry) are logged as nrppa_orphan and dropped.
+	// Ref: TS 38.413 §8.17.3; TS 29.518 §5.2.2.6; TS 23.273 §7.2 step C.
+	pendingNRPPa sync.Map // map[int64]chan NRPPaResult
 
 	// timerCfg holds the timer durations for UE lifecycle management.
 	timerCfg TimerConfig
@@ -538,10 +604,14 @@ func (s *Server) handleGNBConn(ctx context.Context, conn *sctp.SCTPConn) {
 			}
 			return
 		}
-		// Process NGAP messages serially per gNB association. SCTP delivers
-		// in order; a goroutine-per-message would race on per-UE NAS state
-		// (notably SecurityCtx.UplinkCount) when the UE sends back-to-back
-		// messages such as RegistrationComplete + UL NAS Transport.
+		// Decode and route NGAP messages in SCTP arrival order. Handlers that
+		// can block on SBI calls (NAS procedures → AUSF/UDM/SMF) enqueue the
+		// blocking work on the target UE's serial queue (UEContext.EnqueueSerial)
+		// so one slow SBI call cannot delay other UEs' NGAP messages, while
+		// per-UE NAS ordering (notably SecurityCtx.UplinkCount) is preserved.
+		// A bare goroutine-per-message would race on that per-UE state when the
+		// UE sends back-to-back messages such as RegistrationComplete + UL NAS
+		// Transport — do not replace the queue with `go s.dispatch`.
 		s.dispatch(ctx, gnb, buf[:n])
 	}
 }
@@ -565,6 +635,10 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 	case ProcPDUSessionResourceSetup:
 		if msg.Type == 1 { // SuccessfulOutcome
 			s.handlePDUSessionResourceSetupResponse(ctx, gnb, msg)
+		}
+	case ProcInitialContextSetup:
+		if msg.Type == 1 { // SuccessfulOutcome: ICS Response from gNB
+			s.handleInitialContextSetupResponse(ctx, gnb, msg)
 		}
 	case ProcPDUSessionResourceRelease:
 		if msg.Type == 1 { // SuccessfulOutcome
@@ -627,6 +701,16 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 			// Ref: TS 38.413 §8.17.1 (Location Report)
 			s.handleLocationReport(ctx, gnb, msg)
 		}
+	case ProcUplinkUEAssociatedNRPPaTransport:
+		if msg.Type == 0 { // InitiatingMessage from gNB
+			// Ref: TS 38.413 §8.17.3 (Uplink UE Associated NRPPa Transport)
+			s.handleUplinkUEAssociatedNRPPa(ctx, gnb, msg)
+		}
+	case ProcUplinkNonUEAssociatedNRPPaTransport:
+		if msg.Type == 0 { // InitiatingMessage from gNB
+			// Ref: TS 38.413 §8.17.4 (Uplink Non UE Associated NRPPa Transport)
+			s.handleUplinkNonUEAssociatedNRPPa(ctx, gnb, msg)
+		}
 	default:
 		log.Warn("unhandled NGAP procedure", "proc", msg.ProcedureCode)
 	}
@@ -671,6 +755,72 @@ func (s *Server) handlePDUSessionResourceSetupResponse(ctx context.Context, gnb 
 			"spec_ref", "TS 38.413 §8.4.1",
 			"pdu_session_id", setup.PDUSessionID,
 			"smContextRef", smContextRef,
+		)
+		go s.onPDUSessionSetup(ctx, smContextRef, setup.N2SMTransferBytes)
+	}
+}
+
+// handleInitialContextSetupResponse processes the gNB's Initial Context Setup
+// Response. When the ICS Request carried PDUSessionResourceSetupListCxtReq
+// (Service Request UP re-activation), the response's CxtRes list holds the
+// gNB's DL GTP-U tunnel info per session — forward each transfer to the SMF so
+// it re-activates DL forwarding at the UPF (same path as the standalone PDU
+// Session Resource Setup Response). A response without a session list
+// (Initial Registration) needs no action.
+// Ref: TS 38.413 §8.3.1, TS 23.502 §4.2.3.2 step 12
+func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNBContext, msg *Message) {
+	resp, ok := msg.Value.(*InitialContextSetupResponseMsg)
+	if !ok {
+		return
+	}
+
+	for _, psi := range resp.FailedPSIs {
+		s.logger.Warn("Initial Context Setup Response: gNB failed to set up PDU session",
+			"procedure", "ServiceRequest",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "InitialContextSetupResponse",
+			"amf_ue_ngap_id", resp.AMFUENGAPId,
+			"pdu_session_id", psi,
+			"spec_ref", "TS 38.413 §8.3.1",
+		)
+	}
+	if len(resp.Setups) == 0 || s.onPDUSessionSetup == nil {
+		return
+	}
+
+	ue, found := s.mgr.GetByNGAPId(resp.AMFUENGAPId)
+	if !found {
+		s.logger.Error("InitialContextSetupResponse: UE not found",
+			"amf_ue_ngap_id", resp.AMFUENGAPId)
+		return
+	}
+
+	for _, setup := range resp.Setups {
+		ue.Lock()
+		pduSess, hasSess := ue.PDUSessions[setup.PDUSessionID]
+		var smContextRef string
+		if hasSess {
+			smContextRef = pduSess.SMFInstanceID
+		}
+		ue.Unlock()
+
+		if smContextRef == "" {
+			s.logger.Warn("InitialContextSetupResponse: no smContextRef",
+				"pdu_session_id", setup.PDUSessionID)
+			continue
+		}
+
+		s.logger.Info("PDU session re-activated by gNB (ICS Response), notifying SMF",
+			"procedure", "ServiceRequest",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "InitialContextSetupResponse",
+			"amf_ue_ngap_id", resp.AMFUENGAPId,
+			"pdu_session_id", setup.PDUSessionID,
+			"smContextRef", smContextRef,
+			"supi", ue.SUPI,
+			"spec_ref", "TS 23.502 §4.2.3.2 step 12",
 		)
 		go s.onPDUSessionSetup(ctx, smContextRef, setup.N2SMTransferBytes)
 	}
@@ -729,7 +879,7 @@ func (s *Server) handleNGSetup(ctx context.Context, gnb *GNBContext, msg *Messag
 
 	resp := BuildNGSetupResponse(s.cfg.Name, s.cfg.MCC, s.cfg.MNC,
 		s.cfg.RegionID, s.cfg.SetID, s.cfg.AMFID, s.cfg.SNSSAIs)
-	if _, err := gnb.Conn.Write(resp); err != nil {
+	if _, err := writeNGAP(gnb.Conn, resp); err != nil {
 		log.Error("send NG Setup Response failed", "error", err)
 	}
 }
@@ -798,10 +948,15 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 				"tmsi", fmt.Sprintf("%08x", *req.FiveGSTMSI),
 				"spec_ref", "TS 23.502 §4.2.3 / §4.2.2.2.3 / §4.2.2.2.4",
 			)
-			if err := s.nasHandler.HandleNASMessage(ctx, ue, req.NASPdu); err != nil {
-				s.logger.Error("NAS handler error (returning UE)", "error", err,
-					"amf_ue_ngap_id", ue.AMFUENGAPId)
-			}
+			// NAS procedures make blocking SBI calls — run on the UE's serial
+			// queue so other UEs' NGAP messages are not delayed.
+			nasPDU := req.NASPdu
+			ue.EnqueueSerial(func() {
+				if err := s.nasHandler.HandleNASMessage(ctx, ue, nasPDU); err != nil {
+					s.logger.Error("NAS handler error (returning UE)", "error", err,
+						"amf_ue_ngap_id", ue.AMFUENGAPId)
+				}
+			})
 			return
 		}
 		// TMSI not found (AMF restarted or context evicted). Send Service Reject
@@ -819,7 +974,7 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 		gnb.mu.Unlock()
 		// Plain NAS PDU: EPD=0x7E | SHT=0x00 | MT=0x4D (ServiceReject) | Cause=0x09
 		rejectPDU := []byte{0x7E, 0x00, 0x4D, 0x09}
-		if _, err := gnb.Conn.Write(BuildDownlinkNASTransport(tempUE.AMFUENGAPId, req.RANUENGAPId, rejectPDU)); err != nil {
+		if _, err := writeNGAP(gnb.Conn, BuildDownlinkNASTransport(tempUE.AMFUENGAPId, req.RANUENGAPId, rejectPDU)); err != nil {
 			s.logger.Error("send ServiceReject failed", "error", err)
 		}
 		gnb.mu.Lock()
@@ -861,10 +1016,15 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 		ue.TAI = amfctx.TAI{MCC: req.TAI.MCC, MNC: req.TAI.MNC, TAC: req.TAI.TAC}
 	}
 
-	// Hand NAS PDU to NAS handler
-	if err := s.nasHandler.HandleNASMessage(ctx, ue, req.NASPdu); err != nil {
-		log.Error("NAS handler error", "error", err)
-	}
+	// Hand NAS PDU to NAS handler on the UE's serial queue: registration
+	// drives blocking SBI calls (AUSF auth, UDM SDM, PCF) that must not stall
+	// the SCTP read loop for other UEs during registration bursts.
+	nasPDU := req.NASPdu
+	ue.EnqueueSerial(func() {
+		if err := s.nasHandler.HandleNASMessage(ctx, ue, nasPDU); err != nil {
+			log.Error("NAS handler error", "error", err)
+		}
+	})
 }
 
 // ---- Uplink NAS Transport (TS 38.413 §8.6.3) ----------------------------
@@ -913,10 +1073,16 @@ func (s *Server) handleUplinkNASTransport(ctx context.Context, gnb *GNBContext, 
 		"amf_ue_ngap_id", req.AMFUENGAPId,
 		"supi", ue.SUPI,
 	)
-	if err := s.nasHandler.HandleNASMessage(ctx, ue, req.NASPdu); err != nil {
-		s.logger.Error("NAS handler error", "error", err,
-			"amf_ue_ngap_id", req.AMFUENGAPId)
-	}
+	// NAS procedures (e.g. UL NAS Transport → Nsmf_PDUSession_CreateSMContext)
+	// block on SBI calls — run on the UE's serial queue so one slow SMF call
+	// cannot back up NGAP processing for every other UE on this association.
+	nasPDU := req.NASPdu
+	ue.EnqueueSerial(func() {
+		if err := s.nasHandler.HandleNASMessage(ctx, ue, nasPDU); err != nil {
+			s.logger.Error("NAS handler error", "error", err,
+				"amf_ue_ngap_id", req.AMFUENGAPId)
+		}
+	})
 }
 
 // findGNBForUE returns the GNBContext serving the given UE using a direct
@@ -957,7 +1123,7 @@ func (s *Server) SendDownlinkNASTransport(ue *amfctx.UEContext, nasPDU []byte) e
 		"supi", ue.SUPI,
 		"spec_ref", "TS 38.413 §8.6.2",
 	)
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -966,6 +1132,9 @@ func (s *Server) SendDownlinkNASTransport(ue *amfctx.UEContext, nasPDU []byte) e
 // SendInitialContextSetupRequest sends an Initial Context Setup Request to the
 // gNB that serves the UE.  It carries KgNB (AS security base key), UE security
 // capability bitmaps, and the integrity-protected RegistrationAccept NAS PDU.
+// pduSessions, when non-empty, is the PDUSessionResourceSetupListCxtReq for
+// user-plane re-activation during Service Request (TS 23.502 §4.2.3 step 6);
+// pass nil for Initial Registration.
 // Ref: TS 38.413 §8.3.1
 func (s *Server) SendInitialContextSetupRequest(
 	ue *amfctx.UEContext,
@@ -973,6 +1142,7 @@ func (s *Server) SendInitialContextSetupRequest(
 	kgnb [32]byte,
 	cipherAlg, integAlg byte,
 	encAlgsBitmap, intAlgsBitmap uint16,
+	pduSessions []PDUSessionSetupItemCxtReq,
 ) error {
 	gnb := s.findGNBForUE(ue)
 	if gnb == nil {
@@ -987,6 +1157,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		s.cfg.RegionID, s.cfg.SetID, s.cfg.AMFID,
 		ue.AllowedNSSAI,
 		ue.RFSP,
+		pduSessions,
 	)
 	s.logger.Info("Initial Context Setup Request",
 		"procedure", "InitialRegistration",
@@ -996,9 +1167,10 @@ func (s *Server) SendInitialContextSetupRequest(
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
 		"rfsp", ue.RFSP,
+		"pdu_sessions_cxt_req", len(pduSessions),
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -1042,7 +1214,7 @@ func (s *Server) SendPDUSessionResourceSetupRequest(
 		"spec_ref", "TS 38.413 §8.4.1",
 	)
 
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -1082,7 +1254,7 @@ func (s *Server) SendPDUSessionResourceModifyRequest(
 		"supi", ue.SUPI,
 		"spec_ref", "TS 38.413 §8.2.1",
 	)
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -1127,7 +1299,7 @@ func (s *Server) SendPDUSessionResourceReleaseCommand(ue *amfctx.UEContext, pduS
 		"supi", ue.SUPI,
 		"spec_ref", "TS 38.413 §8.4.2",
 	)
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -1221,7 +1393,7 @@ func (s *Server) SendPaging(ue *amfctx.UEContext) error {
 
 	var sent int
 	for _, g := range targets {
-		if _, err := g.Conn.Write(pdu); err != nil {
+		if _, err := writeNGAP(g.Conn, pdu); err != nil {
 			s.logger.Warn("paging write failed",
 				"procedure", "NetworkTriggeredServiceRequest",
 				"interface", "N2", "direction", "OUT",
@@ -1365,8 +1537,13 @@ func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBCon
 	// its PDU sessions if the gNB SCTP association closes before reconnection.
 
 	// Normal AN Release (no deregistration): notify SMF to deactivate DL forwarding.
+	// The callback makes one blocking SBI call per PDU session — run it on the
+	// UE's serial queue so a Service Request arriving right after (same UE) is
+	// processed after the deactivation, and other UEs are not delayed.
 	if s.onANRelease != nil {
-		s.onANRelease(ctx, ue)
+		ue.EnqueueSerial(func() {
+			s.onANRelease(ctx, ue)
+		})
 	}
 
 	// Start Mobile Reachable Timer: UE is now CM-IDLE. If it does not reconnect
@@ -1393,7 +1570,7 @@ func (s *Server) SendUEContextReleaseCommand(gnb *GNBContext, amfUEID, ranUEID i
 		"ran_ue_ngap_id", ranUEID,
 		"spec_ref", "TS 38.413 §8.3.5",
 	)
-	_, err := gnb.Conn.Write(pdu)
+	_, err := writeNGAP(gnb.Conn, pdu)
 	return err
 }
 
@@ -1433,7 +1610,7 @@ func (s *Server) SendLocationReportingControl(ue *amfctx.UEContext) (<-chan Loca
 		"spec_ref", "TS 38.413 §8.17.1",
 	)
 
-	if _, err := gnb.Conn.Write(pdu); err != nil {
+	if _, err := writeNGAP(gnb.Conn, pdu); err != nil {
 		s.pendingLoc.Delete(ue.AMFUENGAPId)
 		return nil, fmt.Errorf("amf: send location reporting control: write: %w", err)
 	}
@@ -1482,6 +1659,139 @@ func (s *Server) handleLocationReport(ctx context.Context, gnb *GNBContext, msg 
 	// Non-blocking send: ch is buffered(1). If the caller already timed out the
 	// send simply succeeds into the buffer and the channel is GC'd.
 	ch <- LocationResult{NRCellID: rep.NRCellID, TAI: rep.TAI}
+}
+
+// ---- NGAP NRPPa Transport (TS 38.413 §8.17.3 / §8.17.4) ------------------
+
+// SendDownlinkNRPPa sends an NGAP DownlinkUEAssociatedNRPPaTransport PDU to
+// the gNB serving the UE. The nrppaPDU bytes are carried as an opaque NRPPa-PDU
+// IE — the AMF never decodes them. routingID may be nil if not yet established.
+//
+// A buffered channel is registered in pendingNRPPa keyed by ue.AMFUENGAPId;
+// the caller blocks on it until the matching UL NRPPa arrives or times out.
+// The caller is responsible for cleaning up the pending entry on timeout.
+//
+// Ref: TS 38.413 §8.17.3; TS 23.273 §7.2 step C; TS 29.518 §5.2.2.6.
+func (s *Server) SendDownlinkNRPPa(ue *amfctx.UEContext, nrppaPDU []byte, routingID []byte) (<-chan NRPPaResult, error) {
+	gnb := s.findGNBForUE(ue)
+	if gnb == nil {
+		return nil, fmt.Errorf("amf: send downlink nrppa: no gNB for UE %d", ue.AMFUENGAPId)
+	}
+
+	pdu := BuildDownlinkUEAssociatedNRPPaTransport(ue.AMFUENGAPId, ue.RANUENGAPId, nrppaPDU, routingID)
+	if pdu == nil {
+		return nil, fmt.Errorf("amf: send downlink nrppa: encode failed")
+	}
+
+	// Buffer of 1: the handleUplinkNRPPa handler sends into the buffer and
+	// continues even if the caller has already timed out (no goroutine leak).
+	ch := make(chan NRPPaResult, 1)
+	s.pendingNRPPa.Store(ue.AMFUENGAPId, ch)
+
+	s.logger.Info("NGAP DownlinkUEAssociatedNRPPaTransport sent",
+		"procedure", "NRPPaTransport",
+		"interface", "N2",
+		"direction", "OUT",
+		"message_type", "DownlinkUEAssociatedNRPPaTransport",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"ran_ue_ngap_id", ue.RANUENGAPId,
+		"supi", ue.SUPI,
+		"nrppa_pdu_len", len(nrppaPDU),
+		"spec_ref", "TS 38.413 §8.17.3",
+	)
+	metrics.AMFNRPPaTransportTotal.WithLabelValues("DL", "UE").Inc()
+
+	if _, err := writeNGAP(gnb.Conn, pdu); err != nil {
+		s.pendingNRPPa.Delete(ue.AMFUENGAPId)
+		return nil, fmt.Errorf("amf: send downlink nrppa: write: %w", err)
+	}
+	return ch, nil
+}
+
+// handleUplinkUEAssociatedNRPPa processes an NGAP UplinkUEAssociatedNRPPaTransport
+// message received from the gNB. It resolves the pending channel keyed by
+// AMF-UE-NGAP-ID and delivers the opaque NRPPa-PDU bytes to the waiting caller
+// (the dl-nrppa-info SBI handler that is blocking on the channel).
+//
+// If no pending channel is found the PDU is an orphan and is dropped with a
+// warning log. The AMF never decodes the NRPPa-PDU content.
+//
+// Ref: TS 38.413 §8.17.3; TS 23.273 §7.2 step C.
+func (s *Server) handleUplinkUEAssociatedNRPPa(ctx context.Context, gnb *GNBContext, msg *Message) {
+	ul, ok := msg.Value.(*UplinkUEAssociatedNRPPaTransportMsg)
+	if !ok || ul == nil {
+		s.logger.Error("UplinkUEAssociatedNRPPaTransport body decode failed",
+			"procedure", "NRPPaTransport",
+			"interface", "N2",
+			"direction", "IN",
+			"spec_ref", "TS 38.413 §8.17.3",
+		)
+		return
+	}
+
+	s.logger.Info("UplinkNRPPa received",
+		"procedure", "NRPPaTransport",
+		"interface", "N2",
+		"direction", "IN",
+		"message_type", "UplinkUEAssociatedNRPPaTransport",
+		"amf_ue_ngap_id", ul.AMFUENGAPId,
+		"ran_ue_ngap_id", ul.RANUENGAPId,
+		"nrppa_pdu_len", len(ul.NRPPaPDU),
+		"spec_ref", "TS 38.413 §8.17.3",
+	)
+	metrics.AMFNRPPaTransportTotal.WithLabelValues("UL", "UE").Inc()
+
+	val, loaded := s.pendingNRPPa.LoadAndDelete(ul.AMFUENGAPId)
+	if !loaded {
+		// No matching pending DL NRPPa request — this is an orphan.
+		// Log and drop: the LMF must handle the missing UL NRPPa via its own
+		// guard timer. Ref: TS 23.273 §7.2 (error table: nrppa_orphan).
+		s.logger.Warn("UplinkNRPPa orphan — no pending dl-nrppa-info request",
+			"procedure", "NRPPaTransport",
+			"amf_ue_ngap_id", ul.AMFUENGAPId,
+			"result", "nrppa_orphan",
+			"spec_ref", "TS 38.413 §8.17.3",
+		)
+		return
+	}
+	ch, ok := val.(chan NRPPaResult)
+	if !ok {
+		return
+	}
+	// Non-blocking send: ch is buffered(1). If the caller has already timed out
+	// the send succeeds into the buffer and the channel is GC'd.
+	ch <- NRPPaResult{NRPPaPDU: ul.NRPPaPDU, RoutingID: ul.RoutingID}
+}
+
+// handleUplinkNonUEAssociatedNRPPa processes an NGAP UplinkNonUEAssociatedNRPPaTransport
+// message received from the gNB. In the E-CID MVP this path is exercised only by
+// unit tests (cell-level NRPPa signalling not tied to a UE context). The AMF logs
+// the event and drops the PDU unless a non-UE relay path is wired.
+//
+// Ref: TS 38.413 §8.17.4.
+func (s *Server) handleUplinkNonUEAssociatedNRPPa(ctx context.Context, gnb *GNBContext, msg *Message) {
+	ul, ok := msg.Value.(*UplinkNonUEAssociatedNRPPaTransportMsg)
+	if !ok || ul == nil {
+		s.logger.Error("UplinkNonUEAssociatedNRPPaTransport body decode failed",
+			"procedure", "NRPPaTransport",
+			"interface", "N2",
+			"direction", "IN",
+			"spec_ref", "TS 38.413 §8.17.4",
+		)
+		return
+	}
+
+	s.logger.Info("UplinkNRPPa received (non-UE-associated)",
+		"procedure", "NRPPaTransport",
+		"interface", "N2",
+		"direction", "IN",
+		"message_type", "UplinkNonUEAssociatedNRPPaTransport",
+		"nrppa_pdu_len", len(ul.NRPPaPDU),
+		"spec_ref", "TS 38.413 §8.17.4",
+	)
+	metrics.AMFNRPPaTransportTotal.WithLabelValues("UL", "NON_UE").Inc()
+	// Non-UE-associated relay to LMF is wired in pass 2 (LMF side).
+	// For pass 1 the AMF logs and drops.
 }
 
 // ---- Stub message types (kept for handler interface compatibility) ------

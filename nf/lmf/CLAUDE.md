@@ -41,14 +41,24 @@ The LMF has **no direct N2 (NGAP/SCTP)** association — the AMF is the sole NGA
 |-----------|---------|-----------|------|
 | NRF | Nnrf_NFManagement | Register + Heartbeat | TS 29.510 §5.2.2 |
 | AMF | Namf_Location | ProvideLocationInfo | TS 29.518 §5.2.2.6 |
+| UDM | Nudm_SDM | Get lcsPrivacyData | TS 29.503 §5.2.2 / TS 23.273 §9.1 |
 
 ## 5. Implemented Procedures
 
 - [x] LMF-001: DetermineLocation (Cell-ID MVP) — TS 29.572 §5.2.2.2 / TS 23.273 §7.2
-- [ ] LMF-002: EventSubscription / periodic / area-of-interest (TS 29.572 §5.2.3)
-- [ ] LMF-003: CancelLocation (TS 29.572 §5.2.2.5)
-- [ ] LMF-004: LPP/NRPPa relay for E-CID/OTDOA/GNSS (TS 38.413 §8.17.2, TS 37.355)
-- [ ] LMF-005: GMLC integration / N56 interface (TS 29.515)
+- [x] LMF-002: Deferred MT Location (paging-then-locate for CM-IDLE UEs) + UDM Location Privacy —
+      TS 23.273 §7.2 steps E2–E7 / §9.1 / TS 29.503 §5.2.2
+- [x] LMF-006: Live Cell-ID E2E — UERANSIM gNB LocationReport patch (`0040`) + LMF synthetic
+      mobility model (`internal/server/mobility.go`) + portal "UE Location" live map (TS 38.413 §8.17)
+- [x] LMF-003: EventSubscription / periodic / area-of-interest + CancelLocation (TS 29.572 §5.2.3, §5.2.2.5)
+- [x] LMF-004: NRPPa relay — E-CID positioning (TS 38.455 / TS 23.273 §6.2.9); core-side codec +
+      AMF NGAP NRPPa transport (ProcCode 8/50) + LMF method selection + weighted centroid
+- [x] LMF-008: Live E-CID E2E — UERANSIM gNB NRPPa-Transport patch `0041` + `validate-ueransim-mod.sh nrppa`
+- [x] LMF-005: LPP relay for GNSS positioning via N1 (TS 37.355, TS 24.501 §8.7.4, payload container
+      type **0x03**) — `shared/lpp` APER codec + WLS GNSS solver; AMF additive 0x03 NAS branch +
+      `dl-lpp-info` synchronous relay; LMF `methodLPP` band (hAccuracy<50 m) + `performLPPOrFallback`
+      (GNSS→E-CID→Cell-ID). Live UE patch `0042` + GNSS E2E deferred (follow-up, mirrors LMF-008)
+- [ ] LMF-007: GMLC integration / N56 interface (TS 29.515)
 
 ## 6. Internal Architecture
 
@@ -56,13 +66,15 @@ The LMF has **no direct N2 (NGAP/SCTP)** association — the AMF is the sole NGA
 cmd/lmf/
   main.go                  Bootstrap + NRF registration + graceful shutdown
 internal/
-  config/config.go         Config loader (YAML) + cell→coord map
+  config/config.go         Config loader (YAML) + cell→coord map + privacy_check flag
   server/
-    server.go              HTTP/2 SBI server + DetermineLocation handler
+    server.go              HTTP/2 SBI server + DetermineLocation handler (privacy gate)
     amf_client.go          AMF Namf_Location client (Namf_Location consumer)
-    server_test.go         Unit tests (httptest, no TLS, mock AMF client)
-config/dev.yaml            Dev configuration
-tests/features/            BDD feature files (step defs: test-engineer task)
+    udm_client.go          UDM SDM client: lcs-privacy-data (5-min per-SUPI cache, fail-open)
+    mobility.go            Synthetic per-SUPI mobility model for cell-ID positioning
+    server_test.go         Unit tests (httptest, no TLS, mock AMF + mock UDM clients)
+config/dev.yaml            Dev configuration (privacy_check: true, peers.udm)
+tests/features/            BDD feature files + step defs (8 scenarios, incl. paging + privacy)
 ```
 
 ## 7. Ports

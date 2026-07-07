@@ -1,0 +1,27 @@
+diff --git a/src/ue/nas/mm/dereg.cpp b/src/ue/nas/mm/dereg.cpp
+index a9e0390..b9efb2f 100644
+--- a/src/ue/nas/mm/dereg.cpp
++++ b/src/ue/nas/mm/dereg.cpp
+@@ -345,11 +345,17 @@ void NasMm::receiveDeregistrationRequest(const nas::DeRegistrationRequestUeTermi
+ 
+     if (reRegistrationRequired)
+     {
+-        // TODO: Perform re-registration, but consider forceLocalReleaseNas
+-        //  if 'forceLocalReleaseNas' is true, local release nas before re-registration.
+-        //  See "5.5.1.2.7 g) De-registration procedure collision."
+-        //  The UE should also re-establish any previously established PDU sessions
+-        (void)forceLocalReleaseNas;
++        // TS 24.501 §5.5.2.3.2: upon "re-registration required" the UE sends the
++        // DEREGISTRATION ACCEPT (done above), enters 5GMM-DEREGISTERED and then
++        // initiates a new initial registration. PDU sessions were already locally
++        // released above and are re-established after the new registration.
++        // "5.5.1.2.7 g) De-registration procedure collision": if a UE-initiated
++        // registration was in progress, release the NAS connection locally first.
++        if (forceLocalReleaseNas)
++            localReleaseConnection(false);
++
++        switchMmState(EMmSubState::MM_DEREGISTERED_NORMAL_SERVICE);
++        initialRegistrationRequired(EInitialRegCause::DUE_TO_DEREGISTRATION);
+     }
+ }
+ 

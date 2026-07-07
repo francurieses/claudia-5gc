@@ -37,7 +37,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "fivegc_upf_pfcp_sessions_active",
+          "expr": "fivegc_upf_pfcp_sessions_active{nf=\"UPF\"}",
           "legendFormat": "",
           "refId": "A"
         }
@@ -125,18 +125,18 @@
     {
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "Mbits"},
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "bps"},
         "overrides": []
       },
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
       "id": 5,
       "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-      "title": "GTP-U Throughput — Uplink vs Downlink (Mbps)",
+      "title": "GTP-U Throughput — Uplink vs Downlink",
       "type": "timeseries",
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (direction)(rate(fivegc_upf_gtp_bytes_total{}[1m])) * 8 / 1e6",
+          "expr": "sum by (direction)(rate(fivegc_upf_gtp_bytes_total{}[1m])) * 8",
           "legendFormat": "{{direction}}",
           "refId": "A"
         }
@@ -145,18 +145,18 @@
     {
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "fieldConfig": {
-        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "Mbits"},
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "bps"},
         "overrides": []
       },
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
       "id": 6,
       "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-      "title": "GTP-U Throughput by DNN (Mbps)",
+      "title": "GTP-U Throughput by DNN",
       "type": "timeseries",
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (dnn)(rate(fivegc_upf_gtp_bytes_total{}[1m])) * 8 / 1e6",
+          "expr": "sum by (dnn)(rate(fivegc_upf_gtp_bytes_total{}[1m])) * 8",
           "legendFormat": "{{dnn}}",
           "refId": "A"
         }
@@ -230,7 +230,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "fivegc_upf_pfcp_sessions_active",
+          "expr": "fivegc_upf_pfcp_sessions_active{nf=\"UPF\"}",
           "legendFormat": "active",
           "refId": "A"
         }

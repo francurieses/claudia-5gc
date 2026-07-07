@@ -28,7 +28,7 @@ sessions:
       sst: 1
       sd: 0x000001
   - type: 'IPv4'
-    apn: 'gold'
+    apn: 'gaming'
     slice:
       sst: 1
       sd: 0x000002   # gold slice (eMBB premium)

@@ -73,7 +73,7 @@ func (d Deps) handleCreateSubscriber(w http.ResponseWriter, r *http.Request) {
 		sub.Slices = []store.SNSSAI{}
 	}
 
-	if err := d.Store.UpsertSubscriber(r.Context(), sub); err != nil {
+	if err := d.Store.UpsertSubscriber(r.Context(), sub, false); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -92,11 +92,18 @@ func (d Deps) handleUpdateSubscriber(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub.SUPI = supi
+	if sub.K == "" || sub.OPc == "" {
+		writeError(w, http.StatusBadRequest, "k and opc are required — an empty value would wipe the subscriber's key material")
+		return
+	}
 	if sub.Slices == nil {
 		sub.Slices = []store.SNSSAI{}
 	}
 
-	if err := d.Store.UpsertSubscriber(r.Context(), sub); err != nil {
+	// preserveSQN: the SQN advances on every authentication; writing back the
+	// value the form read would rewind it and break UERANSIM key derivation
+	// (SMC integrity failure). See UpsertSubscriber.
+	if err := d.Store.UpsertSubscriber(r.Context(), sub, true); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -621,6 +621,52 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// UP re-activation (Service Request): upCnxState=ACTIVATING — re-emit the
+	// PDUSessionResourceSetupRequestTransfer (UL TEID + QoS) so the AMF can
+	// carry N2SM info in InitialContextSetupRequest (TS 23.502 §4.2.3 step 6).
+	// DL forwarding is re-activated when the AMF forwards the gNB's response
+	// transfer back here (default N2SM-response branch below).
+	// Ref: TS 29.502 §5.2.2.3.2.2, TS 23.502 §4.2.3.2 step 12
+	if upCnxState, _ := body["upCnxState"].(string); upCnxState == "ACTIVATING" {
+		s.sessionMu.Lock()
+		sess := s.sessions[smContextRef]
+		s.sessionMu.Unlock()
+		if sess == nil {
+			log.Warn("UP activation: session not found")
+			problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "sm context not found")
+			return
+		}
+
+		n2SmInfo, err := buildPDUSessionResourceSetupRequestTransfer(
+			net.ParseIP(s.cfg.UPFN3Addr), sess.ULTEID, 1 /* QFI */, int64(sess.FiveQI),
+			int64(sess.AMBRULMbps)*1_000_000, int64(sess.AMBRDLMbps)*1_000_000,
+			ngapPDUSessionType(sess.PDUSessionType),
+		)
+		if err != nil {
+			log.Error("N2SM Transfer encoding failed for UP activation", "error", err)
+			problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
+			return
+		}
+
+		log.Info("UP re-activation — N2SM Setup Request Transfer rebuilt",
+			"interface", "Nsmf",
+			"direction", "OUT",
+			"supi", sess.SUPI,
+			"pdu_session_id", sess.PDUSessionID,
+			"ulTEID", sess.ULTEID,
+			"5qi", sess.FiveQI,
+			"spec_ref", "TS 23.502 §4.2.3.2 step 12",
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"n2SmInfo":     base64.StdEncoding.EncodeToString(n2SmInfo),
+			"n2SmInfoType": "PDU_RES_SETUP_REQ",
+			"upCnxState":   "ACTIVATING",
+		})
+		return
+	}
+
 	// AN Release: upCnxState=DEACTIVATED — suspend UPF DL path.
 	// Ref: TS 23.502 §4.2.6 step 5, TS 29.502 §5.2.2.3.2
 	if upCnxState, _ := body["upCnxState"].(string); upCnxState == "DEACTIVATED" {

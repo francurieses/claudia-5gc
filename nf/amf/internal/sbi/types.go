@@ -11,6 +11,8 @@
 //	TS 23.273 §7.2 (Cell-ID positioning).
 package sbi
 
+import "time"
+
 // TransferReason enumerates why the new AMF is requesting the UE context.
 // Ref: TS 29.518 §6.1.6.3.x (TransferReason).
 const (
@@ -212,6 +214,80 @@ type TaiLoc struct {
 // CauseLocationFailure is returned when the NGAP location exchange fails or times out.
 // Ref: TS 29.572 §6.1.x; TS 29.518 §5.2.2.6.
 const CauseLocationFailure = "LOCATION_FAILURE"
+
+// CauseNRPPaRelayFailure is returned when the NGAP NRPPa Transport exchange fails or times out.
+// Ref: TS 38.413 §8.17.3; TS 29.518 §5.2.2.6 (error path for NRPPa relay).
+const CauseNRPPaRelayFailure = "NRPPA_RELAY_FAILURE"
+
+// nrppaTimeout is the maximum time the dl-nrppa-info handler waits for a matching
+// UplinkUEAssociatedNRPPaTransport from the gNB. Mirrors locationTimeout.
+// Ref: TS 23.273 §7.2 (guard timer for NRPPa relay path); TS 38.455 §8.2.
+const nrppaTimeout = 10 * time.Second
+
+// ---- NRPPa relay SBI types (Namf_Location, TS 29.518 §5.2.2.6 extension) ----
+
+// DLNRPPaInfoReq is the request body for POST .../dl-nrppa-info.
+// The LMF sends a base64-encoded NRPPa PDU; the AMF relays it transparently to the gNB.
+// Ref: TS 29.518 §5.2.2.6; TS 38.455 §8.2 (NRPPa transparent container).
+type DLNRPPaInfoReq struct {
+	// NrppaPdu is the base64url-encoded NRPPa PDU to relay to the gNB.
+	// The AMF MUST NOT inspect or modify this content.
+	// Ref: TS 38.413 §9.3.x (NRPPa-PDU IE id=46, opaque container).
+	NrppaPdu string `json:"nrppaPdu"`
+	// RoutingId is the optional LMF routing identity (base64url-encoded).
+	// Carried as NGAP RoutingID IE id=89.
+	// Ref: TS 38.413 §9.3.x (Routing ID IE).
+	RoutingId string `json:"routingId,omitempty"`
+}
+
+// DLNRPPaInfoRsp is the response body for POST .../dl-nrppa-info (HTTP 200).
+// Carries the UL NRPPa PDU received from the gNB, base64url-encoded.
+// Ref: TS 29.518 §5.2.2.6.
+type DLNRPPaInfoRsp struct {
+	// NrppaPdu is the base64url-encoded UL NRPPa PDU received from the gNB.
+	NrppaPdu string `json:"nrppaPdu"`
+}
+
+// ---- LPP relay SBI types (Namf_Location, TS 29.518 §5.2.2.6 extension, LMF-005) ----
+
+// CauseLPPRelayFailure is returned when the DL/UL LPP relay over NAS N1 fails
+// or times out. Ref: TS 24.501 §8.7.4; TS 23.273 §7.2; TS 29.518 §5.2.2.6.
+const CauseLPPRelayFailure = "LPP_RELAY_FAILURE"
+
+// lppTimeout is the maximum time the dl-lpp-info handler waits for a matching
+// UL NAS Transport (payload container type 0x03) from the UE. Mirrors
+// nrppaTimeout; TS 23.273 §7.2 has no normative timer for this guard.
+const lppTimeout = 10 * time.Second
+
+// DLLPPInfoReq is the request body for POST .../dl-lpp-info.
+// The LMF sends a base64-encoded opaque LPP-PDU; the AMF relays it
+// transparently to the UE via a DL NAS Transport (payload container type
+// 0x03) — it MUST NOT inspect or modify this content.
+// Ref: TS 29.518 §5.2.2.6; TS 24.501 §8.7.4 / §9.11.3.40; TS 37.355 §6.
+type DLLPPInfoReq struct {
+	// LppPdu is the base64-encoded LPP-PDU to relay to the UE.
+	LppPdu string `json:"lppPdu"`
+	// LppTransactionId is an optional LMF-assigned correlation aid (not used
+	// for AMF-side correlation, which keys on AMF-UE-NGAP-ID).
+	LppTransactionId int64 `json:"lppTransactionId,omitempty"`
+	// ExpectUlResponse (ADDITIVE, LMF-009; nil/absent defaults to true)
+	// selects the relay mode. true: LMF-005 synchronous behaviour — register
+	// a pendingLPP waiter, block for the matching UL NAS Transport
+	// (PCT=0x03), return 200 with the UL LPP-PDU. false (DL-only leg —
+	// TS 37.355 assistance-data delivery is unsolicited with no response
+	// message): send the DL NAS Transport and return 204 No Content
+	// immediately, WITHOUT registering a waiter.
+	// Ref: docs/procedures/LPPRelay.md §Endpoints; TS 37.355 §6.5.2.
+	ExpectUlResponse *bool `json:"expectUlResponse,omitempty"`
+}
+
+// DLLPPInfoRsp is the response body for POST .../dl-lpp-info (HTTP 200).
+// Carries the UL LPP-PDU received from the UE, base64-encoded.
+// Ref: TS 29.518 §5.2.2.6.
+type DLLPPInfoRsp struct {
+	// LppPdu is the base64-encoded UL LPP-PDU received from the UE.
+	LppPdu string `json:"lppPdu"`
+}
 
 // nasAlgName maps a NAS algorithm identifier (0..3) to its 3GPP short name.
 // Ref: TS 24.501 §9.11.3.34.

@@ -182,6 +182,82 @@ var (
 		Name: "fivegc_lmf_locate_total",
 		Help: "Total Nlmf_Location DetermineLocation requests by result (TS 29.572).",
 	}, []string{"result"})
+
+	// LMFSubscriptionCreateTotal counts Nlmf_Location EventSubscription Create requests.
+	// Label: result ("OK" | "REJECT"). Incremented on every POST /nlmf-loc/v1/subscriptions.
+	// Ref: TS 29.572 §5.2.3.2.
+	LMFSubscriptionCreateTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_lmf_subscription_create_total",
+		Help: "Total Nlmf_Location EventSubscription Create requests by result (TS 29.572 §5.2.3.2).",
+	}, []string{"result"})
+
+	// LMFSubscriptionsActive is the current number of active location event subscriptions.
+	// Ref: TS 29.572 §5.2.3.
+	LMFSubscriptionsActive = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fivegc_lmf_subscriptions_active",
+		Help: "Current number of active Nlmf_Location EventSubscriptions (TS 29.572 §5.2.3).",
+	})
+
+	// LMFNotificationsTotal counts location notification delivery attempts.
+	// Labels: event_trigger ("PERIODIC_REPORTING"|"AREA_OF_INTEREST"), result ("OK"|"RETRIED"|"DROPPED").
+	// Ref: TS 29.572 §6.1.6.2.4.
+	LMFNotificationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_lmf_notifications_total",
+		Help: "Total Nlmf_Location notification delivery attempts by trigger type and result (TS 29.572 §6.1.6.2.4).",
+	}, []string{"event_trigger", "result"})
+
+	// LMFECIDTotal counts E-CID NRPPa positioning attempts by result.
+	// Labels: result ("OK" | "FALLBACK_CELLID" | "FAILURE").
+	//   OK            — E-CID weighted centroid computed and returned.
+	//   FALLBACK_CELLID — NRPPa exchange failed or gNB capability=NONE; Cell-ID returned.
+	//   FAILURE       — hard error (UE not found, context error); 4xx/5xx returned to LCS client.
+	//
+	// Ref: TS 23.273 §6.2.9 (E-CID positioning method);
+	//      TS 29.572 §5.2.2.2 (DetermineLocation quality-driven method selection).
+	LMFECIDTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_lmf_ecid_total",
+		Help: "Total E-CID NRPPa positioning attempts by result (OK|FALLBACK_CELLID|FAILURE).",
+	}, []string{"result"})
+
+	// --- NRPPa Transport (AMF) ---
+
+	// AMFNRPPaTransportTotal counts NGAP NRPPa Transport messages exchanged by the AMF.
+	// Labels:
+	//   direction: "UL" (gNB→AMF) or "DL" (AMF→gNB)
+	//   assoc:     "UE" (UE-associated, ProcCode 8/50) or "NON_UE" (non-UE-associated, ProcCode 5/47)
+	//
+	// Ref: TS 38.413 §8.17.3 (UE-associated NRPPa Transport),
+	//      TS 38.413 §8.17.4 (Non-UE-associated NRPPa Transport).
+	AMFNRPPaTransportTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_amf_nrppa_transport_total",
+		Help: "Total NGAP NRPPa Transport messages by direction (UL/DL) and association type (UE/NON_UE).",
+	}, []string{"direction", "assoc"})
+
+	// --- LPP Relay / GNSS positioning (LMF-005) ---
+
+	// LMFGNSSTotal counts A-GNSS/LPP positioning attempts by result.
+	// Labels: result ("OK" | "FALLBACK_ECID" | "FALLBACK_CELLID" | "FAILURE").
+	//   OK               — GNSS WLS fix computed and returned.
+	//   FALLBACK_ECID    — GNSS unsupported/failed; E-CID (LMF-004) fix returned instead.
+	//   FALLBACK_CELLID  — GNSS and E-CID both unavailable; Cell-ID (LMF-001) fix returned.
+	//   FAILURE          — hard error (UE not found, context error); 4xx/5xx returned to LCS client.
+	//
+	// Ref: TS 23.273 §6.2.10 (GNSS positioning method / A-GNSS via LPP);
+	//      TS 29.572 §5.2.2.2 (DetermineLocation quality-driven method selection).
+	LMFGNSSTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_lmf_gnss_total",
+		Help: "Total A-GNSS/LPP positioning attempts by result (OK|FALLBACK_ECID|FALLBACK_CELLID|FAILURE).",
+	}, []string{"result"})
+
+	// AMFLPPTransportTotal counts NAS DL/UL NAS Transport messages carrying an
+	// opaque LPP container (payload container type 0x03) relayed by the AMF.
+	// Label: direction ("UL" | "DL").
+	// Ref: TS 24.501 §8.7.4 (DL/UL NAS Transport carrying LPP); TS 23.273 §7.2
+	// (AMF is a transparent relay).
+	AMFLPPTransportTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_amf_lpp_transport_total",
+		Help: "Total NAS DL/UL NAS Transport messages carrying an opaque LPP container, by direction (UL/DL).",
+	}, []string{"direction"})
 )
 
 // MetricsServer builds a standalone HTTP server for the /metrics endpoint.

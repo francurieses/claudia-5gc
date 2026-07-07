@@ -110,7 +110,15 @@ func (s *Store) GetSubscriber(ctx context.Context, supi string) (*Subscriber, er
 }
 
 // UpsertSubscriber creates or updates a subscriber (auth + AM data).
-func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {
+//
+// preserveSQN must be true for updates driven by a read-modify-write client
+// (the portal edit form): the SQN is network-managed state that the UDM
+// increments on every authentication, so writing back the value the client
+// read earlier would move it BACKWARDS. UERANSIM does not resync on a
+// backwards SQN — it derives KAUSF from its own higher SQN-MS while the
+// network uses the stale one, and the UE then rejects the Security Mode
+// Command with an integrity failure, permanently blocking re-registration.
+func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber, preserveSQN bool) error {
 	snssaisJSON, err := json.Marshal(sub.Slices)
 	if err != nil {
 		return err
@@ -122,6 +130,10 @@ func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	sqnUpdate := `sqn = EXCLUDED.sqn,`
+	if preserveSQN {
+		sqnUpdate = `sqn = subscription_auth.sqn,`
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO subscription_auth
 		    (supi, authentication_method, enc_permanent_key, protection_parameter_id,
@@ -129,7 +141,7 @@ func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber) error {
 		VALUES ($1,'5G_AKA',$2,'',$3,'NON_TIME_BASED',$4,'milenage',$5,'')
 		ON CONFLICT (supi) DO UPDATE SET
 		    enc_permanent_key = EXCLUDED.enc_permanent_key,
-		    sqn               = EXCLUDED.sqn,
+		    `+sqnUpdate+`
 		    amf               = EXCLUDED.amf,
 		    enc_opc_key       = EXCLUDED.enc_opc_key`,
 		sub.SUPI, sub.K, sub.SQN, sub.AMF, sub.OPc)

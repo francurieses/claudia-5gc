@@ -1,6 +1,11 @@
 amf_id: 1
 amf_region_id: 1
 amf_set_id: 1
+# Registration area (TAI list) sent to UEs in Registration Accept (IEI 0x54).
+# Must cover every TAC the connected gNBs broadcast (config/ueransim/gnb.yaml tac: 1).
+# The UE's current TAC is always included even if missing here.
+served_tacs:
+    - 1
 features:
     ursp_enabled: true
 metrics:

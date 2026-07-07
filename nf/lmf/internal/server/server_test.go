@@ -40,17 +40,25 @@ func (m *mockAMFClient) ProvideLocationInfo(ctx context.Context, ueContextID str
 
 // ---- test helpers ------------------------------------------------------------
 
-// newTestServer builds an LMF server using the supplied mock AMF client and
-// starts it via httptest. TLS is disabled — handler logic (not TLS) is under test.
+// newTestServer builds an LMF server using the supplied mock AMF client (no UDM
+// client → privacy check disabled) and starts it via httptest.
+// TLS is disabled — handler logic (not TLS) is under test.
 func newTestServer(t *testing.T, amfClient AMFLocationClient) *httptest.Server {
+	t.Helper()
+	return newTestServerFull(t, amfClient, nil)
+}
+
+// newTestServerFull builds an LMF server with both an AMF and UDM client.
+func newTestServerFull(t *testing.T, amfClient AMFLocationClient, udmClient UDMSDMClient) *httptest.Server {
 	t.Helper()
 	cfg := &config.Config{}
 	cfg.SBI.Address = "127.0.0.1:0" // not used by httptest
 	cfg.CellCoordinates = map[string]config.CellCoord{
 		"000000010": {Lat: 40.416775, Lon: -3.703790},
 	}
+	cfg.PrivacyCheck = udmClient != nil // enable check only when a UDM client is injected
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(cfg, logger, amfClient)
+	srv := New(cfg, logger, amfClient, udmClient)
 	return httptest.NewServer(srv.Handler())
 }
 
@@ -308,5 +316,78 @@ func TestDetermineLocation_AMFUnreachable(t *testing.T) {
 	decodeJSON(t, resp, &pd)
 	if pd["cause"] != "LOCATION_FAILURE" {
 		t.Errorf("expected cause=LOCATION_FAILURE, got %v", pd["cause"])
+	}
+}
+
+// ---- mock UDM client ----------------------------------------------------------
+
+// mockUDMClient is a test double for UDMSDMClient.
+type mockUDMClient struct {
+	LocationPrivacy string // returned in GetLcsPrivacyData
+	called          int
+}
+
+func (m *mockUDMClient) GetLcsPrivacyData(_ context.Context, _ string) (*LcsPrivacyData, error) {
+	m.called++
+	return &LcsPrivacyData{LocationPrivacy: m.LocationPrivacy}, nil
+}
+
+// TestDetermineLocation_PrivacyAllowed verifies that when UDM returns ALLOW_ALL the
+// location request proceeds normally and AMF is called.
+// Ref: TS 23.273 §9.1; TS 29.572 §5.2.2.2.
+func TestDetermineLocation_PrivacyAllowed(t *testing.T) {
+	amfCallCount := 0
+	amfClient := &mockAMFClient{
+		ProvideFunc: func(_ context.Context, _ string) (*LocationData, string, error) {
+			amfCallCount++
+			return &LocationData{
+				NRCellId: "000000010",
+				Tai:      &TaiLoc{PlmnId: PlmnID{MCC: "001", MNC: "01"}, Tac: "0001"},
+			}, "", nil
+		},
+	}
+	udmClient := &mockUDMClient{LocationPrivacy: "ALLOW_ALL"}
+
+	ts := newTestServerFull(t, amfClient, udmClient)
+	defer ts.Close()
+
+	resp := postLocInfo(t, ts, "imsi-001010000000001", map[string]string{"supi": "imsi-001010000000001"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if udmClient.called != 1 {
+		t.Errorf("UDM client called %d times, want 1", udmClient.called)
+	}
+	if amfCallCount != 1 {
+		t.Errorf("AMF client called %d times, want 1", amfCallCount)
+	}
+}
+
+// TestDetermineLocation_PrivacyDenied verifies that when UDM returns BLOCK_ALL the
+// LMF returns 403 PRIVACY_EXCEPTION_DENIED without calling the AMF.
+// Ref: TS 23.273 §9.1; TS 29.572 §5.2.2.2 error table.
+func TestDetermineLocation_PrivacyDenied(t *testing.T) {
+	amfClient := &mockAMFClient{
+		ProvideFunc: func(_ context.Context, _ string) (*LocationData, string, error) {
+			t.Error("AMF client should not be called when privacy is BLOCK_ALL")
+			return nil, "", nil
+		},
+	}
+	udmClient := &mockUDMClient{LocationPrivacy: "BLOCK_ALL"}
+
+	ts := newTestServerFull(t, amfClient, udmClient)
+	defer ts.Close()
+
+	resp := postLocInfo(t, ts, "imsi-001010000000001", map[string]string{"supi": "imsi-001010000000001"})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+	var pd map[string]any
+	decodeJSON(t, resp, &pd)
+	if pd["cause"] != "PRIVACY_EXCEPTION_DENIED" {
+		t.Errorf("expected cause=PRIVACY_EXCEPTION_DENIED, got %v", pd["cause"])
+	}
+	if udmClient.called != 1 {
+		t.Errorf("UDM client called %d times, want 1", udmClient.called)
 	}
 }

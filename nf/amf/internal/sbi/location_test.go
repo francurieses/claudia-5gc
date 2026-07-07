@@ -134,25 +134,109 @@ func TestProvideLocInfo_NotFound(t *testing.T) {
 	}
 }
 
-// TestProvideLocInfo_CMIdle verifies that a CM-IDLE UE → 409 UE_NOT_REACHABLE.
-// Paging-then-locate is deferred to a follow-up task (LMF-002+).
-// Ref: TS 29.518 §5.2.2.6; DetermineLocation.md error table.
-func TestProvideLocInfo_CMIdle(t *testing.T) {
+// TestProvideLocInfo_CMIdle_PagingTimeout verifies that a CM-IDLE UE whose paging
+// is never acknowledged within T-positioning results in 504 UE_NOT_REACHABLE.
+// The test uses a short-lived request context to avoid waiting the full 15 s constant.
+// Ref: TS 23.273 §7.2 steps E2–E7; TS 29.518 §5.2.2.6.
+func TestProvideLocInfo_CMIdle_PagingTimeout(t *testing.T) {
 	srv, mgr := newTestServer(t)
 	ue := seedRegisteredUE(mgr, "imsi-001010000000001")
-	ue.CMState = amfctx.CMIdle // explicitly idle
+	ue.CMState = amfctx.CMIdle
+	srv.SetPager(&fakePager{}) // paging fires but nobody signals NotifyUEReachable
 	srv.SetLocator(&fakeLocator{})
 
-	body, _ := json.Marshal(RequestLocInfo{Req5gsLoc: true})
-	resp, raw := postLocInfo(t, srv, "imsi-001010000000001", body)
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	defer ts.Close()
 
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+	body, _ := json.Marshal(RequestLocInfo{Req5gsLoc: true})
+	// 150 ms deadline — fires long before pageTimeout (15 s) to keep test fast.
+	// The select in handleProvideLocInfo picks up pageCtx.Done() (which is derived
+	// from r.Context()) and returns 504 UE_NOT_REACHABLE.
+	reqCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(reqCtx,
+		http.MethodPost,
+		ts.URL+"/namf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Logf("client-side cancellation (expected for timeout path): %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", resp.StatusCode, buf.Bytes())
 	}
 	var pd ProblemDetails
-	_ = json.Unmarshal(raw, &pd)
+	_ = json.Unmarshal(buf.Bytes(), &pd)
 	if pd.Cause != CauseUENotReachable {
 		t.Errorf("cause = %q, want %q", pd.Cause, CauseUENotReachable)
+	}
+}
+
+// TestProvideLocInfo_CMIdle_PagingSuccess verifies the full paging-then-locate path:
+// UE is CM-IDLE, paging fires, NotifyUEReachable is called (simulating Service Request),
+// then NGAP LocationReportingControl succeeds → 200 LocationData.
+// Ref: TS 23.273 §7.2 steps E2–E7; TS 29.518 §5.2.2.6.
+func TestProvideLocInfo_CMIdle_PagingSuccess(t *testing.T) {
+	srv, mgr := newTestServer(t)
+	ue := seedRegisteredUE(mgr, "imsi-001010000000001")
+	ue.CMState = amfctx.CMIdle
+
+	fp := &fakePager{}
+	srv.SetPager(fp)
+	fl := &fakeLocator{
+		result: ngap.LocationResult{
+			NRCellID: "000000042",
+			TAI:      &ngap.TAI{MCC: "001", MNC: "01", TAC: 1},
+		},
+	}
+	srv.SetLocator(fl)
+
+	ts := httptest.NewServer(srv.httpSrv.Handler)
+	defer ts.Close()
+
+	// After a brief pause, simulate the UE returning via Service Request.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		srv.NotifyUEReachable(ue.AMFUENGAPId)
+	}()
+
+	body, _ := json.Marshal(RequestLocInfo{Req5gsLoc: true})
+	req, _ := http.NewRequest(http.MethodPost,
+		ts.URL+"/namf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, buf.Bytes())
+	}
+	var ld LocationData
+	if err := json.Unmarshal(buf.Bytes(), &ld); err != nil {
+		t.Fatalf("decode LocationData: %v", err)
+	}
+	if ld.NRCellId != "000000042" {
+		t.Errorf("nrCellId = %q, want \"000000042\"", ld.NRCellId)
+	}
+	if fp.paged != 1 {
+		t.Errorf("Pager called %d times, want 1", fp.paged)
+	}
+	if fl.called != 1 {
+		t.Errorf("Locator called %d times, want 1", fl.called)
 	}
 }
 

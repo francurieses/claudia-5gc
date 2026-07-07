@@ -54,23 +54,61 @@ func DecodeServiceRequest(b []byte) (*ServiceRequest, error) {
 		},
 	}
 
-	// 5G-S-TMSI: mandatory LV (1-byte length) per TS 24.501 §8.2.16.1.
-	// Value layout (7 bytes): identity-type octet (0xF4) | AMF Set ID(10b) +
-	// AMF Pointer(6b) | 5G-TMSI (4 bytes).
-	// (Audit fix: this IE was previously not consumed, so its length byte was
-	// misread as an optional IEI and UplinkDataStatus/PDUSessionStatus were lost.)
-	if tmsiLen, err := rdr.ReadByte(); err == nil {
-		if val, err := rdr.ReadBytes(int(tmsiLen)); err == nil && len(val) >= 7 {
-			r.TMSI = uint32(val[3])<<24 | uint32(val[4])<<16 | uint32(val[5])<<8 | uint32(val[6])
+	// 5G-S-TMSI: mandatory LV-E (2-byte big-endian length) per TS 24.501
+	// Table 8.2.15.1.1 — the 5GS mobile identity IE (§9.11.3.4) is format LV-E,
+	// total 9 octets. Value layout (7 bytes): identity-type octet (0xF4) |
+	// AMF Set ID(10b) + AMF Pointer(6b) | 5G-TMSI (4 bytes).
+	// (Fix: this was previously read as a 1-byte-length LV, shifting the parser
+	// so UplinkDataStatus/PDUSessionStatus were lost on UERANSIM messages.)
+	if hi, err := rdr.ReadByte(); err == nil {
+		if lo, err := rdr.ReadByte(); err == nil {
+			if val, err := rdr.ReadBytes(int(hi)<<8 | int(lo)); err == nil && len(val) >= 7 {
+				r.TMSI = uint32(val[3])<<24 | uint32(val[4])<<16 | uint32(val[5])<<8 | uint32(val[6])
+			}
 		}
 	}
 
-	// Optional TLV IEs
+	// Optional IEs
 	for rdr.Len() >= 2 {
 		iei, err := rdr.ReadByte()
 		if err != nil {
 			break
 		}
+
+		// NAS message container — TLV-E (2-byte length), TS 24.501 §9.11.3.33.
+		// A UE with a valid security context sends the *complete* Service
+		// Request (including Uplink Data Status / PDU Session Status) inside
+		// this container; the outer message carries only ngKSI + 5G-S-TMSI.
+		// Per TS 24.501 §4.4.6 / §5.6.1.4 the network uses the contained
+		// message. The container is plaintext under NEA0 (dev null-ciphering);
+		// with a real cipher the caller must decipher before decoding.
+		if iei == 0x71 {
+			hi, err := rdr.ReadByte()
+			if err != nil {
+				break
+			}
+			lo, err := rdr.ReadByte()
+			if err != nil {
+				break
+			}
+			val, err := rdr.ReadBytes(int(hi)<<8 | int(lo))
+			if err != nil {
+				break
+			}
+			// val is a complete plain NAS message: EPD | SHT | MsgType | body.
+			if len(val) >= 4 && val[0] == PDMobilityManagement && MessageType(val[2]) == MsgTypeServiceRequest {
+				if inner, err := DecodeServiceRequest(val[3:]); err == nil {
+					if inner.UplinkDataStatus != nil {
+						r.UplinkDataStatus = inner.UplinkDataStatus
+					}
+					if inner.PDUSessionStatus != nil {
+						r.PDUSessionStatus = inner.PDUSessionStatus
+					}
+				}
+			}
+			continue
+		}
+
 		length, err := rdr.ReadByte()
 		if err != nil {
 			break
@@ -93,6 +131,22 @@ func DecodeServiceRequest(b []byte) (*ServiceRequest, error) {
 		}
 	}
 	return r, nil
+}
+
+// PSIInStatus reports whether PDU session ID psi is flagged in a decoded
+// Uplink Data Status / PDU Session Status bitmask as stored by
+// DecodeServiceRequest (first wire octet in the high byte: PSI 0-7 → bits
+// 8-15, second wire octet in the low byte: PSI 8-15 → bits 0-7).
+// Ref: TS 24.501 §9.11.3.57 (Uplink data status), §9.11.3.44 (PDU session status)
+func PSIInStatus(mask uint16, psi uint8) bool {
+	switch {
+	case psi <= 7:
+		return mask>>(8+psi)&1 == 1
+	case psi <= 15:
+		return mask>>(psi-8)&1 == 1
+	default:
+		return false
+	}
 }
 
 // ServiceAccept is the (empty) body of a 5GMM Service Accept (0x4E).

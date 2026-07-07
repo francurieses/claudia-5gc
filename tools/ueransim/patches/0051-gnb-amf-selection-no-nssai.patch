@@ -1,0 +1,23 @@
+diff --git a/src/gnb/ngap/nnsf.cpp b/src/gnb/ngap/nnsf.cpp
+index 84ae615..3ea4253 100644
+--- a/src/gnb/ngap/nnsf.cpp
++++ b/src/gnb/ngap/nnsf.cpp
+@@ -14,6 +14,18 @@ namespace nr::gnb
+ NgapAmfContext *NgapTask::selectAmf(int ueId, int32_t &requestedSliceType)
+ {
+     for (auto &amf : m_amfCtx) {
++        // 5GC mod (0051): initial NAS messages other than REGISTRATION REQUEST
++        // (Service Request, secured Registration Update, Deregistration Request)
++        // carry no Requested NSSAI IE, so extractSliceInfoAndModifyPdu leaves
++        // requestedSliceType == -1. Stock code then never matches any advertised
++        // slice and drops the message with "AMF selection failed. Could not find
++        // a suitable AMF." — which breaks Service Request from CM-IDLE entirely.
++        // Fall back to any AMF that completed NG Setup. Ref: TS 23.501 §6.3.5.
++        if (requestedSliceType == -1) {
++            if (amf.second->state == EAmfState::CONNECTED)
++                return amf.second;
++            continue;
++        }
+         for (const auto &plmnSupport : amf.second->plmnSupportList) {
+             for (const auto &singleSlice : plmnSupport->sliceSupportList.slices) {
+                 int32_t supportedSliceType = static_cast<int32_t>(singleSlice.sst);

@@ -91,21 +91,22 @@ func EncodeDeregistrationAcceptUE(_ *DeregistrationAcceptUE) ([]byte, error) {
 type DeregistrationRequestNW struct {
 	// Cause: optional 5GMM cause (IEI=0x58). 0 = omit.
 	Cause5GMM byte
-	// ReregistrationRequired: bit 4 of the De-registration type octet.
+	// ReregistrationRequired: bit 3 (0x04) of the De-registration type value.
+	// TS 24.501 §9.11.3.20: bit 4 = switch off, bit 3 = re-registration required.
 	ReregistrationRequired bool
 	// AccessType: 1=3GPP, 2=non-3GPP, 3=both.
 	AccessType uint8
 }
 
 // EncodeDeregistrationRequestNW serialises the NW-initiated Deregistration Request body.
-// Format: Octet 4 = DeregType (spare|spare|ReRegReq|SwitchOff|AT2|AT1) | spare nibble
+// Format: Octet 4 = NGKSI nibble | DeregType nibble (SwitchOff|ReRegReq|AT2|AT1)
 //
 //	Octet 5+: optional 5GMM Cause (IEI 0x58, TV)
 func EncodeDeregistrationRequestNW(r *DeregistrationRequestNW) ([]byte, error) {
 	at := r.AccessType & 0x03
 	var reReg byte
 	if r.ReregistrationRequired {
-		reReg = 0x08
+		reReg = 0x04
 	}
 	// NGKSI nibble: set to "no key is available" (0x07) for NW-initiated deregistration.
 	ngksi := byte(0x70)

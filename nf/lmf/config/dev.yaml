@@ -15,12 +15,41 @@ sbi:
 peers:
   nrf: "nrf:8000"
   amf: "amf:8001"
+  udm: "udm:8003"
 
 metrics:
   address: "0.0.0.0:9113"
 
-# cell_coordinates is an optional map from PLMN+NRCellId to WGS84 coordinates.
-# When a match is found the DetermineLocation response locationEstimate uses the
-# configured lat/lon; absent entries yield lat=0, lon=0 (placeholder).
+# cell_coordinates maps the serving NRCellId (9-char hex, as rendered by the AMF from the
+# gNB's 36-bit NR Cell Identity) to a WGS84 anchor. The synthesized UE position walks around
+# this anchor (see mobility below). Absent entries fall back to default_coordinate.
+#   UERANSIM gnb.yaml    nci 0x000000010 → "000000010"
+#   UERANSIM gnb-ms.yaml nci 0x000000011 → "000000011"
 # Ref: TS 29.572 §6.1.6.2.2 (locationEstimate, GeographicArea shape=POINT).
-cell_coordinates: {}
+cell_coordinates:
+  "000000010": { lat: 40.4168, lon: -3.7038 }   # Madrid — Puerta del Sol
+  "000000011": { lat: 40.4530, lon: -3.6883 }   # Madrid — Chamartín (multi-slice gNB)
+
+# default_coordinate anchors UEs served by a cell with no explicit entry above.
+default_coordinate: { lat: 40.4168, lon: -3.7038 }
+
+# mobility tunes the synthetic UE-motion model (LMF-side; cell-ID positioning carries no
+# lat/lon on the wire). Each UE follows a smooth, bounded, deterministic walk around its
+# cell anchor. Simulation aid only — NOT a real positioning method.
+mobility:
+  enabled: true
+  radius_m: 500     # max stray from the cell anchor
+  speed_mps: 5      # nominal ground speed of the walk
+
+# privacy_check enables Nudm_SDM lcsData lookup before disclosing location.
+# UDM returns ALLOW_ALL by default so this is transparent in dev.
+# Ref: TS 23.273 §9.1, TS 29.503 §5.2.2.
+privacy_check: true
+
+# location_subscription controls the Nlmf_Location EventSubscription service.
+# Ref: TS 29.572 §5.2.3.
+location_subscription:
+  default_sampling_interval_s: 5      # AOI sample cadence when caller omits samplingInterval
+  default_reporting_interval_s: 10    # periodic default when caller omits reportingInterval
+  max_duration_s: 3600                # cap on subscription lifetime (1 hour)
+  notification_retry: 1               # one retry on 5xx before dropping

@@ -73,6 +73,16 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 			if im.Value.LocationReport != nil {
 				msg.Value = extractLocationReport(im.Value.LocationReport)
 			}
+		case ngapType.ProcedureCodeUplinkUEAssociatedNRPPaTransport: // proc=50 (gNB→AMF)
+			// Ref: TS 38.413 §8.17.3 (UE-associated NRPPa relay)
+			if im.Value.UplinkUEAssociatedNRPPaTransport != nil {
+				msg.Value = extractUplinkUEAssociatedNRPPaTransport(im.Value.UplinkUEAssociatedNRPPaTransport)
+			}
+		case ngapType.ProcedureCodeUplinkNonUEAssociatedNRPPaTransport: // proc=47 (gNB→AMF)
+			// Ref: TS 38.413 §8.17.4 (Non-UE-associated NRPPa relay)
+			if im.Value.UplinkNonUEAssociatedNRPPaTransport != nil {
+				msg.Value = extractUplinkNonUEAssociatedNRPPaTransport(im.Value.UplinkNonUEAssociatedNRPPaTransport)
+			}
 		}
 	case ngapType.NGAPPDUPresentSuccessfulOutcome:
 		so := pdu.SuccessfulOutcome
@@ -91,6 +101,10 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 		case ngapType.ProcedureCodePDUSessionResourceModify:
 			if so.Value.PDUSessionResourceModifyResponse != nil {
 				msg.Value = extractPDUSessionResourceModifyResponse(so.Value.PDUSessionResourceModifyResponse)
+			}
+		case ngapType.ProcedureCodeInitialContextSetup: // gNB's ICS Response (proc=14)
+			if so.Value.InitialContextSetupResponse != nil {
+				msg.Value = extractInitialContextSetupResponse(so.Value.InitialContextSetupResponse)
 			}
 		case ngapType.ProcedureCodeUEContextRelease: // gNB's Complete (proc=41)
 			if so.Value.UEContextReleaseComplete != nil {
@@ -409,10 +423,25 @@ func BuildDownlinkNASTransport(amfID, ranID int64, nasPDU []byte) []byte {
 	return b
 }
 
+// PDUSessionSetupItemCxtReq is one PDU session to (re-)establish inside an
+// Initial Context Setup Request (PDUSessionResourceSetupListCxtReq, IE id=71).
+// Transfer carries the raw APER-encoded PDUSessionResourceSetupRequestTransfer
+// produced by the SMF (UL GTP-U TEID + QoS profile).
+// Ref: TS 38.413 §9.2.2.1, TS 23.502 §4.2.3.2 step 12 (Service Request)
+type PDUSessionSetupItemCxtReq struct {
+	PDUSessionID uint8
+	SST          uint8
+	SD           []byte // 3 bytes, nil to omit
+	Transfer     []byte
+}
+
 // BuildInitialContextSetupRequest builds an Initial Context Setup Request PDU.
 // encAlgsBitmap and intAlgsBitmap are the UE's advertised capability bitmasks
 // (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3) per TS 38.413 §9.3.1.86.
 // rfsp is the Radio Frequency Selection Priority index (1-256) from PCF; 0 means omit.
+// pduSessions, when non-empty, is encoded as PDUSessionResourceSetupListCxtReq
+// (IE id=71) so the gNB re-establishes user-plane resources during Service
+// Request without a separate PDU Session Resource Setup procedure.
 // Ref: TS 38.413 §8.3.1, §9.3.1.27 (IndexToRFSP, IE id=31)
 func BuildInitialContextSetupRequest(
 	amfUEID, ranUEID int64,
@@ -423,6 +452,7 @@ func BuildInitialContextSetupRequest(
 	regionID byte, setID uint16, amfIDByte byte,
 	allowedNSSAI []amfctx.SNSSAISubscribed,
 	rfsp int,
+	pduSessions []PDUSessionSetupItemCxtReq,
 ) []byte {
 	plmn := plmnFromMCCMNC(mcc, mnc)
 
@@ -469,6 +499,30 @@ func BuildInitialContextSetupRequest(
 				GUAMI:   buildGUAMI(plmn, regionID, setID, amfIDByte),
 			},
 		},
+	}
+
+	// (7) PDUSessionResourceSetupListCxtReq (id=71) — position 7 in the spec
+	// table, between GUAMI and AllowedNSSAI. Carries the SMF-built
+	// PDUSessionResourceSetupRequestTransfer per PDU session to activate.
+	// Ref: TS 38.413 §9.2.2.1, TS 23.502 §4.2.3.2 step 12
+	if len(pduSessions) > 0 {
+		var items []ngapType.PDUSessionResourceSetupItemCxtReq
+		for _, ps := range pduSessions {
+			items = append(items, ngapType.PDUSessionResourceSetupItemCxtReq{
+				PDUSessionID:                           ngapType.PDUSessionID{Value: int64(ps.PDUSessionID)},
+				SNSSAI:                                 buildNGAPSNSSAI(ps.SST, ps.SD),
+				PDUSessionResourceSetupRequestTransfer: aper.OctetString(ps.Transfer),
+			})
+		}
+		list := ngapType.PDUSessionResourceSetupListCxtReq{List: items}
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceSetupListCxtReq},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.InitialContextSetupRequestIEsValue{
+				Present:                           ngapType.InitialContextSetupRequestIEsPresentPDUSessionResourceSetupListCxtReq,
+				PDUSessionResourceSetupListCxtReq: &list,
+			},
+		})
 	}
 
 	// (8) AllowedNSSAI (id=0) — position 8 in the spec table, before UESecurityCapabilities.
@@ -843,6 +897,50 @@ func extractPDUSessionResourceSetupResponse(resp *ngapType.PDUSessionResourceSet
 						PDUSessionID:      uint8(item.PDUSessionID.Value),
 						N2SMTransferBytes: []byte(item.PDUSessionResourceSetupResponseTransfer),
 					})
+				}
+			}
+		}
+	}
+	return out
+}
+
+// InitialContextSetupResponseMsg is the decoded Initial Context Setup Response.
+// Setups carries the gNB's PDUSessionResourceSetupResponseTransfer per PDU
+// session re-established via PDUSessionResourceSetupListCxtReq (Service Request
+// UP re-activation). FailedPSIs lists sessions the gNB could not set up.
+// Ref: TS 38.413 §8.3.1, §9.2.2.2
+type InitialContextSetupResponseMsg struct {
+	AMFUENGAPId int64
+	RANUENGAPId int64
+	Setups      []PDUSessionSetupResult
+	FailedPSIs  []uint8
+}
+
+func extractInitialContextSetupResponse(resp *ngapType.InitialContextSetupResponse) *InitialContextSetupResponseMsg {
+	out := &InitialContextSetupResponseMsg{}
+	for _, ie := range resp.ProtocolIEs.List {
+		switch ie.Id.Value {
+		case ngapType.ProtocolIEIDAMFUENGAPID:
+			if ie.Value.AMFUENGAPID != nil {
+				out.AMFUENGAPId = ie.Value.AMFUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDRANUENGAPID:
+			if ie.Value.RANUENGAPID != nil {
+				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDPDUSessionResourceSetupListCxtRes:
+			if ie.Value.PDUSessionResourceSetupListCxtRes != nil {
+				for _, item := range ie.Value.PDUSessionResourceSetupListCxtRes.List {
+					out.Setups = append(out.Setups, PDUSessionSetupResult{
+						PDUSessionID:      uint8(item.PDUSessionID.Value),
+						N2SMTransferBytes: []byte(item.PDUSessionResourceSetupResponseTransfer),
+					})
+				}
+			}
+		case ngapType.ProtocolIEIDPDUSessionResourceFailedToSetupListCxtRes:
+			if ie.Value.PDUSessionResourceFailedToSetupListCxtRes != nil {
+				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListCxtRes.List {
+					out.FailedPSIs = append(out.FailedPSIs, uint8(item.PDUSessionID.Value))
 				}
 			}
 		}
@@ -1986,4 +2084,205 @@ func BuildPathSwitchRequestAcknowledge(amfUENGAPId, ranUENGAPId int64, switchedP
 		return nil
 	}
 	return b
+}
+
+// ---- NRPPa Transport (TS 38.413 §8.17.3 / §8.17.4) -------------------------
+
+// UplinkUEAssociatedNRPPaTransportMsg holds the decoded fields from an NGAP
+// UplinkUEAssociatedNRPPaTransport message (gNB→AMF InitiatingMessage, ProcCode=50).
+// The AMF treats NRPPaPDU as an opaque byte string and relays it to the LMF.
+// Ref: TS 38.413 §8.17.3; TS 38.413 §9.3.x (NRPPa-PDU IE id=46, RoutingID IE id=89).
+type UplinkUEAssociatedNRPPaTransportMsg struct {
+	// AMFUENGAPId is the AMF-side UE NGAP ID used to correlate the pending request.
+	AMFUENGAPId int64
+	// RANUENGAPId is the RAN-side UE NGAP ID (informational).
+	RANUENGAPId int64
+	// RoutingID is the LMF routing identity from IE id=89. May be nil if absent.
+	RoutingID []byte
+	// NRPPaPDU is the opaque NRPPa PDU payload from IE id=46.
+	NRPPaPDU []byte
+}
+
+// UplinkNonUEAssociatedNRPPaTransportMsg holds the decoded fields from an NGAP
+// UplinkNonUEAssociatedNRPPaTransport message (gNB→AMF InitiatingMessage, ProcCode=47).
+// Ref: TS 38.413 §8.17.4.
+type UplinkNonUEAssociatedNRPPaTransportMsg struct {
+	// RoutingID is the LMF routing identity from IE id=89. May be nil if absent.
+	RoutingID []byte
+	// NRPPaPDU is the opaque NRPPa PDU payload from IE id=46.
+	NRPPaPDU []byte
+}
+
+// extractUplinkUEAssociatedNRPPaTransport converts a free5gc UplinkUEAssociatedNRPPaTransport
+// into our internal UplinkUEAssociatedNRPPaTransportMsg.
+// Ref: TS 38.413 §8.17.3 (Uplink UE Associated NRPPa Transport).
+func extractUplinkUEAssociatedNRPPaTransport(msg *ngapType.UplinkUEAssociatedNRPPaTransport) *UplinkUEAssociatedNRPPaTransportMsg {
+	out := &UplinkUEAssociatedNRPPaTransportMsg{}
+	for _, ie := range msg.ProtocolIEs.List {
+		switch ie.Value.Present {
+		case ngapType.UplinkUEAssociatedNRPPaTransportIEsPresentAMFUENGAPID:
+			if ie.Value.AMFUENGAPID != nil {
+				out.AMFUENGAPId = ie.Value.AMFUENGAPID.Value
+			}
+		case ngapType.UplinkUEAssociatedNRPPaTransportIEsPresentRANUENGAPID:
+			if ie.Value.RANUENGAPID != nil {
+				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.UplinkUEAssociatedNRPPaTransportIEsPresentRoutingID:
+			if ie.Value.RoutingID != nil {
+				out.RoutingID = []byte(ie.Value.RoutingID.Value)
+			}
+		case ngapType.UplinkUEAssociatedNRPPaTransportIEsPresentNRPPaPDU:
+			if ie.Value.NRPPaPDU != nil {
+				out.NRPPaPDU = []byte(ie.Value.NRPPaPDU.Value)
+			}
+		}
+	}
+	return out
+}
+
+// extractUplinkNonUEAssociatedNRPPaTransport converts a free5gc
+// UplinkNonUEAssociatedNRPPaTransport into our internal
+// UplinkNonUEAssociatedNRPPaTransportMsg.
+// Ref: TS 38.413 §8.17.4 (Uplink Non UE Associated NRPPa Transport).
+func extractUplinkNonUEAssociatedNRPPaTransport(msg *ngapType.UplinkNonUEAssociatedNRPPaTransport) *UplinkNonUEAssociatedNRPPaTransportMsg {
+	out := &UplinkNonUEAssociatedNRPPaTransportMsg{}
+	for _, ie := range msg.ProtocolIEs.List {
+		switch ie.Value.Present {
+		case ngapType.UplinkNonUEAssociatedNRPPaTransportIEsPresentRoutingID:
+			if ie.Value.RoutingID != nil {
+				out.RoutingID = []byte(ie.Value.RoutingID.Value)
+			}
+		case ngapType.UplinkNonUEAssociatedNRPPaTransportIEsPresentNRPPaPDU:
+			if ie.Value.NRPPaPDU != nil {
+				out.NRPPaPDU = []byte(ie.Value.NRPPaPDU.Value)
+			}
+		}
+	}
+	return out
+}
+
+// BuildDownlinkUEAssociatedNRPPaTransport builds the NGAP
+// DownlinkUEAssociatedNRPPaTransport PDU (AMF→gNB, InitiatingMessage, ProcCode=8).
+//
+// The nrppaPDU bytes are inserted as IE id=46 (NRPPa-PDU) without modification.
+// routingID may be nil; if non-empty it is inserted as IE id=89 (RoutingID).
+//
+// Criticality for all IEs is "reject" per TS 38.413 §9.3.x.
+// Ref: TS 38.413 §8.17.3.
+func BuildDownlinkUEAssociatedNRPPaTransport(amfUENGAPId, ranUENGAPId int64, nrppaPDU []byte, routingID []byte) []byte {
+	msg := &ngapType.DownlinkUEAssociatedNRPPaTransport{}
+
+	// IE: AMF-UE-NGAP-ID (id=10, criticality=reject, mandatory)
+	amfIDIE := ngapType.DownlinkUEAssociatedNRPPaTransportIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAMFUENGAPID},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.DownlinkUEAssociatedNRPPaTransportIEsValue{
+			Present:     ngapType.DownlinkUEAssociatedNRPPaTransportIEsPresentAMFUENGAPID,
+			AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUENGAPId},
+		},
+	}
+	msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, amfIDIE)
+
+	// IE: RAN-UE-NGAP-ID (id=85, criticality=reject, mandatory)
+	ranIDIE := ngapType.DownlinkUEAssociatedNRPPaTransportIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRANUENGAPID},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.DownlinkUEAssociatedNRPPaTransportIEsValue{
+			Present:     ngapType.DownlinkUEAssociatedNRPPaTransportIEsPresentRANUENGAPID,
+			RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUENGAPId},
+		},
+	}
+	msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, ranIDIE)
+
+	// IE: RoutingID (id=89, criticality=reject, optional)
+	if len(routingID) > 0 {
+		ridIE := ngapType.DownlinkUEAssociatedNRPPaTransportIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRoutingID},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.DownlinkUEAssociatedNRPPaTransportIEsValue{
+				Present:   ngapType.DownlinkUEAssociatedNRPPaTransportIEsPresentRoutingID,
+				RoutingID: &ngapType.RoutingID{Value: aper.OctetString(routingID)},
+			},
+		}
+		msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, ridIE)
+	}
+
+	// IE: NRPPa-PDU (id=46, criticality=reject, mandatory)
+	nrppaIE := ngapType.DownlinkUEAssociatedNRPPaTransportIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNRPPaPDU},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.DownlinkUEAssociatedNRPPaTransportIEsValue{
+			Present:  ngapType.DownlinkUEAssociatedNRPPaTransportIEsPresentNRPPaPDU,
+			NRPPaPDU: &ngapType.NRPPaPDU{Value: aper.OctetString(nrppaPDU)},
+		},
+	}
+	msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, nrppaIE)
+
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentInitiatingMessage,
+		InitiatingMessage: &ngapType.InitiatingMessage{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeDownlinkUEAssociatedNRPPaTransport},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitiatingMessageValue{
+				Present:                            ngapType.InitiatingMessagePresentDownlinkUEAssociatedNRPPaTransport,
+				DownlinkUEAssociatedNRPPaTransport: msg,
+			},
+		},
+	}
+	encodedDL, errDL := libngap.Encoder(pdu)
+	if errDL != nil {
+		return nil
+	}
+	return encodedDL
+}
+
+// BuildDownlinkNonUEAssociatedNRPPaTransport builds the NGAP
+// DownlinkNonUEAssociatedNRPPaTransport PDU (AMF→gNB, InitiatingMessage, ProcCode=5).
+//
+// Used for cell-level NRPPa signalling not tied to a specific UE context.
+// Ref: TS 38.413 §8.17.4.
+func BuildDownlinkNonUEAssociatedNRPPaTransport(nrppaPDU []byte, routingID []byte) []byte {
+	msg := &ngapType.DownlinkNonUEAssociatedNRPPaTransport{}
+
+	// IE: RoutingID (id=89, criticality=reject, optional)
+	if len(routingID) > 0 {
+		ridIE := ngapType.DownlinkNonUEAssociatedNRPPaTransportIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRoutingID},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.DownlinkNonUEAssociatedNRPPaTransportIEsValue{
+				Present:   ngapType.DownlinkNonUEAssociatedNRPPaTransportIEsPresentRoutingID,
+				RoutingID: &ngapType.RoutingID{Value: aper.OctetString(routingID)},
+			},
+		}
+		msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, ridIE)
+	}
+
+	// IE: NRPPa-PDU (id=46, criticality=reject, mandatory)
+	nrppaIE := ngapType.DownlinkNonUEAssociatedNRPPaTransportIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNRPPaPDU},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.DownlinkNonUEAssociatedNRPPaTransportIEsValue{
+			Present:  ngapType.DownlinkNonUEAssociatedNRPPaTransportIEsPresentNRPPaPDU,
+			NRPPaPDU: &ngapType.NRPPaPDU{Value: aper.OctetString(nrppaPDU)},
+		},
+	}
+	msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, nrppaIE)
+
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentInitiatingMessage,
+		InitiatingMessage: &ngapType.InitiatingMessage{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeDownlinkNonUEAssociatedNRPPaTransport},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitiatingMessageValue{
+				Present:                               ngapType.InitiatingMessagePresentDownlinkNonUEAssociatedNRPPaTransport,
+				DownlinkNonUEAssociatedNRPPaTransport: msg,
+			},
+		},
+	}
+	encodedNonUE, errNonUE := libngap.Encoder(pdu)
+	if errNonUE != nil {
+		return nil
+	}
+	return encodedNonUE
 }

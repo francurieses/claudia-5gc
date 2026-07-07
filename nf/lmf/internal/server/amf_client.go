@@ -1,14 +1,17 @@
 // Package server implements the LMF Nlmf_Location SBI server and its outbound clients.
 // This file provides the AMF client used by the LMF to consume the Namf_Location
-// ProvideLocationInfo service from the AMF.
+// ProvideLocationInfo service from the AMF, and adds the DL NRPPa relay client
+// for E-CID NRPPa positioning (LMF-004, TS 29.518 §5.2.2.6).
 //
-// Ref: TS 29.518 §5.2.2.6 (Namf_Location_ProvideLocationInfo consumer side)
+// Ref: TS 29.518 §5.2.2.6 (Namf_Location_ProvideLocationInfo + dl-nrppa-info consumer side)
 // Ref: TS 23.273 §7.2 (UE positioning procedure — Cell-ID method)
+// Ref: TS 38.413 §8.17.3 (NGAP UE-Associated NRPPa Transport — AMF relay)
 package server
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,7 +51,8 @@ type RequestLocInfo struct {
 	SupportedGADShapes []string `json:"supportedGADShapes,omitempty"`
 }
 
-// LocationData is the Namf_Location response body returned by the AMF to the LMF.
+// LocationData is the Namf_Location response body returned by the AMF to the LMF,
+// and also the Nlmf_Location response body returned by the LMF to the LCS consumer.
 // Field names and json tags MUST match nf/amf/internal/sbi/types.go LocationData.
 //
 // Ref: TS 29.518 §5.2.2.6; TS 29.572 §6.1.6.2.2.
@@ -61,6 +65,11 @@ type LocationData struct {
 	Tai *TaiLoc `json:"tai,omitempty"`
 	// AgeOfLocationEstimate is minutes since the estimate (0 = fresh report).
 	AgeOfLocationEstimate int `json:"ageOfLocationEstimate"`
+	// PositioningDataList records which positioning method(s) contributed to the estimate.
+	// "eCID" indicates an E-CID (RSRP-weighted centroid) fix via NRPPa relay (LMF-004).
+	// Absent or empty indicates Cell-ID positioning (LMF-001).
+	// Ref: TS 29.572 §6.1.6.2.2 (positioningDataList).
+	PositioningDataList []string `json:"positioningDataList,omitempty"`
 }
 
 // GeographicArea holds a minimal GAD POINT shape.
@@ -70,6 +79,9 @@ type GeographicArea struct {
 	Shape string `json:"shape"`
 	// Point holds the WGS84 lat/lon when Shape is "POINT".
 	Point *LatLon `json:"point,omitempty"`
+	// Uncertainty is the horizontal accuracy radius in metres (LMF-synthesized).
+	// Carried for the consumer/portal; the GAD POINT shape itself has no uncertainty.
+	Uncertainty float64 `json:"uncertainty,omitempty"`
 }
 
 // LatLon is a WGS84 coordinate pair.
@@ -202,4 +214,224 @@ func extractCause(resp *http.Response) string {
 		return ""
 	}
 	return pd.Cause
+}
+
+// ---- DL NRPPa relay client (LMF-004) -----------------------------------------
+//
+// dlNRPPaReqBody is the JSON request body for POST .../dl-nrppa-info.
+// Field names MUST match nf/amf/internal/sbi/types.go DLNRPPaInfoReq.
+// Ref: TS 29.518 §5.2.2.6 (Namf_Location NRPPa relay extension).
+type dlNRPPaReqBody struct {
+	// NrppaPdu is the base64-encoded opaque NRPPa PDU to relay to the gNB.
+	NrppaPdu string `json:"nrppaPdu"`
+	// RoutingId is the optional LMF routing identity (base64-encoded).
+	RoutingId string `json:"routingId,omitempty"`
+}
+
+// dlNRPPaRspBody is the JSON response body for a successful POST .../dl-nrppa-info.
+// Field names MUST match nf/amf/internal/sbi/types.go DLNRPPaInfoRsp.
+type dlNRPPaRspBody struct {
+	// NrppaPdu is the base64-encoded UL NRPPa PDU received from the gNB.
+	NrppaPdu string `json:"nrppaPdu"`
+}
+
+// SendDLNRPPa sends an opaque NRPPa PDU to the gNB serving the UE by POSTing to
+// POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-nrppa-info on the AMF.
+//
+// The AMF wraps the PDU in an NGAP DownlinkUEAssociatedNRPPaTransport (ProcCode=8)
+// and waits for the gNB's UplinkUEAssociatedNRPPaTransport (ProcCode=50) response,
+// then returns the UL NRPPa PDU bytes in the synchronous HTTP response body.
+//
+// Returns (respPDU, "", nil) on success (HTTP 200).
+// Returns (nil, "CONTEXT_NOT_FOUND", ErrUEContextNotFound) on AMF 404.
+// Returns (nil, cause, ErrLocationFailure) on 504 (guard-timer / CM-IDLE) or other errors.
+//
+// The LMF treats any error as a signal to fall back to Cell-ID positioning transparently.
+// Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.3 (NGAP UE-Associated NRPPa Transport);
+// TS 23.273 §7.2 step C; NRPPaRelay.md §Endpoints.
+func (c *HTTPAMFLocationClient) SendDLNRPPa(ctx context.Context, ueContextID string, nrppaPDU []byte) ([]byte, string, error) {
+	url := c.BaseURL + "/namf-loc/v1/ue-contexts/" + ueContextID + "/dl-nrppa-info"
+
+	reqBody := dlNRPPaReqBody{NrppaPdu: base64.StdEncoding.EncodeToString(nrppaPDU)}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-nrppa-info: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-nrppa-info: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if corrID := logging.CorrelationID(ctx); corrID != "" {
+		req.Header.Set("X-Correlation-Id", corrID)
+	}
+
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-nrppa-info: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var rsp dlNRPPaRspBody
+		if err := json.NewDecoder(resp.Body).Decode(&rsp); err != nil {
+			return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-nrppa-info: decode response: %w", err)
+		}
+		pdu, err := base64.StdEncoding.DecodeString(rsp.NrppaPdu)
+		if err != nil {
+			// Try URL-safe encoding fallback (AMF may use either variant).
+			pdu, err = base64.URLEncoding.DecodeString(rsp.NrppaPdu)
+			if err != nil {
+				return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-nrppa-info: decode base64 response: %w", err)
+			}
+		}
+		return pdu, "", nil
+
+	case http.StatusNotFound:
+		// AMF has no UE context — cannot relay NRPPa.
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "CONTEXT_NOT_FOUND"
+		}
+		return nil, cause, ErrUEContextNotFound
+
+	case http.StatusGatewayTimeout:
+		// AMF guard timer expired — no UL NRPPa received from gNB in time.
+		// LMF falls back to Cell-ID; this is NOT a hard error surfaced to the LCS client.
+		// Ref: NRPPaRelay.md §Error table; TS 23.273 §6.2.9 (graceful downgrade on timeout).
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "UE_NOT_REACHABLE"
+		}
+		return nil, cause, fmt.Errorf("%w: dl-nrppa-info guard timer: %s", ErrLocationFailure, cause)
+
+	default:
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "LOCATION_FAILURE"
+		}
+		return nil, cause, fmt.Errorf("%w: dl-nrppa-info status %d: %s", ErrLocationFailure, resp.StatusCode, cause)
+	}
+}
+
+// ---- DL LPP relay client (LMF-005) -------------------------------------------
+//
+// dlLPPReqBody is the JSON request body for POST .../dl-lpp-info.
+// Field names MUST match nf/amf/internal/sbi/types.go DLLPPInfoReq.
+// Ref: TS 29.518 §5.2.2.6 (Namf_Location LPP relay extension); TS 24.501 §8.7.4.
+type dlLPPReqBody struct {
+	// LppPdu is the base64-encoded opaque LPP PDU to relay to the UE.
+	LppPdu string `json:"lppPdu"`
+	// ExpectUlResponse (ADDITIVE, LMF-009; default true when absent) tells
+	// the AMF whether a matching UL NAS Transport (PCT=0x03) is expected.
+	// false = DL-only leg (ProvideAssistanceData — TS 37.355 assistance
+	// delivery is unsolicited, no response message): the AMF sends the DL
+	// NAS Transport and returns 204 No Content without registering a
+	// pendingLPP waiter. Ref: docs/procedures/LPPRelay.md §Endpoints.
+	ExpectUlResponse bool `json:"expectUlResponse"`
+}
+
+// dlLPPRspBody is the JSON response body for a successful POST .../dl-lpp-info.
+// Field names MUST match nf/amf/internal/sbi/types.go DLLPPInfoRsp.
+type dlLPPRspBody struct {
+	// LppPdu is the base64-encoded UL LPP PDU received from the UE.
+	LppPdu string `json:"lppPdu"`
+}
+
+// SendDLLPP sends an opaque LPP PDU to the UE serving the given ueContextID by
+// POSTing to POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-lpp-info on the AMF.
+//
+// The AMF wraps the PDU in a DL NAS Transport (payload container type 0x03).
+// With expectUlResponse=true it waits for the UE's matching UL NAS Transport
+// (payload container type 0x03) and returns the UL LPP PDU bytes in the
+// synchronous HTTP response body; with expectUlResponse=false (leg 2,
+// ProvideAssistanceData — DL-only) it returns immediately after the DL send
+// and the AMF answers 204 No Content.
+//
+// Returns (respPDU, "", nil) on HTTP 200; (nil, "", nil) on HTTP 204.
+// Returns (nil, "CONTEXT_NOT_FOUND", ErrUEContextNotFound) on AMF 404.
+// Returns (nil, cause, ErrLocationFailure) on 504 (guard-timer / CM-IDLE) or
+// other errors.
+//
+// The LMF treats any error as a signal to fall back to E-CID/Cell-ID
+// positioning transparently.
+// Ref: TS 29.518 §5.2.2.6; TS 24.501 §8.7.4; TS 23.273 §6.2.10;
+// docs/procedures/LPPRelay.md §Endpoints.
+func (c *HTTPAMFLocationClient) SendDLLPP(ctx context.Context, ueContextID string, lppPDU []byte, expectUlResponse bool) ([]byte, string, error) {
+	url := c.BaseURL + "/namf-loc/v1/ue-contexts/" + ueContextID + "/dl-lpp-info"
+
+	reqBody := dlLPPReqBody{
+		LppPdu:           base64.StdEncoding.EncodeToString(lppPDU),
+		ExpectUlResponse: expectUlResponse,
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-lpp-info: marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-lpp-info: new request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if corrID := logging.CorrelationID(ctx); corrID != "" {
+		req.Header.Set("X-Correlation-Id", corrID)
+	}
+
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-lpp-info: do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		// DL-only leg (expectUlResponse=false): the AMF sent the DL NAS
+		// Transport; no UL LPP PDU exists by design. Ref: LPPRelay.md leg 2.
+		return nil, "", nil
+
+	case http.StatusOK:
+		var rsp dlLPPRspBody
+		if err := json.NewDecoder(resp.Body).Decode(&rsp); err != nil {
+			return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-lpp-info: decode response: %w", err)
+		}
+		pdu, err := base64.StdEncoding.DecodeString(rsp.LppPdu)
+		if err != nil {
+			// Try URL-safe encoding fallback (AMF may use either variant).
+			pdu, err = base64.URLEncoding.DecodeString(rsp.LppPdu)
+			if err != nil {
+				return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: dl-lpp-info: decode base64 response: %w", err)
+			}
+		}
+		return pdu, "", nil
+
+	case http.StatusNotFound:
+		// AMF has no UE context — cannot relay LPP.
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "CONTEXT_NOT_FOUND"
+		}
+		return nil, cause, ErrUEContextNotFound
+
+	case http.StatusGatewayTimeout:
+		// AMF guard timer expired — no UL LPP received from the UE in time.
+		// LMF falls back to E-CID; this is NOT a hard error surfaced to the LCS client.
+		// Ref: docs/procedures/LPPRelay.md §Error table; TS 23.273 §6.2.10.
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "UE_NOT_REACHABLE"
+		}
+		return nil, cause, fmt.Errorf("%w: dl-lpp-info guard timer: %s", ErrLocationFailure, cause)
+
+	default:
+		cause := extractCause(resp)
+		if cause == "" {
+			cause = "LOCATION_FAILURE"
+		}
+		return nil, cause, fmt.Errorf("%w: dl-lpp-info status %d: %s", ErrLocationFailure, resp.StatusCode, cause)
+	}
 }

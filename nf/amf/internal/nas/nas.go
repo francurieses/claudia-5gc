@@ -23,22 +23,30 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nea"
 	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nia"
 	"github.com/francurieses/claudia-5gc/shared/nas"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
 
 // Sender is the interface to send NAS PDUs and NGAP messages to the UE via the gNB.
 type Sender interface {
 	SendDownlinkNASTransport(ue *amfctx.UEContext, nasPDU []byte) error
+	// SendInitialContextSetupRequest sends the ICS Request. pduSessions is the
+	// PDUSessionResourceSetupListCxtReq for Service Request UP re-activation
+	// (TS 23.502 §4.2.3 step 6); nil for Initial Registration.
 	SendInitialContextSetupRequest(ue *amfctx.UEContext, nasPDU []byte,
 		kgnb [32]byte, cipherAlg, integAlg byte,
-		encAlgsBitmap, intAlgsBitmap uint16) error
+		encAlgsBitmap, intAlgsBitmap uint16,
+		pduSessions []ngap.PDUSessionSetupItemCxtReq) error
 	SendPDUSessionResourceSetupRequest(ue *amfctx.UEContext, pduSessionID uint8, nasPDU []byte, n2SmInfo []byte) error
 	SendPDUSessionResourceReleaseCommand(ue *amfctx.UEContext, pduSessionID uint8, nasPDU []byte) error
 	SendPDUSessionResourceModifyRequest(ue *amfctx.UEContext, pduSessionID uint8, nasPDU []byte, n2SmInfo []byte) error
@@ -75,6 +83,27 @@ type Handler struct {
 	// AN Release by the NGAP layer.
 	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7
 	onUEReachable func(ue *amfctx.UEContext)
+
+	// pendingLPP holds one pending LPPResult channel per AMF-UE-NGAP-ID.
+	// Inserted by SendDownlinkLPP; resolved (and deleted) by handleULLPP when
+	// the matching UL NAS Transport (payload container type 0x03) arrives
+	// from the UE. Mirrors ngap.Server's pendingNRPPa (LMF-004) — the NAS-
+	// transport analogue for LPP (LMF-005), since LPP rides the existing
+	// DL/UL NAS Transport rather than a dedicated NGAP procedure.
+	// Ref: TS 24.501 §8.7.4; TS 23.273 §7.2.
+	pendingLPP sync.Map // map[int64]chan LPPResult
+}
+
+// LPPResult carries the outcome of a DL/UL LPP relay round-trip over the NAS
+// N1 payload container (payload container type 0x03), mirroring
+// ngap.NRPPaResult for the NGAP-layer NRPPa relay (LMF-004).
+// Ref: TS 24.501 §8.7.4; TS 23.273 §7.2.
+type LPPResult struct {
+	// LPPPDU is the opaque UL LPP-PDU bytes received from the UE. The AMF
+	// never decodes this content.
+	LPPPDU []byte
+	// Err is non-nil on a relay/timeout failure.
+	Err error
 }
 
 // NewHandler constructs the NAS handler.
@@ -472,7 +501,7 @@ func (h *Handler) handleSecurityModeComplete(
 	)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, secKey,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
-		encAlgs, intAlgs); err != nil {
+		encAlgs, intAlgs, nil); err != nil {
 		return err
 	}
 	// N2 context now established — UE is CM-CONNECTED.
@@ -908,6 +937,14 @@ func (h *Handler) handleServiceRequest(
 		intAlgs |= 1 << 13
 	}
 
+	// Collect the PDU sessions to re-activate: those the UE flagged in the
+	// Uplink Data Status IE. For each, ask the SMF for the session's
+	// PDUSessionResourceSetupRequestTransfer (Nsmf_PDUSession_UpdateSMContext
+	// upCnxState=ACTIVATING) so the ICS Request below carries the N2SM info
+	// that directly re-establishes user-plane resources at the gNB.
+	// Ref: TS 23.502 §4.2.3.2 steps 4/12, TS 29.502 §5.2.2.3.2.2
+	pduSessions := h.activatePDUSessions(ctx, ue, svcReq.UplinkDataStatus, log)
+
 	// Encode Service Accept (empty body, ciphered SHT=0x02).
 	// Ref: TS 24.501 §8.2.16
 	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement,
@@ -917,17 +954,21 @@ func (h *Handler) handleServiceRequest(
 	}
 
 	// Re-establish the N2 context by sending InitialContextSetupRequest with the
-	// Service Accept NAS PDU and fresh KgNB. The gNB will re-activate AS security.
-	// Ref: TS 38.413 §8.3.1, TS 23.502 §4.2.3 step 4
+	// Service Accept NAS PDU, fresh KgNB, and the PDU sessions to re-activate
+	// (PDUSessionResourceSetupListCxtReq). The gNB re-activates AS security and
+	// sets up the GTP-U resources; its ICS Response returns the DL tunnel info,
+	// which the NGAP layer forwards to the SMF to re-activate DL forwarding.
+	// Ref: TS 38.413 §8.3.1, TS 23.502 §4.2.3 step 6
 	log.Info("sending InitialContextSetupRequest (Service Request)",
 		"interface", "N2",
 		"direction", "OUT",
 		"message_type", "InitialContextSetupRequest",
+		"pdu_sessions_cxt_req", len(pduSessions),
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, kgnb,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
-		encAlgs, intAlgs); err != nil {
+		encAlgs, intAlgs, pduSessions); err != nil {
 		return fmt.Errorf("service request: SendInitialContextSetupRequest: %w", err)
 	}
 
@@ -944,6 +985,76 @@ func (h *Handler) handleServiceRequest(
 		"spec_ref", "TS 23.502 §4.2.3",
 	)
 	return nil
+}
+
+// activatePDUSessions resolves the PDU sessions flagged in the Service
+// Request's Uplink Data Status and fetches each session's
+// PDUSessionResourceSetupRequestTransfer from the SMF (upCnxState=ACTIVATING).
+// Returns the PDUSessionResourceSetupListCxtReq items for the ICS Request, in
+// ascending PSI order. Failures are non-fatal per session: the Service Request
+// still completes and the UE can fall back to UE-requested re-establishment.
+// Ref: TS 23.502 §4.2.3.2 steps 4/12, TS 29.502 §5.2.2.3.2.2
+func (h *Handler) activatePDUSessions(
+	ctx context.Context, ue *amfctx.UEContext,
+	uplinkDataStatus *uint16, log *slog.Logger) []ngap.PDUSessionSetupItemCxtReq {
+
+	if uplinkDataStatus == nil {
+		return nil // signalling-only Service Request — nothing to re-activate
+	}
+	activator, ok := h.sender.(interface {
+		ActivateSMContext(context.Context, string) ([]byte, error)
+	})
+	if !ok {
+		return nil
+	}
+
+	type target struct {
+		psi uint8
+		ref string
+		sst uint8
+		sd  string
+	}
+	ue.Lock()
+	var targets []target
+	for psi, sess := range ue.PDUSessions {
+		if nas.PSIInStatus(*uplinkDataStatus, psi) && sess.SMFInstanceID != "" {
+			targets = append(targets, target{psi: psi, ref: sess.SMFInstanceID,
+				sst: sess.SNSSAI.SST, sd: sess.SNSSAI.SD})
+		}
+	}
+	ue.Unlock()
+	sort.Slice(targets, func(i, j int) bool { return targets[i].psi < targets[j].psi })
+
+	var items []ngap.PDUSessionSetupItemCxtReq
+	for _, t := range targets {
+		transfer, err := activator.ActivateSMContext(ctx, t.ref)
+		if err != nil {
+			log.Warn("UP activation: SMF ActivateSMContext failed — session skipped",
+				"pdu_session_id", t.psi,
+				"smContextRef", t.ref,
+				"error", err,
+				"spec_ref", "TS 29.502 §5.2.2.3.2.2",
+			)
+			continue
+		}
+		var sdBytes []byte
+		if b, err := hex.DecodeString(t.sd); err == nil && len(b) == 3 {
+			sdBytes = b
+		}
+		items = append(items, ngap.PDUSessionSetupItemCxtReq{
+			PDUSessionID: t.psi,
+			SST:          t.sst,
+			SD:           sdBytes,
+			Transfer:     transfer,
+		})
+		log.Info("UP activation: N2SM Setup Request Transfer fetched from SMF",
+			"pdu_session_id", t.psi,
+			"smContextRef", t.ref,
+			"n2sm_len", len(transfer),
+			"spec_ref", "TS 23.502 §4.2.3.2 step 12",
+		)
+	}
+	return items
 }
 
 // ---- Registration Update (Periodic / Mobility) ----------------------------
@@ -1025,7 +1136,7 @@ func (h *Handler) handleRegistrationUpdate(
 	)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, kgnb,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
-		encAlgs, intAlgs); err != nil {
+		encAlgs, intAlgs, nil); err != nil {
 		return fmt.Errorf("%s: SendInitialContextSetupRequest: %w", procedureName, err)
 	}
 	ue.CMState = amfctx.CMConnected
@@ -1176,12 +1287,18 @@ func (h *Handler) handleDeregistration(
 //
 // cause5GMM: optional 5GMM Cause (0 = omit). Common values:
 //
-//	0x06 = illegal UE, 0x09 = UE identity not derived, 0x48 = NW failure.
+//	0x06 = illegal ME, 0x09 = UE identity not derived, 0x48 = NW failure.
+//	Causes 0x03/0x06/0x07 make the UE consider the USIM invalid (5U3, no
+//	re-registration until reboot) — TS 24.501 §5.5.2.3.4. For a subscription
+//	change where the UE must come back, pass cause 0 + reregRequired=true.
+//
+// reregRequired: sets de-registration type "re-registration required" so the
+// UE initiates a new Initial Registration after the Deregistration Accept.
 //
 // accessType: 1=3GPP, 2=non-3GPP, 3=both.
 //
 // Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §8.2.13.1
-func (h *Handler) SendNetworkDeregistration(ctx context.Context, ue *amfctx.UEContext, cause5GMM byte, accessType uint8) error {
+func (h *Handler) SendNetworkDeregistration(ctx context.Context, ue *amfctx.UEContext, cause5GMM byte, accessType uint8, reregRequired bool) error {
 	if accessType == 0 {
 		accessType = 1 // default: 3GPP access
 	}
@@ -1191,6 +1308,7 @@ func (h *Handler) SendNetworkDeregistration(ctx context.Context, ue *amfctx.UECo
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
 		"cause", cause5GMM,
+		"rereg_required", reregRequired,
 		"interface", "N1",
 		"direction", "OUT",
 		"spec_ref", "TS 23.502 §4.2.2.3.3",
@@ -1198,8 +1316,9 @@ func (h *Handler) SendNetworkDeregistration(ctx context.Context, ue *amfctx.UECo
 	log.Info("initiating NW-initiated Deregistration")
 
 	deregReq := &nas.DeregistrationRequestNW{
-		Cause5GMM:  cause5GMM,
-		AccessType: accessType,
+		Cause5GMM:              cause5GMM,
+		AccessType:             accessType,
+		ReregistrationRequired: reregRequired,
 	}
 	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
 		nas.MsgTypeDeregistrationRequestNW, deregReq); err != nil {
@@ -1329,6 +1448,16 @@ func (h *Handler) handleULNASTransport(
 	// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4, TS 24.501 §9.11.3.40
 	if transport.PayloadContainerType == nas.PayloadContainerTypeSMS {
 		return h.handleULSMS(ctx, ue, transport.PayloadContainer, log)
+	}
+
+	// LPP relay (UE-based/UE-assisted A-GNSS positioning, LMF-005): payload
+	// container type 0x03 carries an opaque LPP-PDU (TS 37.355) between the
+	// LMF and the UE. The AMF is a pure transparent relay — it MUST NOT
+	// decode the LPP bytes; it only resolves the pendingLPP waiter keyed by
+	// AMF-UE-NGAP-ID that SendDownlinkLPP registered.
+	// Ref: TS 24.501 §8.7.4 / §9.11.3.40 (PCT=0x03, NOT 0x01 N1SM); TS 23.273 §7.2.
+	if transport.PayloadContainerType == nas.PayloadContainerTypeLPP {
+		return h.handleULLPP(ctx, ue, transport.PayloadContainer)
 	}
 
 	// 5GSM header: EPD | PDU session identity | PTI | Message type | body
@@ -1607,6 +1736,143 @@ func (h *Handler) handleUEPolicyDelivery(
 		)
 	}
 	return nil
+}
+
+// ---- LPP relay (UL path, LMF-005) ------------------------------------------
+
+// handleULLPP processes a UL NAS Transport with payload container type LPP
+// (0x03) — the UE's reply to a DL LPP-PDU the LMF sent via SendDownlinkLPP.
+// The AMF is a pure transparent relay: it never parses the LPP container; it
+// only resolves the pendingLPP waiter keyed by AMF-UE-NGAP-ID so the blocked
+// dl-lpp-info SBI handler (nf/amf/internal/sbi) can return the UL LPP-PDU to
+// the LMF.
+//
+// If no matching pending request is found the container is an orphan (e.g.
+// the dl-lpp-info handler already timed out) — logged and dropped per the
+// same convention as the NRPPa relay's nrppa_orphan case.
+//
+// Ref: TS 24.501 §8.7.4; TS 23.273 §7.2; docs/procedures/LPPRelay.md
+// §Correlation maps.
+func (h *Handler) handleULLPP(_ context.Context, ue *amfctx.UEContext, lppPDU []byte) error {
+	log := h.logger.With(
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"interface", "N1",
+		"direction", "IN",
+		"procedure", "LPPRelay",
+		"spec_ref", "TS 24.501 §8.7.4",
+	)
+	log.Info("UplinkLPP received",
+		"lpp_pdu_len", len(lppPDU),
+		"result", "OK",
+		"spec_ref", "TS 24.501 §8.7.4",
+	)
+	metrics.AMFLPPTransportTotal.WithLabelValues("UL").Inc()
+
+	val, loaded := h.pendingLPP.LoadAndDelete(ue.AMFUENGAPId)
+	if !loaded {
+		log.Warn("UplinkLPP orphan — no pending dl-lpp-info request",
+			"result", "lpp_orphan",
+			"spec_ref", "TS 24.501 §8.7.4",
+		)
+		return nil
+	}
+	ch, ok := val.(chan LPPResult)
+	if !ok {
+		return nil
+	}
+	// Non-blocking send: ch is buffered(1). If the caller has already timed
+	// out the send succeeds into the buffer and the channel is GC'd.
+	ch <- LPPResult{LPPPDU: lppPDU}
+	return nil
+}
+
+// SendDownlinkLPP wraps lppPDU (an opaque LPP-PDU built by the LMF) in a DL
+// NAS Transport with payload container type LPP (0x03), NAS-security-protects
+// it (SHT=0x02), sends it to the UE, and registers a pendingLPP waiter keyed
+// by AMF-UE-NGAP-ID. The caller (nf/amf/internal/sbi's dl-lpp-info handler)
+// blocks on the returned channel until handleULLPP resolves it or its own
+// guard timer expires.
+//
+// The AMF is a pure relay — it MUST NOT decode lppPDU.
+//
+// Ref: TS 24.501 §8.7.4 / §9.11.3.40 (PCT=0x03); TS 23.273 §7.2 step C;
+// TS 29.518 §5.2.2.6 (Namf_Location dl-lpp-info); docs/procedures/LPPRelay.md.
+func (h *Handler) SendDownlinkLPP(ue *amfctx.UEContext, lppPDU []byte) (<-chan LPPResult, error) {
+	nasPDU, err := h.encodeDownlinkLPP(ue, lppPDU)
+	if err != nil {
+		return nil, err
+	}
+
+	// Buffer of 1: handleULLPP sends into the buffer and continues even if
+	// the caller has already timed out (no goroutine leak) — mirrors
+	// ngap.Server.SendDownlinkNRPPa.
+	ch := make(chan LPPResult, 1)
+	h.pendingLPP.Store(ue.AMFUENGAPId, ch)
+
+	h.logDownlinkLPP(ue, len(lppPDU), true)
+
+	if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
+		h.pendingLPP.Delete(ue.AMFUENGAPId)
+		return nil, fmt.Errorf("nasmsg: send downlink lpp: %w", err)
+	}
+	return ch, nil
+}
+
+// SendDownlinkLPPNoWait sends lppPDU in a DL NAS Transport (PCT=0x03) WITHOUT
+// registering a pendingLPP waiter — the LMF-009 DL-only relay leg
+// (ProvideAssistanceData: TS 37.355 assistance-data delivery is unsolicited
+// and has no response message, so no UL NAS Transport is expected; a UL for
+// this leg would by definition be an lpp_orphan). The AMF remains a pure
+// relay and never decodes lppPDU.
+//
+// Ref: TS 24.501 §8.7.4 / §9.11.3.40 (PCT=0x03); TS 37.355 §6.5.2;
+// docs/procedures/LPPRelay.md §Endpoints (expectUlResponse=false → 204).
+func (h *Handler) SendDownlinkLPPNoWait(ue *amfctx.UEContext, lppPDU []byte) error {
+	nasPDU, err := h.encodeDownlinkLPP(ue, lppPDU)
+	if err != nil {
+		return err
+	}
+
+	h.logDownlinkLPP(ue, len(lppPDU), false)
+
+	if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
+		return fmt.Errorf("nasmsg: send downlink lpp (no-wait): %w", err)
+	}
+	return nil
+}
+
+// encodeDownlinkLPP wraps an opaque LPP-PDU in a NAS-security-protected DL
+// NAS Transport with payload container type LPP (0x03) — shared by
+// SendDownlinkLPP and SendDownlinkLPPNoWait.
+func (h *Handler) encodeDownlinkLPP(ue *amfctx.UEContext, lppPDU []byte) ([]byte, error) {
+	if len(lppPDU) == 0 {
+		return nil, fmt.Errorf("nasmsg: empty LPP PDU")
+	}
+	dlTransport := &nas.DLNASTransport{
+		PayloadContainerType: nas.PayloadContainerTypeLPP,
+		PayloadContainer:     lppPDU,
+	}
+	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement, nas.MsgTypeDLNASTransport, dlTransport)
+	if err != nil {
+		return nil, fmt.Errorf("nasmsg: encode DL NAS Transport (LPP): %w", err)
+	}
+	return nasPDU, nil
+}
+
+// logDownlinkLPP emits the canonical DownlinkLPP log line + DL metric.
+func (h *Handler) logDownlinkLPP(ue *amfctx.UEContext, pduLen int, expectUlResponse bool) {
+	h.logger.Info("DownlinkLPP sent",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"procedure", "LPPRelay",
+		"interface", "N1",
+		"direction", "OUT",
+		"lpp_pdu_len", pduLen,
+		"expect_ul_response", expectUlResponse,
+		"spec_ref", "TS 24.501 §8.7.4",
+	)
+	metrics.AMFLPPTransportTotal.WithLabelValues("DL").Inc()
 }
 
 // ---- SMS over NAS (UL path) ------------------------------------------------
