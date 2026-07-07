@@ -36,7 +36,7 @@ export default function Dashboard() {
   })
 
   const upCount = nfStatus?.filter(n => n.healthz_ok || n.metrics_ok).length ?? 0
-  const totalNF = nfStatus?.length ?? 12
+  const totalNF = nfStatus?.length ?? 13
   const registeredCount = ueContexts?.filter(u => u.gmm_state === 1).length ?? 0
 
   return (

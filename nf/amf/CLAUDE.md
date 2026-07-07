@@ -82,7 +82,7 @@ Beyond globals: `amf_ue_ngap_id`, `ran_ue_ngap_id`, `gnb_id`.
 ## 6. NGAP — Implementation Notes
 
 - Current NGAP uses TCP + length-prefix (not real SCTP). For production: `github.com/ishidawataru/sctp`.
-- **NGAP messages processed serially per SCTP association** (no goroutine per message). Required to preserve `UplinkCount` order. Do not re-introduce `go s.dispatch`.
+- **NGAP dispatch: decode in SCTP arrival order, blocking NAS work on a per-UE serial queue** (`UEContext.EnqueueSerial`). Per-UE FIFO preserves `UplinkCount` order; different UEs process concurrently so one slow SBI call (e.g. `CreateSMContext`) cannot back up the association. Do not replace the queue with a bare `go s.dispatch` (races per-UE NAS state) and do not make dispatch fully serial again (head-of-line blocking under burst load).
 
 ## 7. NAS Security
 

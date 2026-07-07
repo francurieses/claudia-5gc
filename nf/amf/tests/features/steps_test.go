@@ -76,6 +76,9 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 
 	// NSSAA (TS 23.502 §4.2.9) — real in-process steps driving the NSSAA state machine.
 	initNSSAASteps(sc)
+
+	// Service Request UP re-activation (TS 23.502 §4.2.3) — E2E-gated steps.
+	initServiceRequestSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

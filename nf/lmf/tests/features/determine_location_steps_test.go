@@ -92,12 +92,29 @@ func (f *fakeAMFClient) ProvideLocationInfo(_ context.Context, _ string) (*lmfsr
 	}
 }
 
+// ---- configurable fake UDM client -------------------------------------------
+
+// fakeUDMClient is a test double for lmfsrv.UDMSDMClient.
+// Set locationPrivacy via the "subscriber location privacy" Given step.
+type fakeUDMClient struct {
+	mu              sync.Mutex
+	locationPrivacy string // "ALLOW_ALL" (default) or "BLOCK_ALL"
+}
+
+func (f *fakeUDMClient) GetLcsPrivacyData(_ context.Context, _ string) (*lmfsrv.LcsPrivacyData, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &lmfsrv.LcsPrivacyData{LocationPrivacy: f.locationPrivacy}, nil
+}
+
 // ---- per-scenario world -------------------------------------------------------
 
 // lmfCtx holds state for a single godog scenario.
 type lmfCtx struct {
 	// amf is the configurable fake injected into the LMF server.
 	amf *fakeAMFClient
+	// udm is the configurable fake UDM privacy client.
+	udm *fakeUDMClient
 	// ts is the httptest server wrapping the LMF handler (no TLS).
 	ts *httptest.Server
 	// client is the HTTP client used to drive the LMF.
@@ -113,8 +130,12 @@ type lmfCtx struct {
 }
 
 // startScenario is the Before hook — wires a fresh LMF server for every scenario.
+// A fakeUDMClient defaulting to ALLOW_ALL is always injected; the privacy check
+// is therefore transparent for existing scenarios. The "subscriber location privacy"
+// Given step can change it to BLOCK_ALL before the When step fires.
 func (c *lmfCtx) startScenario(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
 	c.amf = &fakeAMFClient{mode: amfModeUnreachable} // safe default
+	c.udm = &fakeUDMClient{locationPrivacy: "ALLOW_ALL"}
 	c.metricBaseline = make(map[string]float64)
 
 	cfg := &lmfcfg.Config{}
@@ -127,9 +148,12 @@ func (c *lmfCtx) startScenario(ctx context.Context, _ *godog.Scenario) (context.
 	cfg.CellCoordinates = map[string]lmfcfg.CellCoord{
 		"000000010": {Lat: 40.416775, Lon: -3.703790},
 	}
+	// Enable privacy check — default is ALLOW_ALL so all existing scenarios pass.
+	// Ref: TS 23.273 §9.1.
+	cfg.PrivacyCheck = true
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := lmfsrv.New(cfg, logger, c.amf)
+	srv := lmfsrv.New(cfg, logger, c.amf, c.udm)
 	c.ts = httptest.NewServer(srv.Handler())
 	c.client = c.ts.Client()
 	return ctx, nil
@@ -209,6 +233,17 @@ func (c *lmfCtx) givenMockAMFNotReachable() error {
 	c.amf.mu.Lock()
 	defer c.amf.mu.Unlock()
 	c.amf.mode = amfModeUnreachable
+	return nil
+}
+
+// givenSubscriberLocationPrivacy sets the UDM fake's location privacy for the
+// named SUPI. The supi argument is accepted but ignored — the fake applies to all
+// SUPIs (single-UE scenarios).
+// Ref: TS 23.273 §9.1; TS 29.503 §5.2.2 lcsData.locationPrivacy.
+func (c *lmfCtx) givenSubscriberLocationPrivacy(_, privacy string) error {
+	c.udm.mu.Lock()
+	defer c.udm.mu.Unlock()
+	c.udm.locationPrivacy = privacy
 	return nil
 }
 
@@ -418,6 +453,13 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 		c.givenMockAMFNotReachable,
 	)
 
+	// --- Given — subscriber location privacy (TS 23.273 §9.1) ---
+	// "the subscriber location privacy for "imsi-..." is "ALLOW_ALL"
+	sc.Step(
+		`^the subscriber location privacy for "([^"]+)" is "([^"]+)"$`,
+		c.givenSubscriberLocationPrivacy,
+	)
+
 	// --- When — POST with supi ---
 	// "an LCS consumer POSTs a DetermineLocation request for ueContextId "..." with supi "..."
 	sc.Step(
@@ -468,6 +510,20 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 		`^the metric (fivegc_lmf_locate_total) with label result "([^"]+)" is incremented$`,
 		c.thenMetricIsIncremented,
 	)
+
+	// Register EventSubscription + CancelLocation step definitions.
+	// Follows the same pattern as AMF steps_test.go → initAMFSBISteps / initNSSAASteps.
+	initEventSubscriptionSteps(sc, c)
+
+	// Register NRPPa relay / E-CID positioning step definitions (LMF-004).
+	// Ref: TS 38.455 §8; TS 23.273 §6.2.9; TS 29.572 §5.2.2.2.
+	w := initNRPPARelaySteps(sc, c)
+
+	// Register LPP relay / GNSS positioning step definitions (LMF-005).
+	// Extends the same *ecidWorld (w) so GNSS scenarios that fall back to
+	// E-CID/Cell-ID share one server + one set of AMF/UDM/NRPPa fakes with
+	// the LMF-004 suite. Ref: TS 37.355 §6; TS 23.273 §6.2.10; TS 29.572 §5.2.2.2.
+	initLPPRelaySteps(sc, c, w)
 }
 
 // TestFeatures is the godog test suite entry point.

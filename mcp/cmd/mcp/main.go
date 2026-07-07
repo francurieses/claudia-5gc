@@ -183,13 +183,15 @@ func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logg
 		return fmt.Errorf("group D (trace): %w", err)
 	}
 
-	// Group F: UERANSIM orchestration
-	ueDockerClient := ueclient.NewDockerClient(
+	// Group F: UERANSIM orchestration, proxied through mgmt-portal's nr-cli
+	// endpoint rather than a mounted Docker socket (see clients/ueransim doc).
+	uePortalClient := ueclient.NewPortalClient(
+		cfg.PortalAddr,
 		cfg.UERANSIM.ContainerName,
 		time.Duration(cfg.UERANSIM.ExecTimeoutSec)*time.Second,
 		logger,
 	)
-	if err := reg.RegisterAll(ueransimtools.All(ueDockerClient)...); err != nil {
+	if err := reg.RegisterAll(ueransimtools.All(uePortalClient)...); err != nil {
 		return fmt.Errorf("group F (ueransim): %w", err)
 	}
 
@@ -202,7 +204,7 @@ func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logg
 
 	// Group H: QoS policy write operations (PCF overrides + PDU session with QoS)
 	pcfClient := clients.NewPCF(cfg.PCFAddr, sbiClient)
-	if err := reg.RegisterAll(qostools.All(pcfClient, amfClient, ueDockerClient)...); err != nil {
+	if err := reg.RegisterAll(qostools.All(pcfClient, amfClient, uePortalClient)...); err != nil {
 		return fmt.Errorf("group H (qos): %w", err)
 	}
 

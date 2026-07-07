@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -50,6 +52,11 @@ type Pager interface {
 // positioning, so this is an implementation-defined guard value).
 const locationTimeout = 10 * time.Second
 
+// pageTimeout is the T-positioning guard timer: the maximum time to wait for the
+// UE to respond to paging and return to CM-CONNECTED before giving up on deferred
+// MT location. Implementation-defined per TS 23.273 §6.3.
+const pageTimeout = 15 * time.Second
+
 // Locator triggers an NGAP LocationReportingControl for a CM-CONNECTED UE and
 // returns a channel on which the LocationResult will be delivered when the gNB
 // responds with an NGAP LocationReport. The pending map entry is owned by the
@@ -62,6 +69,35 @@ type Locator interface {
 	SendLocationReportingControl(ue *amfctx.UEContext) (<-chan ngap.LocationResult, error)
 }
 
+// NRPPaRelay sends an opaque NRPPa PDU to the gNB serving a given UE via an
+// NGAP DownlinkUEAssociatedNRPPaTransport message (ProcCode=8) and returns a
+// channel on which the matching UL NRPPa PDU will be delivered when the gNB
+// responds. The AMF is a pure relay — it must NOT parse the NRPPa bytes.
+//
+// Implemented by ngap.Server; defined here to avoid an import cycle.
+// Ref: TS 38.413 §8.17.3; TS 23.273 §7.2 step C; TS 29.518 §5.2.2.6.
+type NRPPaRelay interface {
+	SendDownlinkNRPPa(ue *amfctx.UEContext, nrppaPDU []byte, routingID []byte) (<-chan ngap.NRPPaResult, error)
+}
+
+// LPPRelay sends an opaque LPP PDU to the UE via a DL NAS Transport (payload
+// container type 0x03, TS 24.501 §8.7.4) and returns a channel on which the
+// matching UL LPP PDU will be delivered when the UE responds. The AMF is a
+// pure relay — it must NOT parse the LPP bytes.
+//
+// Implemented by nasmsg.Handler; defined here to mirror NRPPaRelay's
+// decoupling from the concrete producer package (nf/amf/internal/nas), wired
+// by SetLPPRelay in main.go.
+// Ref: TS 24.501 §8.7.4; TS 23.273 §7.2; TS 29.518 §5.2.2.6; LMF-005.
+type LPPRelay interface {
+	SendDownlinkLPP(ue *amfctx.UEContext, lppPDU []byte) (<-chan nasmsg.LPPResult, error)
+	// SendDownlinkLPPNoWait sends the DL NAS Transport without registering a
+	// pendingLPP waiter — the LMF-009 DL-only leg (expectUlResponse=false,
+	// ProvideAssistanceData: unsolicited, no LPP response message exists).
+	// Ref: TS 37.355 §6.5.2; docs/procedures/LPPRelay.md §Endpoints.
+	SendDownlinkLPPNoWait(ue *amfctx.UEContext, lppPDU []byte) error
+}
+
 // Server is the AMF inbound SBI server (namf-comm + namf-loc).
 // Ref: TS 29.518 §5.3.2, §5.2.2.6.
 type Server struct {
@@ -71,6 +107,35 @@ type Server struct {
 	httpSrv *http.Server
 	pager   Pager
 	locator Locator
+	// nrppaRelay sends DL NRPPa PDUs and delivers the matching UL NRPPa PDU.
+	// Implemented by ngap.Server; wired by SetNRPPaRelay in main.go.
+	// Ref: TS 38.413 §8.17.3.
+	nrppaRelay NRPPaRelay
+	// lppRelay sends DL LPP PDUs (over NAS N1) and delivers the matching UL
+	// LPP PDU. Implemented by nasmsg.Handler; wired by SetLPPRelay in
+	// main.go. Nil = dl-lpp-info always fails (503), signalling the LMF to
+	// fall back to E-CID/Cell-ID. Ref: TS 24.501 §8.7.4; LMF-005.
+	lppRelay LPPRelay
+	// pendingLocPage holds in-flight paging-then-locate waiters. Keyed by
+	// AMF-UE-NGAP-ID; value is a buffered chan struct{} (cap 1) that is closed
+	// when the UE returns to CM-CONNECTED via a Service Request.
+	// Ref: TS 23.273 §7.2 steps E2–E7.
+	pendingLocPage sync.Map
+}
+
+// NotifyUEReachable is called by the NAS onUEReachable callback whenever a UE
+// enters CM-CONNECTED. It unblocks any Namf_Location paging-then-locate waiter
+// for that UE so positioning can proceed.
+// Ref: TS 23.273 §7.2 steps E2–E7; TS 23.502 §4.2.3.3.
+func (s *Server) NotifyUEReachable(amfUENGAPId int64) {
+	if v, ok := s.pendingLocPage.LoadAndDelete(amfUENGAPId); ok {
+		if ch, ok := v.(chan struct{}); ok {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 // SetPager wires the NGAP paging trigger used by N1N2MessageTransfer.
@@ -79,6 +144,14 @@ func (s *Server) SetPager(p Pager) { s.pager = p }
 // SetLocator wires the NGAP location trigger used by Namf_Location_ProvideLocationInfo.
 // Must be called before Start(). Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1.
 func (s *Server) SetLocator(l Locator) { s.locator = l }
+
+// SetNRPPaRelay wires the NGAP NRPPa relay used by Namf_Location dl-nrppa-info.
+// Must be called before Start(). Ref: TS 38.413 §8.17.3; TS 29.518 §5.2.2.6.
+func (s *Server) SetNRPPaRelay(r NRPPaRelay) { s.nrppaRelay = r }
+
+// SetLPPRelay wires the NAS LPP relay used by Namf_Location dl-lpp-info.
+// Must be called before Start(). Ref: TS 24.501 §8.7.4; TS 29.518 §5.2.2.6.
+func (s *Server) SetLPPRelay(r LPPRelay) { s.lppRelay = r }
 
 // New builds the inbound SBI server. It does not start listening — call Start.
 func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) {
@@ -93,6 +166,13 @@ func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) 
 	// Namf_Location_ProvideLocationInfo — Cell-ID positioning relay.
 	// Ref: TS 29.518 §5.2.2.6; TS 23.273 §7.2.
 	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info", s.handleProvideLocInfo)
+	// Namf_Location dl-nrppa-info: LMF sends DL NRPPa PDU; AMF relays to gNB and waits for UL NRPPa.
+	// Ref: TS 29.518 §5.2.2.6 (NRPPa relay extension); TS 38.413 §8.17.3.
+	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-nrppa-info", s.handleDLNRPPaInfo)
+	// Namf_Location dl-lpp-info: LMF sends DL LPP PDU; AMF relays it to the UE
+	// over N1 (DL NAS Transport, payload container type 0x03) and waits for
+	// the matching UL LPP PDU. Ref: TS 29.518 §5.2.2.6; TS 24.501 §8.7.4; LMF-005.
+	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-lpp-info", s.handleDLLPPInfo)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -339,14 +419,47 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 	log = log.With("supi", supi, "amf_ue_ngap_id", amfID)
 
 	if !connected {
-		// MVP: CM-IDLE → return UE_NOT_REACHABLE. Paging-then-locate is deferred.
-		// Ref: TS 29.518 §5.2.2.6; DetermineLocation.md error table.
-		log.Info("ProvideLocationInfo: UE is CM-IDLE — not reachable for location",
-			"result", "REJECT", "cause", CauseUENotReachable)
-		s.problem(w, http.StatusConflict, CauseUENotReachable,
-			"UE is CM-IDLE; paging-then-locate is deferred (LMF-002+)")
-		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
-		return
+		// Paging-then-locate (Deferred MT Location, TS 23.273 §7.2 steps E2–E7):
+		// trigger NGAP Paging, block until the UE returns to CM-CONNECTED via a
+		// Service Request, then fall through to the NGAP location exchange below.
+		if s.pager == nil {
+			log.Error("ProvideLocationInfo: no Pager wired — cannot page CM-IDLE UE",
+				"result", "FAILURE", "cause", CauseLocationFailure)
+			s.problem(w, http.StatusServiceUnavailable, CauseLocationFailure,
+				"internal: Pager not configured")
+			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+			return
+		}
+		pageCh := make(chan struct{}, 1)
+		s.pendingLocPage.Store(amfID, pageCh)
+		log.Info("ProvideLocationInfo: UE is CM-IDLE — triggering paging-then-locate",
+			"direction", "OUT", "interface", "N2",
+			"spec_ref", "TS 23.273 §7.2 steps E2-E7")
+		if err := s.pager.SendPaging(ue); err != nil {
+			s.pendingLocPage.Delete(amfID)
+			log.Error("ProvideLocationInfo: paging failed", "error", err,
+				"result", "FAILURE", "cause", CauseLocationFailure)
+			s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure,
+				"paging failed: "+err.Error())
+			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+			return
+		}
+		pageCtx, pageCancel := context.WithTimeout(r.Context(), pageTimeout)
+		defer pageCancel()
+		select {
+		case <-pageCh:
+			log.Info("ProvideLocationInfo: paged UE returned to CM-CONNECTED — proceeding with location",
+				"supi", supi, "spec_ref", "TS 23.273 §7.2 step E7")
+		case <-pageCtx.Done():
+			s.pendingLocPage.Delete(amfID)
+			log.Warn("ProvideLocationInfo: UE did not respond to paging within T-positioning",
+				"timeout_s", pageTimeout.Seconds(), "result", "FAILURE", "cause", CauseUENotReachable)
+			s.problem(w, http.StatusGatewayTimeout, CauseUENotReachable,
+				"UE did not respond to paging within T-positioning (15 s)")
+			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+			return
+		}
+		// UE is now CM-CONNECTED; fall through to NGAP LocationReportingControl.
 	}
 
 	if s.locator == nil {
@@ -425,6 +538,363 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 		"spec_ref", "TS 29.518 §5.2.2.6",
 	)
 	metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "OK").Inc()
+}
+
+// handleDLNRPPaInfo serves Namf_Location dl-nrppa-info (producer side).
+//
+// The LMF sends a base64url-encoded NRPPa PDU in the request body. The AMF:
+//  1. Resolves the UE (must be CM-CONNECTED).
+//  2. Sends NGAP DownlinkUEAssociatedNRPPaTransport (ProcCode=8) to the serving gNB.
+//  3. Blocks until the matching UplinkUEAssociatedNRPPaTransport arrives from the gNB
+//     (keyed by AMF-UE-NGAP-ID via pendingNRPPa) or the nrppaTimeout expires.
+//  4. Returns HTTP 200 with the UL NRPPa PDU base64url-encoded in the response body.
+//
+// The AMF is a pure relay — it MUST NOT decode the NRPPa-PDU bytes.
+//
+// Ref: TS 29.518 §5.2.2.6 (Namf_Location extension for NRPPa relay);
+// TS 38.413 §8.17.3 (UE-associated NRPPa Transport);
+// TS 23.273 §7.2 step C.
+func (s *Server) handleDLNRPPaInfo(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	ueContextID := r.PathValue("ueContextId")
+	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
+	corrID := logging.CorrelationID(ctx)
+	log := logging.NewProcedureLogger(ctx, s.logger, "NRPPaRelay").With(
+		"nf", "AMF",
+		"procedure", "NRPPaRelay",
+		"interface", "Namf",
+		"direction", "IN",
+		"spec_ref", "TS 38.413 §8.17.3",
+		"correlation_id", corrID,
+		"ue_context_id", ueContextID,
+	)
+
+	var req DLNRPPaInfoReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Warn("dl-nrppa-info: malformed request body",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "REJECT").Inc()
+		return
+	}
+
+	if req.NrppaPdu == "" {
+		log.Warn("dl-nrppa-info: nrppaPdu missing",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING",
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "nrppaPdu is mandatory")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "REJECT").Inc()
+		return
+	}
+
+	nrppaPDU, err := base64.StdEncoding.DecodeString(req.NrppaPdu)
+	if err != nil {
+		// Try URL-safe encoding fallback.
+		nrppaPDU, err = base64.URLEncoding.DecodeString(req.NrppaPdu)
+		if err != nil {
+			log.Warn("dl-nrppa-info: invalid base64 nrppaPdu",
+				"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err,
+				"duration_ms", time.Since(start).Milliseconds())
+			s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "nrppaPdu: invalid base64")
+			metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "REJECT").Inc()
+			return
+		}
+	}
+
+	var routingID []byte
+	if req.RoutingId != "" {
+		routingID, _ = base64.StdEncoding.DecodeString(req.RoutingId)
+		if routingID == nil {
+			routingID, _ = base64.URLEncoding.DecodeString(req.RoutingId)
+		}
+	}
+
+	ue, found := s.lookupUE(ueContextID)
+	if !found {
+		log.Info("dl-nrppa-info: UE context not found",
+			"result", "REJECT", "cause", "CONTEXT_NOT_FOUND",
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "no UE context for the given identifier")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "REJECT").Inc()
+		return
+	}
+
+	ue.Lock()
+	connected := ue.CMState == amfctx.CMConnected
+	supi := ue.SUPI
+	amfID := ue.AMFUENGAPId
+	ue.Unlock()
+
+	log = log.With("supi", supi, "amf_ue_ngap_id", amfID)
+
+	if !connected {
+		log.Warn("dl-nrppa-info: UE is not CM-CONNECTED — NRPPa relay requires active N2",
+			"result", "FAILURE", "cause", CauseNRPPaRelayFailure,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseNRPPaRelayFailure,
+			"UE is CM-IDLE — NRPPa relay requires CM-CONNECTED")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "FAILURE").Inc()
+		return
+	}
+
+	if s.nrppaRelay == nil {
+		log.Error("dl-nrppa-info: no NRPPaRelay wired",
+			"result", "FAILURE", "cause", CauseNRPPaRelayFailure,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusServiceUnavailable, CauseNRPPaRelayFailure,
+			"internal: NRPPaRelay not configured")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "FAILURE").Inc()
+		return
+	}
+
+	log.Info("sending NGAP DownlinkUEAssociatedNRPPaTransport",
+		"direction", "OUT",
+		"interface", "N2",
+		"nrppa_pdu_len", len(nrppaPDU),
+		"spec_ref", "TS 38.413 §8.17.3",
+	)
+
+	ch, err := s.nrppaRelay.SendDownlinkNRPPa(ue, nrppaPDU, routingID)
+	if err != nil {
+		log.Error("dl-nrppa-info: SendDownlinkNRPPa failed",
+			"result", "FAILURE", "cause", CauseNRPPaRelayFailure, "error", err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseNRPPaRelayFailure,
+			fmt.Sprintf("NGAP DownlinkUEAssociatedNRPPaTransport failed: %v", err))
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "FAILURE").Inc()
+		return
+	}
+
+	// Block until the gNB responds with UplinkUEAssociatedNRPPaTransport or nrppaTimeout.
+	// nrppaTimeout is an implementation-defined guard; TS 38.455 §8.2 has no normative timer
+	// on the AMF side.
+	nrppaCtx, cancel := context.WithTimeout(ctx, nrppaTimeout)
+	defer cancel()
+
+	var result ngap.NRPPaResult
+	select {
+	case result = <-ch:
+	case <-nrppaCtx.Done():
+		// Timeout: the channel is buffered(1); a late UL NRPPa will drain into the buffer
+		// and not block the gNB handler goroutine (no goroutine leak).
+		result = ngap.NRPPaResult{Err: fmt.Errorf("nrppa relay timeout after %s", nrppaTimeout)}
+	}
+
+	if result.Err != nil {
+		log.Warn("dl-nrppa-info: NRPPa relay exchange failed",
+			"result", "FAILURE", "cause", CauseNRPPaRelayFailure, "error", result.Err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseNRPPaRelayFailure, result.Err.Error())
+		metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "FAILURE").Inc()
+		return
+	}
+
+	rsp := DLNRPPaInfoRsp{
+		NrppaPdu: base64.StdEncoding.EncodeToString(result.NRPPaPDU),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(rsp)
+
+	log.Info("dl-nrppa-info complete — UL NRPPa relayed to LMF",
+		"ul_nrppa_pdu_len", len(result.NRPPaPDU),
+		"result", "OK",
+		"spec_ref", "TS 38.413 §8.17.3",
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+	metrics.ProcedureTotal.WithLabelValues(nfName, "NRPPaRelay", "OK").Inc()
+}
+
+// handleDLLPPInfo serves Namf_Location dl-lpp-info (producer side, LMF-005).
+//
+// The LMF sends a base64-encoded opaque LPP-PDU in the request body. The AMF:
+//  1. Resolves the UE (must be CM-CONNECTED — LPP needs an active N1/N2 path).
+//  2. Wraps the LPP-PDU in a DL NAS Transport (payload container type 0x03)
+//     and sends it to the UE (ciphered, SHT=0x02) via the LPPRelay.
+//  3. Blocks until the matching UL NAS Transport (payload container type
+//     0x03) arrives from the UE (keyed by AMF-UE-NGAP-ID via pendingLPP) or
+//     lppTimeout expires.
+//  4. Returns HTTP 200 with the UL LPP-PDU base64-encoded in the response body.
+//
+// The AMF is a pure relay — it MUST NOT decode the LPP-PDU bytes.
+//
+// Ref: TS 29.518 §5.2.2.6 (Namf_Location extension for LPP relay);
+// TS 24.501 §8.7.4 / §9.11.3.40 (DL/UL NAS Transport, PCT=0x03);
+// TS 23.273 §7.2 (AMF transparent relay); TS 37.355 §6.
+func (s *Server) handleDLLPPInfo(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	ueContextID := r.PathValue("ueContextId")
+	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
+	corrID := logging.CorrelationID(ctx)
+	log := logging.NewProcedureLogger(ctx, s.logger, "LPPRelay").With(
+		"nf", "AMF",
+		"procedure", "LPPRelay",
+		"interface", "Namf",
+		"direction", "IN",
+		"spec_ref", "TS 24.501 §8.7.4",
+		"correlation_id", corrID,
+		"ue_context_id", ueContextID,
+	)
+
+	var req DLLPPInfoReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Warn("dl-lpp-info: malformed request body",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "REJECT").Inc()
+		return
+	}
+
+	if req.LppPdu == "" {
+		log.Warn("dl-lpp-info: lppPdu missing",
+			"result", "REJECT", "cause", "MANDATORY_IE_MISSING",
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "lppPdu is mandatory")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "REJECT").Inc()
+		return
+	}
+
+	lppPDU, err := base64.StdEncoding.DecodeString(req.LppPdu)
+	if err != nil {
+		// Try URL-safe encoding fallback.
+		lppPDU, err = base64.URLEncoding.DecodeString(req.LppPdu)
+		if err != nil {
+			log.Warn("dl-lpp-info: invalid base64 lppPdu",
+				"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err,
+				"duration_ms", time.Since(start).Milliseconds())
+			s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "lppPdu: invalid base64")
+			metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "REJECT").Inc()
+			return
+		}
+	}
+
+	ue, found := s.lookupUE(ueContextID)
+	if !found {
+		log.Info("dl-lpp-info: UE context not found",
+			"result", "REJECT", "cause", "CONTEXT_NOT_FOUND",
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "no UE context for the given identifier")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "REJECT").Inc()
+		return
+	}
+
+	ue.Lock()
+	connected := ue.CMState == amfctx.CMConnected
+	supi := ue.SUPI
+	amfID := ue.AMFUENGAPId
+	ue.Unlock()
+
+	log = log.With("supi", supi, "amf_ue_ngap_id", amfID)
+
+	if !connected {
+		log.Warn("dl-lpp-info: UE is not CM-CONNECTED — LPP relay requires active N1/N2",
+			"result", "FAILURE", "cause", CauseLPPRelayFailure,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseLPPRelayFailure,
+			"UE is CM-IDLE — LPP relay requires CM-CONNECTED")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "FAILURE").Inc()
+		return
+	}
+
+	if s.lppRelay == nil {
+		log.Error("dl-lpp-info: no LPPRelay wired",
+			"result", "FAILURE", "cause", CauseLPPRelayFailure,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusServiceUnavailable, CauseLPPRelayFailure,
+			"internal: LPPRelay not configured")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "FAILURE").Inc()
+		return
+	}
+
+	// expectUlResponse (ADDITIVE, LMF-009): absent/nil defaults to true
+	// (LMF-005 synchronous behaviour, unchanged).
+	expectUL := req.ExpectUlResponse == nil || *req.ExpectUlResponse
+
+	log.Info("sending DL NAS Transport (LPP)",
+		"direction", "OUT",
+		"interface", "N1",
+		"lpp_pdu_len", len(lppPDU),
+		"expect_ul_response", expectUL,
+		"spec_ref", "TS 24.501 §8.7.4",
+	)
+
+	if !expectUL {
+		// DL-only leg (ProvideAssistanceData — TS 37.355 assistance-data
+		// delivery is unsolicited, no response message): send the DL NAS
+		// Transport, register NO pendingLPP waiter, return 204 No Content.
+		// Ref: docs/procedures/LPPRelay.md §Endpoints; TS 37.355 §6.5.2.
+		if err := s.lppRelay.SendDownlinkLPPNoWait(ue, lppPDU); err != nil {
+			log.Error("dl-lpp-info: SendDownlinkLPPNoWait failed",
+				"result", "FAILURE", "cause", CauseLPPRelayFailure, "error", err,
+				"duration_ms", time.Since(start).Milliseconds())
+			s.problem(w, http.StatusGatewayTimeout, CauseLPPRelayFailure,
+				fmt.Sprintf("DL NAS Transport (LPP, no-wait) failed: %v", err))
+			metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "FAILURE").Inc()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		log.Info("dl-lpp-info complete — DL-only leg sent (204, no pendingLPP waiter)",
+			"result", "OK",
+			"spec_ref", "TS 24.501 §8.7.4 / TS 37.355 §6.5.2",
+			"duration_ms", time.Since(start).Milliseconds(),
+		)
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "OK").Inc()
+		return
+	}
+
+	ch, err := s.lppRelay.SendDownlinkLPP(ue, lppPDU)
+	if err != nil {
+		log.Error("dl-lpp-info: SendDownlinkLPP failed",
+			"result", "FAILURE", "cause", CauseLPPRelayFailure, "error", err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseLPPRelayFailure,
+			fmt.Sprintf("DL NAS Transport (LPP) failed: %v", err))
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "FAILURE").Inc()
+		return
+	}
+
+	// Block until the UE responds with a UL NAS Transport (PCT=0x03) or lppTimeout.
+	// lppTimeout is an implementation-defined guard; TS 23.273 §7.2 has no
+	// normative timer for the LPP relay path.
+	lppCtx, cancel := context.WithTimeout(ctx, lppTimeout)
+	defer cancel()
+
+	var result nasmsg.LPPResult
+	select {
+	case result = <-ch:
+	case <-lppCtx.Done():
+		// Timeout: the channel is buffered(1); a late UL LPP will drain into
+		// the buffer and not block the NAS handler goroutine (no leak).
+		result = nasmsg.LPPResult{Err: fmt.Errorf("lpp relay timeout after %s", lppTimeout)}
+	}
+
+	if result.Err != nil {
+		log.Warn("dl-lpp-info: LPP relay exchange failed",
+			"result", "FAILURE", "cause", CauseLPPRelayFailure, "error", result.Err,
+			"duration_ms", time.Since(start).Milliseconds())
+		s.problem(w, http.StatusGatewayTimeout, CauseLPPRelayFailure, result.Err.Error())
+		metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "FAILURE").Inc()
+		return
+	}
+
+	rsp := DLLPPInfoRsp{
+		LppPdu: base64.StdEncoding.EncodeToString(result.LPPPDU),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(rsp)
+
+	log.Info("dl-lpp-info complete — UL LPP relayed to LMF",
+		"ul_lpp_pdu_len", len(result.LPPPDU),
+		"result", "OK",
+		"spec_ref", "TS 24.501 §8.7.4",
+		"duration_ms", time.Since(start).Milliseconds(),
+	)
+	metrics.ProcedureTotal.WithLabelValues(nfName, "LPPRelay", "OK").Inc()
 }
 
 // buildTransferRsp assembles the UeContextTransferRspData from the UE context.

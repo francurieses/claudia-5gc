@@ -77,14 +77,14 @@ type AUSFInitResponse struct {
 	AuthCtxID string
 	RAND      [16]byte
 	AUTN      [16]byte
-	HXRESStar []byte   // 16 bytes
+	HXRESStar []byte // 16 bytes
 	SUPI      string
 }
 
 // AUSFConfirmResponse carries KAUSF from AUSF after verification.
 type AUSFConfirmResponse struct {
-	SUPI      string
-	KAUSF     []byte
+	SUPI  string
+	KAUSF []byte
 }
 
 // UDMClient calls UDM for subscriber data.
@@ -102,6 +102,7 @@ type UDMAMSubscription struct {
 	AMBRUplink   uint64
 	AMBRDownlink uint64
 }
+
 // PCFClient calls PCF for UE-level policy (N15 interface, Npcf_UEPolicyControl).
 // Optional: when nil, no URSP policy is delivered at registration.
 // Ref: TS 29.525 §4.2.2.2
@@ -135,8 +136,8 @@ type RegistrationHandler struct {
 	ausf         AUSFClient
 	udm          UDMClient
 	nrf          NRFClient
-	nssf         NSSFClient    // optional; when nil, local UDM-subscription filter is used
-	pcf          PCFClient     // optional; when nil, no UE policy (URSP) N15 call is made
+	nssf         NSSFClient     // optional; when nil, local UDM-subscription filter is used
+	pcf          PCFClient      // optional; when nil, no UE policy (URSP) N15 call is made
 	amPolicy     AMPolicyClient // optional; when nil, no AM policy association is created
 	nssaa        NSSAAClient    // optional; when nil, no slice-specific auth is run
 	logger       *slog.Logger
@@ -163,6 +164,11 @@ type RegistrationHandler struct {
 	// does not provide one. 0 means "omit the IE entirely".
 	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
 	defaultRFSP int
+	// servedTACs is the registration area sent to the UE as the TAI list in
+	// Registration Accept (IEI 0x54). The UE's current TAC is always included
+	// even if absent here. Configured via nf/amf/config/dev.yaml "served_tacs".
+	// Ref: TS 24.501 §9.11.3.9, TS 23.501 §5.3.2.3
+	servedTACs []uint32
 }
 
 // NewRegistrationHandler builds a handler wired to the AMF's NF clients.
@@ -238,6 +244,36 @@ func (h *RegistrationHandler) WithT3512(secs int) {
 	h.t3512Secs = secs
 }
 
+// WithServedTACs sets the operator-configured TACs that form the registration
+// area (TAI list) sent in Registration Accept.
+// Ref: TS 24.501 §9.11.3.9, TS 23.501 §5.3.2.3
+func (h *RegistrationHandler) WithServedTACs(tacs []uint32) {
+	h.servedTACs = tacs
+}
+
+// buildTAIList builds the 5GS tracking area identity list for ue's
+// Registration Accept: the configured served TACs plus the UE's current TAC
+// (TS 24.501 §5.5.1.2.4 — the registration area assigned by the AMF shall
+// include the current TAI, otherwise the UE cancels Service Request from
+// CM-IDLE with "current TAI is not in the TAI list").
+// Ref: TS 24.501 §9.11.3.9, §8.2.7.1 (IEI 0x54)
+func (h *RegistrationHandler) buildTAIList(ue *amfctx.UEContext) []byte {
+	tacs := make([]uint32, 0, len(h.servedTACs)+1)
+	tacs = append(tacs, h.servedTACs...)
+	current := ue.TAI.TAC
+	found := false
+	for _, t := range tacs {
+		if t == current {
+			found = true
+			break
+		}
+	}
+	if !found {
+		tacs = append(tacs, current)
+	}
+	return nas.EncodeTAIList(h.plmnMCC, h.plmnMNC, tacs)
+}
+
 // WithNullSecurity forces NEA0+NIA0 for all UEs when enabled (dev/debug only).
 // NAS PDUs travel in plain text — do NOT use in production.
 // Ref: TS 33.501 §6.7.2
@@ -247,10 +283,10 @@ func (h *RegistrationHandler) WithNullSecurity(enabled bool) {
 
 // RegistrationInput carries the decoded Registration Request and NGAP context.
 type RegistrationInput struct {
-	UE               *amfctx.UEContext
-	RegRequest       *nas.RegistrationRequest
+	UE         *amfctx.UEContext
+	RegRequest *nas.RegistrationRequest
 	// Raw Registration Request bytes (needed for SecurityModeCommand replay)
-	RawRegRequest    []byte
+	RawRegRequest []byte
 }
 
 // RegistrationOutput carries what the NAS/NGAP layer needs to send back.
@@ -304,10 +340,14 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 
 	// Store UE security capabilities for later Security Mode Command
 	if sc := in.RegRequest.UESecurityCapability; sc != nil {
-		ue.UESecCapEA[0] = sc.EA0; ue.UESecCapEA[1] = sc.EA1
-		ue.UESecCapEA[2] = sc.EA2; ue.UESecCapEA[3] = sc.EA3
-		ue.UESecCapIA[0] = sc.IA0; ue.UESecCapIA[1] = sc.IA1
-		ue.UESecCapIA[2] = sc.IA2; ue.UESecCapIA[3] = sc.IA3
+		ue.UESecCapEA[0] = sc.EA0
+		ue.UESecCapEA[1] = sc.EA1
+		ue.UESecCapEA[2] = sc.EA2
+		ue.UESecCapEA[3] = sc.EA3
+		ue.UESecCapIA[0] = sc.IA0
+		ue.UESecCapIA[1] = sc.IA1
+		ue.UESecCapIA[2] = sc.IA2
+		ue.UESecCapIA[3] = sc.IA3
 		ue.RawUESecCap = sc.Raw // verbatim bytes for exact SMC replay
 	}
 
@@ -795,6 +835,10 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 				TMSI:        guti.TMSI,
 			},
 		},
+		// TAI list (IEI 0x54): registration area. Without it UERANSIM cancels
+		// Service Request from CM-IDLE ("current TAI is not in the TAI list").
+		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
+		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
 		// URSP intentionally omitted — delivered via DL NAS TRANSPORT after registration.
 	}
@@ -941,6 +985,9 @@ func (h *RegistrationHandler) BuildRegistrationUpdateAccept(
 				TMSI:        guti.TMSI,
 			},
 		},
+		// TAI list (IEI 0x54): registration area — same as Initial Registration.
+		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
+		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
 	}
 	if h.t3512Secs > 0 {

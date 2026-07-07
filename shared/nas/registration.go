@@ -42,22 +42,22 @@ type RegistrationRequest struct {
 
 // IEI codes for RegistrationRequest optional IEs (TS 24.501 §8.2.6.1 Table 8.2.6.1.1)
 const (
-	IEINonCurrentNGKSI         = 0x17
-	IEI5GMMCapability          = 0x10
-	IEIUESecurityCapability    = 0x2E
-	IEIRequestedNSSAI          = 0x6D
-	IEILastVisitedTAI          = 0x52
-	IEIS1UENetworkCapability   = 0x40
-	IEIUplinkDataStatus        = 0x50
-	IEIPDUSessionStatus        = 0x2B  // Note: same IEI as UE Status in some revisions
-	IEIAdditionalGUTI          = 0x77
-	IEIRequestedDRXParameters  = 0x51
-	IEIEPSNASMessageContainer  = 0x70
-	IEILADNIndication          = 0x74
-	IEIPayloadContainer        = 0x7B
+	IEINonCurrentNGKSI          = 0x17
+	IEI5GMMCapability           = 0x10
+	IEIUESecurityCapability     = 0x2E
+	IEIRequestedNSSAI           = 0x6D
+	IEILastVisitedTAI           = 0x52
+	IEIS1UENetworkCapability    = 0x40
+	IEIUplinkDataStatus         = 0x50
+	IEIPDUSessionStatus         = 0x2B // Note: same IEI as UE Status in some revisions
+	IEIAdditionalGUTI           = 0x77
+	IEIRequestedDRXParameters   = 0x51
+	IEIEPSNASMessageContainer   = 0x70
+	IEILADNIndication           = 0x74
+	IEIPayloadContainer         = 0x7B
 	IEINetworkSlicingIndication = 0x9A
-	IEI5GSDRXParameters        = 0x6E
-	IEINASMessageContainer     = 0x71
+	IEI5GSDRXParameters         = 0x6E
+	IEINASMessageContainer      = 0x71
 )
 
 // DecodeRegistrationRequest parses the body bytes after the message type.
@@ -256,6 +256,34 @@ func EncodeGPRSTimer3(seconds int) byte {
 	return byte(5<<5) | byte(mins)
 }
 
+// EncodeTAIList encodes a 5GS tracking area identity list containing a single
+// type-00 partial list ("list of TACs belonging to one PLMN, with
+// non-consecutive TAC values"). This is the registration area the UE stores;
+// a UE will not send a Service Request from a TAI outside this list.
+//
+// Layout (TS 24.501 §9.11.3.9):
+//
+//	octet 1:   bit 8 spare (0) | bits 7-6 type of list (00) | bits 5-1 number of elements - 1
+//	octets 2-4: MCC/MNC in BCD
+//	then 3 octets per TAC (big-endian 24-bit)
+//
+// A type-00 partial list holds at most 16 TACs (TS 24.501 §9.11.3.9);
+// extra entries are truncated. Returns nil for an empty TAC set.
+func EncodeTAIList(mcc, mnc string, tacs []uint32) []byte {
+	if len(tacs) == 0 {
+		return nil
+	}
+	if len(tacs) > 16 {
+		tacs = tacs[:16]
+	}
+	out := []byte{byte(len(tacs)-1) & 0x1F} // type of list 00 + element count
+	out = append(out, encodeMCCMNC(mcc, mnc)...)
+	for _, tac := range tacs {
+		out = append(out, byte(tac>>16), byte(tac>>8), byte(tac))
+	}
+	return out
+}
+
 // EncodeRegistrationAccept serialises a RegistrationAccept into wire bytes.
 // Ref: TS 24.501 §8.2.7.1
 // IEI alignment validated against UERANSIM v3.2.8 RegistrationAccept::onBuild.
@@ -335,6 +363,10 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 			gutiBytes, _ := rdr.ReadBytes(length)
 			mi, _ := DecodeMobileIdentity(gutiBytes)
 			ra.FiveGGUTI = mi
+		case 0x54: // TAI list — IE4 (1-byte length), raw value kept as-is
+			l, _ := rdr.ReadByte()
+			taiBytes, _ := rdr.ReadBytes(int(l))
+			ra.TAIList = taiBytes
 		case 0x15: // Allowed NSSAI — IE4 (1-byte length), UERANSIM uses 0x15
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))

@@ -34,6 +34,7 @@ var pcapSidecars = map[string]string{
 	"smsf": "smsf-pcap",
 	"bsf":  "bsf-pcap",
 	"nef":  "nef-pcap",
+	"lmf":  "lmf-pcap",
 }
 
 // PCAPStatus describes the state of a PCAP sidecar.

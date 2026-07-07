@@ -85,7 +85,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=\"OK\"}[5m])",
+          "expr": "round(increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=\"OK\"}[5m]))",
           "legendFormat": "OK",
           "refId": "A"
         }
@@ -114,7 +114,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "expr": "increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=~\"REJECT|FAILURE\"}[5m])",
+          "expr": "round(increase(fivegc_procedure_total{nf=\"AMF\",procedure=\"InitialRegistration\",result=~\"REJECT|FAILURE\"}[5m]))",
           "legendFormat": "Failed",
           "refId": "A"
         }
@@ -202,7 +202,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "opm",
           "custom": { "lineWidth": 2, "fillOpacity": 10 }
         },
         "overrides": [
@@ -290,7 +290,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "opm",
           "custom": { "lineWidth": 2, "fillOpacity": 10 }
         },
         "overrides": [
@@ -330,7 +330,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "opm",
           "custom": { "lineWidth": 2, "fillOpacity": 10 }
         },
         "overrides": [

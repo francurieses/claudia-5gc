@@ -843,6 +843,7 @@ services:
       AMF_URL: "http://amf:9002"
       UDM_URL: "https://udm:8003"
       PCF_URL: "https://pcf:8006"
+      LMF_URL: "https://lmf:8012"
       NF_CONFIGS_PATH: "/app/nf-configs"
       OPERATOR_CONFIG_PATH: "/etc/5gc/operator.yaml"
       LISTEN_ADDR: ":8080"
@@ -890,12 +891,17 @@ services:
       UDM_ADDR: "https://udm:8003"
       JAEGER_ADDR: "http://jaeger:16686"
       PROMETHEUS_ADDR: "http://prometheus:9090"
+      # Group F (UERANSIM) proxies docker exec through mgmt-portal instead of
+      # a mounted Docker socket — see mcp/internal/ueransim/client.go.
+      PORTAL_ADDR: "http://mgmt-portal:8080"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       # Set MCP_BEARER_TOKEN to require Bearer auth on the SSE transport.
     depends_on:
       nrf:
         condition: service_started
       amf:
+        condition: service_started
+      mgmt-portal:
         condition: service_started
     healthcheck:
       test: ["CMD", "/bin/mcp", "healthcheck"]

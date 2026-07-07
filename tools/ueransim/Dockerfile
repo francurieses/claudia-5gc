@@ -34,6 +34,17 @@ RUN wget -qO- \
 #          (ursp-show / ursp-match / ursp-establish / ps-modify)
 #   0030 — NW-initiated PDU session modification: UE 0xCB→0xCC handler + gNB
 #          NGAP PDUSessionResourceModify forwarding (TS 23.502 §4.3.3.2)
+#   0040 — gNB NGAP LocationReportingControl → LocationReport (TS 38.413 §8.17)
+#   0041 — gNB NRPPa E-CID transport, real ASN.1 APER (TS 38.455 §8/§9)
+#   0042 — LPP A-GNSS UE responder: payload container type 3 (TS 24.501
+#          §9.11.3.40) → TS 37.355 UNALIGNED-PER codec mirroring shared/lpp;
+#          ProvideCapabilities / anchor-seeded synthetic GNSS measurements /
+#          gnss-Error; LPP_GNSS_NONE=1 negative mode (docs/procedures/LPPRelay.md)
+#   0050 — UE re-registration on NW-initiated deregistration with
+#          "re-registration required" (TS 24.501 §5.5.2.3.2)
+#   0051 — gNB AMF selection fallback for initial NAS messages without a
+#          Requested NSSAI (Service Request from CM-IDLE, secured Registration
+#          Update) — stock selectAmf drops them with "AMF selection failed"
 COPY tools/ueransim/patches/ /patches/
 RUN set -e; for p in /patches/*.patch; do \
         echo "Applying $p"; \

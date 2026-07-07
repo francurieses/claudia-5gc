@@ -38,7 +38,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_procedure_total{procedure=\"InitialRegistration\", result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_procedure_total{procedure=\"InitialRegistration\"}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_procedure_total{procedure=\"InitialRegistration\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{procedure=\"InitialRegistration\"}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -63,7 +63,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_authentication_total{result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_authentication_total{}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_authentication_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_authentication_total{}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -88,7 +88,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_pdu_session_total{result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_pdu_session_total{}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_pdu_session_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_pdu_session_total{}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -113,7 +113,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_handover_total{result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_handover_total{}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_handover_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_handover_total{}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -138,7 +138,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_sbi_requests_total{status_code=~\"4xx|5xx\"}[5m])) / clamp_min(sum(rate(fivegc_sbi_requests_total{}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_sbi_requests_total{status_code=~\"4xx|5xx\"}[5m])) or vector(0)) / (sum(rate(fivegc_sbi_requests_total{}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -401,7 +401,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "fivegc_bsf_bindings_active",
+          "expr": "fivegc_bsf_bindings_active{nf=\"BSF\"}",
           "legendFormat": "",
           "refId": "A"
         }
@@ -426,7 +426,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_procedure_total{nf=\"BSF\", procedure=\"PcfBindingRegister\", result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_procedure_total{nf=\"BSF\", procedure=\"PcfBindingRegister\"}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_procedure_total{nf=\"BSF\", procedure=\"PcfBindingRegister\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{nf=\"BSF\", procedure=\"PcfBindingRegister\"}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -477,7 +477,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "fivegc_nef_subscriptions_active",
+          "expr": "fivegc_nef_subscriptions_active{nf=\"NEF\"}",
           "legendFormat": "",
           "refId": "A"
         }
@@ -502,7 +502,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_procedure_total{nf=\"NEF\", procedure=\"AsSessionWithQoSCreate\", result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_procedure_total{nf=\"NEF\", procedure=\"AsSessionWithQoSCreate\"}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_procedure_total{nf=\"NEF\", procedure=\"AsSessionWithQoSCreate\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{nf=\"NEF\", procedure=\"AsSessionWithQoSCreate\"}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -554,7 +554,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"SmsActivate\", result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"SmsActivate\"}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"SmsActivate\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"SmsActivate\"}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -579,7 +579,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"UplinkSMS\", result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"UplinkSMS\"}[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"UplinkSMS\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{nf=\"SMSF\", procedure=\"UplinkSMS\"}[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -631,7 +631,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_lmf_locate_total{result=\"OK\"}[5m])) / clamp_min(sum(rate(fivegc_lmf_locate_total[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_lmf_locate_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_locate_total[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -656,7 +656,7 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "100 * sum(rate(fivegc_lmf_locate_total{result=\"REJECT\"}[5m])) / clamp_min(sum(rate(fivegc_lmf_locate_total[5m])), 1)",
+          "expr": "100 * (sum(rate(fivegc_lmf_locate_total{result=\"REJECT\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_locate_total[5m])) > 0)",
           "legendFormat": "",
           "refId": "A"
         }
@@ -709,6 +709,345 @@
           "expr": "sum(rate(fivegc_lmf_locate_total{result=\"FAILURE\"}[2m]))",
           "legendFormat": "FAILURE",
           "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Current number of active Nlmf_Location EventSubscriptions in the LMF (TS 29.572 §5.2.3). Sourced from fivegc_lmf_subscriptions_active.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 77},
+      "id": 28,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "LMF Active Location Subscriptions",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "fivegc_lmf_subscriptions_active{nf=\"LMF\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of Nlmf_Location EventSubscription Create requests per second by result (OK / REJECT). Sourced from fivegc_lmf_subscription_create_total (TS 29.572 §5.2.3.2).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 10, "x": 4, "y": 77},
+      "id": 29,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "LMF EventSubscription Create Rate by Result",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (result)(rate(fivegc_lmf_subscription_create_total[2m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of Nlmf_Location notification delivery attempts per second, broken down by event_trigger (PERIODIC_REPORTING / AREA_OF_INTEREST) and result (OK / RETRIED / DROPPED). Sourced from fivegc_lmf_notifications_total (TS 29.572 §6.1.6.2.4).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 10, "x": 14, "y": 77},
+      "id": 30,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "LMF Notification Delivery Rate by Trigger and Result",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (event_trigger, result)(rate(fivegc_lmf_notifications_total[2m]))",
+          "legendFormat": "{{event_trigger}} {{result}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Percentage of E-CID NRPPa positioning attempts that returned a weighted-centroid fix (OK). Low values indicate frequent gNB fallback to Cell-ID or NRPPa relay failures. Sourced from fivegc_lmf_ecid_total (TS 23.273 §6.2.9).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 50}, {"color": "green", "value": 80}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 85},
+      "id": 31,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "E-CID Positioning Success Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * (sum(rate(fivegc_lmf_ecid_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_ecid_total[5m])) > 0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Percentage of E-CID attempts that fell back to Cell-ID positioning (gNB reported E-CID unsupported, NRPPa round timed out, or no mapped cells). A high fallback rate is expected when gNBs are not E-CID capable. Sourced from fivegc_lmf_ecid_total{result=FALLBACK_CELLID} (TS 23.273 §6.2.9).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 30}, {"color": "red", "value": 70}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 85},
+      "id": 32,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "E-CID Positioning Fallback Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * (sum(rate(fivegc_lmf_ecid_total{result=\"FALLBACK_CELLID\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_ecid_total[5m])) > 0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of E-CID NRPPa positioning attempts per second, broken down by result: OK (weighted-centroid fix returned), FALLBACK_CELLID (gNB unsupported or NRPPa failure — Cell-ID returned transparently), FAILURE (hard error, 4xx/5xx returned to LCS client). Sourced from fivegc_lmf_ecid_total (TS 23.273 §6.2.9 / TS 38.455 §8).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byFrameRefID", "options": "A"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "B"},
+            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "C"},
+            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 85},
+      "id": 33,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "LMF E-CID NRPPa Positioning Rate by Result (OK / FALLBACK_CELLID / FAILURE)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_ecid_total{result=\"OK\"}[2m]))",
+          "legendFormat": "OK",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_ecid_total{result=\"FALLBACK_CELLID\"}[2m]))",
+          "legendFormat": "FALLBACK_CELLID",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_ecid_total{result=\"FAILURE\"}[2m]))",
+          "legendFormat": "FAILURE",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of NGAP NRPPa Transport messages exchanged by the AMF per second, split by direction (DL=AMF→gNB, UL=gNB→AMF) and association type (UE=UE-associated ProcCode 8/50, NON_UE=non-UE-associated ProcCode 5/47). Sourced from fivegc_amf_nrppa_transport_total (TS 38.413 §8.17.3 / §8.17.4). DL and UL UE counts should roughly match; a persistent UL>DL gap indicates orphan PDUs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 93},
+      "id": 34,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "AMF NRPPa Transport Rate by Direction and Association Type (TS 38.413 §8.17.3/§8.17.4)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (direction, assoc)(rate(fivegc_amf_nrppa_transport_total[2m]))",
+          "legendFormat": "{{direction}} {{assoc}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Percentage of A-GNSS/LPP positioning attempts that returned a WLS GNSS fix (OK). Low values indicate frequent UE GNSS-capability=NONE, LPP relay failures, or WLS solves that did not converge. Sourced from fivegc_lmf_gnss_total (TS 23.273 §6.2.10).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 50}, {"color": "green", "value": 80}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 101},
+      "id": 35,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "GNSS/LPP Positioning Success Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * (sum(rate(fivegc_lmf_gnss_total{result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_gnss_total[5m])) > 0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Percentage of GNSS/LPP attempts that fell back to E-CID or Cell-ID positioning (UE reported GNSS unsupported, LPP round failed, too few usable satellites, or WLS solve did not converge). A high fallback rate is expected when UEs lack GNSS capability. Sourced from fivegc_lmf_gnss_total{result=~\"FALLBACK_.*\"} (TS 23.273 §6.2.10).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 30}, {"color": "red", "value": 70}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 101},
+      "id": 36,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "GNSS/LPP Positioning Fallback Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * (sum(rate(fivegc_lmf_gnss_total{result=~\"FALLBACK_.*\"}[5m])) or vector(0)) / (sum(rate(fivegc_lmf_gnss_total[5m])) > 0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of A-GNSS/LPP positioning attempts per second, broken down by result: OK (WLS GNSS fix returned), FALLBACK_ECID (GNSS unsupported/failed — E-CID fix returned), FALLBACK_CELLID (GNSS and E-CID both unavailable — Cell-ID returned), FAILURE (hard error, 4xx/5xx returned to LCS client). Sourced from fivegc_lmf_gnss_total (TS 23.273 §6.2.10 / TS 37.355 §6).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byFrameRefID", "options": "A"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "B"},
+            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "C"},
+            "properties": [{"id": "color", "value": {"fixedColor": "dark-orange", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byFrameRefID", "options": "D"},
+            "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 101},
+      "id": 37,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "LMF GNSS/LPP Positioning Rate by Result (OK / FALLBACK_ECID / FALLBACK_CELLID / FAILURE)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_gnss_total{result=\"OK\"}[2m]))",
+          "legendFormat": "OK",
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_gnss_total{result=\"FALLBACK_ECID\"}[2m]))",
+          "legendFormat": "FALLBACK_ECID",
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_gnss_total{result=\"FALLBACK_CELLID\"}[2m]))",
+          "legendFormat": "FALLBACK_CELLID",
+          "refId": "C"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum(rate(fivegc_lmf_gnss_total{result=\"FAILURE\"}[2m]))",
+          "legendFormat": "FAILURE",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of DL/UL NAS Transport messages carrying an opaque LPP container (payload container type 0x03) relayed by the AMF per second, split by direction (DL=AMF→UE, UL=UE→AMF). Sourced from fivegc_amf_lpp_transport_total (TS 24.501 §8.7.4). DL and UL counts should roughly match; a persistent UL>DL gap indicates orphan LPP PDUs.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 109},
+      "id": 38,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "AMF LPP Transport Rate by Direction (TS 24.501 §8.7.4)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (direction)(rate(fivegc_amf_lpp_transport_total[2m]))",
+          "legendFormat": "{{direction}}",
+          "refId": "A"
         }
       ]
     }

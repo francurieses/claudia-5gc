@@ -25,6 +25,7 @@ var knownNFs = []struct {
 	{"smsf", "https://smsf:8009", "9110"},
 	{"bsf", "https://bsf:8010", "9111"},
 	{"nef", "https://nef:8011", "9112"},
+	{"lmf", "https://lmf:8012", "9113"},
 }
 
 // NFStatus holds the health status for a single NF.
@@ -121,6 +122,8 @@ func toNFType(name string) string {
 		return "BSF"
 	case "nef":
 		return "NEF"
+	case "lmf":
+		return "LMF"
 	default:
 		return name
 	}

@@ -1,0 +1,1173 @@
+diff --git a/src/ue/nas/mm/mm.hpp b/src/ue/nas/mm/mm.hpp
+index 4fd69f8..9574608 100644
+--- a/src/ue/nas/mm/mm.hpp
++++ b/src/ue/nas/mm/mm.hpp
+@@ -10,6 +10,7 @@
+ 
+ #include <lib/crypt/milenage.hpp>
+ #include <lib/nas/nas.hpp>
++#include <ue/nas/lpp.hpp>
+ #include <ue/nas/storage.hpp>
+ #include <ue/nas/ursp.hpp>
+ #include <ue/nas/usim/usim.hpp>
+@@ -77,6 +78,12 @@
+     // Stored so the SM layer can steer PDU sessions and nr-cli can introspect it.
+     std::optional<UrspPolicy> m_urspPolicy{};
+ 
++    // 5GC Rel-17 mod: most recent LPP assistance data (TS 37.355 leg 2 —
++    // gnss-ReferenceTime + wire-quantized gnss-ReferenceLocation). Persisted
++    // between the ProvideAssistanceData and RequestLocationInformation legs
++    // (separate DL NAS Transports); seeds the synthetic GNSS constellation.
++    std::optional<lpp::AssistanceData> m_lppAssistance{};
++
+     friend class UeCmdHandler;
+     friend class NasSm;
+     friend class NasTask;
+@@ -120,6 +127,11 @@
+     void sendManageUePolicyComplete(int pti);
+     void sendManageUePolicyCommandReject(int pti, int cause);
+ 
++  private: /* LPP A-GNSS positioning (5GC Rel-17 mod, TS 37.355 / LMF-009) */
++    void receiveLppMessage(const OctetString &container);
++    void sendLppLocationInformation(const lpp::TransactionID &txn);
++    void sendLppMessage(const std::vector<uint8_t> &lppPdu);
++
+   private: /* Registration */
+     EProcRc sendInitialRegistration(EInitialRegCause regCause);
+     EProcRc sendMobilityRegistration(ERegUpdateCause updateCause);
+diff --git a/src/ue/nas/mm/transport.cpp b/src/ue/nas/mm/transport.cpp
+index 8530e2d..e7c3b68 100644
+--- a/src/ue/nas/mm/transport.cpp
++++ b/src/ue/nas/mm/transport.cpp
+@@ -8,8 +8,12 @@
+ 
+ #include "mm.hpp"
+ 
++#include <cmath>
++#include <cstdlib>
++
+ #include <lib/nas/utils.hpp>
+ #include <ue/nas/enc.hpp>
++#include <ue/nas/lpp.hpp>
+ #include <ue/nas/sm/sm.hpp>
+ #include <ue/rrc/task.hpp>
+ 
+@@ -53,6 +57,20 @@
+         return;
+     }
+ 
++    // 5GC Rel-17 mod: handle LPP (TS 37.355) carried in a DL NAS Transport with
++    // payload container type "LPP message container" (0x03, TS 24.501 §9.11.3.40)
++    // — the UE side of the LMF A-GNSS positioning flow (TS 23.273 §6.2.10).
++    if (msg.payloadContainerType.payloadContainerType == nas::EPayloadContainerType::LPP_MESSAGE)
++    {
++        if (msg.payloadContainer.data.length() == 0)
++        {
++            m_logger->err("Empty LPP message container received");
++            return;
++        }
++        receiveLppMessage(msg.payloadContainer.data);
++        return;
++    }
++
+     if (msg.payloadContainerType.payloadContainerType != nas::EPayloadContainerType::N1_SM_INFORMATION)
+     {
+         m_logger->err("Unhandled DL NAS Transport payload container type [%d]",
+@@ -216,4 +234,114 @@
+     deliverUlTransport(ul, ENasTransportHint::UE_POLICY_DELIVERY);
+ }
+ 
++// 5GC Rel-17 mod: LPP A-GNSS responder (TS 37.355, docs/procedures/LPPRelay.md,
++// LMF-009). The UE answers the three DL LPP legs the LMF relays over N1
++// (TS 23.273 §7.2): RequestCapabilities -> ProvideCapabilities;
++// ProvideAssistanceData -> store the wire-quantized reference location (no
++// reply — unsolicited); RequestLocationInformation -> ProvideLocationInformation
++// with 4 synthetic GNSS-SatMeasElement pseudoranges derived from the stored
++// anchor (C++ mirror of shared/lpp/gnss.go — Go is the source of truth).
++void NasMm::receiveLppMessage(const OctetString &container)
++{
++    lpp::Pdu pdu;
++    std::string err;
++    if (!lpp::Decode(container.data(), static_cast<size_t>(container.length()), pdu, err))
++    {
++        m_logger->err("LPP: failed to decode DL LPP message: %s", err.c_str());
++        return;
++    }
++
++    switch (pdu.type)
++    {
++    case lpp::MsgRequestCapabilities: {
++        // Negative mode: LPP_GNSS_NONE=1 reports GNSS unsupported so the LMF
++        // falls back to E-CID/Cell-ID (TS 23.273 §6.2.10) with no 5xx.
++        const char *none = std::getenv("LPP_GNSS_NONE");
++        bool gnssNone = none != nullptr && none[0] == '1' && none[1] == '\0';
++        if (gnssNone)
++            m_logger->info("LPP: GNSS disabled (LPP_GNSS_NONE) -> ProvideCapabilities without GNSS");
++        else
++            m_logger->info("LPP RequestCapabilities received -> ProvideCapabilities (GNSS supported)");
++        sendLppMessage(lpp::BuildProvideCapabilities(pdu.transactionID, !gnssNone));
++        break;
++    }
++    case lpp::MsgProvideAssistanceData: {
++        // Unsolicited assistance delivery — TS 37.355 has no response message.
++        m_lppAssistance = pdu.assistanceData;
++        m_logger->info("LPP ProvideAssistanceData received (reference location stored)");
++        break;
++    }
++    case lpp::MsgRequestLocationInformation: {
++        if (!m_lppAssistance.has_value())
++        {
++            m_logger->warn("LPP RequestLocationInformation received with no stored assistance data -> gnss-Error");
++            sendLppMessage(
++                lpp::BuildProvideLocationInformationError(pdu.transactionID, lpp::GnssErrorAssistanceDataMissing));
++            break;
++        }
++        sendLppLocationInformation(pdu.transactionID);
++        break;
++    }
++    default:
++        m_logger->warn("LPP: unhandled DL LPP message type [%d]", static_cast<int>(pdu.type));
++        break;
++    }
++}
++
++// Compute the leg-3 synthetic GNSS measurements and send ProvideLocationInformation.
++// Quantized-anchor rule: the constellation is seeded with the lat/lon DECODED
++// from the wire (raw*90/2^23, raw*360/2^24), so LMF and UE derive byte-identical
++// geometry. UE true position = anchor +25 m N +15 m E; every pseudorange carries
++// a +150 m receiver clock bias that the LMF's WLS solves out.
++void NasMm::sendLppLocationInformation(const lpp::TransactionID &txn)
++{
++    const auto &loc = m_lppAssistance->referenceLocation;
++    double anchorLat = lpp::DecodeLatitude(loc.latitudeSign, loc.degreesLatitude);
++    double anchorLon = lpp::DecodeLongitude(loc.degreesLongitude);
++
++    auto ephemeris = lpp::GenerateSyntheticEphemeris(anchorLat, anchorLon);
++
++    double trueLat, trueLon;
++    lpp::OffsetGeodetic(anchorLat, anchorLon, lpp::UEOffsetNorthM, lpp::UEOffsetEastM, trueLat, trueLon);
++    double ux, uy, uz;
++    lpp::GeodeticToECEF(trueLat, trueLon, 0.0, ux, uy, uz);
++
++    lpp::LocationMeasurements meas{};
++    meas.gnssTODMsec = lpp::GpsTodMsecNow();
++    for (const auto &sat : ephemeris)
++    {
++        double dx = ux - sat.x, dy = uy - sat.y, dz = uz - sat.z;
++        double pseudorange = std::sqrt(dx * dx + dy * dy + dz * dz) + lpp::UEClockBiasM;
++
++        lpp::SatMeas sv{};
++        if (!lpp::PseudorangeToCodePhase(pseudorange, sv.integerCodePhase, sv.codePhase))
++        {
++            m_logger->warn("LPP: pseudorange %.1f m exceeds integerCodePhase range -> gnss-Error", pseudorange);
++            sendLppMessage(lpp::BuildProvideLocationInformationError(txn, lpp::GnssErrorNotEnoughSatellites));
++            return;
++        }
++        sv.svid = static_cast<uint8_t>(sat.svid - 1); // SV-ID.satellite-id = constellation index - 1
++        sv.cno = lpp::CNoDefault;
++        sv.mpathDet = lpp::MpathDetLow;
++        sv.codePhaseRMSError = lpp::CodePhaseRMSErrorDefault;
++        meas.sats.push_back(sv);
++    }
++
++    m_logger->info("LPP RequestLocationInformation received -> ProvideLocationInformation (%d satellites)",
++                   static_cast<int>(meas.sats.size()));
++    sendLppMessage(lpp::BuildProvideLocationInformation(txn, meas));
++}
++
++// Wrap a UL LPP message in an UL NAS Transport with payload container type
++// "LPP message container" (0x03) — TS 24.501 §8.7.4 / §9.11.3.40.
++void NasMm::sendLppMessage(const std::vector<uint8_t> &lppPdu)
++{
++    nas::UlNasTransport ul;
++    ul.payloadContainerType.payloadContainerType = nas::EPayloadContainerType::LPP_MESSAGE;
++    for (uint8_t b : lppPdu)
++        ul.payloadContainer.data.appendOctet(b);
++
++    deliverUlTransport(ul, ENasTransportHint::LPP_TRANSPORT);
++}
++
+ } // namespace nr::ue
+diff --git a/src/ue/nas/lpp.cpp b/src/ue/nas/lpp.cpp
+new file mode 100644
+index 0000000..417a846
+--- /dev/null
++++ b/src/ue/nas/lpp.cpp
+@@ -0,0 +1,755 @@
++//
++// 5GC Rel-17 modification — LPP A-GNSS UPER codec + synthetic GNSS geometry.
++// See lpp.hpp. Wire format: ASN.1 BASIC-PER UNALIGNED (X.691) per TS 37.355 §4,
++// hand-rolled as a 1:1 mirror of the 5GC Go codec shared/lpp (uper.go, lpp.go,
++// gnss.go) — Go is the source of truth (tools/ueransim/CLAUDE.md §4). The UL
++// encoders byte-match shared/lpp's golden-hex dumps (shared/lpp/lpp_test.go).
++//
++
++#include "lpp.hpp"
++
++#include <chrono>
++#include <cmath>
++#include <stdexcept>
++
++namespace nr::ue::lpp
++{
++
++namespace
++{
++
++// ---- LPP-MessageBody.c1 alternative indices (16-way CHOICE, 4-bit index) ------
++
++constexpr uint64_t kC1RequestCapabilities = 0;
++constexpr uint64_t kC1ProvideCapabilities = 1;
++constexpr uint64_t kC1ProvideAssistanceData = 3;
++constexpr uint64_t kC1RequestLocationInformation = 4;
++constexpr uint64_t kC1ProvideLocationInformation = 5;
++constexpr uint64_t kC1Alternatives = 16;
++
++// ---- Root counts of the extensible ENUMERATEDs in the subset ------------------
++
++constexpr uint64_t kGnssIdRootCount = 5;         // gps, sbas, qzss, galileo, glonass
++constexpr uint64_t kMpathDetRootCount = 4;       // notMeasured, low, medium, high
++constexpr uint64_t kGnssTargetErrorRootCount = 4;
++constexpr uint64_t kLocationInfoTypeRootCount = 4;
++
++constexpr uint8_t kGnssIdGps = 0;
++
++// Pinned BIT STRING payloads (docs/procedures/LPPRelay.md wire contract).
++constexpr uint64_t kPosModesUEAssisted = 0x20;    // '00100000'B — ue-assisted(2)
++constexpr uint64_t kGnssSignalIdsGpsL1CA = 0x80;  // '10000000'B — GPS L1 C/A
++constexpr int kBitStringPinnedLen = 8;
++
++// ---- bitWidth: ceil(log2(n)) for n >= 1 (X.691 §11.5.7 unaligned) --------------
++
++int BitWidth(uint64_t n)
++{
++    if (n <= 1)
++        return 0;
++    int w = 0;
++    for (uint64_t m = n - 1; m != 0; m >>= 1)
++        w++;
++    return w;
++}
++
++// ---- bit writer (MSB-first unaligned bit stream; mirror of uper.go) ------------
++
++struct BitWriter
++{
++    std::vector<uint8_t> buf;
++    size_t bitLen = 0;
++
++    void writeBit(uint64_t b)
++    {
++        if (bitLen % 8 == 0)
++            buf.push_back(0);
++        if (b != 0)
++            buf[bitLen / 8] |= static_cast<uint8_t>(0x80u >> (bitLen % 8));
++        bitLen++;
++    }
++
++    void writeBits(uint64_t v, int n)
++    {
++        for (int i = n - 1; i >= 0; i--)
++            writeBit((v >> static_cast<unsigned>(i)) & 1);
++    }
++
++    void writeBool(bool b)
++    {
++        writeBit(b ? 1 : 0);
++    }
++
++    // Constrained whole number in [lb, ub] (X.691 §11.5.7 unaligned). The Go
++    // encoder errors on out-of-range; here inputs are pre-validated by the
++    // synthetic model, so clamp defensively (never emit an over-range field).
++    void writeConstrained(int64_t v, int64_t lb, int64_t ub)
++    {
++        if (v < lb)
++            v = lb;
++        if (v > ub)
++            v = ub;
++        writeBits(static_cast<uint64_t>(v - lb), BitWidth(static_cast<uint64_t>(ub - lb + 1)));
++    }
++
++    // Extensible ENUMERATED root value (X.691 §14.3): ext bit 0 + index.
++    void writeEnumExt(uint64_t v, uint64_t rootCount)
++    {
++        writeBit(0);
++        writeBits(v, BitWidth(rootCount));
++    }
++};
++
++// ---- bit reader (mirror of uper.go; errors as internal exception) --------------
++
++struct DecodeError : std::runtime_error
++{
++    using std::runtime_error::runtime_error;
++};
++
++struct BitReader
++{
++    const uint8_t *buf;
++    size_t len; // octets
++    size_t pos = 0;
++
++    uint64_t readBit()
++    {
++        if (pos >= len * 8)
++            throw DecodeError("truncated bit stream");
++        uint64_t b = (buf[pos / 8] >> (7 - pos % 8)) & 1;
++        pos++;
++        return b;
++    }
++
++    uint64_t readBits(int n)
++    {
++        uint64_t v = 0;
++        for (int i = 0; i < n; i++)
++            v = (v << 1) | readBit();
++        return v;
++    }
++
++    bool readBool()
++    {
++        return readBit() == 1;
++    }
++
++    int64_t readConstrained(int64_t lb, int64_t ub)
++    {
++        uint64_t v = readBits(BitWidth(static_cast<uint64_t>(ub - lb + 1)));
++        int64_t out = lb + static_cast<int64_t>(v);
++        if (out > ub)
++            throw DecodeError("decoded value exceeds upper bound");
++        return out;
++    }
++
++    // Extensible ENUMERATED: root values decode to their index; extension
++    // values decode to rootCount + normally-small number (tolerance rule).
++    uint64_t readEnumExt(uint64_t rootCount)
++    {
++        if (readBit() == 0)
++            return readBits(BitWidth(rootCount));
++        return rootCount + readNormallySmall();
++    }
++
++    // Normally-small non-negative whole number (X.691 §11.6): bit 0 -> 6-bit value.
++    uint64_t readNormallySmall()
++    {
++        if (readBit() == 1)
++            throw DecodeError("normally-small number >= 64 not supported");
++        return readBits(6);
++    }
++
++    // General (unconstrained) length determinant (X.691 §11.9, unaligned).
++    int readGeneralLength()
++    {
++        uint64_t b = readBits(8);
++        if ((b & 0x80) == 0)
++            return static_cast<int>(b);
++        if ((b & 0x40) == 0)
++        {
++            uint64_t b2 = readBits(8);
++            return static_cast<int>((b & 0x3F) << 8 | b2);
++        }
++        throw DecodeError("fragmented open-type length not supported");
++    }
++
++    // Skip one open-type encoding (general length + that many whole octets).
++    void skipOpenType()
++    {
++        int n = readGeneralLength();
++        for (int i = 0; i < n; i++)
++            readBits(8);
++    }
++
++    // Skip the extension-additions block of a SEQUENCE whose extension bit was 1
++    // (X.691 §19.7-19.9) — "tolerate a future peer" decode rule.
++    void skipSequenceExtensions()
++    {
++        uint64_t countMinus1 = readNormallySmall();
++        int count = static_cast<int>(countMinus1) + 1;
++        std::vector<bool> present(static_cast<size_t>(count));
++        for (int i = 0; i < count; i++)
++            present[static_cast<size_t>(i)] = readBit() == 1;
++        for (bool p : present)
++            if (p)
++                skipOpenType();
++    }
++
++    std::vector<bool> readPresence(int n)
++    {
++        std::vector<bool> out(static_cast<size_t>(n));
++        for (int i = 0; i < n; i++)
++            out[static_cast<size_t>(i)] = readBit() == 1;
++        return out;
++    }
++
++    // Extensible SEQUENCE preamble: returns whether extension additions follow
++    // the root fields (caller must skipSequenceExtensions() after them).
++    bool readSeqExt()
++    {
++        return readBit() == 1;
++    }
++};
++
++// ---- Envelope encode (mirror of lpp.go writeEnvelope) ---------------------------
++
++void WriteEnvelope(BitWriter &w, const TransactionID &txn, bool endTransaction, uint64_t c1Index)
++{
++    // LPP-Message presence bits: transactionID=1, sequenceNumber=0,
++    // acknowledgement=0, lpp-MessageBody=1.
++    w.writeBits(0b1001, 4);
++
++    // LPP-TransactionID: ext bit + extensible ENUM(2 roots) + INTEGER(0..255).
++    w.writeBit(0);
++    w.writeEnumExt(txn.initiator, 2);
++    w.writeBits(txn.number, 8);
++
++    w.writeBool(endTransaction);
++
++    // LPP-MessageBody CHOICE {c1, messageClassExtension}: 1-bit index, then the
++    // 16-way c1 CHOICE (4-bit index).
++    w.writeBit(0);
++    w.writeBits(c1Index, BitWidth(kC1Alternatives));
++
++    // criticalExtensions CHOICE {c1, future} (1 bit) + 4-way c1 CHOICE (2 bits).
++    w.writeBit(0);
++    w.writeBits(0, 2);
++}
++
++// GNSS-ID: extensible SEQUENCE (no OPTIONALs) wrapping extensible gnss-id ENUM.
++void WriteGnssId(BitWriter &w, uint8_t id)
++{
++    w.writeBit(0);
++    w.writeEnumExt(id, kGnssIdRootCount);
++}
++
++uint8_t ReadGnssId(BitReader &r)
++{
++    bool ext = r.readSeqExt();
++    uint64_t v = r.readEnumExt(kGnssIdRootCount);
++    if (ext)
++        r.skipSequenceExtensions();
++    return static_cast<uint8_t>(v);
++}
++
++// ---- Envelope decode helpers (mirror of lpp.go) ----------------------------------
++
++void ReadTransactionId(BitReader &r, TransactionID &txn)
++{
++    bool ext = r.readSeqExt();
++    txn.initiator = static_cast<uint8_t>(r.readEnumExt(2));
++    txn.number = static_cast<uint8_t>(r.readBits(8));
++    if (ext)
++        r.skipSequenceExtensions();
++}
++
++void ReadCriticalExtensions(BitReader &r)
++{
++    if (r.readBit() != 0)
++        throw DecodeError("criticalExtensionsFuture not supported");
++    if (r.readBits(2) != 0)
++        throw DecodeError("criticalExtensions spare alternative");
++}
++
++// ---- DL message decoders (mirror of lpp.go decode* — the UE receives only these) -
++
++// RequestCapabilities-r9-IEs: structural validation only.
++void DecodeRequestCapabilities(BitReader &r)
++{
++    bool ext = r.readSeqExt();
++    auto presence = r.readPresence(5); // common, a-gnss, otdoa, ecid, epdu
++    if (presence[0] || presence[2] || presence[3] || presence[4])
++        throw DecodeError("non-A-GNSS root OPTIONAL present (outside subset)");
++    if (presence[1])
++    {
++        bool aExt = r.readSeqExt();
++        for (int i = 0; i < 3; i++) // gnss-SupportListReq, assistanceDataSupportListReq, locationVelocityTypesReq
++            r.readBool();
++        if (aExt)
++            r.skipSequenceExtensions();
++    }
++    if (ext)
++        r.skipSequenceExtensions();
++}
++
++// ProvideAssistanceData-r9-IEs -> AssistanceData (gnss-ReferenceTime +
++// gnss-ReferenceLocation; the leg-2 anchor).
++AssistanceData DecodeProvideAssistanceData(BitReader &r)
++{
++    bool ext = r.readSeqExt();
++    auto presence = r.readPresence(4); // commonIEs, a-gnss, otdoa, epdu
++    if (presence[0] || presence[2] || presence[3])
++        throw DecodeError("non-A-GNSS root OPTIONAL present (outside subset)");
++    if (!presence[1])
++        throw DecodeError("a-gnss-ProvideAssistanceData absent");
++
++    bool aExt = r.readSeqExt();
++    auto aPresence = r.readPresence(3); // commonAssistData, genericAssistData, gnss-Error
++    if (aPresence[1] || aPresence[2])
++        throw DecodeError("gnss-GenericAssistData/gnss-Error present (outside subset)");
++    if (!aPresence[0])
++        throw DecodeError("gnss-CommonAssistData absent");
++
++    bool cExt = r.readSeqExt();
++    auto cPresence = r.readPresence(4); // refTime, refLocation, iono, eop
++    if (cPresence[2] || cPresence[3])
++        throw DecodeError("ionospheric/earth-orientation present (outside subset)");
++    if (!cPresence[0] || !cPresence[1])
++        throw DecodeError("gnss-ReferenceTime and gnss-ReferenceLocation both required");
++
++    AssistanceData ad{};
++
++    // GNSS-ReferenceTime.
++    bool rtExt = r.readSeqExt();
++    auto rtPresence = r.readPresence(2); // referenceTimeUnc, gnss-ReferenceTimeForCells
++    if (rtPresence[1])
++        throw DecodeError("gnss-ReferenceTimeForCells present (outside subset)");
++    // GNSS-SystemTime.
++    bool stExt = r.readSeqExt();
++    auto stPresence = r.readPresence(3); // frac-msec, leap, gps-TOW-Assist
++    if (stPresence[2])
++        throw DecodeError("gps-TOW-Assist present (outside subset)");
++    ReadGnssId(r); // gnss-TimeID
++    ad.dayNumber = static_cast<uint16_t>(r.readConstrained(0, 32767));
++    ad.timeOfDay = static_cast<uint32_t>(r.readConstrained(0, 86399));
++    if (stPresence[0]) // gnss-TimeOfDayFrac-msec INTEGER (0..999) — consume.
++        r.readConstrained(0, 999);
++    if (stPresence[1]) // notificationOfLeapSecond BIT STRING (SIZE(2)) — consume.
++        r.readBits(2);
++    if (stExt)
++        r.skipSequenceExtensions();
++    if (rtPresence[0])
++        ad.referenceTimeUnc = static_cast<uint8_t>(r.readConstrained(0, 127));
++    if (rtExt)
++        r.skipSequenceExtensions();
++
++    // GNSS-ReferenceLocation (extensible wrapper, no OPTIONALs) ->
++    // EllipsoidPointWithAltitudeAndUncertaintyEllipsoid (NOT extensible).
++    bool rlExt = r.readSeqExt();
++    auto &loc = ad.referenceLocation;
++    loc.latitudeSign = static_cast<uint8_t>(r.readBits(1));
++    loc.degreesLatitude = static_cast<uint32_t>(r.readConstrained(0, 8388607));
++    loc.degreesLongitude = static_cast<int32_t>(r.readConstrained(-8388608, 8388607));
++    loc.altitudeDirection = static_cast<uint8_t>(r.readBits(1));
++    loc.altitude = static_cast<uint16_t>(r.readConstrained(0, 32767));
++    loc.uncertaintySemiMajor = static_cast<uint8_t>(r.readConstrained(0, 127));
++    loc.uncertaintySemiMinor = static_cast<uint8_t>(r.readConstrained(0, 127));
++    loc.orientationMajorAxis = static_cast<uint8_t>(r.readConstrained(0, 179));
++    loc.uncertaintyAltitude = static_cast<uint8_t>(r.readConstrained(0, 127));
++    loc.confidence = static_cast<uint8_t>(r.readConstrained(0, 100));
++    if (rlExt)
++        r.skipSequenceExtensions();
++    if (cExt)
++        r.skipSequenceExtensions();
++    if (aExt)
++        r.skipSequenceExtensions();
++    if (ext)
++        r.skipSequenceExtensions();
++    return ad;
++}
++
++// RequestLocationInformation-r9-IEs: structural validation only.
++void DecodeRequestLocationInformation(BitReader &r)
++{
++    bool ext = r.readSeqExt();
++    auto presence = r.readPresence(5); // commonIEs, a-gnss, otdoa, ecid, epdu
++    if (presence[2] || presence[3] || presence[4])
++        throw DecodeError("non-A-GNSS root OPTIONAL present (outside subset)");
++    if (presence[0])
++    {
++        bool cExt = r.readSeqExt();
++        auto cPresence = r.readPresence(7);
++        for (bool p : cPresence)
++            if (p)
++                throw DecodeError("commonIEs root OPTIONAL present (outside subset)");
++        r.readEnumExt(kLocationInfoTypeRootCount); // locationInformationType
++        if (cExt)
++            r.skipSequenceExtensions();
++    }
++    if (presence[1])
++    {
++        bool aExt = r.readSeqExt();
++        bool piExt = r.readSeqExt(); // GNSS-PositioningInstructions
++        // gnss-Methods: GNSS-ID-Bitmap wrapping gnss-ids BIT STRING (SIZE(1..16)).
++        bool bmExt = r.readSeqExt();
++        int64_t n = r.readConstrained(1, 16);
++        r.readBits(static_cast<int>(n));
++        if (bmExt)
++            r.skipSequenceExtensions();
++        for (int i = 0; i < 4; i++) // fineTimeAssistanceMeasReq, adrMeasReq, multiFreqMeasReq, assistanceAvailability
++            r.readBool();
++        if (piExt)
++            r.skipSequenceExtensions();
++        if (aExt)
++            r.skipSequenceExtensions();
++    }
++    if (ext)
++        r.skipSequenceExtensions();
++}
++
++} // namespace
++
++// ---- Decode (top-level, mirror of lpp.go Decode) ----------------------------------
++
++bool Decode(const uint8_t *data, size_t len, Pdu &out, std::string &error)
++{
++    BitReader r{data, len};
++    out = Pdu{};
++    try
++    {
++        auto presence = r.readPresence(4);
++        bool hasTxn = presence[0], hasSeq = presence[1], hasAck = presence[2], hasBody = presence[3];
++
++        if (hasTxn)
++        {
++            out.hasTransactionID = true;
++            ReadTransactionId(r, out.transactionID);
++        }
++        out.endTransaction = r.readBool();
++
++        if (hasSeq) // SequenceNumber INTEGER (0..255) — never sent; consume.
++            r.readConstrained(0, 255);
++        if (hasAck) // Acknowledgement — consume and ignore.
++        {
++            auto ackPresence = r.readPresence(1);
++            r.readBool();
++            if (ackPresence[0])
++                r.readConstrained(0, 255);
++        }
++        if (!hasBody)
++            throw DecodeError("lpp-MessageBody absent");
++
++        if (r.readBit() != 0)
++            throw DecodeError("messageClassExtension body not supported");
++        uint64_t c1 = r.readBits(BitWidth(kC1Alternatives));
++
++        ReadCriticalExtensions(r);
++
++        switch (c1)
++        {
++        case kC1RequestCapabilities:
++            out.type = MsgRequestCapabilities;
++            DecodeRequestCapabilities(r);
++            break;
++        case kC1ProvideAssistanceData:
++            out.type = MsgProvideAssistanceData;
++            out.assistanceData = DecodeProvideAssistanceData(r);
++            break;
++        case kC1RequestLocationInformation:
++            out.type = MsgRequestLocationInformation;
++            DecodeRequestLocationInformation(r);
++            break;
++        default:
++            throw DecodeError("unsupported LPP-MessageBody c1 index (UE handles the DL subset only)");
++        }
++        return true;
++    }
++    catch (const DecodeError &e)
++    {
++        error = e.what();
++        return false;
++    }
++}
++
++// ---- UL builders (mirror of lpp.go Build* — byte-match the Go goldens) ------------
++
++std::vector<uint8_t> BuildProvideCapabilities(const TransactionID &txn, bool gnssSupported)
++{
++    BitWriter w;
++    WriteEnvelope(w, txn, true, kC1ProvideCapabilities);
++
++    w.writeBit(0); // ProvideCapabilities-r9-IEs extension bit
++    if (!gnssSupported)
++    {
++        w.writeBits(0b00000, 5); // all five root OPTIONALs absent (GNSS=NONE)
++        return w.buf;
++    }
++    w.writeBits(0b01000, 5); // only a-gnss-ProvideCapabilities present
++
++    // A-GNSS-ProvideCapabilities (extensible, 4 root OPTIONALs): only gnss-SupportList.
++    w.writeBit(0);
++    w.writeBits(0b1000, 4);
++
++    // GNSS-SupportList ::= SEQUENCE (SIZE(1..16)) OF — one element.
++    w.writeConstrained(1, 1, 16);
++
++    // GNSS-SupportElement (extensible; root OPTIONALs sbas-IDs, fta-MeasSupport absent).
++    w.writeBit(0);
++    w.writeBits(0b00, 2);
++    WriteGnssId(w, kGnssIdGps);
++    // agnss-Modes: PositioningModes wrapping posModes BIT STRING (SIZE(1..8)) — 8 bits.
++    w.writeBit(0);
++    w.writeConstrained(kBitStringPinnedLen, 1, 8);
++    w.writeBits(kPosModesUEAssisted, kBitStringPinnedLen);
++    // gnss-Signals: GNSS-SignalIDs wrapping BIT STRING (SIZE(8)) — fixed, no determinant.
++    w.writeBit(0);
++    w.writeBits(kGnssSignalIdsGpsL1CA, 8);
++    w.writeBool(false); // adr-Support
++    w.writeBool(false); // velocityMeasurementSupport
++    return w.buf;
++}
++
++std::vector<uint8_t> BuildProvideLocationInformation(const TransactionID &txn, const LocationMeasurements &meas)
++{
++    BitWriter w;
++    WriteEnvelope(w, txn, true, kC1ProvideLocationInformation);
++
++    // ProvideLocationInformation-r9-IEs (extensible, 5 root OPTIONALs):
++    // only a-gnss-ProvideLocationInformation present.
++    w.writeBit(0);
++    w.writeBits(0b01000, 5);
++
++    // A-GNSS-ProvideLocationInformation (extensible, 3 root OPTIONALs):
++    // only gnss-SignalMeasurementInformation present.
++    w.writeBit(0);
++    w.writeBits(0b100, 3);
++
++    // GNSS-SignalMeasurementInformation (extensible, no root OPTIONALs).
++    w.writeBit(0);
++
++    // MeasurementReferenceTime (extensible; gnss-TOD-frac, gnss-TOD-unc,
++    // networkTime all absent).
++    w.writeBit(0);
++    w.writeBits(0b000, 3);
++    w.writeConstrained(meas.gnssTODMsec, 0, 3599999);
++    WriteGnssId(w, kGnssIdGps); // gnss-TimeID
++
++    // GNSS-MeasurementList ::= SEQUENCE (SIZE(1..16)) OF — one entry.
++    w.writeConstrained(1, 1, 16);
++    // GNSS-MeasurementForOneGNSS (extensible, no root OPTIONALs).
++    w.writeBit(0);
++    WriteGnssId(w, kGnssIdGps);
++    // GNSS-SgnMeasList ::= SEQUENCE (SIZE(1..8)) OF — one entry.
++    w.writeConstrained(1, 1, 8);
++    // GNSS-SgnMeasElement (extensible; root OPTIONAL gnss-CodePhaseAmbiguity absent).
++    w.writeBit(0);
++    w.writeBits(0b0, 1);
++    // gnss-SignalID: GNSS-SignalID wrapping INTEGER (0..7) = 0 (GPS L1 C/A).
++    w.writeBit(0);
++    w.writeBits(0, 3);
++    // GNSS-SatMeasList ::= SEQUENCE (SIZE(1..64)) OF.
++    w.writeConstrained(static_cast<int64_t>(meas.sats.size()), 1, 64);
++    for (const auto &sv : meas.sats)
++    {
++        // GNSS-SatMeasElement (extensible; root OPTIONALs carrierQualityInd,
++        // integerCodePhase, doppler, adr — integerCodePhase always included).
++        w.writeBit(0);
++        w.writeBits(0b0100, 4);
++        // svID: SV-ID (extensible SEQUENCE) wrapping satellite-id INTEGER (0..63).
++        w.writeBit(0);
++        w.writeConstrained(sv.svid, 0, 63);
++        w.writeConstrained(sv.cno, 0, 63);
++        w.writeEnumExt(sv.mpathDet, kMpathDetRootCount);
++        w.writeConstrained(sv.codePhase, 0, 2097151);
++        w.writeConstrained(sv.integerCodePhase, 0, 127);
++        w.writeConstrained(sv.codePhaseRMSError, 0, 63);
++    }
++    return w.buf;
++}
++
++std::vector<uint8_t> BuildProvideLocationInformationError(const TransactionID &txn, uint8_t cause)
++{
++    BitWriter w;
++    WriteEnvelope(w, txn, true, kC1ProvideLocationInformation);
++
++    w.writeBit(0);           // r9-IEs extension bit
++    w.writeBits(0b01000, 5); // only a-gnss-ProvideLocationInformation
++
++    // A-GNSS-ProvideLocationInformation: only gnss-Error present.
++    w.writeBit(0);
++    w.writeBits(0b001, 3);
++
++    // A-GNSS-Error ::= CHOICE {locationServerErrorCauses, targetDeviceErrorCauses, ...}
++    // — extensible: ext bit + 1-bit index (targetDeviceErrorCauses = 1).
++    w.writeBit(0);
++    w.writeBits(1, 1);
++
++    // GNSS-TargetDeviceErrorCauses (extensible; 3 root OPTIONAL NULLs absent).
++    w.writeBit(0);
++    w.writeBits(0b000, 3);
++    w.writeEnumExt(cause, kGnssTargetErrorRootCount);
++    return w.buf;
++}
++
++// ---- GNSS math (mirror of shared/lpp/gnss.go — same formulas, double math) --------
++
++namespace
++{
++
++// WGS84 ellipsoid constants (TS 23.032 / NIMA TR8350.2).
++constexpr double kWgs84SemiMajorAxisM = 6378137.0;
++constexpr double kWgs84Flattening = 1.0 / 298.257223563;
++const double kWgs84EccentricitySquared = kWgs84Flattening * (2.0 - kWgs84Flattening);
++
++constexpr double kPi = 3.14159265358979323846;
++
++// Representative satellite-to-receiver slant range for the mock geometry.
++constexpr double kGnssSlantRangeM = 22000000.0;
++
++// Fixed (elevation, azimuth) pairs for the 4-satellite synthetic constellation.
++constexpr double kSatGeometries[4][2] = {{75.0, 0.0}, {60.0, 90.0}, {45.0, 200.0}, {30.0, 300.0}};
++
++// ECEF -> WGS84 geodetic (Bowring iterative, 6 iterations — mirror of gnss.go).
++void ECEFToGeodetic(double x, double y, double z, double &latDeg, double &lonDeg, double &altM)
++{
++    double lon = std::atan2(y, x);
++    double p = std::sqrt(x * x + y * y);
++
++    double lat = std::atan2(z, p * (1.0 - kWgs84EccentricitySquared));
++    double n = 0.0;
++    for (int i = 0; i < 6; i++)
++    {
++        double sinLat = std::sin(lat);
++        n = kWgs84SemiMajorAxisM / std::sqrt(1.0 - kWgs84EccentricitySquared * sinLat * sinLat);
++        double alt = p / std::cos(lat) - n;
++        lat = std::atan2(z, p * (1.0 - kWgs84EccentricitySquared * (n / (n + alt))));
++    }
++    double sinLat = std::sin(lat);
++    n = kWgs84SemiMajorAxisM / std::sqrt(1.0 - kWgs84EccentricitySquared * sinLat * sinLat);
++    double alt = p / std::cos(lat) - n;
++
++    latDeg = lat * 180.0 / kPi;
++    lonDeg = lon * 180.0 / kPi;
++    altM = alt;
++}
++
++// Local East-North-Up unit direction (elevation/azimuth at a WGS84 anchor) ->
++// ECEF unit direction vector.
++void EnuUnitVectorToECEF(double anchorLat, double anchorLon, double elevationDeg, double azimuthDeg, double &dx,
++                         double &dy, double &dz)
++{
++    double el = elevationDeg * kPi / 180.0;
++    double az = azimuthDeg * kPi / 180.0;
++    double e = std::cos(el) * std::sin(az);
++    double n = std::cos(el) * std::cos(az);
++    double u = std::sin(el);
++
++    double lat = anchorLat * kPi / 180.0;
++    double lon = anchorLon * kPi / 180.0;
++    double sinLat = std::sin(lat), cosLat = std::cos(lat);
++    double sinLon = std::sin(lon), cosLon = std::cos(lon);
++
++    dx = -sinLon * e - sinLat * cosLon * n + cosLat * cosLon * u;
++    dy = cosLon * e - sinLat * sinLon * n + cosLat * sinLon * u;
++    dz = cosLat * n + sinLat * u;
++}
++
++} // namespace
++
++double DecodeLatitude(uint8_t sign, uint32_t raw)
++{
++    double lat = static_cast<double>(raw) * 90.0 / 8388608.0; // 2^23
++    return sign == 1 ? -lat : lat;
++}
++
++double DecodeLongitude(int32_t raw)
++{
++    return static_cast<double>(raw) * 360.0 / 16777216.0; // 2^24
++}
++
++void GeodeticToECEF(double latDeg, double lonDeg, double altM, double &x, double &y, double &z)
++{
++    double lat = latDeg * kPi / 180.0;
++    double lon = lonDeg * kPi / 180.0;
++    double sinLat = std::sin(lat), cosLat = std::cos(lat);
++    double sinLon = std::sin(lon), cosLon = std::cos(lon);
++
++    double n = kWgs84SemiMajorAxisM / std::sqrt(1.0 - kWgs84EccentricitySquared * sinLat * sinLat);
++    x = (n + altM) * cosLat * cosLon;
++    y = (n + altM) * cosLat * sinLon;
++    z = (n * (1.0 - kWgs84EccentricitySquared) + altM) * sinLat;
++}
++
++std::vector<SatEphemeris> GenerateSyntheticEphemeris(double anchorLatDeg, double anchorLonDeg)
++{
++    double ax, ay, az;
++    GeodeticToECEF(anchorLatDeg, anchorLonDeg, 0.0, ax, ay, az);
++
++    std::vector<SatEphemeris> out;
++    out.reserve(4);
++    for (int i = 0; i < 4; i++)
++    {
++        double dx, dy, dz;
++        EnuUnitVectorToECEF(anchorLatDeg, anchorLonDeg, kSatGeometries[i][0], kSatGeometries[i][1], dx, dy, dz);
++        SatEphemeris e{};
++        e.svid = static_cast<uint8_t>(i + 1);
++        e.x = ax + dx * kGnssSlantRangeM;
++        e.y = ay + dy * kGnssSlantRangeM;
++        e.z = az + dz * kGnssSlantRangeM;
++        out.push_back(e);
++    }
++    return out;
++}
++
++void OffsetGeodetic(double latDeg, double lonDeg, double northM, double eastM, double &outLatDeg, double &outLonDeg)
++{
++    double x, y, z;
++    GeodeticToECEF(latDeg, lonDeg, 0.0, x, y, z);
++    // East unit vector (elevation 0, azimuth 90).
++    double ex, ey, ez;
++    EnuUnitVectorToECEF(latDeg, lonDeg, 0.0, 90.0, ex, ey, ez);
++    // North unit vector (elevation 0, azimuth 0).
++    double nx, ny, nz;
++    EnuUnitVectorToECEF(latDeg, lonDeg, 0.0, 0.0, nx, ny, nz);
++    x += eastM * ex + northM * nx;
++    y += eastM * ey + northM * ny;
++    z += eastM * ez + northM * nz;
++    double altM;
++    ECEFToGeodetic(x, y, z, outLatDeg, outLonDeg, altM);
++}
++
++bool PseudorangeToCodePhase(double pseudorangeM, uint8_t &integerCodePhase, uint32_t &codePhase)
++{
++    if (pseudorangeM < 0.0)
++        return false;
++    double totalMs = pseudorangeM / MetersPerMsOfRange;
++    double icp = std::floor(totalMs);
++    double cp = std::round((totalMs - icp) * CodePhaseUnitsPerMs);
++    if (cp >= CodePhaseUnitsPerMs) // rounding carry
++    {
++        cp = 0.0;
++        icp += 1.0;
++    }
++    if (icp > 127.0)
++        return false;
++    integerCodePhase = static_cast<uint8_t>(icp);
++    codePhase = static_cast<uint32_t>(cp);
++    return true;
++}
++
++uint32_t GpsTodMsec(int64_t unixUtc, int msec)
++{
++    int64_t gpsSeconds = unixUtc - GpsEpochUnix + GpsUtcLeapSeconds;
++    return static_cast<uint32_t>((gpsSeconds % 3600) * 1000 + msec);
++}
++
++uint32_t GpsTodMsecNow()
++{
++    auto now = std::chrono::system_clock::now().time_since_epoch();
++    int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
++    return GpsTodMsec(ms / 1000, static_cast<int>(ms % 1000));
++}
++
++} // namespace nr::ue::lpp
+diff --git a/src/ue/nas/lpp.hpp b/src/ue/nas/lpp.hpp
+new file mode 100644
+index 0000000..30db18d
+--- /dev/null
++++ b/src/ue/nas/lpp.hpp
+@@ -0,0 +1,197 @@
++//
++// 5GC Rel-17 modification — LPP A-GNSS UE responder (TS 37.355 subset, LMF-009).
++//
++// Adds UE-side handling of the LTE Positioning Protocol (LPP) carried in a
++// DL NAS TRANSPORT with payload container type "LPP message container" (0x03),
++// per TS 24.501 §8.7.4 / §9.11.3.40. Stock UERANSIM v3.2.8 has no LPP support
++// and logs "Unhandled payload container type [3]".
++//
++// The wire format is ASN.1 BASIC-PER UNALIGNED (X.691) as TS 37.355 §4
++// mandates. This file hand-rolls the same unaligned-PER bit codec as the 5GC
++// Go encoder in shared/lpp (uper.go + lpp.go) and mirrors the deterministic
++// GNSS geometry in shared/lpp/gnss.go — Go is the source of truth
++// (tools/ueransim/CLAUDE.md §4); the UL encoders below byte-match the Go
++// package's golden-hex test dumps (shared/lpp/lpp_test.go).
++//
++// Message subset (docs/procedures/LPPRelay.md — the LMF-009 wire contract):
++//   DL  RequestCapabilities          -> UL ProvideCapabilities (echo txn)
++//   DL  ProvideAssistanceData        -> (no reply; reference location stored)
++//   DL  RequestLocationInformation   -> UL ProvideLocationInformation
++//                                        (4 synthetic GNSS-SatMeasElement, or
++//                                         gnss-Error when no anchor stored)
++//
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace nr::ue::lpp
++{
++
++// ---- Message type discriminators (local, not wire bytes) ---------------------
++
++constexpr uint8_t MsgRequestCapabilities = 1;
++constexpr uint8_t MsgProvideCapabilities = 2;
++constexpr uint8_t MsgProvideAssistanceData = 3;
++constexpr uint8_t MsgRequestLocationInformation = 4;
++constexpr uint8_t MsgProvideLocationInformation = 5;
++
++// ---- Transaction handling (TS 37.355 §5.2) ------------------------------------
++
++// LPP-TransactionID.initiator (extensible ENUMERATED {locationServer(0),
++// targetDevice(1), ...}). The UE always ECHOES the LMF-assigned transaction.
++constexpr uint8_t InitiatorLocationServer = 0;
++constexpr uint8_t InitiatorTargetDevice = 1;
++
++struct TransactionID
++{
++    uint8_t initiator = 0;
++    uint8_t number = 0; // TransactionNumber ::= INTEGER (0..255)
++};
++
++// ---- GNSS-TargetDeviceErrorCauses.cause root values (TS 37.355 §6.5.2) --------
++
++constexpr uint8_t GnssErrorUndefined = 0;
++constexpr uint8_t GnssErrorNotEnoughSatellites = 1;
++constexpr uint8_t GnssErrorAssistanceDataMissing = 2;
++
++// ---- Wire-contract pinned per-SV values (docs/procedures/LPPRelay.md) ---------
++
++constexpr uint8_t CNoDefault = 44;               // dB-Hz
++constexpr uint8_t MpathDetLow = 1;               // mpathDet ENUM low(1)
++constexpr uint8_t CodePhaseRMSErrorDefault = 20; // k=8y+x => x=4,y=2 => 3.0 m
++
++// ---- Synthetic-UE model constants (mirror shared/lpp/gnss.go) ------------------
++
++constexpr double UEOffsetNorthM = 25.0; // synthetic true position offset from anchor
++constexpr double UEOffsetEastM = 15.0;
++constexpr double UEClockBiasM = 150.0; // receiver clock bias (metres of range)
++
++// ---- Pseudorange / GPS time constants (TS 37.355 §6.5.2) -----------------------
++
++constexpr double MetersPerMsOfRange = 299792.458;   // c x 1 ms
++constexpr double CodePhaseUnitsPerMs = 2097152.0;   // 2^21 codePhase units per ms
++constexpr int64_t GpsEpochUnix = 315964800;         // 1980-01-06T00:00:00Z
++constexpr int64_t GpsUtcLeapSeconds = 18;           // documented implementation constant
++
++// ---- Decoded / builder value types ---------------------------------------------
++
++// EllipsoidPointWithAltitudeAndUncertaintyEllipsoid raw wire values
++// (TS 23.032 §6 quantization — see DecodeLatitude/DecodeLongitude).
++struct ReferenceLocation
++{
++    uint8_t latitudeSign = 0;      // 0 = north, 1 = south
++    uint32_t degreesLatitude = 0;  // 0..8388607 (23-bit)
++    int32_t degreesLongitude = 0;  // -8388608..8388607 (24-bit)
++    uint8_t altitudeDirection = 0; // 0 = height, 1 = depth
++    uint16_t altitude = 0;         // 0..32767 metres
++    uint8_t uncertaintySemiMajor = 0;
++    uint8_t uncertaintySemiMinor = 0;
++    uint8_t orientationMajorAxis = 0;
++    uint8_t uncertaintyAltitude = 0;
++    uint8_t confidence = 0;
++};
++
++// Decoded leg-2 ProvideAssistanceData payload (gnss-ReferenceTime +
++// gnss-ReferenceLocation) — the stored anchor that seeds the synthetic
++// constellation on the leg-3 reply.
++struct AssistanceData
++{
++    uint16_t dayNumber = 0;       // gnss-DayNumber INTEGER (0..32767)
++    uint32_t timeOfDay = 0;       // gnss-TimeOfDay INTEGER (0..86399)
++    uint8_t referenceTimeUnc = 0; // referenceTimeUnc INTEGER (0..127)
++    ReferenceLocation referenceLocation{};
++};
++
++// One GNSS-SatMeasElement (the fields this subset carries).
++struct SatMeas
++{
++    uint8_t svid = 0;              // SV-ID.satellite-id 0..63 (constellation index - 1)
++    uint8_t cno = 0;               // 0..63 dB-Hz
++    uint8_t mpathDet = 0;          // ENUM index (root)
++    uint32_t codePhase = 0;        // 0..2097151, 2^-21 ms units
++    uint8_t integerCodePhase = 0;  // 0..127 whole ms (always included)
++    uint8_t codePhaseRMSError = 0; // 0..63
++};
++
++// Leg-3 UL measurement payload (gnss-SignalMeasurementInformation).
++struct LocationMeasurements
++{
++    uint32_t gnssTODMsec = 0; // measurementReferenceTime.gnss-TOD-msec (0..3599999)
++    std::vector<SatMeas> sats;
++};
++
++// Decoded DL LPP-Message. `type` selects the message kind; assistanceData is
++// set only for ProvideAssistanceData. (The UE only ever receives the 3 DL
++// messages of the contract; UL bodies decode as an error.)
++struct Pdu
++{
++    uint8_t type = 0;
++    bool hasTransactionID = false;
++    TransactionID transactionID{};
++    bool endTransaction = false;
++    std::optional<AssistanceData> assistanceData{};
++};
++
++// ---- Codec (mirror of shared/lpp/lpp.go — byte-compatible) ---------------------
++
++// Decode raw UPER LPP-Message bytes (the NAS payload container value, PCT 0x03).
++// Returns true on success; on failure returns false and sets `error`.
++// Extension additions set by a future peer on any extensible SEQUENCE are
++// skipped (X.691 §19.7-19.9 open-type skip), matching the Go decoder.
++bool Decode(const uint8_t *data, size_t len, Pdu &out, std::string &error);
++
++// Build the leg-1 UL ProvideCapabilities, echoing txn with endTransaction=TRUE.
++// gnssSupported=true: one GNSS-SupportElement {gps, ue-assisted, GPS L1 C/A}.
++// gnssSupported=false (LPP_GNSS_NONE): a-gnss-ProvideCapabilities absent.
++std::vector<uint8_t> BuildProvideCapabilities(const TransactionID &txn, bool gnssSupported);
++
++// Build the leg-3 UL ProvideLocationInformation, echoing txn with
++// endTransaction=TRUE (1..64 satellites; this UE sends 4). Inputs must be in
++// range (guaranteed by the synthetic model); out-of-range values are clamped.
++std::vector<uint8_t> BuildProvideLocationInformation(const TransactionID &txn, const LocationMeasurements &meas);
++
++// Build a ProvideLocationInformation carrying gnss-Error.targetDeviceErrorCauses
++// {cause} instead of measurements (e.g. assistanceDataMissing when no anchor).
++std::vector<uint8_t> BuildProvideLocationInformationError(const TransactionID &txn, uint8_t cause);
++
++// ---- GNSS math (mirror of shared/lpp/gnss.go — same formulas, double math) -----
++
++// A per-satellite synthetic ephemeris entry (ECEF metres). svid is the 1-based
++// constellation index; it rides the wire as SV-ID.satellite-id = svid - 1.
++struct SatEphemeris
++{
++    uint8_t svid = 0;
++    double x = 0, y = 0, z = 0;
++};
++
++// TS 23.032 §6 dequantization — the quantized-anchor rule: both ends seed the
++// synthetic geometry with THESE decoded degrees, never the pristine config floats.
++double DecodeLatitude(uint8_t sign, uint32_t raw); // raw * 90 / 2^23, negated for south
++double DecodeLongitude(int32_t raw);               // raw * 360 / 2^24
++
++// WGS84 geodetic (degrees, metres) -> ECEF (metres).
++void GeodeticToECEF(double latDeg, double lonDeg, double altM, double &x, double &y, double &z);
++
++// Deterministic 4-satellite constellation around the (quantized) anchor:
++// (elev, az) = {75,0} {60,90} {45,200} {30,300} at 22,000 km slant range.
++std::vector<SatEphemeris> GenerateSyntheticEphemeris(double anchorLatDeg, double anchorLonDeg);
++
++// Displace a WGS84 point by (northM, eastM) metres via the local ENU frame.
++void OffsetGeodetic(double latDeg, double lonDeg, double northM, double eastM, double &outLatDeg, double &outLonDeg);
++
++// Pseudorange (metres) -> wire (integerCodePhase, codePhase). Returns false when
++// the pseudorange exceeds the integerCodePhase range (> 127 ms) or is negative.
++bool PseudorangeToCodePhase(double pseudorangeM, uint8_t &integerCodePhase, uint32_t &codePhase);
++
++// MeasurementReferenceTime.gnss-TOD-msec (0..3599999) — ms into the current GPS hour.
++uint32_t GpsTodMsec(int64_t unixUtc, int msec);
++
++// GpsTodMsec for the current wall clock.
++uint32_t GpsTodMsecNow();
++
++} // namespace nr::ue::lpp
+diff --git a/src/ue/types.hpp b/src/ue/types.hpp
+index 36edf79..445e7c9 100644
+--- a/src/ue/types.hpp
++++ b/src/ue/types.hpp
+@@ -647,7 +647,13 @@
+     // 5GC Rel-17 mod: UE policy delivery service (TS 24.501 Annex D). Carried in an
+     // UL NAS TRANSPORT with payload container type "UE policy container" (0x05);
+     // not subject to UAC nor to the N1-SM/SMS non-allowed-area restriction.
+-    UE_POLICY_DELIVERY
++    UE_POLICY_DELIVERY,
++
++    // 5GC Rel-17 mod: LPP positioning transport (TS 37.355 over TS 24.501 §8.7.4).
++    // Carried in an UL NAS TRANSPORT with payload container type "LPP message
++    // container" (0x03); like UE policy delivery, not subject to UAC nor to the
++    // N1-SM/SMS non-allowed-area restriction.
++    LPP_TRANSPORT
+ };
+ 
+ Json ToJson(const ECmState &state);

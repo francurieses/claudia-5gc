@@ -101,8 +101,40 @@ func main() {
 		Logger:  logger,
 	}
 
+	// ---- Construct UDM SDM client (location privacy check) --------------------
+	// The UDM provides Nudm_SDM lcs-privacy-data queried before disclosing location.
+	// Ref: TS 29.503 §5.2.2; TS 23.273 §9.1.
+	var udmClient server.UDMSDMClient
+	if cfg.Peers.UDM != "" {
+		udmClient = &server.HTTPUDMSDMClient{
+			BaseURL: "https://" + cfg.Peers.UDM,
+			Client:  httpClient,
+		}
+	}
+
+	// ---- Notification client (EventSubscription LocationNotification delivery) -
+	// Posts LocationNotification bodies to subscriber notificationUris over the
+	// same mTLS HTTP/2 client. Ref: TS 29.572 §6.1.6.2.4; TS 29.500 §4.4.1.
+	notifClient := &server.HTTPNotificationClient{Client: httpClient}
+
 	// ---- SBI server -----------------------------------------------------------
-	srv := server.New(cfg, logger, amfClient)
+	srv := server.NewWithNotifClient(cfg, logger, amfClient, udmClient, notifClient)
+
+	// ---- Wire NRPPa relay client (E-CID positioning, LMF-004) ----------------
+	// HTTPAMFLocationClient implements both AMFLocationClient (Cell-ID) and
+	// DLNRPPASender (E-CID NRPPa relay). Setting the client here enables E-CID
+	// quality-driven method selection for DetermineLocation requests with
+	// hAccuracy ≤ 200 m. When nil, the server silently falls back to Cell-ID.
+	// Ref: TS 23.273 §6.2.9; TS 29.518 §5.2.2.6 (dl-nrppa-info).
+	srv.SetNRPPAClient(amfClient)
+
+	// ---- Wire LPP relay client (GNSS positioning, LMF-005) --------------------
+	// HTTPAMFLocationClient also implements LPPSender (dl-lpp-info). Setting the
+	// client here enables GNSS/LPP quality-driven method selection for
+	// DetermineLocation requests with hAccuracy < 50 m. When nil, the server
+	// silently downgrades to E-CID (or Cell-ID if that is also unwired).
+	// Ref: TS 23.273 §6.2.10; TS 29.518 §5.2.2.6 (dl-lpp-info).
+	srv.SetLPPClient(amfClient)
 
 	// ---- Signal + context -----------------------------------------------------
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

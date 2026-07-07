@@ -1,7 +1,7 @@
 # Procedure: DetermineLocation (Nlmf_Location — UE Cell-ID Positioning)
 
-**Spec:** TS 23.273 §6 (architecture) · §7.2 (UE positioning) · TS 29.572 §5.2.2.2 (Nlmf_Location DetermineLocation) · TS 29.518 §5.2.2.6 (Namf_Location producer) · TS 38.413 §8.17.1 (NGAP LocationReportingControl / LocationReport) · TS 23.501 §6.2.18 (LMF) · TS 29.510 §6.1.6.3.3 (NRF NFType=LMF)
-**Status:** 🟡 In progress (MVP — Cell-ID only)
+**Spec:** TS 23.273 §6 (architecture) · §7.2 (UE positioning) · §9.1 (location privacy) · TS 29.572 §5.2.2.2 (Nlmf_Location DetermineLocation) · TS 29.518 §5.2.2.6 (Namf_Location producer) · TS 38.413 §8.17.1 (NGAP LocationReportingControl / LocationReport) · TS 23.501 §6.2.18 (LMF) · TS 29.503 §5.2.2 (Nudm_SDM lcsData) · TS 29.510 §6.1.6.3.3 (NRF NFType=LMF)
+**Status:** ✅ Implemented (Cell-ID + Deferred MT Location + Location Privacy)
 **Primary NF:** LMF (Nlmf_Location producer)
 **Other NFs involved:** AMF (Namf_Location producer + NGAP relay to RAN), gNB, UE, LCS Client (5GC-internal consumer of Nlmf)
 
@@ -12,10 +12,10 @@ The **Location Management Function (LMF)** is the 5GC NF responsible for UE posi
 through the AMF acting as an NGAP relay** — the LMF never has a direct N2 (NGAP/SCTP)
 association to the gNB.
 
-This procedure implements the **MVP** of TS 23.273 §7.2: **Cell-ID positioning only**.
-The serving cell of the UE (its NRCGI + TAI, reported by the gNB) is returned as the
-location estimate. There is no LPP/NRPPa measurement exchange, no GMLC, no UDM
-location-privacy check (all deferred — see *Out of scope*).
+This procedure implements **Cell-ID positioning (TS 23.273 §7.2)**, **Deferred MT Location
+paging-then-locate (TS 23.273 §7.2 steps E2–E7)**, and **Location Privacy (TS 23.273 §9.1)**.
+The serving cell of the UE (its NRCGI + TAI, reported by the gNB) is returned as the location
+estimate. LPP/NRPPa and GMLC remain deferred (see *Out of scope*).
 
 Two NFs participate:
 
@@ -67,24 +67,41 @@ LCS Client ──Nlmf_Location──▶ LMF ──Namf_Location──▶ AMF ═
 ## Sequence Diagram
 
 Each message is annotated with its governing TS section. `[M]` = mandatory step in the
-Cell-ID flow; `[C]` = conditional.
+Cell-ID flow; `[C]` = conditional; `[D]` = deferred MT Location (paging sub-flow).
 
 ```mermaid
 sequenceDiagram
     participant LCS as LCS Client / Consumer
     participant LMF
+    participant UDM
     participant AMF
     participant gNB
     participant UE
 
     Note over LCS,LMF: TS 29.572 §5.2.2.2 — Nlmf_Location DetermineLocation
     LCS->>LMF: [M] POST /nlmf-loc/v1/ue-contexts/{id}/provide-loc-info<br/>RequestLocInfo {supi/gpsi, locationQoS, priority}
-    Note over LMF: TS 23.273 §7.2 — select positioning method = Cell-ID (MVP)
+    Note over LMF: TS 23.273 §7.2 — select positioning method = Cell-ID
+
+    Note over LMF,UDM: TS 23.273 §9.1 — Location Privacy check (if privacy_check=true)
+    LMF->>UDM: [C] GET /nudm-sdm/v2/{supi}/lcs-privacy-data
+    UDM-->>LMF: [C] 200 OK {locationPrivacy: "ALLOW_ALL"}
+    Note over LMF: BLOCK_ALL → 403 PRIVACY_EXCEPTION_DENIED (stop)
 
     Note over LMF,AMF: TS 29.518 §5.2.2.6 — Namf_Location ProvideLocationInfo
     LMF->>AMF: [M] POST /namf-loc/v1/ue-contexts/{id}/provide-loc-info<br/>RequestLocInfo {req5gsLoc, supportedGADShapes}
-    Note over AMF: Resolve {id} → UEContext.<br/>Check CM-CONNECTED (N2 association exists).<br/>Insert pending entry keyed by AMF-UE-NGAP-ID.
+    Note over AMF: Resolve {id} → UEContext.<br/>Check CM-CONNECTED (N2 association exists).
 
+    alt UE is CM-IDLE — Deferred MT Location (TS 23.273 §7.2 steps E2–E7)
+        Note over AMF: T-positioning guard timer = 15 s
+        AMF->>gNB: [D] NGAP Paging (ProcCode=24) — 5G-S-TMSI + TAI list
+        gNB->>UE: [D] RRC Paging
+        UE->>gNB: [D] RRC: RRCSetupRequest / RRCResumeRequest
+        gNB->>AMF: [D] NGAP InitialUEMessage — ServiceRequest NAS
+        AMF->>AMF: [D] handle Service Request → CM-CONNECTED<br/>onUEReachable → NotifyUEReachable(AMF-UE-NGAP-ID)
+        Note over AMF: Proceed to LocationReportingControl ↓
+    end
+
+    Note over AMF: Insert pending entry keyed by AMF-UE-NGAP-ID.
     Note over AMF,gNB: TS 38.413 §8.17.1 — NGAP relay (AMF on behalf of LMF)
     AMF->>gNB: [M] NGAP LocationReportingControl (ProcCode=16)<br/>AMF-UE-NGAP-ID(10), RAN-UE-NGAP-ID(85),<br/>LocationReportingRequestType(33): EventType=Direct, ReportArea=Cell
     gNB->>AMF: [M] NGAP LocationReport (ProcCode=18)<br/>AMF-UE-NGAP-ID(10), RAN-UE-NGAP-ID(85),<br/>UserLocationInformation(121) → UserLocationInformationNR(NRCGI + TAI)
@@ -161,12 +178,15 @@ UE-associated, class-1-less control message; carried on the existing N2 associat
 
 ## Error / cause table
 
-| Trigger | NF | HTTP | Cause / NGAP result | Behaviour |
+| Trigger | NF | HTTP | Cause | Behaviour |
 |---|---|---|---|---|
-| `{ueContextId}` has no UE context in the AMF | AMF | 404 | `CONTEXT_NOT_FOUND` (ProblemDetails) | Namf_Location rejected; LMF propagates failure to LCS Client |
-| UE is **CM-IDLE** (no N2 association) | AMF | 409 / 504 | `UE_NOT_REACHABLE` (or trigger paging — deferred) | Cannot send NGAP control; MVP returns failure. *(Paging-then-locate is a follow-up.)* |
-| No NGAP LocationReport before timeout | AMF | 504 | `LOCATION_FAILURE` / timeout | Pending channel closed on `ctx` deadline; failure result returned |
+| `{ueContextId}` has no UE context in the AMF | AMF | 404 | `CONTEXT_NOT_FOUND` | Namf_Location rejected; LMF propagates failure to LCS Client |
+| UE is **CM-IDLE** — paging initiated, UE responds | AMF | — | — | AMF pages UE (NGAP Paging ProcCode=24); waits T-positioning (15 s); on Service Request falls through to LocationReportingControl |
+| UE is **CM-IDLE** — paging timeout (T-positioning 15 s) | AMF | 504 | `UE_NOT_REACHABLE` | UE did not respond to paging; `pendingLocPage` channel closed; error returned |
+| No NGAP LocationReport before timeout | AMF | 504 | `LOCATION_FAILURE` | Pending channel closed on `ctx` deadline; failure result returned |
 | gNB returns failure / cannot determine cell | AMF | 504 | `POSITIONING_DENIED` / `UNSPECIFIED` | Decoded error relayed as failure |
+| Subscriber location privacy = `BLOCK_ALL` (UDM lcsData) | LMF | 403 | `PRIVACY_EXCEPTION_DENIED` | LMF refuses to disclose location; AMF is never called. Ref: TS 23.273 §9.1 |
+| UDM unreachable during privacy check | LMF | — | — | Fail-open: location proceeds (warning logged) |
 | Missing mandatory IE in the request body | LMF / AMF | 400 | `MANDATORY_IE_MISSING` | Request rejected before any NGAP signalling |
 | UE not identifiable (`supi`/`gpsi` both absent) | LMF | 400 | `MANDATORY_IE_MISSING` | Rejected at the Nlmf producer |
 | LMF cannot reach AMF / AMF discovery fails | LMF | 504 | `LOCATION_FAILURE` | Returned to LCS Client |
@@ -206,16 +226,15 @@ UE-associated, class-1-less control message; carried on the existing N2 associat
   `duration_ms`.
 - **Metrics**: `fivegc_lmf_locate_total{result}` on :9113.
 
-## Out of scope (deferred — follow-up tasks LMF-002+)
+## Out of scope (deferred — follow-up tasks LMF-003+)
 
 - LPP / NRPPa relay for E-CID / OTDOA / NR-ECID / GNSS (TS 38.413 §8.17.2, TS 37.355).
 - Nlmf_Location EventSubscription / periodic / area-of-interest (TS 29.572 §5.2.3).
 - CancelLocation (TS 29.572 §5.2.2.5).
 - GMLC integration / N56 interface (TS 29.515).
-- UDM location-privacy check (TS 29.503 §5.2.2 `lcsData`).
+- Fine-grained privacy exception lists (`lcsPrivacyExceptionList` per-service-class). Current impl enforces `ALLOW_ALL` vs `BLOCK_ALL` only.
 - Nlmf_Broadcast service for OTDOA assistance (TS 29.572 §5.3).
 - LocationContextTransfer during handover (TS 23.273 §7.8).
-- Paging-then-locate for a CM-IDLE UE (combine with network-triggered Service Request).
 
 ## Validation approach
 
@@ -231,7 +250,25 @@ UE-associated, class-1-less control message; carried on the existing N2 associat
   by the LCS Client / consumer.
 - **mTLS + HTTP/2:** both Nlmf and Namf endpoints set `TLSConfig` (`NextProtos: ["h2"]`)
   before `http2.ConfigureServer` and require client certs (TS 29.500 §4.4, TS 33.501 §13).
-- **E2E (UERANSIM):** `make ueransim` → register UE → POST
-  `/nlmf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info` → expect NRCGI in the
-  response. UERANSIM's gNB does answer NGAP LocationReportingControl with a Cell-ID-level
-  LocationReport, so live E2E is achievable.
+- **E2E (UERANSIM):** `make ueransim` → register UE + PDU session → POST
+  `/nlmf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info` → expect the serving NRCGI/TAI
+  and a non-zero lat/lon in the response (`scripts/validate-ueransim-mod.sh location`).
+  **Note:** stock UERANSIM v3.2.8 gNB has **no** LocationReportingControl handler — it logs
+  *"Unhandled NGAP initiating-message"* and never replies, so the flow times out. The gNB
+  patch `tools/ueransim/patches/0040-location-reporting.patch` (LMF-006) adds
+  `receiveLocationReportingControl()`, which answers with a Cell-ID-level LocationReport. Build it
+  with `make ueransim-build-only`.
+
+## Coordinate synthesis & live monitoring (LMF-006)
+
+Cell-ID positioning carries only the serving cell (NRCGI/TAI) on the N2/NGAP wire — no lat/lon.
+The LMF synthesizes a WGS84 coordinate from the serving cell via a **mobility model**
+(`nf/lmf/internal/server/mobility.go`): a deterministic, bounded, per-SUPI walk anchored at the
+cell's configured base coordinate (`cell_coordinates` / `default_coordinate` / `mobility` in
+`nf/lmf/config/dev.yaml`). Values are artificial but exhibit realistic, continuous motion; the
+authoritative output remains the serving cell. The horizontal accuracy is reported in
+`locationEstimate.uncertainty` (metres).
+
+The management portal exposes a **UE Location** page (live Leaflet map + table, auto-poll 3 s)
+backed by `GET /api/v1/location/summary` and `/location/ue/{supi}`, which act as an LCS client of
+the LMF over mTLS. CM-IDLE/unreachable UEs are listed with their 3GPP cause.

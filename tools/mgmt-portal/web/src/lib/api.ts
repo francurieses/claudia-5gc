@@ -143,6 +143,26 @@ export const getNFStatus = () => request<NFStatus[]>('GET', '/nf-status')
 export const getSessions = () => request<PDUSession[]>('GET', '/sessions')
 export const getUEContexts = () => request<UEContext[]>('GET', '/ue-contexts')
 
+// ---- UE Location (Nlmf_Location DetermineLocation — TS 29.572 §5.2.2.2) ----
+
+export interface UELocation {
+  supi: string
+  gmm_state: number
+  reachable: boolean
+  latitude?: number
+  longitude?: number
+  accuracy_m?: number
+  nr_cell_id?: string
+  tac?: string
+  plmn?: string
+  cause?: string
+  timestamp: string
+}
+
+export const getLocationSummary = () => request<UELocation[]>('GET', '/location/summary')
+export const getUELocation = (supi: string) =>
+  request<UELocation>('GET', `/location/ue/${encodeURIComponent(supi)}`)
+
 // ---- Metrics -------------------------------------------------------------
 
 export const getMetricsSummary = () => request<MetricsSummary>('GET', '/metrics/summary')

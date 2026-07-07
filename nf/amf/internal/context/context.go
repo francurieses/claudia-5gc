@@ -249,6 +249,45 @@ type UEContext struct {
 	MobileReachableTimer *time.Timer
 	ImplicitDetachTimer  *time.Timer
 	PendingRemovalTimer  *time.Timer
+
+	// Per-UE serial task queue used by the NGAP layer to process this UE's
+	// messages in arrival order without blocking the shared SCTP read loop
+	// (one slow SBI call for one UE must not delay other UEs' NGAP messages).
+	// Guarded by taskMu — separate from mu because queued tasks themselves
+	// take mu. See EnqueueSerial.
+	taskMu       sync.Mutex
+	taskQueue    []func()
+	taskDraining bool
+}
+
+// EnqueueSerial appends f to this UE's serial task queue and returns
+// immediately. Tasks run one at a time in FIFO order on a lazily started
+// drain goroutine, so per-UE NAS ordering (notably SecurityCtx.UplinkCount)
+// is preserved while tasks for different UEs run concurrently.
+func (u *UEContext) EnqueueSerial(f func()) {
+	u.taskMu.Lock()
+	u.taskQueue = append(u.taskQueue, f)
+	if u.taskDraining {
+		u.taskMu.Unlock()
+		return
+	}
+	u.taskDraining = true
+	u.taskMu.Unlock()
+
+	go func() {
+		for {
+			u.taskMu.Lock()
+			if len(u.taskQueue) == 0 {
+				u.taskDraining = false
+				u.taskMu.Unlock()
+				return
+			}
+			next := u.taskQueue[0]
+			u.taskQueue = u.taskQueue[1:]
+			u.taskMu.Unlock()
+			next()
+		}
+	}()
 }
 
 // TAI is a Tracking Area Identity.

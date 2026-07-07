@@ -420,6 +420,40 @@ func (c *HTTPSMFClient) NotifyANRelease(ctx context.Context, smContextRef string
 	return nil
 }
 
+// ActivateSMContext calls Nsmf_PDUSession_UpdateSMContext with upCnxState=ACTIVATING.
+// The SMF rebuilds the PDUSessionResourceSetupRequestTransfer (UL TEID + QoS) for the
+// session so the AMF can carry it as N2SM info in InitialContextSetupRequest during
+// Service Request UP re-activation.
+// Ref: TS 29.502 §5.2.2.3.2.2, TS 23.502 §4.2.3.2 step 12
+func (c *HTTPSMFClient) ActivateSMContext(ctx context.Context, smContextRef string) ([]byte, error) {
+	body, _ := json.Marshal(map[string]string{"upCnxState": "ACTIVATING"})
+	url := "https://" + c.address + "/nsmf-pdusession/v1/sm-contexts/" + smContextRef + "/modify"
+	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("smf: activate sm context: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("smf: activate sm context: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		N2SmInfo string `json:"n2SmInfo"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("smf: activate sm context: decode response: %w", err)
+	}
+	n2SmInfo, err := base64.StdEncoding.DecodeString(result.N2SmInfo)
+	if err != nil || len(n2SmInfo) == 0 {
+		return nil, fmt.Errorf("smf: activate sm context: empty or invalid n2SmInfo")
+	}
+	return n2SmInfo, nil
+}
+
 // ModifySMContext sends Nsmf_PDUSession_UpdateSMContext with the 5GSM Modification Request.
 // Returns the body of the 5GSM Modification Command and the N2SM Modify Request Transfer.
 // Ref: TS 29.502 §5.2.2.3.2, TS 23.502 §4.3.3.1

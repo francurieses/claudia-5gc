@@ -136,6 +136,33 @@ func TestEncodeDeregistrationRequestNW_WithCause(t *testing.T) {
 	}
 }
 
+// TestEncodeDeregistrationRequestNW_ReregRequired tests that the
+// "re-registration required" flag sets bit 3 (0x04) of the de-registration
+// type value — not bit 4 (0x08), which is "switch off".
+// Ref: TS 24.501 §9.11.3.20
+func TestEncodeDeregistrationRequestNW_ReregRequired(t *testing.T) {
+	r := &DeregistrationRequestNW{
+		AccessType:             1,
+		ReregistrationRequired: true,
+	}
+	b, err := EncodeDeregistrationRequestNW(r)
+	if err != nil {
+		t.Fatalf("EncodeDeregistrationRequestNW failed: %v", err)
+	}
+	if len(b) != 1 {
+		t.Fatalf("expected 1 byte, got %d: %x", len(b), b)
+	}
+	if b[0]&0x04 == 0 {
+		t.Errorf("re-registration required bit (0x04) not set: %02x", b[0])
+	}
+	if b[0]&0x08 != 0 {
+		t.Errorf("switch off bit (0x08) must not be set: %02x", b[0])
+	}
+	if b[0]&0x03 != 1 {
+		t.Errorf("expected access type 1 (3GPP), got %02x", b[0]&0x03)
+	}
+}
+
 // TestEncodeDeregistrationRequestNW_NoCause tests encoding without optional cause.
 func TestEncodeDeregistrationRequestNW_NoCause(t *testing.T) {
 	r := &DeregistrationRequestNW{

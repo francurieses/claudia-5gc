@@ -32,6 +32,7 @@ func main() {
 	amfURL := envOr("AMF_URL", "http://amf:9002")
 	udmURL := envOr("UDM_URL", "https://udm:8003")
 	pcfURL := envOr("PCF_URL", "https://pcf:8006")
+	lmfURL := envOr("LMF_URL", "https://lmf:8012")
 	nfConfigsPath := envOr("NF_CONFIGS_PATH", "/app/nf-configs")
 	certFile := envOr("PORTAL_CERT_FILE", "")
 	keyFile := envOr("PORTAL_KEY_FILE", "")
@@ -78,6 +79,7 @@ func main() {
 		AMFBaseURL: amfURL,
 		UDMBaseURL: udmURL,
 		PCFBaseURL: pcfURL,
+		LMFBaseURL: lmfURL,
 		MTLSClient: sbiClient,
 	}
 

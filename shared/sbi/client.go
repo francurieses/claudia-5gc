@@ -14,6 +14,17 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// readIdleTimeout/pingTimeout make http2.Transport proactively detect a dead
+// peer connection (e.g. the container on the other end restarted without the
+// TCP FIN reaching this side) instead of keeping it pooled indefinitely. Without
+// these, a stale pooled connection silently hangs every request against it
+// until http.Client.Timeout aborts it — indistinguishable from a DNS/network
+// outage to the caller, and only cleared by restarting this process.
+const (
+	readIdleTimeout = 30 * time.Second
+	pingTimeout     = 15 * time.Second
+)
+
 // NewHTTP2Client returns an *http.Client configured for HTTP/2 over TLS.
 // caFile is the path to the PEM-encoded CA certificate used to verify server
 // certificates. If caFile is empty, it falls back to H2C (cleartext HTTP/2 for dev).
@@ -47,6 +58,8 @@ func NewHTTP2Client(caFile string) (*http.Client, error) {
 	// Configure HTTP/2 transport with TLS
 	transport := &http2.Transport{
 		TLSClientConfig: tlsCfg,
+		ReadIdleTimeout: readIdleTimeout,
+		PingTimeout:     pingTimeout,
 	}
 
 	return &http.Client{
@@ -79,8 +92,12 @@ func NewMTLSClient(caFile, certFile, keyFile string) (*http.Client, error) {
 		KeyLogWriter: OpenKeyLogWriter(),
 	}
 	return &http.Client{
-		Transport: &http2.Transport{TLSClientConfig: tlsCfg},
-		Timeout:   10 * time.Second,
+		Transport: &http2.Transport{
+			TLSClientConfig: tlsCfg,
+			ReadIdleTimeout: readIdleTimeout,
+			PingTimeout:     pingTimeout,
+		},
+		Timeout: 10 * time.Second,
 	}, nil
 }
 
@@ -94,6 +111,8 @@ func NewH2CClient() *http.Client {
 		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
 			return net.Dial(network, addr)
 		},
+		ReadIdleTimeout: readIdleTimeout,
+		PingTimeout:     pingTimeout,
 	}
 	return &http.Client{
 		Transport: transport,

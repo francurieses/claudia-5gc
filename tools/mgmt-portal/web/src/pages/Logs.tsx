@@ -4,7 +4,7 @@ import { Download, Trash2, Pause, Play } from 'lucide-react'
 import { getServices } from '../lib/api'
 import PageHeader from '../components/PageHeader'
 
-const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf']
+const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'lmf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf']
 
 type LogLine = { raw: string; level: string; msg: string; ts: string }
 

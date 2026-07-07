@@ -198,6 +198,11 @@ func newWithServer(s *Server, tlsCfg TLSConfig) (*Server, error) {
 	// default QoS, consumed by the SMF over N10 (TS 29.503 §6.1.6.2.7)
 	mux.HandleFunc("GET /nudm-sdm/v2/{supi}/sm-data",
 		s.handleGetSMData)
+	// Nudm_SDM: LCS location privacy data — allow-all stub for dev.
+	// Consumed by LMF before disclosing a UE's location to an LCS client.
+	// Ref: TS 29.503 §5.2.2, TS 23.273 §9.1.
+	mux.HandleFunc("GET /nudm-sdm/v2/{supi}/lcs-privacy-data",
+		s.handleGetLcsPrivacyData)
 
 	// Nudm_SDM: Subscribe / Unsubscribe (TS 29.503 §5.3.2)
 	mux.HandleFunc("POST /nudm-sdm/v2/{supi}/sdm-subscriptions",
@@ -612,6 +617,24 @@ func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 	)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(filtered)
+}
+
+// handleGetLcsPrivacyData serves Nudm_SDM Get for lcs-privacy-data.
+// Returns an allow-all policy for all subscribers (dev stub).
+// Real implementations would look up per-subscriber privacy exceptions from UDR.
+// Ref: TS 29.503 §5.2.2, TS 23.273 §9.1, TS 29.571 §5.2.7.5.
+func (s *Server) handleGetLcsPrivacyData(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	s.logger.Info("GetLcsPrivacyData request",
+		"procedure", "GetLcsPrivacyData",
+		"supi", supi,
+		"nf", "UDM",
+		"interface", "Nudm",
+		"direction", "IN",
+		"spec_ref", "TS 29.503 §5.2.2",
+	)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"locationPrivacy": "ALLOW_ALL"})
 }
 
 // ---- Nudm_UECM AMF Registration / Deregistration --------------------------

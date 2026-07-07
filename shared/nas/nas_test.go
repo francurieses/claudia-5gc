@@ -102,13 +102,13 @@ func TestDecode_SecurityProtected_Header(t *testing.T) {
 	// Security-protected PDU:
 	// EPD(1) | SHT(1) | MAC(4) | SN(1) | inner EPD(1) | inner SHT(1) | inner MT(1) | body...
 	data := []byte{
-		0x7E,                         // EPD
-		0x02,                         // SHT = IntegrityProtectedAndCiphered
-		0xDE, 0xAD, 0xBE, 0xEF,       // MAC
-		0x42,                         // Sequence Number
-		0x7E, 0x00,                   // inner EPD + inner SHT (plain inner)
-		0x64,                         // inner MsgType = Status5GMM (0x64) → RawBody
-		0xCA, 0xFE,                   // inner body bytes
+		0x7E,                   // EPD
+		0x02,                   // SHT = IntegrityProtectedAndCiphered
+		0xDE, 0xAD, 0xBE, 0xEF, // MAC
+		0x42,       // Sequence Number
+		0x7E, 0x00, // inner EPD + inner SHT (plain inner)
+		0x64,       // inner MsgType = Status5GMM (0x64) → RawBody
+		0xCA, 0xFE, // inner body bytes
 	}
 	msg, err := nas.Decode(data)
 	if err != nil {
@@ -361,10 +361,10 @@ func TestDecodeIdentityResponse_GUTI(t *testing.T) {
 	// Build a GUTI mobile identity: type(1) + MCC/MNC(3) + RegID(1) + AMFRef(2) + TMSI(4) = 11 bytes
 	// encodeMCCMNC("208","93") = [0x02, 0xF8, 0x39]
 	gutiBytes := []byte{
-		0x02,                   // type = GUTI (2), SUPIFormat = 0
-		0x02, 0xF8, 0x39,       // MCC=208, MNC=93
-		0xAB,                   // AMF Region ID
-		0x00, 0x41,             // AMFSetID=1 (10 bits), AMFID=1 (6 bits) → (1<<6)|1 = 0x41
+		0x02,             // type = GUTI (2), SUPIFormat = 0
+		0x02, 0xF8, 0x39, // MCC=208, MNC=93
+		0xAB,       // AMF Region ID
+		0x00, 0x41, // AMFSetID=1 (10 bits), AMFID=1 (6 bits) → (1<<6)|1 = 0x41
 		0x12, 0x34, 0x56, 0x78, // TMSI
 	}
 	// Identity Response body: LV-E (2-byte big-endian length) + MI bytes per TS 24.501 §8.2.14.1 IE type 6
@@ -695,10 +695,10 @@ func TestDecodeMobileIdentity_SUCI(t *testing.T) {
 	suciBytes := []byte{
 		0x01,             // type=SUCI(1), SUPIFormat=IMSI(0) → (0<<3)|1
 		0x02, 0xF8, 0x39, // MCC=208, MNC=93
-		0x00, 0x00,       // Routing Indicator
-		0x00,             // Protection Scheme = null
-		0x00,             // HN Public Key ID
-		0xAA, 0xBB,       // Scheme Output (MSIN in plaintext for null scheme)
+		0x00, 0x00, // Routing Indicator
+		0x00,       // Protection Scheme = null
+		0x00,       // HN Public Key ID
+		0xAA, 0xBB, // Scheme Output (MSIN in plaintext for null scheme)
 	}
 	mi, err := nas.DecodeMobileIdentity(suciBytes)
 	if err != nil {
@@ -780,5 +780,68 @@ func TestRegistrationAccept_T3512(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("IEI 0x5E (T3512) not found in encoded Registration Accept: %x", encoded)
+	}
+}
+
+// ---- TAI list (TS 24.501 §9.11.3.9) -----------------------------------------
+
+func TestEncodeTAIList_Type00Wire(t *testing.T) {
+	// PLMN 001/01, single TAC 1 → type-00 partial list:
+	// header 0x00 (type 00, 1 element), PLMN BCD 00 F1 10, TAC 00 00 01.
+	got := nas.EncodeTAIList("001", "01", []uint32{1})
+	want := []byte{0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x01}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("EncodeTAIList: got %x, want %x", got, want)
+	}
+
+	// Two TACs → element count bits = 1 (count-1), 3 bytes per TAC.
+	got = nas.EncodeTAIList("001", "01", []uint32{1, 0x000200})
+	want = []byte{0x01, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("EncodeTAIList 2 TACs: got %x, want %x", got, want)
+	}
+
+	if nas.EncodeTAIList("001", "01", nil) != nil {
+		t.Fatal("EncodeTAIList with no TACs must return nil")
+	}
+}
+
+func TestRegistrationAccept_TAIList(t *testing.T) {
+	// Regression: Registration Accept must carry the TAI list (IEI 0x54) —
+	// without it UERANSIM cancels Service Request from CM-IDLE with
+	// "current TAI is not in the TAI list". Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
+	taiList := nas.EncodeTAIList("001", "01", []uint32{1})
+	ra := &nas.RegistrationAccept{
+		RegistrationResult: 0x01,
+		TAIList:            taiList,
+	}
+	pdu := &nas.Message{
+		Header: nas.Header{
+			ExtendedProtocolDiscriminator: nas.PDMobilityManagement,
+			MessageType:                   nas.MsgTypeRegistrationAccept,
+		},
+		Body: ra,
+	}
+	encoded, err := nas.Encode(pdu)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	// TLV on the wire: 0x54 | length | value.
+	wantTLV := append([]byte{0x54, byte(len(taiList))}, taiList...)
+	if !bytes.Contains(encoded, wantTLV) {
+		t.Fatalf("IEI 0x54 (TAI list) TLV %x not found in encoded Registration Accept: %x",
+			wantTLV, encoded)
+	}
+
+	decoded, err := nas.Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	got, ok := decoded.Body.(*nas.RegistrationAccept)
+	if !ok {
+		t.Fatalf("expected *RegistrationAccept, got %T", decoded.Body)
+	}
+	if !bytes.Equal(got.TAIList, taiList) {
+		t.Fatalf("TAIList roundtrip: got %x, want %x", got.TAIList, taiList)
 	}
 }

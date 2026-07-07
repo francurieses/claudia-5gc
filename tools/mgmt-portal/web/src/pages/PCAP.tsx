@@ -34,6 +34,7 @@ const NF_LIST: NFMeta[] = [
   { id: 'smsf', label: 'SMSF',  description: 'SMS Function',                           group: 'nf' },
   { id: 'bsf',  label: 'BSF',   description: 'Binding Support',                        group: 'nf' },
   { id: 'nef',  label: 'NEF',   description: 'Network Exposure',                       group: 'nf' },
+  { id: 'lmf',  label: 'LMF',   description: 'Location Management (Nlmf)',              group: 'nf' },
 ]
 
 function formatBytes(bytes: number): string {

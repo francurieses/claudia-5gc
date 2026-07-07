@@ -184,7 +184,13 @@ export default function Subscribers() {
             <Field label="K (hex 32)" value={form.k} onChange={v => setForm(f => ({ ...f, k: v }))} mono />
             <Field label="OPc (hex 32)" value={form.opc} onChange={v => setForm(f => ({ ...f, opc: v }))} mono />
             <Field label="AMF (hex 4)" value={form.amf} onChange={v => setForm(f => ({ ...f, amf: v }))} mono />
-            <Field label="SQN (hex 12)" value={form.sqn} onChange={v => setForm(f => ({ ...f, sqn: v }))} mono />
+            <Field
+              label={editSUPI ? 'SQN (network-managed, read-only)' : 'SQN (hex 12)'}
+              value={form.sqn}
+              onChange={v => setForm(f => ({ ...f, sqn: v }))}
+              disabled={!!editSUPI}
+              mono
+            />
             <div>
               <label className="block text-xs text-gray-400 mb-1">AMBR UL / DL (kbps)</label>
               <div className="flex gap-2">

@@ -1,0 +1,458 @@
+diff --git a/src/gnb/ngap/radio.cpp b/src/gnb/ngap/radio.cpp
+index 1405bb4..407e4cf 100644
+--- a/src/gnb/ngap/radio.cpp
++++ b/src/gnb/ngap/radio.cpp
+@@ -13,14 +13,17 @@
+ #include <gnb/gtp/task.hpp>
+ #include <gnb/rrc/task.hpp>
+ 
++#include <asn/ngap/ASN_NGAP_DownlinkUEAssociatedNRPPaTransport.h>
+ #include <asn/ngap/ASN_NGAP_EventType.h>
+ #include <asn/ngap/ASN_NGAP_FiveG-S-TMSI.h>
+ #include <asn/ngap/ASN_NGAP_LocationReport.h>
+ #include <asn/ngap/ASN_NGAP_LocationReportingControl.h>
+ #include <asn/ngap/ASN_NGAP_LocationReportingRequestType.h>
++#include <asn/ngap/ASN_NGAP_NRPPa-PDU.h>
+ #include <asn/ngap/ASN_NGAP_Paging.h>
+ #include <asn/ngap/ASN_NGAP_ProtocolIE-Field.h>
+ #include <asn/ngap/ASN_NGAP_ReportArea.h>
++#include <asn/ngap/ASN_NGAP_UplinkUEAssociatedNRPPaTransport.h>
+ 
+ namespace nr::gnb
+ {
+@@ -106,5 +109,393 @@ void NgapTask::receiveLocationReportingControl(int amfId, ASN_NGAP_LocationRepor
+ 
+     m_logger->info("Location Report sent (cell-ID positioning)");
+ }
++// ---- NRPPa E-CID APER transport (5GC Rel-17 mod, TS 38.455 / TS 38.413 §8.17.3) ----
++//
++// The NRPPa-PDU carried over NGAP UE-associated transport uses real ASN.1 Aligned
++// PER (APER) encoding, per TS 38.455 Annex A — matching the Go encoder in
++// shared/nrppa (github.com/free5gc/aper Marshal, hand-written structs since
++// free5gc has no NRPPa module). This C++ encoder byte-matches that Go encoder
++// exactly for the fixed E-CID subset messages this patch sends/receives; see
++// tools/ueransim/CLAUDE.md §4 (Go is source of truth).
++//
++// Procedure codes used (TS 38.455 Table 9.1-1 — NOT the values an earlier
++// revision of this patch used, which collided with unrelated real procedures):
++//   positioningInformationExchange = 9, e-CIDMeasurementInitiation = 2,
++//   e-CIDMeasurementReport = 4.
++//
++// This gNB always answers with a spec-legal, real NG-RANAccessPointPosition
++// estimate (TS 38.455 §9 — a real optional IE, the TS 23.032 Ellipsoid Point
++// with Uncertainty Ellipse shape) rather than fabricated neighbour-cell RSRP:
++// TS 38.455's E-CID-MeasurementResult.measuredResults field is E-UTRA-only
++// (legacy LPPa inter-RAT assistance), so it cannot legally carry NR neighbour
++// RSRP — see shared/nrppa's package doc comment for the full rationale.
++namespace
++{
++
++// BitWriter accumulates bits MSB-first for APER encoding, matching the bit
++// layout produced by github.com/free5gc/aper (verified byte-for-byte against
++// the Go encoder's golden output — see the LMF-004 fix session notes).
++struct NrppaBitWriter
++{
++    std::vector<uint8_t> buf;
++    size_t bits = 0;
++
++    void writeBit(uint8_t v)
++    {
++        size_t byteIdx = bits / 8;
++        size_t bitIdx = 7 - (bits % 8);
++        if (byteIdx >= buf.size())
++            buf.push_back(0);
++        if (v)
++            buf[byteIdx] |= static_cast<uint8_t>(1u << bitIdx);
++        bits++;
++    }
++
++    void writeBits(uint64_t val, int n)
++    {
++        for (int i = n; i > 0; i--)
++            writeBit(static_cast<uint8_t>((val >> (i - 1)) & 1));
++    }
++
++    void align()
++    {
++        size_t rem = bits % 8;
++        if (rem != 0)
++            bits += 8 - rem;
++    }
++
++    void writeAlignedBytes(const uint8_t *data, size_t n)
++    {
++        align();
++        buf.insert(buf.end(), data, data + n);
++        bits += n * 8;
++    }
++
++    void writeAlignedU8(uint8_t v) { writeAlignedBytes(&v, 1); }
++
++    void writeAlignedU16(uint16_t v)
++    {
++        uint8_t b[2] = {static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
++        writeAlignedBytes(b, 2);
++    }
++
++    void writeAlignedU24(uint32_t v)
++    {
++        uint8_t b[3] = {static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
++        writeAlignedBytes(b, 3);
++    }
++};
++
++// minBits returns the minimum bit count to represent [0, range).
++int nrppaMinBits(uint64_t range)
++{
++    int i = 0;
++    while ((1ull << i) < range)
++        i++;
++    return i;
++}
++
++// writeConstrainedSmall matches free5gc/aper's appendConstraintValue bucket rules
++// for a constrained whole number with range <= 65536: range<=255 -> unaligned
++// minimal-bit field; range==256 -> 1 aligned octet; else -> 2 aligned octets.
++void writeConstrainedSmall(NrppaBitWriter &w, uint64_t val, uint64_t range)
++{
++    if (range <= 255)
++        w.writeBits(val, nrppaMinBits(range));
++    else if (range == 256)
++        w.writeAlignedU8(static_cast<uint8_t>(val));
++    else
++        w.writeAlignedU16(static_cast<uint16_t>(val));
++}
++
++// writeExtInt encodes an extensible constrained INTEGER whose value is in the
++// root range: 1 extension-marker bit (0 = root) + writeConstrainedSmall.
++void writeExtInt(NrppaBitWriter &w, uint64_t val, uint64_t rootRange)
++{
++    w.writeBits(0, 1);
++    writeConstrainedSmall(w, val, rootRange);
++}
++
++// writeOpenType wraps content with APER's OPEN TYPE framing: align, then a
++// 1-byte length determinant (content is always < 128 bytes here), then content.
++void writeOpenType(NrppaBitWriter &outer, const std::vector<uint8_t> &content)
++{
++    outer.align();
++    outer.writeAlignedU8(static_cast<uint8_t>(content.size()));
++    outer.writeAlignedBytes(content.data(), content.size());
++}
++
++// writeSeqOfLen16 writes a ProtocolIE-Container length determinant: SIZE(0..65535)
++// has range 65536, hitting the "256<range<=65536" bucket -> 2 aligned octets.
++void writeSeqOfLen16(NrppaBitWriter &w, uint16_t count) { w.writeAlignedU16(count); }
++
++// writeIEField appends one ProtocolIE-Field: id(2B aligned) + criticality(2 bits,
++// unaligned, + 6-bit pad to the next aligned field) + openType(value).
++void writeIEField(NrppaBitWriter &w, uint16_t id, uint8_t crit2bit, const std::vector<uint8_t> &value)
++{
++    w.writeAlignedU16(id);
++    w.writeBits(crit2bit, 2);
++    w.writeBits(0, 6);
++    writeOpenType(w, value);
++}
++
++// ueMeasIDContent encodes a UE-Measurement-ID IE value: INTEGER(1..15,...,16..256),
++// root range 15. measID is 1-based (matches shared/nrppa's external API).
++std::vector<uint8_t> ueMeasIDContent(uint16_t measID)
++{
++    NrppaBitWriter w;
++    writeExtInt(w, measID - 1, 15);
++    return w.buf;
++}
++
++// nrppaUncertaintyCode implements the TS 23.032 §6.7 "uncertainty code" (C=10,
++// x=0.1): the minimal k such that 10*((1.1)^k - 1) >= metres, matching
++// shared/nrppa's metersToUncertaintyCode exactly (same recurrence, no <cmath>
++// dependency — iteratively multiplies rather than calling pow()).
++uint8_t nrppaUncertaintyCode(double metres)
++{
++    if (metres <= 0)
++        return 0;
++    uint64_t k = 0;
++    double factor = 1.0;
++    double r = 0.0;
++    while (r < metres && k < 127)
++    {
++        k++;
++        factor *= 1.1;
++        r = 10.0 * (factor - 1.0);
++    }
++    return static_cast<uint8_t>(k);
++}
++
++// buildAPPosition encodes the NG-RANAccessPointPosition content (TS 38.455 §9 —
++// the TS 23.032 Ellipsoid Point with Uncertainty Ellipse shape). Byte-matches
++// shared/nrppa's APPosition.toWire()/EncodeECIDReport exactly.
++//
++// Latitude (range 8388608) and Longitude (range 16777216) exceed 65536, so per
++// X.691 §10.5.7.4 a real APER codec ignores the range for the length
++// calculation and instead writes an octet-aligned length-determinant (sized to
++// hold up to the range's max octet count — 3 octets for both fields here)
++// followed by the minimal octets for *this specific value*. An earlier
++// revision of this patch instead wrote a fixed-width 3-octet field with no
++// length-determinant at all (assuming free5gc/aper's matching behaviour was a
++// library bug rather than correct X.691) — that assumption was wrong and
++// desynced the bitstream, caught via a live pcap capture showing garbage
++// altitude/uncertainty values downstream. This gNB always reports the same
++// fixed non-zero survey point (see kSurveyLatDeg/kSurveyLonDeg below), so both
++// values always need exactly 3 octets in practice — the length-determinant is
++// therefore hardcoded to "3 octets" (2-bit field, value 2) rather than
++// generically computed; see shared/nrppa/nrppa_asn1.go's NGRANAccessPointPosition
++// doc comment for the full, value-dependent rule a generic encoder would need.
++std::vector<uint8_t> buildAPPosition(double latDeg, double lonDeg, double uncMajorM, double uncMinorM,
++                                      uint8_t confidencePct)
++{
++    NrppaBitWriter w;
++    w.writeBits(0, 1); // extension marker
++    w.writeBits(0, 1); // iE-Extensions optional bit (absent)
++    int latSign = latDeg < 0 ? 1 : 0;
++    double latAbs = latDeg < 0 ? -latDeg : latDeg;
++    w.writeBits(static_cast<uint64_t>(latSign), 1); // LatitudeSign: 0=north,1=south
++    int64_t latRaw = static_cast<int64_t>(latAbs / 90.0 * 8388607.0);
++    if (latRaw < 0)
++        latRaw = 0;
++    if (latRaw > 8388607)
++        latRaw = 8388607;
++    w.writeBits(2, 2); // length-determinant: 3 octets (rawLength-1=2), see doc comment above
++    w.writeAlignedU24(static_cast<uint32_t>(latRaw));
++    int64_t lonRawSigned = static_cast<int64_t>(lonDeg / 180.0 * 8388608.0);
++    if (lonRawSigned < -8388608)
++        lonRawSigned = -8388608;
++    if (lonRawSigned > 8388607)
++        lonRawSigned = 8388607;
++    w.writeBits(2, 2); // length-determinant: 3 octets, same as Latitude
++    w.writeAlignedU24(static_cast<uint32_t>(lonRawSigned + 8388608)); // (value - lb), lb=-8388608
++    w.writeBits(0, 1);                                                // DirectionOfAltitude = height
++    w.writeAlignedU16(0);                                             // Altitude = 0
++    writeConstrainedSmall(w, nrppaUncertaintyCode(uncMajorM), 128);   // UncertaintySemiMajor, 7 bits
++    writeConstrainedSmall(w, nrppaUncertaintyCode(uncMinorM), 128);   // UncertaintySemiMinor, 7 bits
++    writeConstrainedSmall(w, 0, 180);                                 // OrientationOfMajorAxis, 8 bits
++    writeConstrainedSmall(w, 0, 128);                                 // UncertaintyAltitude, 7 bits
++    writeConstrainedSmall(w, confidencePct, 101);                     // Confidence, 7 bits
++    return w.buf;
++}
++
++// buildECIDMeasurementResult encodes the E-CID-MeasurementResult IE value
++// (id=7): servingCell-ID (NG-RAN-CGI) + servingCellTAC + nG-RANAccessPointPosition
++// (always present — see the AP-position rationale in the namespace doc comment
++// above). Byte-matches shared/nrppa/nrppa.go's EncodeECIDReport exactly.
++std::vector<uint8_t> buildECIDMeasurementResult(const octet3 &plmn, int64_t nci, const octet3 &tac,
++                                                 double latDeg, double lonDeg, double uncM, uint8_t confidencePct)
++{
++    NrppaBitWriter w;
++    // ECIDMeasurementResult preamble: ext(1) + 3 optional bits (APPosition=present,
++    // MeasuredResults=absent, IEExtensions=absent).
++    w.writeBits(0, 1);
++    w.writeBits(1, 1);
++    w.writeBits(0, 1);
++    w.writeBits(0, 1);
++    // NG-RAN-CGI preamble: ext(1) + 1 optional bit (IEExtensions=absent) — packed
++    // contiguously with the bits above, no alignment yet (matches free5gc/aper's
++    // nested-SEQUENCE preamble behaviour, verified against the Go golden output).
++    w.writeBits(0, 1);
++    w.writeBits(0, 1);
++    uint8_t plmnBytes[3] = {plmn[0], plmn[1], plmn[2]};
++    w.writeAlignedBytes(plmnBytes, 3); // PLMN-Identity OCTET STRING(3), aligns the 6 preamble bits above
++    // NGRANCell CHOICE index: 0=eUTRA-CellID, 1=nR-CellID, 2=choice-Extension (never sent).
++    // Width is 2 bits (ceil(log2(3)), the real 3-alternative count) even though this patch
++    // only ever sends index 1 — a 1-bit width (as an earlier revision had) desyncs every bit
++    // after it, verified against a live pcap capture (Wireshark decoded it as
++    // choice-Extension, not nR-CellID, corrupting latitude/altitude downstream).
++    w.writeBits(1, 2);
++    uint64_t packed = (static_cast<uint64_t>(nci) & 0xFFFFFFFFFULL) << 4; // 36-bit NCI, MSB-aligned in 5 bytes
++    uint8_t cellBytes[5] = {
++        static_cast<uint8_t>(packed >> 32), static_cast<uint8_t>(packed >> 24), static_cast<uint8_t>(packed >> 16),
++        static_cast<uint8_t>(packed >> 8), static_cast<uint8_t>(packed)};
++    w.writeAlignedBytes(cellBytes, 5); // NRCellIdentifier BIT STRING(36), aligns the choice-index bit above
++    uint8_t tacBytes[3] = {tac[0], tac[1], tac[2]};
++    w.writeAlignedBytes(tacBytes, 3);  // servingCellTAC OCTET STRING(3)
++    auto ap = buildAPPosition(latDeg, lonDeg, uncM, uncM, confidencePct);
++    w.buf.insert(w.buf.end(), ap.begin(), ap.end());
++    w.bits += ap.size() * 8;
++    return w.buf;
++}
++
++} // namespace
++
++void NgapTask::receiveDownlinkUEAssociatedNRPPaTransport(int amfId, ASN_NGAP_DownlinkUEAssociatedNRPPaTransport *msg)
++{
++    // 5GC Rel-17 mod: handler for AMF→gNB UE-associated NRPPa transport (TS 38.413 §8.17.3,
++    // ProcCode=8). Stock UERANSIM gNB drops it as "Unhandled NGAP initiating-message". This
++    // patch replies with real APER-encoded E-CID messages via UplinkUEAssociatedNRPPaTransport
++    // (ProcCode=50). Wire format: ASN.1 APER per TS 38.455 Annex A / X.691.
++    m_logger->debug("Downlink UE-associated NRPPa Transport received");
++
++    auto *ue = findUeByNgapIdPair(amfId, ngap_utils::FindNgapIdPair(msg));
++    if (ue == nullptr)
++        return;
++
++    auto *nrppaIe = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_NRPPa_PDU);
++    if (nrppaIe == nullptr)
++    {
++        m_logger->warn("NRPPa Transport without NRPPa-PDU IE — ignoring");
++        return;
++    }
++
++    OctetString dlPdu = asn::GetOctetString(nrppaIe->NRPPa_PDU);
++    if (dlPdu.length() < 5)
++    {
++        m_logger->warn("NRPPa-PDU too short (%d bytes) — ignoring", dlPdu.length());
++        return;
++    }
++
++    // APER NRPPA-PDU header (TS 38.455 Annex A):
++    //   byte 0: CHOICE discriminator (0x00=InitiatingMessage, 0x20=SuccessfulOutcome,
++    //           0x40=UnsuccessfulOutcome)
++    //   byte 1: ProcedureCode (TS 38.455 Table 9.1-1)
++    uint8_t choice = dlPdu.get(0);
++    uint8_t procCode = dlPdu.get(1);
++
++    const octet3 plmn = ngap_utils::PlmnToOctet3(m_base->config->plmn);
++    const int64_t nci = m_base->config->nci;
++    const octet3 tac{m_base->config->tac};
++
++    // Fixed base coordinate the gNB reports as its own AP position survey point
++    // (TS 38.455 §9 NG-RANAccessPointPosition — a real, spec-defined, optional
++    // field carrying the gNB's own WGS84 estimate). Matches the LMF's Madrid
++    // "Puerta del Sol" default_coordinate anchor (nf/lmf/config/dev.yaml) so the
++    // live E2E result lands near the Cell-ID anchor, just with a tighter
++    // uncertainty band — synthetic/simulation value, not a real gNB survey.
++    constexpr double kSurveyLatDeg = 40.4168;
++    constexpr double kSurveyLonDeg = -3.7038;
++    constexpr double kSurveyUncertaintyM = 90.0; // within the E-CID band (50-150 m)
++    constexpr uint8_t kSurveyConfidencePct = 68;
++
++    std::vector<uint8_t> reply;
++
++    if (choice == 0x00 && procCode == 0x09)
++    {
++        // InitiatingMessage + positioningInformationExchange (procCode=9)
++        // -> PositioningInformationResponse{}, SuccessfulOutcome, bare ack (0 IEs;
++        // every real IE this message defines is optional and outside the E-CID
++        // subset — see shared/nrppa's PositioningInformationResponse doc comment).
++        NrppaBitWriter w;
++        w.writeAlignedU8(0x20); // SuccessfulOutcome
++        w.writeAlignedU8(0x09); // procCode=9
++        w.writeBits(0, 2);
++        w.writeBits(0, 6); // criticality=reject
++        w.writeAlignedU16(2); // NRPPATransactionID (any value; not used for correlation)
++        std::vector<uint8_t> content;
++        {
++            NrppaBitWriter cw;
++            cw.writeBits(0, 1); // extension marker
++            cw.align();
++            writeSeqOfLen16(cw, 0); // empty ProtocolIE-Container
++            content = cw.buf;
++        }
++        writeOpenType(w, content);
++        reply = w.buf;
++        m_logger->info("NRPPa PositioningInformationRequest -> Response (E-CID supported)");
++    }
++    else if (choice == 0x00 && procCode == 0x02)
++    {
++        // InitiatingMessage + e-CIDMeasurementInitiation (procCode=2)
++        // LMF-UE-Measurement-ID IE (id=2) content byte is always at fixed offset 13
++        // for this message shape (header=5B + openTypeLen=1B + inner-ext-pad=1B +
++        // count=2B + id=2B + crit=1B + openTypeLen=1B = 13 bytes precede it).
++        // Ref: shared/nrppa golden-byte verification, LMF-004 fix session.
++        if (dlPdu.length() < 14)
++        {
++            m_logger->warn("NRPPa E-CIDMeasurementInitiationRequest too short (%d) -- ignoring",
++                           dlPdu.length());
++            return;
++        }
++        uint16_t lmfMeasId = static_cast<uint16_t>((dlPdu.get(13) >> 3) & 0x0F) + 1;
++        uint16_t ranMeasId = 1;
++
++        NrppaBitWriter inner;
++        inner.writeBits(0, 1); // extension marker
++        inner.align();
++        writeSeqOfLen16(inner, 3);
++        writeIEField(inner, 2 /*id-LMF-UE-Measurement-ID*/, 0 /*reject*/, ueMeasIDContent(lmfMeasId));
++        writeIEField(inner, 6 /*id-RAN-UE-Measurement-ID*/, 0 /*reject*/, ueMeasIDContent(ranMeasId));
++        auto result = buildECIDMeasurementResult(plmn, nci, tac, kSurveyLatDeg, kSurveyLonDeg,
++                                                   kSurveyUncertaintyM, kSurveyConfidencePct);
++        writeIEField(inner, 7 /*id-E-CID-MeasurementResult*/, 1 /*ignore*/, result);
++
++        NrppaBitWriter w;
++        w.writeAlignedU8(0x00); // InitiatingMessage
++        w.writeAlignedU8(0x04); // procCode=4 (e-CIDMeasurementReport)
++        w.writeBits(1, 2);
++        w.writeBits(0, 6); // criticality=ignore
++        w.writeAlignedU16(3); // NRPPATransactionID
++        writeOpenType(w, inner.buf);
++        reply = w.buf;
++
++        m_logger->info(
++            "NRPPa ECIDMeasurementInitiationRequest (procCode=2) -> ECIDMeasurementReport "
++            "(procCode=4, AP position, APER)");
++    }
++    else
++    {
++        m_logger->warn("Unsupported NRPPa CHOICE/procCode 0x%02x/0x%02x -- ignoring", choice, procCode);
++        return;
++    }
++
++    // Wrap the reply NRPPa-PDU in an UplinkUEAssociatedNRPPaTransport (ProcCode=50).
++    // AMF-UE-NGAP-ID and RAN-UE-NGAP-ID are added automatically by sendNgapUeAssociated.
++    std::vector<ASN_NGAP_UplinkUEAssociatedNRPPaTransportIEs *> ies;
++
++    auto *ie = asn::New<ASN_NGAP_UplinkUEAssociatedNRPPaTransportIEs>();
++    ie->id = ASN_NGAP_ProtocolIE_ID_id_NRPPa_PDU;
++    ie->criticality = ASN_NGAP_Criticality_reject;
++    ie->value.present = ASN_NGAP_UplinkUEAssociatedNRPPaTransportIEs__value_PR_NRPPa_PDU;
++    asn::SetOctetString(ie->value.choice.NRPPa_PDU, OctetString(std::move(reply)));
++    ies.push_back(ie);
++
++    auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_UplinkUEAssociatedNRPPaTransport>(ies);
++    sendNgapUeAssociated(ue->ctxId, pdu);
++
++    m_logger->info("Uplink UE-associated NRPPa Transport sent (E-CID APER)");
++}
+ 
+ } // namespace nr::gnb
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+index 84c77d8..4443f8f 100644
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -36,6 +36,7 @@ extern "C"
+     struct ASN_NGAP_PDUSessionResourceReleaseCommand;
+     struct ASN_NGAP_Paging;
+     struct ASN_NGAP_LocationReportingControl;
++    struct ASN_NGAP_DownlinkUEAssociatedNRPPaTransport;
+ }
+ 
+ namespace nr::gnb
+@@ -131,6 +132,9 @@ class NgapTask : public NtsTask
+ 
+     /* Location reporting (5GC Rel-17 mod) */
+     void receiveLocationReportingControl(int amfId, ASN_NGAP_LocationReportingControl *msg);
++
++    /* NRPPa E-CID transport (5GC Rel-17 mod) */
++    void receiveDownlinkUEAssociatedNRPPaTransport(int amfId, ASN_NGAP_DownlinkUEAssociatedNRPPaTransport *msg);
+ };
+ 
+ } // namespace nr::gnb
+\ No newline at end of file
+diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
+index ca1cb4b..ce41b7a 100644
+--- a/src/gnb/ngap/transport.cpp
++++ b/src/gnb/ngap/transport.cpp
+@@ -303,6 +303,14 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+             // with a LocationReport carrying the serving cell. Ref: TS 38.413 §8.17.
+             receiveLocationReportingControl(amf->ctxId, &value.choice.LocationReportingControl);
+             break;
++        case ASN_NGAP_InitiatingMessage__value_PR_DownlinkUEAssociatedNRPPaTransport:
++            // 5GC Rel-17 mod: stock UERANSIM gNB has no NRPPa-Transport handler, so the AMF's
++            // DL NRPPa (E-CID capability + measurement requests, relayed from the LMF) is dropped
++            // and the LMF falls back to Cell-ID. This answers it with synthetic E-CID measurements
++            // returned via UplinkUEAssociatedNRPPaTransport. Ref: TS 38.413 §8.17.3, TS 38.455 §8.
++            receiveDownlinkUEAssociatedNRPPaTransport(amf->ctxId,
++                                                      &value.choice.DownlinkUEAssociatedNRPPaTransport);
++            break;
+         default:
+             m_logger->err("Unhandled NGAP initiating-message received (%d)", value.present);
+             break;

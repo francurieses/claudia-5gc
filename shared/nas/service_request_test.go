@@ -6,9 +6,11 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/nas"
 )
 
-// tmsiLV is a spec-conformant mandatory 5G-S-TMSI IE (LV, TS 24.501 §8.2.16.1):
-// length=7, identity-type octet 0xF4, AMF Set ID/Pointer, 5G-TMSI 0x00000010.
-var tmsiLV = []byte{0x07, 0xF4, 0x00, 0x40, 0x00, 0x00, 0x00, 0x10}
+// tmsiLV is a spec-conformant mandatory 5G-S-TMSI IE (LV-E, 2-byte length,
+// TS 24.501 Table 8.2.15.1.1): length=7, identity-type octet 0xF4,
+// AMF Set ID/Pointer, 5G-TMSI 0x00000010. This matches UERANSIM's encoding
+// (IE5gsMobileIdentity is an InformationElement6 → 2-byte length).
+var tmsiLV = []byte{0x00, 0x07, 0xF4, 0x00, 0x40, 0x00, 0x00, 0x00, 0x10}
 
 func TestDecodeServiceRequest_Signalling(t *testing.T) {
 	// ServiceType=Signalling(0x00) | NGKSI.Type=1 NGKSI.KSI=3 → combined byte: (0x00<<4)|(1<<3)|0x03 = 0x0B
@@ -88,5 +90,23 @@ func TestServiceRequestRoundTrip_ViaMessage(t *testing.T) {
 	}
 	if sr.NGKSI.KeySetIdentifier != 1 {
 		t.Errorf("KSI: got %d, want 1", sr.NGKSI.KeySetIdentifier)
+	}
+}
+
+func TestPSIInStatus(t *testing.T) {
+	// UERANSIM encodes PSI 1 pending as first wire octet 0x02 (bit1), second 0x00.
+	// DecodeServiceRequest stores it as val[0]<<8|val[1] = 0x0200.
+	if !nas.PSIInStatus(0x0200, 1) {
+		t.Error("PSI 1 should be set in 0x0200")
+	}
+	if nas.PSIInStatus(0x0200, 2) {
+		t.Error("PSI 2 should not be set in 0x0200")
+	}
+	// PSI 8 lives in the second wire octet bit0 → mask bit0.
+	if !nas.PSIInStatus(0x0001, 8) {
+		t.Error("PSI 8 should be set in 0x0001")
+	}
+	if nas.PSIInStatus(0xFFFF, 16) {
+		t.Error("PSI 16 is out of range and must be false")
 	}
 }

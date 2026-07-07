@@ -25,6 +25,7 @@ type Deps struct {
 	AMFBaseURL string // for push-policies endpoint
 	UDMBaseURL string // for subscription QoS lookups (Nudm_SDM sm-data)
 	PCFBaseURL string // for SM policy QoS overrides (NW-triggered session flow)
+	LMFBaseURL string // for Nlmf_Location DetermineLocation (UE location map)
 	// MTLSClient is an HTTP client carrying the portal's mTLS client certificate.
 	// Used for /healthz probes against NFs that enforce mutual TLS (NRF, AMF).
 	MTLSClient *http.Client
@@ -113,6 +114,10 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Get("/qos/subscription/{supi}", deps.handleQoSSubscription)
 		// NW-triggered additional PDU session (URSP-based — TS 23.503 §6.6.2)
 		r.Post("/qos/nw-sessions", deps.handleNWSessionTrigger)
+
+		// UE Location (Nlmf_Location DetermineLocation — TS 29.572 §5.2.2.2)
+		r.Get("/location/summary", deps.handleLocationSummary)
+		r.Get("/location/ue/{supi}", deps.handleGetUELocation)
 
 		// Policies (URSP — TS 24.526 / TS 29.525)
 		r.Get("/policies", deps.handleListPolicies)
