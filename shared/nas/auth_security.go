@@ -15,7 +15,7 @@ type AuthenticationRequest struct {
 	// IEI 0x21 — Authentication parameter RAND (TV, 16 bytes)
 	RAND [16]byte
 	// IEI 0x20 — Authentication parameter AUTN (TLV, 16 bytes)
-	// Note: UERANSIM uses 0x20 for AUTN; TS 24.501 Table 8.2.1.1.1 specifies 0x28.
+	// Ref: TS 24.501 Table 8.2.1.1.1 (IEI 20, format from TS 24.008 §10.5.3.1.1)
 	AUTN [16]byte
 	// Optional (IEI 0x78 — EAP message)
 	EAPMessage []byte
@@ -39,7 +39,7 @@ func EncodeAuthenticationRequest(ar *AuthenticationRequest) ([]byte, error) {
 	out = append(out, 0x21)
 	out = append(out, ar.RAND[:]...)
 
-	// IEI 0x20 — AUTN (16 bytes): TLV — UERANSIM uses 0x20, not 0x28
+	// IEI 0x20 — AUTN (16 bytes): TLV per TS 24.501 Table 8.2.1.1.1
 	out = append(out, 0x20, 0x10)
 	out = append(out, ar.AUTN[:]...)
 
@@ -68,7 +68,7 @@ func DecodeAuthenticationRequest(b []byte) (*AuthenticationRequest, error) {
 	}
 
 	// Optional IEs: RAND IEI=0x21 TV (no length), AUTN IEI=0x20 TLV, EAP IEI=0x78 TLV-E.
-	// UERANSIM uses 0x20 for AUTN (non-standard; TS 24.501 §8.2.1.1 specifies 0x28).
+	// Ref: TS 24.501 Table 8.2.1.1.1
 	for rdr.Len() > 0 {
 		iei, err := rdr.ReadByte()
 		if err != nil {
@@ -214,18 +214,32 @@ func DecodeIdentityResponse(b []byte) (*IdentityResponse, error) {
 // SecurityModeCommand selects NAS security algorithms and starts NAS security.
 type SecurityModeCommand struct {
 	// Mandatory
-	SelectedNASSecurityAlgorithms NASSecurityAlgorithms
-	NGKSI                         NGKSI
+	SelectedNASSecurityAlgorithms  NASSecurityAlgorithms
+	NGKSI                          NGKSI
 	ReplayedUESecurityCapabilities UESecurityCapability
 	// Optional
-	// IEI 0xE- — IMEISV request
+	// IEI 0xE- — IMEISV request (TV ½, TS 24.501 §9.11.3.28; value 1 = requested)
 	IMEISVRequest *byte
-	// IEI 0x57 — replayed NonCurrentNGKSI
-	// IEI 0x36 — HashAMF
-	HashAMF []byte
-	// IEI 0x77 — NAS message container (replayed Registration Request)
+	// IEI 0x36 — Additional 5G security information (TLV 3, TS 24.501 §9.11.3.12).
+	// Value octet: bit 1 = HDP (horizontal derivation), bit 2 = RINMR
+	// (retransmission of the initial NAS message requested). The AMF sets RINMR
+	// when the initial NAS message was sent without integrity protection so the
+	// UE retransmits the full message (with non-cleartext IEs) in the NAS message
+	// container of the Security Mode Complete. Ref: TS 24.501 §4.4.6, §5.4.2.2.
+	Additional5GSecurityInfo *byte
+	// IEI 0x71 — NAS message container (replayed Registration Request)
 	NASMessageContainer []byte
 }
+
+// Additional 5G security information value bits (TS 24.501 §9.11.3.12).
+const (
+	Additional5GSecInfoHDP   byte = 0x01 // horizontal derivation of KAMF required
+	Additional5GSecInfoRINMR byte = 0x02 // retransmission of initial NAS message requested
+)
+
+// IMEISVRequested is the IMEISV request IE value "IMEISV requested"
+// (TS 24.501 §9.11.3.28 → TS 24.008 §10.5.5.10).
+const IMEISVRequested byte = 0x01
 
 // EncodeSecurityModeCommand serialises the message body.
 // Ref: TS 24.501 §8.2.25.1 Figure 8.2.25.1.1
@@ -245,10 +259,15 @@ func EncodeSecurityModeCommand(smc *SecurityModeCommand) ([]byte, error) {
 	out = append(out, byte(len(caps)))
 	out = append(out, caps...)
 
-	// IEI 0x36 — HashAMF (optional)
-	if len(smc.HashAMF) > 0 {
-		out = append(out, 0x36, byte(len(smc.HashAMF)))
-		out = append(out, smc.HashAMF...)
+	// IEI 0xE- — IMEISV request (TV ½: IEI in high nibble, value in low nibble).
+	// Ordered per TS 24.501 Table 8.2.25.1.1 (before Additional 5G security info).
+	if smc.IMEISVRequest != nil {
+		out = append(out, 0xE0|(*smc.IMEISVRequest&0x07))
+	}
+
+	// IEI 0x36 — Additional 5G security information (TLV, 1-octet value)
+	if smc.Additional5GSecurityInfo != nil {
+		out = append(out, 0x36, 0x01, *smc.Additional5GSecurityInfo)
 	}
 
 	// IEI 0x71 — NAS message container (replayed Registration Request, optional)
@@ -286,10 +305,19 @@ func DecodeSecurityModeCommand(b []byte) (*SecurityModeCommand, error) {
 		if err != nil {
 			break
 		}
+		// TV ½ IEs: IEI in high nibble. 0xE- = IMEISV request.
+		if iei>>4 == 0xE {
+			v := iei & 0x07
+			smc.IMEISVRequest = &v
+			continue
+		}
 		switch iei {
-		case 0x36:
+		case 0x36: // Additional 5G security information — TLV
 			l, _ := rdr.ReadByte()
-			smc.HashAMF, _ = rdr.ReadBytes(int(l))
+			if v, err := rdr.ReadBytes(int(l)); err == nil && len(v) > 0 {
+				val := v[0]
+				smc.Additional5GSecurityInfo = &val
+			}
 		case 0x71:
 			hi, _ := rdr.ReadByte()
 			lo, _ := rdr.ReadByte()

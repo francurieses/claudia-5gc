@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +93,44 @@ type Handler struct {
 	// DL/UL NAS Transport rather than a dedicated NGAP procedure.
 	// Ref: TS 24.501 §8.7.4; TS 23.273 §7.2.
 	pendingLPP sync.Map // map[int64]chan LPPResult
+
+	// pendingRelease holds one pendingReleaseState per NW-initiated PDU Session
+	// Release, keyed by "<amfUeNgapId>:<psi>". Inserted by
+	// InitiateNetworkPDUSessionRelease after the Release Command is sent;
+	// resolved by completeNetworkPDUSessionRelease when the UE's PDU Session
+	// Release Complete arrives (or when the T3592 guard fires). The SM context
+	// must not be deleted before that point — TS 23.502 §4.3.4.3 orders the
+	// Nsmf_PDUSession_UpdateSMContext (and the N4 release it triggers) *after*
+	// the UE confirms the release.
+	// Ref: TS 23.502 §4.3.4.3 steps 5-8.
+	pendingRelease sync.Map // map[string]*pendingReleaseState
+}
+
+// pendingReleaseState tracks one in-flight NW-initiated PDU Session Release
+// between the Release Command going out on N1/N2 and the UE's Release Complete
+// coming back. Ref: TS 23.502 §4.3.4.3.
+type pendingReleaseState struct {
+	smContextRef string
+	guard        *time.Timer
+	once         sync.Once
+}
+
+// t3592Guard bounds how long the AMF waits for a PDU Session Release Complete
+// before releasing the SM context anyway. T3592 is the network-side timer for
+// the PDU Session Release Command (8 s); the extra second covers N1/N2 transit
+// so a UE that answers just inside T3592 still takes the confirmed path.
+// Ref: TS 24.501 §10.3 (T3592), TS 23.502 §4.3.4.3.
+const t3592Guard = 9 * time.Second
+
+// releaseSMContextTimeout bounds the detached Nsmf_PDUSession SM context
+// deletion. The trigger for a NW-initiated release is an HTTP request whose
+// context dies the moment the handler returns, so the SBI call must run on a
+// context detached from it — otherwise the DELETE is cancelled in flight.
+const releaseSMContextTimeout = 10 * time.Second
+
+// pendingReleaseKey builds the pendingRelease map key for a UE + PDU session.
+func pendingReleaseKey(amfUeNgapID int64, psi uint8) string {
+	return fmt.Sprintf("%d:%d", amfUeNgapID, psi)
 }
 
 // LPPResult carries the outcome of a DL/UL LPP relay round-trip over the NAS
@@ -435,6 +474,29 @@ func (h *Handler) handleSecurityModeReject(
 func (h *Handler) handleSecurityModeComplete(
 	ctx context.Context, ue *amfctx.UEContext, msg *nas.Message) error {
 
+	// Process the Security Mode Complete payload before completing registration:
+	//   - IMEISV: requested in the SMC (IEI 0xE-); store as the UE's PEI.
+	//   - NAS message container: the retransmitted complete Registration Request.
+	//     A real UE sends only cleartext IEs in the unprotected initial message
+	//     (TS 24.501 §4.4.6), so the non-cleartext IEs — Requested NSSAI, 5GMM
+	//     capability — are only visible here. Must be applied before Phase3
+	//     computes the Allowed NSSAI. Ref: TS 24.501 §5.4.2.3.
+	if smcComplete, ok := msg.Body.(*nas.SecurityModeComplete); ok {
+		if smcComplete.IMEISV != nil && smcComplete.IMEISV.IMEISV != "" {
+			ue.PEI = "imeisv-" + smcComplete.IMEISV.IMEISV
+			h.logger.Info("IMEISV received in SecurityModeComplete",
+				"procedure", "InitialRegistration",
+				"amf_ue_ngap_id", ue.AMFUENGAPId,
+				"supi", ue.SUPI,
+				"pei", ue.PEI,
+				"spec_ref", "TS 24.501 §8.2.26",
+			)
+		}
+		if len(smcComplete.NASMessageContainer) > 0 {
+			h.applyRetransmittedRegistrationRequest(ue, smcComplete.NASMessageContainer)
+		}
+	}
+
 	// Phase 3: fetch subscription data, assign GUTI, build RegistrationAccept
 	regAccept, err := h.reg.Phase3_ProcessSMCComplete(ctx, ue)
 	if err != nil {
@@ -459,10 +521,16 @@ func (h *Handler) handleSecurityModeComplete(
 		return err
 	}
 
-	// KgNB is derived from KAMF and NAS uplink COUNT so the gNB can activate
-	// AS security alongside the initial radio context.
+	// KgNB is derived from KAMF and the NAS uplink COUNT of the message that
+	// triggered AS security activation — here the Security Mode Complete. The
+	// UE derives KgNB from that same count, so the two must match exactly or the
+	// gNB's RRC Security Mode Command fails the UE's MAC check (real gNB replies
+	// InitialContextSetupFailure, RadioNetwork=failure-in-radio-interface-procedure).
+	// unwrapNASSecurity already incremented UplinkCount while decoding the Security
+	// Mode Complete, so the triggering message's count is UplinkCount-1 — matching
+	// the Service Request and Registration Update paths below.
 	// Ref: TS 33.501 §A.9, TS 38.413 §8.3.1
-	kgnbBytes := kdf.KgNB(ue.SecurityCtx.KAMF, ue.SecurityCtx.UplinkCount, 0x01)
+	kgnbBytes := kdf.KgNB(ue.SecurityCtx.KAMF, ue.SecurityCtx.UplinkCount-1, 0x01)
 	var secKey [32]byte
 	copy(secKey[:], kgnbBytes)
 	ue.KgNB = secKey
@@ -507,6 +575,37 @@ func (h *Handler) handleSecurityModeComplete(
 	// N2 context now established — UE is CM-CONNECTED.
 	ue.CMState = amfctx.CMConnected
 	return nil
+}
+
+// applyRetransmittedRegistrationRequest decodes the complete Registration
+// Request the UE retransmitted in the Security Mode Complete's NAS message
+// container (in response to the RINMR bit in the Security Mode Command) and
+// applies the non-cleartext IEs to the UE context. Currently: Requested NSSAI
+// (drives the Allowed NSSAI intersection in Phase3). Decode failures are
+// logged and ignored — the registration continues with the cleartext IEs.
+// Ref: TS 24.501 §4.4.6, §5.4.2.3; TS 23.502 §4.2.2.2.2
+func (h *Handler) applyRetransmittedRegistrationRequest(ue *amfctx.UEContext, container []byte) {
+	inner, err := nas.Decode(container)
+	if err != nil {
+		h.logger.Warn("SecurityModeComplete NAS message container decode failed",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "error", err,
+			"spec_ref", "TS 24.501 §5.4.2.3")
+		return
+	}
+	regReq, ok := inner.Body.(*nas.RegistrationRequest)
+	if !ok || inner.Header.MessageType != nas.MsgTypeRegistrationRequest {
+		return
+	}
+	if regReq.RequestedNSSAI != nil {
+		ue.RequestedNSSAI = nssaiToSubscribed(regReq.RequestedNSSAI)
+	}
+	h.logger.Info("retransmitted Registration Request processed from SecurityModeComplete",
+		"procedure", "InitialRegistration",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"requested_nssai_count", len(ue.RequestedNSSAI),
+		"spec_ref", "TS 24.501 §4.4.6",
+	)
 }
 
 // ---- Registration Complete ----------------------------------------------
@@ -770,12 +869,14 @@ func (h *Handler) sendNASSecured(ue *amfctx.UEContext, epd byte, msgType nas.Mes
 		return nil, fmt.Errorf("nas: NIA2: %w", err)
 	}
 
-	// TS 24.501 §4.4.4.3: when 5G-EA0 is selected, use SHT=0x01 (integrity only).
-	// SHT=0x02 signals ciphering to Wireshark even if inner PDU is plaintext.
+	// Once the 5G NAS security context is active, every DL NAS message is sent
+	// as "integrity protected and ciphered" (SHT=0x02) per TS 24.501 §4.4.5 —
+	// this holds even when the selected ciphering algorithm is 5G-EA0, where the
+	// ciphering is a no-op and the inner PDU stays plaintext (handled above). Real
+	// UEs (e.g. Nokia) that have activated a security context strictly require
+	// SHT=0x02 and silently discard SHT=0x01 messages, breaking Registration
+	// Complete and the whole registration. (UERANSIM leniently accepts 0x01.)
 	sht := nas.SecurityHeaderIntegrityProtectedAndCiphered
-	if ue.SecurityCtx.CipheringAlgID == 0 {
-		sht = nas.SecurityHeaderIntegrityProtected
-	}
 
 	pdu := make([]byte, 7+len(ciphered))
 	pdu[0] = epd
@@ -1489,6 +1590,10 @@ func (h *Handler) handleULNASTransport(
 			"result", "OK",
 			"spec_ref", "TS 24.501 §8.3.10",
 		)
+		// For a NW-initiated release this is step 5 of TS 23.502 §4.3.4.3 — the
+		// UE's confirmation is what releases the SM context (and with it the N4
+		// session). No-op for a UE-initiated release, which deletes it inline.
+		h.completeNetworkPDUSessionRelease(ctx, ue, pduSessionID, "RELEASE_COMPLETE")
 		return nil
 	case nas.MsgTypePDUSessionModificationRequest:
 		return h.handlePDUSessionModification(ctx, ue, pduSessionID, pti, transport.PayloadContainer, log)
@@ -1583,11 +1688,33 @@ func (h *Handler) handleULNASTransport(
 	}
 
 	// Resolve the S-NSSAI for this session. The UE-requested slice is honoured
-	// only if it is in the Allowed NSSAI; otherwise the AMF substitutes an
-	// allowed slice (TS 23.501 §5.15.5.2.1). This stops a UE configured with a
-	// stale/unauthorised slice from establishing a session on it.
+	// only if it is in the Allowed NSSAI (TS 23.501 §5.15.5.2.1); otherwise the
+	// request is rejected rather than moved to another slice.
 	// Ref: TS 23.502 §4.3.2.2.1 step 3a
-	snssai, overridden := resolveSessionSNSSAI(transport.SNSSAI, ue.AllowedNSSAI)
+	snssai, authorised := resolveSessionSNSSAI(transport.SNSSAI, ue.AllowedNSSAI)
+
+	if pduSessionID == 0 {
+		log.Warn("UL NAS Transport: invalid PDU Session ID")
+		return nil
+	}
+
+	// The UE asked for a slice outside its Allowed NSSAI. Do not forward the
+	// 5GSM message to the SMF: answer with a DL NAS TRANSPORT carrying 5GMM
+	// cause #90 "payload was not forwarded" and echo the payload container back.
+	// Ref: TS 24.501 §5.4.5.2.5
+	if !authorised {
+		reqSST, reqSD := requestedSNSSAIForLog(transport.SNSSAI)
+		log.Warn("UE requested S-NSSAI not in Allowed NSSAI — rejecting PDU session",
+			"pdu_session_id", pduSessionID,
+			"requested_sst", reqSST, "requested_sd", reqSD,
+			"allowed_nssai", formatAllowedNSSAI(ue.AllowedNSSAI),
+			"result", "REJECT", "cause", nas.CausePayloadNotForwarded,
+			"spec_ref", "TS 24.501 §5.4.5.2.5",
+		)
+		return h.rejectULNASTransport(ue, pduSessionID,
+			transport.PayloadContainerType, transport.PayloadContainer,
+			uint8(nas.CausePayloadNotForwarded))
+	}
 
 	// Use the subscribed DNN as the default only when the UE did NOT provide one.
 	// Per TS 23.502 §4.3.2.2.1: the subscribed DNN is substituted only when the
@@ -1599,26 +1726,6 @@ func (h *Handler) handleULNASTransport(
 			"subscribed_dnn", snssai.DNN,
 			"spec_ref", "TS 23.502 §4.3.2.2.1 step 3a",
 		)
-	}
-	if overridden {
-		reqSD := ""
-		if transport.SNSSAI != nil && transport.SNSSAI.SD != nil {
-			reqSD = fmt.Sprintf("%06x", *transport.SNSSAI.SD)
-		}
-		reqSST := uint8(0)
-		if transport.SNSSAI != nil {
-			reqSST = transport.SNSSAI.SST
-		}
-		log.Warn("UE requested S-NSSAI not in Allowed NSSAI — substituting allowed slice",
-			"requested_sst", reqSST, "requested_sd", reqSD,
-			"resolved_sst", snssai.SST, "resolved_sd", snssai.SD,
-			"spec_ref", "TS 23.501 §5.15.5.2.1",
-		)
-	}
-
-	if pduSessionID == 0 {
-		log.Warn("UL NAS Transport: invalid PDU Session ID")
-		return nil
 	}
 
 	log = log.With("pdu_session_id", pduSessionID, "snssai_sst", snssai.SST, "snssai_sd", snssai.SD)
@@ -1996,8 +2103,12 @@ func (h *Handler) handlePDUSessionRelease(
 			DeleteSMContext(ctx context.Context, smContextRef string) error
 		})
 		if canDel {
+			// Detach from the caller's context: this outlives the handler that
+			// spawned it, and a cancelled ctx aborts the DELETE in flight.
+			delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseSMContextTimeout)
 			go func() {
-				if err := smfDel.DeleteSMContext(ctx, smContextRef); err != nil {
+				defer cancel()
+				if err := smfDel.DeleteSMContext(delCtx, smContextRef); err != nil {
 					log.Warn("SMF DeleteSMContext failed", "error", err, "smContextRef", smContextRef)
 				} else {
 					log.Info("SMF DeleteSMContext succeeded", "smContextRef", smContextRef)
@@ -2034,9 +2145,16 @@ func (h *Handler) handlePDUSessionRelease(
 //
 // Flow per TS 23.502 §4.3.4.3:
 //  1. Build 5GSM PDU Session Release Command + wrap in secured DL NAS Transport
-//  2. Send NGAP PDU Session Resource Release Command to gNB
-//  3. Call SMF to delete the SM context (PFCP teardown on UPF)
-//  4. Remove PDU session from UE context
+//  2. Send NGAP PDU Session Resource Release Command to gNB (steps 3-4)
+//  3. Wait for the UE's PDU Session Release Complete on N1 (steps 5-6)
+//  4. Call SMF to delete the SM context — this is the Nsmf_PDUSession_UpdateSMContext
+//     of step 7, and it is what makes the SMF tear the N4 session down (step 8)
+//  5. Remove PDU session from UE context
+//
+// Steps 3-5 run in completeNetworkPDUSessionRelease, driven either by the UE's
+// Release Complete or by the T3592 guard timer if the UE never answers. Deleting
+// the SM context here — before the UE has confirmed — would both invert the spec
+// ordering and race the caller's request context.
 //
 // Ref: TS 23.502 §4.3.4.3, TS 24.501 §8.3.9
 func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfctx.UEContext, pduSessionID uint8) error {
@@ -2073,31 +2191,26 @@ func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 		return fmt.Errorf("nas: NW PDU release: encode DL NAS Transport: %w", err)
 	}
 
-	// Send NGAP PDU Session Resource Release Command to gNB
+	// Send NGAP PDU Session Resource Release Command to gNB (TS 23.502 §4.3.4.3 step 3)
 	if err := h.sender.SendPDUSessionResourceReleaseCommand(ue, pduSessionID, nasPDU); err != nil {
 		return fmt.Errorf("nas: NW PDU release: SendPDUSessionResourceReleaseCommand: %w", err)
 	}
 
-	// Delete SM context at SMF (async — PFCP teardown happens inside SMF)
-	if smContextRef != "" {
-		smfDel, canDel := h.sender.(interface {
-			DeleteSMContext(ctx context.Context, smContextRef string) error
-		})
-		if canDel {
-			go func() {
-				if err := smfDel.DeleteSMContext(ctx, smContextRef); err != nil {
-					log.Warn("SMF DeleteSMContext failed on NW PDU release",
-						"smContextRef", smContextRef, "error", err)
-				}
-			}()
-		}
-	}
-
-	// Remove PDU session from UE context
-	ue.Lock()
-	delete(ue.PDUSessions, pduSessionID)
-	ue.Unlock()
-	h.reg.PersistUE(ctx, ue)
+	// Arm the pending release. The SM context lives until the UE confirms with a
+	// PDU Session Release Complete (step 5) or T3592 expires — see
+	// completeNetworkPDUSessionRelease. The context is detached from the caller's
+	// (an HTTP mgmt request whose ctx is cancelled as soon as it returns 202) but
+	// keeps its values so the correlation_id survives into the SBI call.
+	detached := context.WithoutCancel(ctx)
+	key := pendingReleaseKey(ue.AMFUENGAPId, pduSessionID)
+	st := &pendingReleaseState{smContextRef: smContextRef}
+	st.guard = time.AfterFunc(t3592Guard, func() {
+		log.Warn("PDU Session Release Complete not received before T3592 — releasing SM context anyway",
+			"spec_ref", "TS 24.501 §10.3",
+		)
+		h.completeNetworkPDUSessionRelease(detached, ue, pduSessionID, "T3592_EXPIRY")
+	})
+	h.pendingRelease.Store(key, st)
 
 	log.Info("NW PDU Session Release Command sent",
 		"interface", "N2", "direction", "OUT",
@@ -2105,6 +2218,69 @@ func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 		"result", "OK",
 	)
 	return nil
+}
+
+// completeNetworkPDUSessionRelease finishes a NW-initiated PDU Session Release
+// once the UE has confirmed it (or T3592 has expired): it deletes the SM context
+// at the SMF — which is what drives the N4/PFCP teardown on the UPF — and drops
+// the session from the UE context. Safe to call more than once and for sessions
+// that were never NW-released; both are no-ops.
+//
+// Ref: TS 23.502 §4.3.4.3 steps 7-8, TS 29.502 §5.2.2.3.3.
+func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfctx.UEContext, pduSessionID uint8, reason string) {
+	key := pendingReleaseKey(ue.AMFUENGAPId, pduSessionID)
+	v, ok := h.pendingRelease.LoadAndDelete(key)
+	if !ok {
+		return // not a NW-initiated release, or already completed
+	}
+	st := v.(*pendingReleaseState)
+	st.once.Do(func() {
+		if st.guard != nil {
+			st.guard.Stop()
+		}
+
+		log := h.logger.With(
+			"procedure", "NetworkPDUSessionRelease",
+			"amf_ue_ngap_id", ue.AMFUENGAPId,
+			"supi", ue.SUPI,
+			"pdu_session_id", pduSessionID,
+			"smContextRef", st.smContextRef,
+			"reason", reason,
+		)
+
+		if st.smContextRef != "" {
+			if smfDel, canDel := h.sender.(interface {
+				DeleteSMContext(ctx context.Context, smContextRef string) error
+			}); canDel {
+				delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseSMContextTimeout)
+				defer cancel()
+				if err := smfDel.DeleteSMContext(delCtx, st.smContextRef); err != nil {
+					log.Warn("SMF DeleteSMContext failed on NW PDU release",
+						"interface", "Nsmf", "direction", "OUT",
+						"spec_ref", "TS 29.502 §5.2.2.3.3",
+						"result", "FAILURE", "error", err,
+					)
+				} else {
+					log.Info("SM context deleted at SMF",
+						"interface", "Nsmf", "direction", "OUT",
+						"spec_ref", "TS 23.502 §4.3.4.3 step 7",
+						"result", "OK",
+					)
+				}
+			}
+		}
+
+		// Remove PDU session from UE context
+		ue.Lock()
+		delete(ue.PDUSessions, pduSessionID)
+		ue.Unlock()
+		h.reg.PersistUE(ctx, ue)
+
+		log.Info("NW-initiated PDU Session Release complete",
+			"spec_ref", "TS 23.502 §4.3.4.3",
+			"result", "OK",
+		)
+	})
 }
 
 // InitiateNetworkQoSModification triggers a NW-initiated PDU Session Modification to
@@ -2233,13 +2409,13 @@ func (h *Handler) handlePDUSessionModification(
 //
 // Per TS 23.501 §5.15.5.2.1, the S-NSSAI of a PDU session must be one of the
 // UE's Allowed NSSAI. The slice the UE requests in the UL NAS Transport is
-// honoured only when it is in the Allowed NSSAI; otherwise the AMF substitutes
-// an allowed slice (the first one). This prevents a UE configured with a stale
-// or unauthorised slice from pinning a PDU session to it — e.g. after the
-// operator changes the subscriber's slice, a UERANSIM UE still configured with
-// the old S-NSSAI must not be able to establish a session on it.
+// honoured only when it is in the Allowed NSSAI; a UE configured with a stale
+// or unauthorised slice must not be able to establish a session on it — e.g.
+// after the operator changes the subscriber's slice.
 //
-// The bool return reports whether the UE-requested slice was overridden.
+// The bool return reports whether the resolved slice is authorised. False means
+// the UE asked for a slice outside its Allowed NSSAI and the caller must reject
+// the request; the returned S-NSSAI is then zero and must not be used.
 // Falls back to the first allowed slice when the UE indicates none; last resort
 // is SST=1/SD="000001" when the UE has no Allowed NSSAI at all.
 // Ref: TS 23.501 §5.15.5.2.1, TS 23.502 §4.3.2.2.1 step 3a
@@ -2254,20 +2430,64 @@ func resolveSessionSNSSAI(t *nas.SNSSAITransport, allowed []amfctx.SNSSAISubscri
 			if a.SST == requested.SST && a.SD == requested.SD {
 				// Return the subscription entry (not the UE-requested one) so that
 				// the portal-assigned DNN is carried through to PDU session setup.
-				return a, false
+				return a, true
 			}
 		}
-		// Requested slice is not authorised — substitute an allowed one.
+		// Requested slice is not in the Allowed NSSAI. Never substitute another
+		// slice here: the session would silently come up on a slice the UE did
+		// not ask for, with the wrong QoS and UP path, and both the UE and the
+		// operator would see it as a success. The caller rejects instead.
 		if len(allowed) > 0 {
-			return allowed[0], true
+			return amfctx.SNSSAISubscribed{}, false
 		}
-		// No Allowed NSSAI known — accept the requested slice as a last resort.
-		return requested, false
+		// No Allowed NSSAI known (e.g. context restored without it) — accept the
+		// requested slice rather than blocking the session on missing state.
+		return requested, true
 	}
+	// UE indicated no S-NSSAI — the AMF selects one on its behalf, which is not
+	// an authorisation failure.
 	if len(allowed) > 0 {
-		return allowed[0], false
+		return allowed[0], true
 	}
-	return amfctx.SNSSAISubscribed{SST: 1, SD: "000001"}, false
+	return amfctx.SNSSAISubscribed{SST: 1, SD: "000001"}, true
+}
+
+// requestedSNSSAIForLog renders the UE-requested S-NSSAI for logging. Returns
+// SST=0 and an empty SD when the UE indicated no slice.
+func requestedSNSSAIForLog(t *nas.SNSSAITransport) (uint8, string) {
+	if t == nil {
+		return 0, ""
+	}
+	sd := ""
+	if t.SD != nil {
+		sd = fmt.Sprintf("%06x", *t.SD)
+	}
+	return t.SST, sd
+}
+
+// formatAllowedNSSAI renders the Allowed NSSAI as "sst/sd,sst/sd" so a rejected
+// request shows what the UE was actually entitled to.
+func formatAllowedNSSAI(allowed []amfctx.SNSSAISubscribed) string {
+	parts := make([]string, 0, len(allowed))
+	for _, a := range allowed {
+		parts = append(parts, fmt.Sprintf("%d/%s", a.SST, a.SD))
+	}
+	return strings.Join(parts, ",")
+}
+
+// rejectULNASTransport answers an UL NAS Transport whose 5GSM payload the AMF
+// did not forward to the SMF. The payload container of the received message is
+// echoed back alongside the 5GMM cause, per TS 24.501 §5.4.5.2.5.
+func (h *Handler) rejectULNASTransport(ue *amfctx.UEContext, pduSessionID uint8,
+	containerType uint8, container []byte, cause uint8) error {
+	psi := pduSessionID
+	return h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+		nas.MsgTypeDLNASTransport, &nas.DLNASTransport{
+			PayloadContainerType: containerType,
+			PayloadContainer:     container,
+			PDUSessionID:         &psi,
+			Cause5GMM:            &cause,
+		})
 }
 
 // nssaiToSubscribed converts a NAS NSSAI (SD as uint32) to the AMF context type

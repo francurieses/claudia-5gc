@@ -27,6 +27,7 @@ UDR is the subscription, policy, and exposure data repository. UDM, PCF, and NEF
 | GET | `/nudr-dr/v2/subscription-data/{supi}/{plmn}/provisioned-data/am-data` | AM subscription |
 | GET/PUT | `/nudr-dr/v2/subscription-data/{supi}/{plmn}/provisioned-data/sm-data` | SM subscription (per-slice `5gQosProfile` + `sessionAmbr`, TS 29.503 §6.1.6.2.7) |
 | PUT | `/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access` | AMF context |
+| POST | `/nudr-internal/v1/subscribers/{supi}/sync-sm-data` | **Internal, not 3GPP.** Re-derives sm-data from the slices in am-data. The management portal provisions slices by writing `subscription_am` directly; this keeps the slice→QoS mapping (`store.BuildSMSubscriptions`) owned by the UDR instead of duplicated in the portal. |
 
 ## 4. Implementation Status
 

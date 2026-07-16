@@ -40,6 +40,8 @@ sessions:
 configured-nssai:
   - sst: 1
     sd: 0x000001
+  - sst: 1
+    sd: 0x001234
 default-nssai:
   - sst: 1
     sd: 0x000001

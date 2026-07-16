@@ -2,7 +2,7 @@
 
 ClaudIA 5GC Standalone implementation conforming to 3GPP Release 17, containerized with Docker, observable end-to-end, and managed via a centralized web portal.
 
-> **Current status**: NRF + AMF + SMF + UPF + PCF + UDM + AUSF + NSSF + UDR operational. E2E integration with UERANSIM verified. Network slicing: 4 slices (internet/gold/silver/bronze) with per-DNN subnet isolation. Implemented procedures include PCF SM policy lifecycle, NW-initiated deregistration and PDU session release, Xn and N2 handover, NRF NFStatusSubscribe/Notify, DNN- and SNSSAI-filtered NRF discovery, SUCI Profile A (X25519), full URSP policy delivery (UE policy container), PDU session QoS management, and NW-triggered additional PDU sessions. Tooling: web management portal in `tools/mgmt-portal`, an MCP server in `mcp/` exposing the core to LLM clients, and PacketRusher-driven handover scenarios.
+> **Current status**: NRF + AMF + SMF + UPF + PCF + UDM + AUSF + NSSF + UDR + LMF operational. E2E integration with UERANSIM verified. Network slicing: 4 slices (internet/gold/silver/bronze) with per-DNN subnet isolation. Implemented procedures include PCF SM policy lifecycle, NW-initiated deregistration and PDU session release, Xn and N2 handover, NRF NFStatusSubscribe/Notify, DNN- and SNSSAI-filtered NRF discovery, SUCI Profile A (X25519), full URSP policy delivery (UE policy container), PDU session QoS management, NW-triggered additional PDU sessions, and UE **location services** via the LMF (`Nlmf_Location`): live Cell-ID positioning, Enhanced Cell-ID via NRPPa relay, and A-GNSS via LPP relay over N1 — all validated end-to-end against UERANSIM, with a live map in the portal. Tooling: web management portal in `tools/mgmt-portal`, an MCP server in `mcp/` exposing the core to LLM clients, and PacketRusher-driven handover scenarios.
 
 ---
 
@@ -98,10 +98,11 @@ make portal-build    # Alias for docker-portal
 | **Sessions** | `/sessions` | Active PDU sessions and UE contexts read live from PostgreSQL |
 | **QoS** | `/qos` | PDU session table with 5QI per session color-coded by category (GBR / Non-GBR / Delay-critical, TS 23.501 Table 5.7.4-1). **Modify QoS drawer**: NW-initiated 5QI change (TS 23.502 §4.3.3.2). **Subscription QoS inspector**: look up UDM SM subscription defaults per SUPI (TS 29.503). **NW-Triggered PDU Session panel**: orchestrate an additional PSI via URSP steering with 5-step live checklist (TS 23.503 §6.6.2). **E2E validation panel**: automated end-to-end QoS verification |
 | **Policies** | `/policies` | **Policy Templates**: 4 slice-scoped URSP templates (internet / gold / silver / bronze) — create, edit, delete JSON rule sets. **Apply to UE dialog**: pick a registered UE, optionally customize rules, view the 3GPP delivery path (PCF N15 → AMF → DL NAS Transport), and push in one click. **Per-subscriber overrides**: list active per-SUPI policies with inline Push button. Collapsible spec reference showing IEI encoding and delivery flow (TS 24.526 / TS 29.525 / TS 24.501 Annex D) |
+| **UE Location** | `/location` | Live Cell-ID UE positioning via LMF (`Nlmf_Location DetermineLocation`, TS 29.572 §5.2.2.2) — map view backed by the LMF's synthetic mobility model, refreshed against real gNB `LocationReport` |
 | **UERANSIM** | `/ueransim` | **Test Scenarios panel**: Standard / Multi-Slice / SUCI Profile A — one-click Start/Stop with automatic conflict resolution. Per-container start/stop, live log streaming, **ping test** (selectable source UE IP), `nr-cli` commands (ps-establish, ps-release, deregister, ps-list), PDU session details per UE. **Force Deregister** via AMF management API |
 | **PacketRusher** | `/packetrusher` | Xn Handover (TS 23.502 §4.9.1.2) and N2 Handover (TS 23.502 §4.9.1.3) scenario control — Start/Stop/Pause/Resume per scenario. **Live log tabs**: PacketRusher (Xn), PacketRusher (N2), AMF, SMF. **Mobility event checklist**: auto-detected checkpoints from live logs (UE Registered → PDU Session → HO Triggered → Path Switch / HandoverCommand → Handover Complete) |
 | **Logs** | `/logs` | Real-time log streaming via Docker API. Per-container selector, text filter, pause, export. Structured JSON parsing with level-based colorization |
-| **PCAP** | `/pcap` | On-demand tcpdump per NF sidecar (off by default). Start/Stop, 5-minute rotating files, direct `.pcap` download |
+| **PCAP** | `/pcap` | On-demand tcpdump per NF sidecar (off by default), including the LMF. Start/Stop, 5-minute rotating files, direct `.pcap` download |
 
 ### Portal Architecture
 
@@ -300,6 +301,7 @@ make docker && make ueransim
 | UDR | ✅ Operational | PostgreSQL 16 + fallback in-memory, auto-migrate; NSSAI profiles + per-subscriber URSP/policy data |
 | AUSF | 🟡 MVP | 5G-AKA happy path; Redis auth context store (TTL 5 min) |
 | UDM | 🟡 MVP | Auth + AM data + UECM + SDM sm-data; SUCI deconcealment (null-scheme + Profile A X25519) |
+| LMF | ✅ Operational | UE positioning (`Nlmf_Location DetermineLocation`, TS 29.572): live Cell-ID (gNB `LocationReport`, TS 38.413 §8.17), Enhanced Cell-ID via NRPPa relay with real ASN.1 APER codec (TS 38.455), A-GNSS via LPP relay over N1 (TS 37.355) — all validated end-to-end against UERANSIM; deferred MT-location (paging-then-locate for CM-IDLE UEs) + UDM location-privacy enforcement (TS 23.273 §7.2/§9.1); EventSubscription/CancelLocation (TS 29.572 §5.2.3); portal UE-location map. GMLC/N56 integration (TS 29.515) not yet implemented |
 
 ---
 

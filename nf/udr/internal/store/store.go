@@ -398,14 +398,32 @@ func SeedTestSubscriberWithNSSAI(s Store, supi, kHex, opcHex, amfHex, sqnHex str
 		return err
 	}
 
-	// Session management subscription: one entry per slice, each with a
-	// non-zero subscribed default 5QI (TS 29.503 §6.1.6.2.7).
+	return s.PutSMSubscriptions(supi, BuildSMSubscriptions(snssais))
+}
+
+// BuildSMSubscriptions derives session management subscription data from a
+// subscriber's allowed S-NSSAIs: one entry per slice, each with a non-zero
+// subscribed default 5QI (TS 29.503 §6.1.6.2.7).
+//
+// This is the single place that maps a slice to its DNN configuration. Both the
+// dev seed and the portal-driven resync (SyncSMDataFromAM) go through it, so a
+// slice provisioned through either path gets identical QoS.
+//
+// A slice's DNN is the portal-assigned one when set (SNSSAISubscribed.DNN),
+// falling back to "internet" — the DNN every dev slice is expected to carry.
+// Without this, a slice provisioned with a non-default DNN would have no
+// matching DNNConfiguration and the SMF would fall back to OPERATOR_DEFAULT QoS.
+func BuildSMSubscriptions(snssais []SNSSAISubscribed) []SessionManagementSubscriptionData {
 	smSubs := make([]SessionManagementSubscriptionData, 0, len(snssais))
 	for _, n := range snssais {
+		dnn := n.DNN
+		if dnn == "" {
+			dnn = "internet"
+		}
 		smSubs = append(smSubs, SessionManagementSubscriptionData{
 			SingleNSSAI: SNSSAIKey{SST: n.SST, SD: n.SD},
 			DNNConfigurations: map[string]DNNConfiguration{
-				"internet": {
+				dnn: {
 					PDUSessionTypes: PDUSessionTypes{
 						DefaultSessionType:  "IPV4",
 						AllowedSessionTypes: []string{"IPV4"},
@@ -416,7 +434,31 @@ func SeedTestSubscriberWithNSSAI(s Store, supi, kHex, opcHex, amfHex, sqnHex str
 			},
 		})
 	}
-	return s.PutSMSubscriptions(supi, smSubs)
+	return smSubs
+}
+
+// SyncSMDataFromAM regenerates a subscriber's session management subscription
+// data from the slices currently in its AM subscription, and returns the number
+// of slices written.
+//
+// The management portal provisions slices by writing subscription_am directly.
+// Nothing derived sm-data from that, so a portal-added slice had an Allowed
+// NSSAI entry but no session management data: the SMF found no DNNConfiguration
+// for it and silently fell back to OPERATOR_DEFAULT QoS. Calling this after an
+// am-data write keeps the two consistent.
+func SyncSMDataFromAM(s Store, supi string) (int, error) {
+	am, err := s.GetAMSubscription(supi)
+	if err != nil {
+		return 0, fmt.Errorf("udr: sync sm-data: read am subscription: %w", err)
+	}
+	if am == nil {
+		return 0, fmt.Errorf("udr: sync sm-data: no am subscription for %s", supi)
+	}
+	smSubs := BuildSMSubscriptions(am.NSSAI.SNSSAIs)
+	if err := s.PutSMSubscriptions(supi, smSubs); err != nil {
+		return 0, fmt.Errorf("udr: sync sm-data: write sm subscriptions: %w", err)
+	}
+	return len(smSubs), nil
 }
 
 // DefaultQoSForSlice maps the dev slices to subscribed default QoS profiles.

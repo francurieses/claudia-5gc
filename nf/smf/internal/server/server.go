@@ -1430,7 +1430,7 @@ func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qf
 					Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 					Value: ngapType.PDUSessionResourceSetupRequestTransferIEsValue{
 						Present:                 ngapType.PDUSessionResourceSetupRequestTransferIEsPresentQosFlowSetupRequestList,
-						QosFlowSetupRequestList: buildQosFlowSetupRequestList(qfi, fiveQI),
+						QosFlowSetupRequestList: buildQosFlowSetupRequestList(qfi, fiveQI, ambrULBps, ambrDLBps),
 					},
 				},
 			},
@@ -1487,25 +1487,37 @@ func encodeGTPTEID(teid uint32) []byte {
 }
 
 // buildQosFlowSetupRequestList creates a list with one QoS flow using the given 5QI.
-// Ref: TS 38.413 §9.3.4.5, TS 23.501 §5.7.2
-func buildQosFlowSetupRequestList(qfi uint8, fiveQI int64) *ngapType.QosFlowSetupRequestList {
+// For GBR 5QIs the GBR QoS Flow Information IE is mandatory (TS 38.413 §9.3.1.12:
+// "shall be present for GBR QoS flows") — a real gNB rejects a GBR flow without
+// it. GFBR/MFBR are set to the session AMBR since our flows carry the whole
+// session. Ref: TS 38.413 §9.3.4.1, §9.3.1.12; TS 23.501 §5.7.2
+func buildQosFlowSetupRequestList(qfi uint8, fiveQI, ambrULBps, ambrDLBps int64) *ngapType.QosFlowSetupRequestList {
+	params := ngapType.QosFlowLevelQosParameters{
+		QosCharacteristics: ngapType.QosCharacteristics{
+			Present: ngapType.QosCharacteristicsPresentNonDynamic5QI,
+			NonDynamic5QI: &ngapType.NonDynamic5QIDescriptor{
+				FiveQI: ngapType.FiveQI{Value: fiveQI},
+			},
+		},
+		AllocationAndRetentionPriority: ngapType.AllocationAndRetentionPriority{
+			PriorityLevelARP:        ngapType.PriorityLevelARP{Value: 9},
+			PreEmptionCapability:    ngapType.PreEmptionCapability{Value: ngapType.PreEmptionCapabilityPresentShallNotTriggerPreEmption},
+			PreEmptionVulnerability: ngapType.PreEmptionVulnerability{Value: ngapType.PreEmptionVulnerabilityPresentNotPreEmptable},
+		},
+	}
+	if nas.Is5QIGBR(uint8(fiveQI)) {
+		params.GBRQosInformation = &ngapType.GBRQosInformation{
+			MaximumFlowBitRateDL:    ngapType.BitRate{Value: ambrDLBps},
+			MaximumFlowBitRateUL:    ngapType.BitRate{Value: ambrULBps},
+			GuaranteedFlowBitRateDL: ngapType.BitRate{Value: ambrDLBps},
+			GuaranteedFlowBitRateUL: ngapType.BitRate{Value: ambrULBps},
+		}
+	}
 	return &ngapType.QosFlowSetupRequestList{
 		List: []ngapType.QosFlowSetupRequestItem{
 			{
-				QosFlowIdentifier: ngapType.QosFlowIdentifier{Value: int64(qfi)},
-				QosFlowLevelQosParameters: ngapType.QosFlowLevelQosParameters{
-					QosCharacteristics: ngapType.QosCharacteristics{
-						Present: ngapType.QosCharacteristicsPresentNonDynamic5QI,
-						NonDynamic5QI: &ngapType.NonDynamic5QIDescriptor{
-							FiveQI: ngapType.FiveQI{Value: fiveQI},
-						},
-					},
-					AllocationAndRetentionPriority: ngapType.AllocationAndRetentionPriority{
-						PriorityLevelARP:        ngapType.PriorityLevelARP{Value: 9},
-						PreEmptionCapability:    ngapType.PreEmptionCapability{Value: ngapType.PreEmptionCapabilityPresentShallNotTriggerPreEmption},
-						PreEmptionVulnerability: ngapType.PreEmptionVulnerability{Value: ngapType.PreEmptionVulnerabilityPresentNotPreEmptable},
-					},
-				},
+				QosFlowIdentifier:         ngapType.QosFlowIdentifier{Value: int64(qfi)},
+				QosFlowLevelQosParameters: params,
 			},
 		},
 	}

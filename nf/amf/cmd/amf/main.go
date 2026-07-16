@@ -255,6 +255,16 @@ func main() {
 		AMFID:       cfg.AMFID,
 	}
 	mgr := amfctx.NewManager(amfID, ueStore, ueCache, logger)
+	// LoadFromStore purges the previous run's UE contexts; give it a way to release
+	// their SM contexts at the SMF first, or every restart orphans an SMF session,
+	// a UPF PFCP session and a UE IP per PDU session. Bounded per call: the SMF may
+	// still be booting and startup must not block on it.
+	// Ref: TS 23.007 §16, TS 29.502 §5.2.2.3.3.
+	mgr.SetSMContextReleaser(func(ctx context.Context, smContextRef string) error {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return smfClient.DeleteSMContext(ctx, smContextRef)
+	})
 	if err := mgr.LoadFromStore(context.Background()); err != nil {
 		logger.Warn("AMF: LoadFromStore failed — starting with empty context", "error", err)
 	}
@@ -470,6 +480,16 @@ func main() {
 	ngapSrv.SetPDUSessionResponseHandler(func(ctx context.Context, smContextRef string, n2SmTransfer []byte) {
 		if err := smfClient.UpdateSMContext(ctx, smContextRef, n2SmTransfer); err != nil {
 			logger.Error("SMF UpdateSMContext failed",
+				"smContextRef", smContextRef, "error", err)
+		}
+	})
+
+	// When the gNB reports a PDU session in FailedToSetupListSURes, release the
+	// SM context at the SMF so the UE IP and PFCP session are freed.
+	// Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16
+	ngapSrv.SetPDUSessionSetupFailureHandler(func(ctx context.Context, smContextRef string) {
+		if err := smfClient.DeleteSMContext(ctx, smContextRef); err != nil {
+			logger.Error("SMF DeleteSMContext failed for gNB-rejected PDU session",
 				"smContextRef", smContextRef, "error", err)
 		}
 	})

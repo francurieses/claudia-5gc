@@ -30,8 +30,72 @@ import (
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
+
+// NGAP Cause values for releasing the logical NGAP connection after the AMF
+// rejects an initial NAS message it cannot associate with a UE context.
+// Ref: TS 38.413 §9.3.1.2 (Cause), Table 9.3.1.2-1.
+const (
+	ngapCausePresentNas             = 3 // ngapType.CausePresentNas
+	ngapCauseNasNormalRelease int64 = 0 // ngapType.CauseNasPresentNormalRelease
+)
+
+// rejectForUnknownTMSI picks the NAS reject for an initial NAS message whose
+// 5G-GUTI the AMF has no context for (typically: the AMF restarted and purged
+// its contexts). It returns the plain NAS PDU, plus a name and spec reference
+// for logging.
+//
+// The reject must match the procedure the UE actually started. A UE in
+// 5GMM-REGISTERED-INITIATED discards a SERVICE REJECT as "message not
+// compatible with protocol state" and retries on T3512 forever, so answering
+// every unknown TMSI with a Service Reject deadlocks any UE doing a mobility or
+// periodic registration update.
+//
+// Ref: TS 24.501 §5.5.1.3.5, §5.6.1.5.2, §9.11.3.2.
+func rejectForUnknownTMSI(msgType nas.MessageType, typeKnown bool) (pdu []byte, name, specRef string) {
+	if typeKnown && msgType == nas.MsgTypeRegistrationRequest {
+		// Mobility/periodic registration update with a 5G-GUTI the AMF has no
+		// context for. 5GMM cause #10 states exactly what happened — the network
+		// implicitly de-registered the UE — and per TS 24.501 §5.5.1.3.5 the UE
+		// then enters 5GMM-DEREGISTERED.NORMAL-SERVICE and performs a fresh
+		// initial registration with its SUCI, which the AMF can resolve.
+		// Plain NAS: EPD | SHT=0x00 | MT=0x44 (RegistrationReject) | cause
+		return []byte{nas.PDMobilityManagement, 0x00,
+			byte(nas.MsgTypeRegistrationReject), byte(nas.CauseImplicitlyDeregistered)},
+			"RegistrationReject", "TS 24.501 §5.5.1.3.5"
+	}
+	// Service Request / Control Plane Service Request, or a type that could not
+	// be read (ciphered inner header). 5GMM cause #9 "UE identity cannot be
+	// derived by the network" makes the UE clear its stale GUTI and re-register.
+	// Plain NAS: EPD | SHT=0x00 | MT=0x4D (ServiceReject) | cause
+	return []byte{nas.PDMobilityManagement, 0x00,
+		byte(nas.MsgTypeServiceReject), byte(nas.CauseUEIdentityNotDerived)},
+		"ServiceReject", "TS 24.501 §5.6.1.5.2"
+}
+
+// nasMessageTypeName renders a peeked 5GMM message type for logging. Only the
+// types that can open an N1 connection with a 5G-GUTI are named; anything else
+// is reported by value so an unexpected initial message is still diagnosable.
+// Ref: TS 24.501 §9.7.
+func nasMessageTypeName(t nas.MessageType, known bool) string {
+	if !known {
+		return "UNREADABLE" // ciphered or malformed inner header
+	}
+	switch t {
+	case nas.MsgTypeRegistrationRequest:
+		return "RegistrationRequest"
+	case nas.MsgTypeServiceRequest:
+		return "ServiceRequest"
+	case nas.MsgTypeControlPlaneServiceRequest:
+		return "ControlPlaneServiceRequest"
+	case nas.MsgTypeDeregistrationRequestUE:
+		return "DeregistrationRequestUE"
+	default:
+		return fmt.Sprintf("0x%02X", byte(t))
+	}
+}
 
 // ngapPPID is the SCTP Payload Protocol Identifier for NGAP.
 // TS 38.412 §7 / IANA: PPID 60 (0x3C) is assigned to NGAP over SCTP.
@@ -100,6 +164,11 @@ const (
 	ProcHandoverResourceAllocation ProcedureCode = 13 // HandoverRequest (AMF→tgt) + HandoverRequestAck (tgt→AMF)
 	ProcUEContextModification      ProcedureCode = 26
 	ProcNGReset                    ProcedureCode = 20
+	// UE Radio Capability Info Indication (gNB→AMF, InitiatingMessage, class 2).
+	// Sent after the UE context is established so the AMF can store the UE's radio
+	// capabilities for later use (e.g. HandoverRequest). No response is expected.
+	// Ref: TS 38.413 Table 9.1-1, §8.7.6.
+	ProcUERadioCapabilityInfoIndication ProcedureCode = 44
 	// ProcLocationReportingControl is the procedure code for LocationReportingControl
 	// (AMF→gNB, InitiatingMessage). Ref: TS 38.413 Table 9.1-1, §8.17.1.
 	ProcLocationReportingControl ProcedureCode = 16
@@ -248,6 +317,12 @@ type Server struct {
 	// onPDUSessionRelease is called when gNB confirms PDU session resource release.
 	onPDUSessionRelease func(ctx context.Context, amfUENGAPID int64)
 
+	// onPDUSessionSetupFailure is called for each PDU session the gNB reports in
+	// PDUSessionResourceFailedToSetupListSURes so the SM context is released at
+	// the SMF (frees the UE IP and the PFCP session).
+	// Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16
+	onPDUSessionSetupFailure func(ctx context.Context, smContextRef string)
+
 	// onANRelease is called when the UE Context Release Complete is received and the UE
 	// transitions to CM-IDLE. The AMF should notify SMF for each PDU session.
 	// Ref: TS 23.502 §4.2.6
@@ -334,6 +409,14 @@ func (s *Server) SetPDUSessionResponseHandler(fn func(ctx context.Context, smCon
 // PDU session resource release.
 func (s *Server) SetPDUSessionReleaseHandler(fn func(ctx context.Context, amfUENGAPID int64)) {
 	s.onPDUSessionRelease = fn
+}
+
+// SetPDUSessionSetupFailureHandler registers a callback invoked per PDU session
+// the gNB failed to set up (FailedToSetupListSURes). Wire it to the SMF
+// DeleteSMContext client so the session's resources are freed.
+// Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16
+func (s *Server) SetPDUSessionSetupFailureHandler(fn func(ctx context.Context, smContextRef string)) {
+	s.onPDUSessionSetupFailure = fn
 }
 
 // SetANReleaseHandler registers a callback invoked when the UE context is fully
@@ -639,6 +722,8 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 	case ProcInitialContextSetup:
 		if msg.Type == 1 { // SuccessfulOutcome: ICS Response from gNB
 			s.handleInitialContextSetupResponse(ctx, gnb, msg)
+		} else if msg.Type == 2 { // UnsuccessfulOutcome: ICS Failure from gNB
+			s.handleInitialContextSetupFailure(ctx, gnb, msg)
 		}
 	case ProcPDUSessionResourceRelease:
 		if msg.Type == 1 { // SuccessfulOutcome
@@ -711,6 +796,11 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 			// Ref: TS 38.413 §8.17.4 (Uplink Non UE Associated NRPPa Transport)
 			s.handleUplinkNonUEAssociatedNRPPa(ctx, gnb, msg)
 		}
+	case ProcUERadioCapabilityInfoIndication:
+		if msg.Type == 0 { // InitiatingMessage from gNB
+			// Ref: TS 38.413 §8.7.6 (UE Radio Capability Info Indication)
+			s.handleUERadioCapabilityInfoIndication(ctx, gnb, msg)
+		}
 	default:
 		log.Warn("unhandled NGAP procedure", "proc", msg.ProcedureCode)
 	}
@@ -718,11 +808,13 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 
 // handlePDUSessionResourceSetupResponse processes the gNB's confirmation that
 // PDU session resources have been set up. Extracts the gNB's GTP-U tunnel info
-// and notifies the SMF so it can update PFCP with the DL TEID.
-// Ref: TS 38.413 §8.4.1
+// and notifies the SMF so it can update PFCP with the DL TEID. Sessions in the
+// FailedToSetupListSURes are released at the SMF and removed from the UE
+// context — leaving them would strand the UE IP / PFCP session and permanently
+// block the PSI. Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16.
 func (s *Server) handlePDUSessionResourceSetupResponse(ctx context.Context, gnb *GNBContext, msg *Message) {
 	resp, ok := msg.Value.(*PDUSessionResourceSetupResponseMsg)
-	if !ok || s.onPDUSessionSetup == nil {
+	if !ok {
 		return
 	}
 
@@ -730,6 +822,37 @@ func (s *Server) handlePDUSessionResourceSetupResponse(ctx context.Context, gnb 
 	if !ok {
 		s.logger.Error("PDUSessionResourceSetupResponse: UE not found",
 			"amf_ue_ngap_id", resp.AMFUENGAPId)
+		return
+	}
+
+	for _, psi := range resp.FailedPSIs {
+		ue.Lock()
+		pduSess, hasSess := ue.PDUSessions[psi]
+		var smContextRef string
+		if hasSess {
+			smContextRef = pduSess.SMFInstanceID
+			delete(ue.PDUSessions, psi)
+		}
+		ue.Unlock()
+
+		s.logger.Warn("PDU Session Resource Setup failed at gNB — releasing session",
+			"procedure", "PDUSessionEstablishment",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "PDUSessionResourceSetupResponse",
+			"amf_ue_ngap_id", resp.AMFUENGAPId,
+			"pdu_session_id", psi,
+			"smContextRef", smContextRef,
+			"supi", ue.SUPI,
+			"result", "FAILURE",
+			"spec_ref", "TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16",
+		)
+		if smContextRef != "" && s.onPDUSessionSetupFailure != nil {
+			go s.onPDUSessionSetupFailure(ctx, smContextRef)
+		}
+	}
+
+	if s.onPDUSessionSetup == nil {
 		return
 	}
 
@@ -785,7 +908,23 @@ func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNB
 			"spec_ref", "TS 38.413 §8.3.1",
 		)
 	}
-	if len(resp.Setups) == 0 || s.onPDUSessionSetup == nil {
+	if len(resp.Setups) == 0 {
+		// Initial Registration: the ICS Request carried no PDU sessions, so the
+		// response confirms only that the UE context (and the NAS-PDU Registration
+		// Accept it carried) was delivered. Log it for traceability, then wait for
+		// the UE's Registration Complete over Uplink NAS Transport.
+		// Ref: TS 38.413 §8.3.1, TS 23.502 §4.2.2.2.2 step 22.
+		s.logger.Info("Initial Context Setup Response received (registration)",
+			"procedure", "InitialRegistration",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "InitialContextSetupResponse",
+			"amf_ue_ngap_id", resp.AMFUENGAPId,
+			"spec_ref", "TS 38.413 §8.3.1",
+		)
+		return
+	}
+	if s.onPDUSessionSetup == nil {
 		return
 	}
 
@@ -823,6 +962,126 @@ func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNB
 			"spec_ref", "TS 23.502 §4.2.3.2 step 12",
 		)
 		go s.onPDUSessionSetup(ctx, smContextRef, setup.N2SMTransferBytes)
+	}
+}
+
+// handleUERadioCapabilityInfoIndication stores the UE radio capabilities the gNB
+// reports after the UE context is established. This is a class-2 procedure: no
+// response is sent. The capability blob is opaque to the AMF and kept for later
+// N2 use (e.g. included in a HandoverRequest to a target gNB). Its arrival also
+// confirms the Initial Context Setup succeeded and the UE received the NAS-PDU
+// (Registration Accept) carried in the ICS Request.
+// Ref: TS 38.413 §8.7.6.
+func (s *Server) handleUERadioCapabilityInfoIndication(_ context.Context, gnb *GNBContext, msg *Message) {
+	ind, ok := msg.Value.(*UERadioCapabilityInfoIndicationMsg)
+	if !ok {
+		return
+	}
+	ue, found := s.mgr.GetByNGAPId(ind.AMFUENGAPId)
+	if !found {
+		s.logger.Warn("UERadioCapabilityInfoIndication: UE not found",
+			"procedure", "InitialRegistration",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "UERadioCapabilityInfoIndication",
+			"amf_ue_ngap_id", ind.AMFUENGAPId,
+			"ran_ue_ngap_id", ind.RANUENGAPId,
+			"spec_ref", "TS 38.413 §8.7.6",
+		)
+		return
+	}
+	ue.Lock()
+	ue.UERadioCapability = ind.UERadioCapability
+	supi := ue.SUPI
+	ue.Unlock()
+	s.logger.Info("UE Radio Capability stored",
+		"procedure", "InitialRegistration",
+		"interface", "N2",
+		"direction", "IN",
+		"message_type", "UERadioCapabilityInfoIndication",
+		"amf_ue_ngap_id", ind.AMFUENGAPId,
+		"ran_ue_ngap_id", ind.RANUENGAPId,
+		"supi", supi,
+		"radio_cap_bytes", len(ind.UERadioCapability),
+		"spec_ref", "TS 38.413 §8.7.6",
+	)
+}
+
+// ngapCauseReleaseDueTo5gcGeneratedReason is used to release the N2 signalling
+// connection after the AMF itself aborts a procedure (e.g. a failed Initial
+// Context Setup), as opposed to a radio-side or NAS-side reason.
+// Ref: TS 38.413 §9.3.1.2, ngapType.CauseRadioNetworkPresentReleaseDueTo5gcGeneratedReason.
+const ngapCauseReleaseDueTo5gcGeneratedReason int64 = 4
+
+// handleInitialContextSetupFailure processes the gNB's rejection of an
+// Initial Context Setup Request. By the time the AMF sends that request the
+// registration has already been committed on its side — GMMRegistered,
+// GUTI assigned, NAS security keys pushed to the gNB (Phase3_ProcessSMCComplete,
+// nf/amf/internal/procedures/registration.go) — because the Registration
+// Accept rides inside the request's NAS-PDU IE. If the gNB rejects the
+// request, that NAS-PDU never reaches the UE, so the "registered" state on
+// the AMF side is stale: left alone, the UE's inevitable retry arrives as a
+// fresh InitialUEMessage that collides with the old context (observed live
+// against a real Nokia gNB: ASN.1 abstract-syntax-error-reject on the ICS
+// Request, then the UE's retry immediately fails Authentication with cause
+// #71 "ngKSI already in use" because nothing ever released the failed
+// attempt). This handler undoes the premature transition and releases the
+// N2 connection so the retry starts clean.
+// Ref: TS 38.413 §8.3.1, §8.3.5
+func (s *Server) handleInitialContextSetupFailure(ctx context.Context, gnb *GNBContext, msg *Message) {
+	fail, ok := msg.Value.(*InitialContextSetupFailureMsg)
+	if !ok {
+		return
+	}
+
+	ue, found := s.mgr.GetByNGAPId(fail.AMFUENGAPId)
+	if !found {
+		s.logger.Error("InitialContextSetupFailure: UE not found",
+			"procedure", "InitialRegistration",
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "InitialContextSetupFailure",
+			"amf_ue_ngap_id", fail.AMFUENGAPId,
+			"ran_ue_ngap_id", fail.RANUENGAPId,
+			"cause_present", fail.CausePresent,
+			"cause_value", fail.CauseValue,
+			"result", "FAILURE",
+			"spec_ref", "TS 38.413 §8.3.1",
+		)
+		return
+	}
+
+	s.logger.Error("InitialContextSetupFailure — gNB rejected Initial Context Setup Request",
+		"procedure", "InitialRegistration",
+		"interface", "N2",
+		"direction", "IN",
+		"message_type", "InitialContextSetupFailure",
+		"amf_ue_ngap_id", fail.AMFUENGAPId,
+		"ran_ue_ngap_id", fail.RANUENGAPId,
+		"supi", ue.SUPI,
+		"cause_present", fail.CausePresent,
+		"cause_value", fail.CauseValue,
+		"result", "FAILURE",
+		"spec_ref", "TS 38.413 §8.3.1",
+	)
+
+	// The UE never received the Registration Accept the failed request was
+	// carrying, so from the UE's point of view it is still unregistered —
+	// undo the transition made in Phase3_ProcessSMCComplete before it sent
+	// this request.
+	ue.TransitionTo(amfctx.GMMDeregistered)
+
+	// PendingRemoval must be set BEFORE SendUEContextReleaseCommandForUE so the
+	// watchdog is armed and handleUEContextReleaseComplete removes the context
+	// (same invariant as UE-initiated deregistration — see nf/amf/CLAUDE.md §9).
+	ue.PendingRemoval = true
+	if err := s.SendUEContextReleaseCommandForUE(
+		ue, ngapCausePresentRadioNetwork, ngapCauseReleaseDueTo5gcGeneratedReason); err != nil {
+		s.logger.Warn("SendUEContextReleaseCommandForUE failed after ICS failure — gNB may self-release",
+			"error", err,
+			"amf_ue_ngap_id", fail.AMFUENGAPId,
+			"supi", ue.SUPI,
+		)
 	}
 }
 
@@ -959,28 +1218,55 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 			})
 			return
 		}
-		// TMSI not found (AMF restarted or context evicted). Send Service Reject
-		// cause 0x09 ("UE identity cannot be derived by the network") to force the
-		// UE to start a fresh Initial Registration.
-		// Ref: TS 24.501 §5.6.1.5.2, §9.11.3.2; TS 24.501 §8.2.17
-		s.logger.Warn("Service Request: TMSI not found — sending ServiceReject",
+		// TMSI not found (AMF restarted or context evicted).
+		msgType, typeKnown := nas.PeekMessageType(req.NASPdu)
+		rejectPDU, rejectName, specRef := rejectForUnknownTMSI(msgType, typeKnown)
+		s.logger.Warn("initial NAS message: TMSI not found — rejecting",
 			"tmsi", fmt.Sprintf("%08x", *req.FiveGSTMSI),
-			"spec_ref", "TS 24.501 §5.6.1.5.2",
+			"message_type", nasMessageTypeName(msgType, typeKnown),
+			"reject", rejectName,
+			"spec_ref", specRef,
 		)
 		// Allocate a temporary context just to supply AMF UE NGAP ID for the NGAP PDU.
 		tempUE := s.mgr.AllocateUEContext(req.RANUENGAPId)
 		gnb.mu.Lock()
 		gnb.UEs[req.RANUENGAPId] = tempUE
 		gnb.mu.Unlock()
-		// Plain NAS PDU: EPD=0x7E | SHT=0x00 | MT=0x4D (ServiceReject) | Cause=0x09
-		rejectPDU := []byte{0x7E, 0x00, 0x4D, 0x09}
 		if _, err := writeNGAP(gnb.Conn, BuildDownlinkNASTransport(tempUE.AMFUENGAPId, req.RANUENGAPId, rejectPDU)); err != nil {
-			s.logger.Error("send ServiceReject failed", "error", err)
+			s.logger.Error("send reject failed", "error", err, "reject", rejectName)
+			gnb.mu.Lock()
+			delete(gnb.UEs, req.RANUENGAPId)
+			gnb.mu.Unlock()
+			s.mgr.Remove(ctx, tempUE)
+			return
 		}
-		gnb.mu.Lock()
-		delete(gnb.UEs, req.RANUENGAPId)
-		gnb.mu.Unlock()
-		s.mgr.Remove(ctx, tempUE)
+		// Release the logical NGAP/RRC connection instead of dropping the context
+		// on the floor. The reject makes the UE start a *new* registration
+		// immediately; if the RRC connection is left up, that registration arrives
+		// as an UplinkNASTransport against an AMF UE NGAP ID we already removed and
+		// is discarded, stalling the UE until T3510 expires (~16 s). Releasing here
+		// puts the UE in RRC-IDLE so its retry arrives as a fresh InitialUEMessage.
+		// PendingRemoval must be set BEFORE the command so the watchdog is armed and
+		// handleUEContextReleaseComplete removes the context (nf/amf/CLAUDE.md §9).
+		// The gNB is addressed directly rather than via SendUEContextReleaseCommandForUE:
+		// that resolves the gNB through ue.GNBAddr, which a temp context never has, so
+		// it would silently skip the release *and* return nil — leaking tempUE.
+		// Ref: TS 38.413 §8.3.3, TS 24.501 §5.5.1.3.5.
+		tempUE.PendingRemoval = true
+		if err := s.SendUEContextReleaseCommand(gnb, tempUE.AMFUENGAPId, req.RANUENGAPId,
+			ngapCausePresentNas, ngapCauseNasNormalRelease); err != nil {
+			// Could not ask the gNB to release: clean up locally so the temp
+			// context does not linger (the gNB will self-release on RRC timeout).
+			s.logger.Warn("UEContextReleaseCommand after reject failed — cleaning up locally",
+				"error", err, "amf_ue_ngap_id", tempUE.AMFUENGAPId)
+			gnb.mu.Lock()
+			delete(gnb.UEs, req.RANUENGAPId)
+			gnb.mu.Unlock()
+			s.mgr.Remove(ctx, tempUE)
+			return
+		}
+		// Backstop: if UEContextReleaseComplete never arrives, force-remove tempUE.
+		s.startPendingRemovalTimer(tempUE)
 		return
 	}
 
@@ -1149,6 +1435,9 @@ func (s *Server) SendInitialContextSetupRequest(
 		return fmt.Errorf("ngap: no gNB found for UE %d", ue.RANUENGAPId)
 	}
 
+	// Subscribed UE-AMBR from UDM am-data is stored in kbit/s; NGAP BitRate is
+	// bit/s. Zero (no subscription value) falls back to the builder's default.
+	// Ref: TS 38.413 §9.3.1.58
 	pdu := BuildInitialContextSetupRequest(
 		ue.AMFUENGAPId, ue.RANUENGAPId,
 		nasPDU, kgnb,
@@ -1156,6 +1445,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		s.cfg.MCC, s.cfg.MNC,
 		s.cfg.RegionID, s.cfg.SetID, s.cfg.AMFID,
 		ue.AllowedNSSAI,
+		int64(ue.SubscribedAMBR.UL)*1000, int64(ue.SubscribedAMBR.DL)*1000,
 		ue.RFSP,
 		pduSessions,
 	)

@@ -24,6 +24,7 @@ type Deps struct {
 	SMFBaseURL string
 	AMFBaseURL string // for push-policies endpoint
 	UDMBaseURL string // for subscription QoS lookups (Nudm_SDM sm-data)
+	UDRBaseURL string // for re-deriving sm-data after a slice change (internal API)
 	PCFBaseURL string // for SM policy QoS overrides (NW-triggered session flow)
 	LMFBaseURL string // for Nlmf_Location DetermineLocation (UE location map)
 	// MTLSClient is an HTTP client carrying the portal's mTLS client certificate.

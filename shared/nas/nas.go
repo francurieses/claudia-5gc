@@ -155,6 +155,39 @@ func Decode(data []byte) (*Message, error) {
 	}
 }
 
+// PeekMessageType reports the 5GMM message type of a NAS PDU without decoding
+// the body or verifying integrity. It is for the narrow case of an *initial*
+// NAS message the AMF cannot authenticate — e.g. a 5G-GUTI it has no context
+// for — where the response depends on which procedure the UE started
+// (Registration Reject vs. Service Reject are not interchangeable).
+//
+// Both plain and security-protected initial NAS messages are readable: per
+// TS 24.501 §4.4.5 the UE sends an initial NAS message integrity protected but
+// *not* ciphered (non-cleartext IEs travel inside the NAS message container),
+// so the inner header is plaintext. ok=false when the PDU is too short or the
+// inner header is not a plausible plaintext 5GMM header — i.e. the caller must
+// not assume a type it could not read.
+//
+// Ref: TS 24.501 §4.4.5, §9.1.1.
+func PeekMessageType(data []byte) (MessageType, bool) {
+	if len(data) < 3 || data[0] != PDMobilityManagement {
+		return 0, false
+	}
+	if SecurityHeaderType(data[1]&0x0F) == SecurityHeaderPlainNAS {
+		return MessageType(data[2]), true
+	}
+	// Security-protected: EPD | SHT | MAC (4) | SN (1) | inner EPD | SHT | MT
+	if len(data) < 10 {
+		return 0, false
+	}
+	// The inner header must itself look like a plain 5GMM message; if it does
+	// not, the body is ciphered (or malformed) and the type is unreadable.
+	if data[7] != PDMobilityManagement || SecurityHeaderType(data[8]&0x0F) != SecurityHeaderPlainNAS {
+		return 0, false
+	}
+	return MessageType(data[9]), true
+}
+
 // Encode serialises a plain NAS PDU.
 func Encode(msg *Message) ([]byte, error) {
 	body, err := encodeBody(msg)

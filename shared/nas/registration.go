@@ -22,7 +22,7 @@ type RegistrationRequest struct {
 	FiveGMMCapability []byte
 	// IEI 0x2E — UE security capability
 	UESecurityCapability *UESecurityCapability
-	// IEI 0x6D — Requested NSSAI
+	// IEI 0x2F — Requested NSSAI
 	RequestedNSSAI *NSSAI
 	// IEI 0x52 — Last visited registered TAI
 	LastVisitedTAI []byte
@@ -42,22 +42,23 @@ type RegistrationRequest struct {
 
 // IEI codes for RegistrationRequest optional IEs (TS 24.501 §8.2.6.1 Table 8.2.6.1.1)
 const (
-	IEINonCurrentNGKSI          = 0x17
-	IEI5GMMCapability           = 0x10
-	IEIUESecurityCapability     = 0x2E
-	IEIRequestedNSSAI           = 0x6D
-	IEILastVisitedTAI           = 0x52
-	IEIS1UENetworkCapability    = 0x40
-	IEIUplinkDataStatus         = 0x50
-	IEIPDUSessionStatus         = 0x2B // Note: same IEI as UE Status in some revisions
-	IEIAdditionalGUTI           = 0x77
-	IEIRequestedDRXParameters   = 0x51
-	IEIEPSNASMessageContainer   = 0x70
-	IEILADNIndication           = 0x74
-	IEIPayloadContainer         = 0x7B
-	IEINetworkSlicingIndication = 0x9A
-	IEI5GSDRXParameters         = 0x6E
-	IEINASMessageContainer      = 0x71
+	IEI5GMMCapability        = 0x10
+	IEIUESecurityCapability  = 0x2E
+	IEIRequestedNSSAI        = 0x2F // TS 24.501 Table 8.2.6.1.1 (was wrongly 0x6D — never matched)
+	IEILastVisitedTAI        = 0x52
+	IEIS1UENetworkCapability = 0x17
+	IEIUplinkDataStatus      = 0x40
+	IEIPDUSessionStatus      = 0x50
+	IEIUEStatus              = 0x2B
+	IEIAdditionalGUTI        = 0x77
+	IEIAllowedPDUSessStatus  = 0x25
+	IEIUEUsageSetting        = 0x18
+	IEIRequestedDRX          = 0x51
+	IEIEPSNASMsgContainer    = 0x70
+	IEILADNIndication        = 0x74 // TLV-E (TS 24.501 §9.11.3.29); UERANSIM fork emits 0x7E
+	IEIPayloadContainerReg   = 0x7B
+	IEI5GSUpdateType         = 0x53
+	IEINASMessageContainer   = 0x71
 )
 
 // DecodeRegistrationRequest parses the body bytes after the message type.
@@ -108,11 +109,16 @@ func DecodeRegistrationRequest(b []byte) (*RegistrationRequest, error) {
 		if err != nil {
 			break
 		}
-		// Half-byte IEIs (type-only IEs) — handled via nibble check
-		if (iei >> 4) == 0x1 { // 0x10-0x1F range: 5GMM capability
-			iei = 0x10
-		}
 		switch iei {
+		case IEI5GMMCapability:
+			l, err := rdr.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			r.FiveGMMCapability, err = rdr.ReadBytes(int(l))
+			if err != nil {
+				return nil, err
+			}
 		case IEIUESecurityCapability:
 			l, err := rdr.ReadByte()
 			if err != nil {
@@ -141,10 +147,12 @@ func DecodeRegistrationRequest(b []byte) (*RegistrationRequest, error) {
 				return nil, err
 			}
 			r.RequestedNSSAI = &nssai
-		case IEINASMessageContainer, IEIEPSNASMessageContainer, IEIAdditionalGUTI, IEIPayloadContainer:
+		case IEINASMessageContainer, IEIEPSNASMsgContainer, IEIAdditionalGUTI,
+			IEIPayloadContainerReg, IEILADNIndication, 0x7E:
 			// TLV-E IEs (2-byte big-endian length): NAS message container (0x71),
 			// EPS NAS message container (0x70), Additional GUTI (0x77), Payload
-			// container (0x7B). Skipping these with a 1-byte length would shift
+			// container (0x7B), LADN indication (0x74 per spec; 0x7E in the
+			// UERANSIM fork). Skipping these with a 1-byte length would shift
 			// the parser and corrupt every subsequent IE.
 			// Ref: TS 24.501 Table 8.2.6.1.1, TS 24.007 §11.2.1.1.4
 			hi, err := rdr.ReadByte()

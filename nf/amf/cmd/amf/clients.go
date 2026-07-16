@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
@@ -284,7 +286,13 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 		return nil, fmt.Errorf("udm: decode AM data: %w", err)
 	}
 
-	sub := &procedures.UDMAMSubscription{}
+	sub := &procedures.UDMAMSubscription{
+		// Subscribed UE-AMBR (TS 29.571 BitRate strings, e.g. "1 Gbps") → kbit/s.
+		// Forwarded to the gNB in the InitialContextSetupRequest UE-AMBR IE.
+		// Ref: TS 38.413 §9.3.1.58, TS 23.501 §5.7.2.6
+		AMBRUplink:   parseBitRateKbps(result.SubscribedUEAMBR.Uplink),
+		AMBRDownlink: parseBitRateKbps(result.SubscribedUEAMBR.Downlink),
+	}
 	for _, s := range result.NSSAI.DefaultSingleNssais {
 		sub.AllowedNSSAI = append(sub.AllowedNSSAI, amfctx.SNSSAISubscribed{
 			SST:            uint8(s.SST),
@@ -294,6 +302,33 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 		})
 	}
 	return sub, nil
+}
+
+// parseBitRateKbps converts a TS 29.571 BitRate string ("200 Kbps", "1 Gbps",
+// "1.5 Mbps") to kbit/s. Returns 0 for an empty or unparseable value so the
+// caller falls back to the operator default.
+func parseBitRateKbps(s string) uint64 {
+	fields := strings.Fields(s)
+	if len(fields) != 2 {
+		return 0
+	}
+	val, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || val < 0 {
+		return 0
+	}
+	switch fields[1] {
+	case "bps":
+		return uint64(val / 1000)
+	case "Kbps":
+		return uint64(val)
+	case "Mbps":
+		return uint64(val * 1000)
+	case "Gbps":
+		return uint64(val * 1000 * 1000)
+	case "Tbps":
+		return uint64(val * 1000 * 1000 * 1000)
+	}
+	return 0
 }
 
 // ---- SMF Client (Nsmf_PDUSession) ----------------------------------------

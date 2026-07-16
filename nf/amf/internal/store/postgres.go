@@ -152,6 +152,32 @@ func (p *Postgres) ListRegisteredUEs(ctx context.Context) ([]*UERecord, error) {
 	return result, rows.Err()
 }
 
+// ListAllUEContexts returns every persisted UE context, regardless of 5GMM
+// state. Unlike ListRegisteredUEs it does not filter: it is used at startup to
+// find the SM contexts that must be released at the SMF before the rows are
+// purged, and a UE can still own PDU sessions while not in 5GMM-REGISTERED.
+// Ref: TS 23.007 §16 (restoration of data in the AMF).
+func (p *Postgres) ListAllUEContexts(ctx context.Context) ([]*UERecord, error) {
+	rows, err := p.pool.Query(ctx, `SELECT context_json FROM amf_ue_contexts`)
+	if err != nil {
+		return nil, fmt.Errorf("amf store: ListAllUEContexts: %w", err)
+	}
+	defer rows.Close()
+	var result []*UERecord
+	for rows.Next() {
+		var js []byte
+		if err := rows.Scan(&js); err != nil {
+			return nil, fmt.Errorf("amf store: scan: %w", err)
+		}
+		rec, err := unmarshalRecord(js)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, rec)
+	}
+	return result, rows.Err()
+}
+
 func (p *Postgres) MaxTMSI(ctx context.Context) (uint32, error) {
 	var max *int64
 	err := p.pool.QueryRow(ctx,

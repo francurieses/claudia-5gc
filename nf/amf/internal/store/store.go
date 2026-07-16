@@ -23,6 +23,9 @@ type Store interface {
 	DeleteUE(ctx context.Context, supi string) error
 	// ListRegisteredUEs returns all GMMRegistered UEs.
 	ListRegisteredUEs(ctx context.Context) ([]*UERecord, error)
+	// ListAllUEContexts returns every persisted UE context regardless of 5GMM
+	// state. Used at startup to release SM contexts before purging.
+	ListAllUEContexts(ctx context.Context) ([]*UERecord, error)
 	// MaxTMSI returns the highest TMSI currently stored, or 0 if none.
 	MaxTMSI(ctx context.Context) (uint32, error)
 	// PurgeAllUEContexts deletes all rows; returns the number of rows deleted.

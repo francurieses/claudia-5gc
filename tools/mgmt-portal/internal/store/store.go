@@ -172,8 +172,16 @@ func (s *Store) DeleteSubscriber(ctx context.Context, supi string) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Every subscription_* table must be listed: a SUPI left behind in any of
+	// them is silently inherited when the same SUPI is re-created later.
+	// subscription_sm and subscription_smf are distinct tables (session
+	// management subscription data vs SMF selection data) — deleting only the
+	// latter orphans the former.
 	for _, table := range []string{
 		"subscription_smf",
+		"subscription_sm",
+		"subscription_sm_policy",
+		"subscription_policy",
 		"subscription_am",
 		"subscription_auth",
 		"amf_ue_contexts",

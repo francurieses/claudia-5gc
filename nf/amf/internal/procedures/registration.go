@@ -299,6 +299,17 @@ type RegistrationOutput struct {
 	RegAccept *nas.RegistrationAccept
 }
 
+// allocateFreshNGKSI returns an ngKSI value in the valid range 0..6 that differs
+// from currentKSI (the ngKSI the UE reports for its existing native 5G security
+// context, or 7 = "no key available"). (currentKSI+1)%7 is guaranteed to differ
+// from currentKSI for currentKSI in 0..6, and maps the "no key" value 7 to 1.
+// Assigning a colliding ngKSI makes a spec-conformant UE reject the Authentication
+// Request with 5GMM cause #71 "ngKSI already in use".
+// Ref: TS 24.501 §5.4.1.2.1, §5.4.1.3.2, §5.4.1.3.7.
+func allocateFreshNGKSI(currentKSI byte) byte {
+	return (currentKSI + 1) % 7
+}
+
 // Phase1_InitiateAuthentication handles steps 1-9 of TS 23.502 §4.2.2.2.2:
 // receives Registration Request, discovers AUSF via NRF, triggers 5G-AKA.
 //
@@ -330,6 +341,14 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 	ue.SUCI = suciOrGUTI
 	ue.RegistrationType = byte(in.RegRequest.RegistrationType)
 	log = log.With("suci", suciOrGUTI)
+
+	// Allocate a fresh ngKSI for this authentication, distinct from the one the UE
+	// reports for its existing native 5G security context. Reusing the same value
+	// makes a spec-conformant UE (e.g. a real Nokia UE) reject the Authentication
+	// Request with 5GMM cause #71 "ngKSI already in use". Computed once here so the
+	// SUCI-retry and AUTS-resync paths reuse it via ue.PendingNGKSI.
+	// Ref: TS 24.501 §5.4.1.2.1, §5.4.1.3.2, §5.4.1.3.7.
+	ue.PendingNGKSI = allocateFreshNGKSI(in.RegRequest.NGKSI.KeySetIdentifier)
 
 	log.Info("Registration Request received",
 		"reg_type", in.RegRequest.RegistrationType,
@@ -403,7 +422,7 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 
 	// Step 9: send Authentication Request to UE (TS 24.501 §8.2.1)
 	return &nas.AuthenticationRequest{
-		NGKSI: nas.NGKSI{KeySetIdentifier: 0, Type: 0}, // native, new
+		NGKSI: nas.NGKSI{KeySetIdentifier: ue.PendingNGKSI, Type: 0}, // native, freshly allocated
 		ABBA:  h.abba,
 		RAND:  ausfResp.RAND,
 		AUTN:  ausfResp.AUTN,
@@ -462,7 +481,7 @@ func (h *RegistrationHandler) Phase1_AuthenticateWithSUCI(
 	span.SetAttributes(attribute.String("auth_ctx_id", ausfResp.AuthCtxID))
 
 	return &nas.AuthenticationRequest{
-		NGKSI: nas.NGKSI{KeySetIdentifier: 0, Type: 0},
+		NGKSI: nas.NGKSI{KeySetIdentifier: ue.PendingNGKSI, Type: 0},
 		ABBA:  h.abba,
 		RAND:  ausfResp.RAND,
 		AUTN:  ausfResp.AUTN,
@@ -515,7 +534,7 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 	span.SetStatus(codes.Ok, "")
 
 	return &nas.AuthenticationRequest{
-		NGKSI: nas.NGKSI{KeySetIdentifier: 0, Type: 0},
+		NGKSI: nas.NGKSI{KeySetIdentifier: ue.PendingNGKSI, Type: 0},
 		ABBA:  h.abba,
 		RAND:  ausfResp.RAND,
 		AUTN:  ausfResp.AUTN,
@@ -598,7 +617,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	// Derive NAS keys
 	ue.SecurityCtx.KNASint = kdf.KNASint(kamf, integAlg)
 	ue.SecurityCtx.KNASenc = kdf.KNASenc(kamf, cipherAlg)
-	ue.SecurityCtx.NGKSI = 0 // first native context
+	ue.SecurityCtx.NGKSI = ue.PendingNGKSI // must match the ngKSI sent in the Authentication Request / SMC
 	ue.SecurityCtx.Active = true
 
 	log.Info("NAS security context established, sending SecurityModeCommand",
@@ -624,7 +643,19 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 
 	metrics.NASMessagesTotal.WithLabelValues(nfName, "SecurityModeCommand", "OUT", "OK").Inc()
 
-	// Step 14: send Security Mode Command to UE (TS 24.501 §8.2.25)
+	// Step 14: send Security Mode Command to UE (TS 24.501 §8.2.25).
+	//
+	// IMEISV request: retrieve the PEI in the Security Mode Complete
+	// (TS 33.501 §6.12.4 — the PEI shall only be sent after security activation).
+	//
+	// RINMR: the initial Registration Request was sent without integrity
+	// protection, so a spec-conformant UE included only the cleartext IEs
+	// (TS 24.501 §4.4.6 — no Requested NSSAI, no 5GMM capability). Setting RINMR
+	// makes the UE retransmit the complete message in the NAS message container
+	// of the Security Mode Complete, where handleSecurityModeComplete processes
+	// it. Ref: TS 24.501 §5.4.2.2.
+	imeisvReq := nas.IMEISVRequested
+	addSecInfo := nas.Additional5GSecInfoRINMR
 	return &nas.SecurityModeCommand{
 		SelectedNASSecurityAlgorithms: nas.NASSecurityAlgorithms{
 			CipheringAlgorithmID: cipherAlg,
@@ -638,6 +669,8 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 			IA2: ue.UESecCapIA[2], IA3: ue.UESecCapIA[3],
 			Raw: ue.RawUESecCap, // replay verbatim to satisfy UERANSIM byte comparison
 		},
+		IMEISVRequest:            &imeisvReq,
+		Additional5GSecurityInfo: &addSecInfo,
 	}, displaced, nil
 }
 

@@ -27,3 +27,5 @@ snssais:
       sst: 2
     - sd: "000001"
       sst: 3
+    - sd: "001234"
+      sst: 1
