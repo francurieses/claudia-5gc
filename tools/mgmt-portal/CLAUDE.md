@@ -215,6 +215,7 @@ make portal          # up-obs + docker-compose up mgmt-portal
 | `PROMETHEUS_URL` | Prometheus URL | `http://prometheus:9090` |
 | `SMF_URL` | SMF base URL (mTLS SBI; mgmt API shares the listener) | `https://smf:8004` |
 | `UDM_URL` | UDM base URL for sm-data lookups | `https://udm:8003` |
+| `UDR_URL` | UDR base URL for re-deriving sm-data after a slice change (internal API) | `https://udr:8005` |
 | `PCF_URL` | PCF base URL for SM policy QoS overrides (NW-triggered sessions) | `https://pcf:8006` |
 | `NF_CONFIGS_PATH` | NF YAML config directory | `/app/nf-configs` |
 | `OPERATOR_CONFIG_PATH` | Path to shared operator.yaml (must be writable for DNN management) | `/etc/5gc/operator.yaml` |

@@ -111,13 +111,22 @@ Beyond globals: `amf_ue_ngap_id`, `ran_ue_ngap_id`, `gnb_id`.
 
 **Env vars**: `DATABASE_URL=postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable`, `REDIS_URL=redis:6379`. Both nil-safe.
 
+**Startup purge releases SM contexts first.** `LoadFromStore` purges all persisted UE contexts (post-restart every gNB SCTP association is gone, so they are stale) — but those rows are the AMF's only record of which PDU sessions exist. It therefore calls `releaseStaleSMContexts` **before** `PurgeAllUEContexts`; skipping that orphans an SMF session + UPF PFCP session + UE IP per PDU session on every restart. The releaser is injected (`Manager.SetSMContextReleaser`, wired in `cmd/amf/main.go`) so `internal/context` never imports the SBI layer; it is best-effort — failures are logged and the purge proceeds, so a booting SMF cannot block startup. Ref: TS 23.007 §16.
+
 ## 9. Invariants: Deregistration / Context Release
 
 - `CMState = CMConnected` is set when sending `InitialContextSetupRequest` (also in TMSI-found path of `handleInitialUEMessage`).
 - **`ue.PendingRemoval = true` is set BEFORE calling `SendUEContextReleaseCommandForUE`.** If set after, the watchdog timer doesn't arm. `handleUEContextReleaseComplete` calls `mgr.Remove` only if `PendingRemoval == true`.
-- TMSI not found in `InitialUEMessage` → `ServiceReject` cause 0x09 (TS 24.501 §5.6.1.5.2), do not create empty context.
+- **TMSI not found in `InitialUEMessage` → the reject must match the procedure the UE started** (`rejectForUnknownTMSI`). `nas.PeekMessageType` reads the initial NAS message type without verifying integrity (per TS 24.501 §4.4.5 an initial NAS message is integrity protected but *not* ciphered, so the inner header is plaintext):
+  - **Registration Request** → `RegistrationReject` 5GMM cause **#10 "Implicitly de-registered"** (TS 24.501 §5.5.1.3.5) → UE enters 5GMM-DEREGISTERED.NORMAL-SERVICE and re-registers with SUCI.
+  - **Service Request / CP Service Request / unreadable** → `ServiceReject` cause **#9** (TS 24.501 §5.6.1.5.2).
+
+  Do **not** send a Service Reject for a registration update: the UE is in 5GMM-REGISTERED-INITIATED, discards it as "message not compatible with protocol state", and retries every T3512 **forever**. Do not create an empty context.
+- **After rejecting an unknown TMSI, release the NGAP/RRC connection** (`SendUEContextReleaseCommand` on the gNB directly — *not* `SendUEContextReleaseCommandForUE`, which resolves the gNB via `ue.GNBAddr` that a temp context never has, so it silently skips the release **and returns nil**, leaking the temp context). Without the release the UE's re-registration arrives as an `UplinkNASTransport` for the removed AMF UE NGAP ID and is dropped, stalling it until T3510 (~16 s). Set `PendingRemoval = true` before the command and arm `startPendingRemovalTimer` as the backstop.
 - **`ProcPDUSessionResourceRelease = 28`** (not 30; that code is `PDUSessionResourceNotify`). Ref: TS 38.413 Table 9.1-1.
 - 5GSM Cause in Release Command: send **only the value byte** (no IEI 0x59 prefix). UERANSIM v3.2.8 uses `mandatoryIE` which reads 1 byte without prefix. Format = `EPD|PSI|PTI|0xD3|cause_value` (5 bytes). Ref: TS 24.501 §8.3.9.
+- **NW-initiated PDU Session Release: never delete the SM context alongside the Release Command.** TS 23.502 §4.3.4.3 orders it at step 7 — after the UE's PDU Session Release Complete (step 5) — because that deletion is what drives the SMF's N4 teardown (step 8). `InitiateNetworkPDUSessionRelease` only arms `Handler.pendingRelease`; `completeNetworkPDUSessionRelease` (called from the 0xD4 branch of `handleULNASTransport`, or by the **T3592 guard**, 9 s, so a silent UE can't leak a session) does the delete and drops the session from the UE context. Completion is idempotent — the Release-Complete/guard race is expected.
+- **Anything outliving the mgmt-API handler must detach from `r.Context()`** (`context.WithoutCancel` + timeout). The `:9002` handlers return 202 while the procedure is still in flight, so a goroutine holding the request context sees it cancelled immediately — this is what broke NW PDU release (`smf: delete sm context: context canceled`).
 
 ## 10. Service Request — KgNB Invariant
 

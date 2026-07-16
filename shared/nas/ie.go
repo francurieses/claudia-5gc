@@ -109,8 +109,31 @@ func DecodeMobileIdentity(b []byte) (*MobileIdentity, error) {
 			return nil, err
 		}
 		mi.GUTI = guti
+	case MobileIdentityIMEI, MobileIdentityIMEISV:
+		mi.IMEISV = decodeIMEIDigits(b)
 	}
 	return mi, nil
+}
+
+// decodeIMEIDigits decodes the BCD digits of an IMEI/IMEISV mobile identity.
+// Octet 1: digit 1 in bits 8-5, odd/even in bit 4, type in bits 3-1; following
+// octets carry two digits each, low nibble first. For an even digit count the
+// final high nibble is the filler 0xF and is dropped.
+// Ref: TS 24.501 §9.11.3.4, Figure 9.11.3.4.2/9.11.3.4.3
+func decodeIMEIDigits(b []byte) string {
+	digits := make([]byte, 0, 16)
+	digits = append(digits, b[0]>>4)
+	for _, oct := range b[1:] {
+		digits = append(digits, oct&0x0F, oct>>4)
+	}
+	out := make([]byte, 0, len(digits))
+	for _, d := range digits {
+		if d > 9 {
+			break // 0xF filler terminates the digit string
+		}
+		out = append(out, '0'+d)
+	}
+	return string(out)
 }
 
 func decodeSUCI(b []byte) (*SUCIMobileIdentity, error) {
@@ -236,17 +259,17 @@ func DecodeNSSAI(b []byte) (NSSAI, error) {
 type RegistrationType byte
 
 const (
-	RegistrationTypeInitial     RegistrationType = 1
-	RegistrationTypeMobility    RegistrationType = 2
-	RegistrationTypePeriodic    RegistrationType = 3
-	RegistrationTypeEmergency   RegistrationType = 4
+	RegistrationTypeInitial   RegistrationType = 1
+	RegistrationTypeMobility  RegistrationType = 2
+	RegistrationTypePeriodic  RegistrationType = 3
+	RegistrationTypeEmergency RegistrationType = 4
 )
 
 // FollowOnRequestPending bit (bit 4 of octet 1)
 type FollowOnRequest bool
 
 const (
-	FollowOnPending  FollowOnRequest = true
+	FollowOnPending   FollowOnRequest = true
 	FollowOnNoPending FollowOnRequest = false
 )
 
@@ -254,8 +277,8 @@ const (
 
 // NGKSI identifies the NAS key set.
 type NGKSI struct {
-	KeySetIdentifier byte  // 0-6; 7 = no key is available
-	Type             byte  // 0=native, 1=mapped
+	KeySetIdentifier byte // 0-6; 7 = no key is available
+	Type             byte // 0=native, 1=mapped
 }
 
 // ---- NAS Security Algorithms (TS 24.501 §9.11.3.34) ----------------------
@@ -318,14 +341,30 @@ func EncodeUESecurityCapability(c UESecurityCapability) []byte {
 		return append([]byte(nil), c.Raw...)
 	}
 	var b [2]byte
-	if c.EA0 { b[0] |= 0x80 }
-	if c.EA1 { b[0] |= 0x40 }
-	if c.EA2 { b[0] |= 0x20 }
-	if c.EA3 { b[0] |= 0x10 }
-	if c.IA0 { b[1] |= 0x80 }
-	if c.IA1 { b[1] |= 0x40 }
-	if c.IA2 { b[1] |= 0x20 }
-	if c.IA3 { b[1] |= 0x10 }
+	if c.EA0 {
+		b[0] |= 0x80
+	}
+	if c.EA1 {
+		b[0] |= 0x40
+	}
+	if c.EA2 {
+		b[0] |= 0x20
+	}
+	if c.EA3 {
+		b[0] |= 0x10
+	}
+	if c.IA0 {
+		b[1] |= 0x80
+	}
+	if c.IA1 {
+		b[1] |= 0x40
+	}
+	if c.IA2 {
+		b[1] |= 0x20
+	}
+	if c.IA3 {
+		b[1] |= 0x10
+	}
 	return b[:]
 }
 
@@ -340,20 +379,25 @@ type ABBA [2]byte
 type Cause5GMM byte
 
 const (
-	CauseIllegalUE                   Cause5GMM = 3
-	CauseIdentificationNotAccepted   Cause5GMM = 5
-	CauseIllegalME                   Cause5GMM = 6
-	Cause5GSServicesNotAllowed        Cause5GMM = 7
-	CauseUEIdentityNotDerived        Cause5GMM = 9
-	CauseImplicitlyDeregistered      Cause5GMM = 10
-	CausePLMNNotAllowed              Cause5GMM = 11
-	CauseTANotAllowed                Cause5GMM = 12
-	CauseRoamingNotAllowed           Cause5GMM = 13
-	CauseNoSuitableCellsInTA         Cause5GMM = 15
-	CauseMACFailure                  Cause5GMM = 20
-	CauseSynchFailure                Cause5GMM = 21
-	CauseCongestino                  Cause5GMM = 22
-	CauseUnspecified                 Cause5GMM = 111
+	CauseIllegalUE                 Cause5GMM = 3
+	CauseIdentificationNotAccepted Cause5GMM = 5
+	CauseIllegalME                 Cause5GMM = 6
+	Cause5GSServicesNotAllowed     Cause5GMM = 7
+	CauseUEIdentityNotDerived      Cause5GMM = 9
+	CauseImplicitlyDeregistered    Cause5GMM = 10
+	CausePLMNNotAllowed            Cause5GMM = 11
+	CauseTANotAllowed              Cause5GMM = 12
+	CauseRoamingNotAllowed         Cause5GMM = 13
+	CauseNoSuitableCellsInTA       Cause5GMM = 15
+	CauseMACFailure                Cause5GMM = 20
+	CauseSynchFailure              Cause5GMM = 21
+	CauseCongestino                Cause5GMM = 22
+	// Causes returned in DL NAS TRANSPORT when the AMF does not forward a
+	// 5GSM message to the SMF. Ref: TS 24.501 §5.4.5.2.5, Table 9.11.3.2.1.
+	CausePayloadNotForwarded    Cause5GMM = 90
+	CauseDNNNotSupportedInSlice Cause5GMM = 91
+	CauseInsufficientUPResource Cause5GMM = 92
+	CauseUnspecified            Cause5GMM = 111
 )
 
 // ---- BCD helpers -----------------------------------------------------------

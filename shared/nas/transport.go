@@ -22,6 +22,11 @@ type DLNASTransport struct {
 	PayloadContainer     []byte
 	PDUSessionID         *uint8 // Optional
 	Cause5GSM            *uint8 // Optional
+	// Cause5GMM is set when the AMF does not forward the 5GSM payload to the
+	// SMF (e.g. the requested S-NSSAI is not in the Allowed NSSAI). The
+	// payload container then echoes back the 5GSM message that was not
+	// forwarded. Ref: TS 24.501 §5.4.5.2.5.
+	Cause5GMM *uint8 // Optional
 }
 
 // SNSSAITransport carries SNSSAI in DL/UL NAS Transport context
@@ -46,6 +51,7 @@ const (
 	IEIRequestTypeNibble    uint8 = 0x80 // Nibble IEI: high nibble = 0x8, low nibble = value (TV, 1 byte)
 	IEISNSSAITransport      uint8 = 0x22
 	IEIDNN                  uint8 = 0x25
+	IEICause5GMM            uint8 = 0x58 // TV format (2 bytes: IEI + value)
 )
 
 // DecodeULNASTransport decodes an UL NAS Transport message body.
@@ -166,6 +172,13 @@ func EncodeDLNASTransport(msg *DLNASTransport) ([]byte, error) {
 		// TV format: IEI + value (2 bytes total)
 		out = append(out, IEIPDUSessionID)
 		out = append(out, *msg.PDUSessionID)
+	}
+
+	// 5GMM cause (TV: IEI + value). Per Table 8.7.2.1.1 it precedes the
+	// back-off timer IE.
+	if msg.Cause5GMM != nil {
+		out = append(out, IEICause5GMM)
+		out = append(out, *msg.Cause5GMM)
 	}
 
 	if msg.Cause5GSM != nil {

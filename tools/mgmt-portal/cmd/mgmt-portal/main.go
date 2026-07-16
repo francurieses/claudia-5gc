@@ -31,6 +31,7 @@ func main() {
 	smfURL := envOr("SMF_URL", "https://smf:8004")
 	amfURL := envOr("AMF_URL", "http://amf:9002")
 	udmURL := envOr("UDM_URL", "https://udm:8003")
+	udrURL := envOr("UDR_URL", "https://udr:8005")
 	pcfURL := envOr("PCF_URL", "https://pcf:8006")
 	lmfURL := envOr("LMF_URL", "https://lmf:8012")
 	nfConfigsPath := envOr("NF_CONFIGS_PATH", "/app/nf-configs")
@@ -78,6 +79,7 @@ func main() {
 		SMFBaseURL: smfURL,
 		AMFBaseURL: amfURL,
 		UDMBaseURL: udmURL,
+		UDRBaseURL: udrURL,
 		PCFBaseURL: pcfURL,
 		LMFBaseURL: lmfURL,
 		MTLSClient: sbiClient,

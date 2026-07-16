@@ -83,6 +83,11 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 			if im.Value.UplinkNonUEAssociatedNRPPaTransport != nil {
 				msg.Value = extractUplinkNonUEAssociatedNRPPaTransport(im.Value.UplinkNonUEAssociatedNRPPaTransport)
 			}
+		case ngapType.ProcedureCodeUERadioCapabilityInfoIndication: // proc=44 (gNB→AMF)
+			// Ref: TS 38.413 §8.7.6 (UE Radio Capability Info Indication)
+			if im.Value.UERadioCapabilityInfoIndication != nil {
+				msg.Value = extractUERadioCapabilityInfoIndication(im.Value.UERadioCapabilityInfoIndication)
+			}
 		}
 	case ngapType.NGAPPDUPresentSuccessfulOutcome:
 		so := pdu.SuccessfulOutcome
@@ -120,6 +125,12 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 		msg.Type = 2
 		msg.ProcedureCode = ProcedureCode(uo.ProcedureCode.Value)
 		msg.Criticality = Criticality(uo.Criticality.Value)
+		switch uo.ProcedureCode.Value {
+		case ngapType.ProcedureCodeInitialContextSetup: // gNB rejected the ICS Request (proc=14)
+			if uo.Value.InitialContextSetupFailure != nil {
+				msg.Value = extractInitialContextSetupFailure(uo.Value.InitialContextSetupFailure)
+			}
+		}
 	}
 	return msg
 }
@@ -303,6 +314,59 @@ func extractErrorIndication(msg *ngapType.ErrorIndication) *ErrorIndicationMsg {
 	return out
 }
 
+// InitialContextSetupFailureMsg is the decoded gNB rejection of an Initial
+// Context Setup Request (TS 38.413 §8.3.1, UnsuccessfulOutcome).
+type InitialContextSetupFailureMsg struct {
+	AMFUENGAPId int64
+	RANUENGAPId int64
+	// CausePresent: 1=RadioNetwork 2=Transport 3=NAS 4=Protocol 5=Misc; 0=absent
+	CausePresent int
+	CauseValue   int64
+}
+
+func extractInitialContextSetupFailure(msg *ngapType.InitialContextSetupFailure) *InitialContextSetupFailureMsg {
+	out := &InitialContextSetupFailureMsg{}
+	for _, ie := range msg.ProtocolIEs.List {
+		switch ie.Id.Value {
+		case ngapType.ProtocolIEIDAMFUENGAPID:
+			if ie.Value.AMFUENGAPID != nil {
+				out.AMFUENGAPId = ie.Value.AMFUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDRANUENGAPID:
+			if ie.Value.RANUENGAPID != nil {
+				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDCause:
+			if ie.Value.Cause != nil {
+				out.CausePresent = ie.Value.Cause.Present
+				switch ie.Value.Cause.Present {
+				case ngapType.CausePresentRadioNetwork:
+					if ie.Value.Cause.RadioNetwork != nil {
+						out.CauseValue = int64(ie.Value.Cause.RadioNetwork.Value)
+					}
+				case ngapType.CausePresentTransport:
+					if ie.Value.Cause.Transport != nil {
+						out.CauseValue = int64(ie.Value.Cause.Transport.Value)
+					}
+				case ngapType.CausePresentNas:
+					if ie.Value.Cause.Nas != nil {
+						out.CauseValue = int64(ie.Value.Cause.Nas.Value)
+					}
+				case ngapType.CausePresentProtocol:
+					if ie.Value.Cause.Protocol != nil {
+						out.CauseValue = int64(ie.Value.Cause.Protocol.Value)
+					}
+				case ngapType.CausePresentMisc:
+					if ie.Value.Cause.Misc != nil {
+						out.CauseValue = int64(ie.Value.Cause.Misc.Value)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
 // ---- Encoders ------------------------------------------------------------
 
 // BuildNGSetupResponse builds a real NG Setup Response PDU (ASN.1 PER).
@@ -438,6 +502,8 @@ type PDUSessionSetupItemCxtReq struct {
 // BuildInitialContextSetupRequest builds an Initial Context Setup Request PDU.
 // encAlgsBitmap and intAlgsBitmap are the UE's advertised capability bitmasks
 // (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3) per TS 38.413 §9.3.1.86.
+// ambrULBps/ambrDLBps is the subscribed UE Aggregate Maximum Bit Rate in bit/s
+// (TS 38.413 §9.3.1.58); pass 0 to fall back to the 1 Gbps operator default.
 // rfsp is the Radio Frequency Selection Priority index (1-256) from PCF; 0 means omit.
 // pduSessions, when non-empty, is encoded as PDUSessionResourceSetupListCxtReq
 // (IE id=71) so the gNB re-establishes user-plane resources during Service
@@ -451,10 +517,20 @@ func BuildInitialContextSetupRequest(
 	mcc, mnc string,
 	regionID byte, setID uint16, amfIDByte byte,
 	allowedNSSAI []amfctx.SNSSAISubscribed,
+	ambrULBps, ambrDLBps int64,
 	rfsp int,
 	pduSessions []PDUSessionSetupItemCxtReq,
 ) []byte {
 	plmn := plmnFromMCCMNC(mcc, mnc)
+
+	// UE-AMBR: subscribed value from UDM am-data; 1 Gbps operator default when
+	// the subscription carries none. Ref: TS 38.413 §9.3.1.58, TS 23.501 §5.7.2.6
+	if ambrULBps <= 0 {
+		ambrULBps = 1_000_000_000
+	}
+	if ambrDLBps <= 0 {
+		ambrDLBps = 1_000_000_000
+	}
 
 	// IEs in the exact order specified by TS 38.413 Table 9.2.2.1-1.
 	// TS 38.413 §8.1: "Protocol IEs shall be contained in the order specified in the
@@ -485,8 +561,8 @@ func BuildInitialContextSetupRequest(
 			Value: ngapType.InitialContextSetupRequestIEsValue{
 				Present: ngapType.InitialContextSetupRequestIEsPresentUEAggregateMaximumBitRate,
 				UEAggregateMaximumBitRate: &ngapType.UEAggregateMaximumBitRate{
-					UEAggregateMaximumBitRateUL: ngapType.BitRate{Value: 1000000000},
-					UEAggregateMaximumBitRateDL: ngapType.BitRate{Value: 1000000000},
+					UEAggregateMaximumBitRateUL: ngapType.BitRate{Value: ambrULBps},
+					UEAggregateMaximumBitRateDL: ngapType.BitRate{Value: ambrDLBps},
 				},
 			},
 		},
@@ -571,20 +647,11 @@ func BuildInitialContextSetupRequest(
 		},
 	})
 
-	// (13) NAS-PDU (id=38) — Optional, position 13 in the spec table.
-	if len(nasPDU) > 0 {
-		nasPduVal := ngapType.NASPDU{Value: aper.OctetString(nasPDU)}
-		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNASPDU},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
-			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present: ngapType.InitialContextSetupRequestIEsPresentNASPDU,
-				NASPDU:  &nasPduVal,
-			},
-		})
-	}
-
-	// (15) IndexToRFSP (id=31) — Optional, position 15 in the spec table (after NAS-PDU).
+	// (15) IndexToRFSP (id=31) — Optional, position 15 in the spec table.
+	// Must precede NAS-PDU (id=38, position 17): TS 38.413 Table 9.2.2.1-1 lists
+	// Index to RAT/Frequency Selection Priority before NAS-PDU. A strict decoder
+	// (real Nokia RAN) rejects the whole PDU with abstract-syntax-error-reject if
+	// these are out of tabular order.
 	// Radio Frequency Selection Priority index: 1=lowest priority, 256=highest.
 	// Operator default (1) guarantees this IE is always on the wire.
 	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2, TS 29.507 §4.2.2.2
@@ -596,6 +663,19 @@ func BuildInitialContextSetupRequest(
 			Value: ngapType.InitialContextSetupRequestIEsValue{
 				Present:     ngapType.InitialContextSetupRequestIEsPresentIndexToRFSP,
 				IndexToRFSP: &rfspVal,
+			},
+		})
+	}
+
+	// (17) NAS-PDU (id=38) — Optional, position 17 in the spec table (after IndexToRFSP).
+	if len(nasPDU) > 0 {
+		nasPduVal := ngapType.NASPDU{Value: aper.OctetString(nasPDU)}
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDNASPDU},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitialContextSetupRequestIEsValue{
+				Present: ngapType.InitialContextSetupRequestIEsPresentNASPDU,
+				NASPDU:  &nasPduVal,
 			},
 		})
 	}
@@ -871,11 +951,15 @@ type PDUSessionSetupResult struct {
 }
 
 // PDUSessionResourceSetupResponseMsg is the decoded PDU Session Resource Setup Response.
-// Carries the gNB GTP-U tunnel info for each PDU session.
+// Carries the gNB GTP-U tunnel info for each PDU session. FailedPSIs lists the
+// sessions the gNB could not set up (PDUSessionResourceFailedToSetupListSURes) —
+// the AMF must inform the SMF so the session is released and its resources
+// (UE IP, PFCP) are freed. Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16.
 type PDUSessionResourceSetupResponseMsg struct {
 	AMFUENGAPId int64
 	RANUENGAPId int64
 	Setups      []PDUSessionSetupResult
+	FailedPSIs  []uint8
 }
 
 func extractPDUSessionResourceSetupResponse(resp *ngapType.PDUSessionResourceSetupResponse) *PDUSessionResourceSetupResponseMsg {
@@ -897,6 +981,12 @@ func extractPDUSessionResourceSetupResponse(resp *ngapType.PDUSessionResourceSet
 						PDUSessionID:      uint8(item.PDUSessionID.Value),
 						N2SMTransferBytes: []byte(item.PDUSessionResourceSetupResponseTransfer),
 					})
+				}
+			}
+		case ngapType.ProtocolIEIDPDUSessionResourceFailedToSetupListSURes:
+			if ie.Value.PDUSessionResourceFailedToSetupListSURes != nil {
+				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListSURes.List {
+					out.FailedPSIs = append(out.FailedPSIs, uint8(item.PDUSessionID.Value))
 				}
 			}
 		}
@@ -1096,6 +1186,38 @@ func extractUEContextReleaseRequest(req *ngapType.UEContextReleaseRequest) *UECo
 						out.CauseValue = int64(ie.Value.Cause.Misc.Value)
 					}
 				}
+			}
+		}
+	}
+	return out
+}
+
+// ---- UE Radio Capability Info Indication (gNB→AMF, InitiatingMessage, ProcCode=44) ---
+// Ref: TS 38.413 §8.7.6
+
+// UERadioCapabilityInfoIndicationMsg holds the decoded fields of a
+// UE Radio Capability Info Indication. Class-2 procedure — no response.
+type UERadioCapabilityInfoIndicationMsg struct {
+	AMFUENGAPId       int64
+	RANUENGAPId       int64
+	UERadioCapability []byte // OCTET STRING, opaque to the AMF; stored for later N2 use
+}
+
+func extractUERadioCapabilityInfoIndication(m *ngapType.UERadioCapabilityInfoIndication) *UERadioCapabilityInfoIndicationMsg {
+	out := &UERadioCapabilityInfoIndicationMsg{}
+	for _, ie := range m.ProtocolIEs.List {
+		switch ie.Id.Value {
+		case ngapType.ProtocolIEIDAMFUENGAPID:
+			if ie.Value.AMFUENGAPID != nil {
+				out.AMFUENGAPId = ie.Value.AMFUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDRANUENGAPID:
+			if ie.Value.RANUENGAPID != nil {
+				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDUERadioCapability:
+			if ie.Value.UERadioCapability != nil {
+				out.UERadioCapability = append([]byte(nil), ie.Value.UERadioCapability.Value...)
 			}
 		}
 	}

@@ -28,15 +28,19 @@ sessions:
       sst: 1
       sd: 0x000001
   - type: 'IPv4'
-    apn: 'bronze'
+    apn: 'ims'
     slice:
       sst: 3
       sd: 0x000001   # bronze slice (MIoT)
 configured-nssai:
   - sst: 3
     sd: 0x000001
+  - sst: 1
+    sd: 0x000001
 default-nssai:
   - sst: 3
+    sd: 0x000001
+  - sst: 1
     sd: 0x000001
 integrity:
   IA1: false

@@ -117,7 +117,7 @@ services:
         aliases: [amf-n2.5gc.local]
       obs-net: {}
     ports:
-      - "38412:38412"   # N2 NGAP/SCTP (TCP stub in dev)
+      - "38412:38412/sctp"   # N2 NGAP/SCTP (TS 38.412)
       - "8001:8001"     # SBI
       - "9002:9002"     # Management API (NW-initiated ops + UCU push)
       - "9101:9101"     # Prometheus
@@ -842,6 +842,7 @@ services:
       SMF_URL: "https://smf:8004"
       AMF_URL: "http://amf:9002"
       UDM_URL: "https://udm:8003"
+      UDR_URL: "https://udr:8005"
       PCF_URL: "https://pcf:8006"
       LMF_URL: "https://lmf:8012"
       NF_CONFIGS_PATH: "/app/nf-configs"

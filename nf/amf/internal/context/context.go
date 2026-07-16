@@ -154,12 +154,23 @@ type UEContext struct {
 	// RawUESecCap stores the verbatim wire bytes of the UE Security Capability IE
 	// so they can be replayed exactly in the Security Mode Command.
 	RawUESecCap []byte
+	// UERadioCapability is the opaque UE radio-capability blob reported by the gNB
+	// in a UE Radio Capability Info Indication (TS 38.413 §8.7.6). Kept for later
+	// N2 use such as populating a HandoverRequest to a target gNB.
+	UERadioCapability []byte
 
 	// Authentication state (used during auth procedure)
 	AuthCtxID   string   // AUSF auth context ID
 	PendingRAND [16]byte // RAND sent to UE in AuthenticationRequest; needed for AUTS resync
-	KAUSF       []byte
-	KSEAF       []byte
+	// PendingNGKSI is the ngKSI the AMF allocated for the in-flight authentication.
+	// It must differ from the ngKSI of the UE's existing native 5G security context
+	// (which the UE reports in the Registration Request) or the UE rejects the
+	// Authentication Request with 5GMM cause #71 "ngKSI already in use".
+	// The same value is carried into the SecurityModeCommand and the resulting
+	// SecurityContext. Ref: TS 24.501 §5.4.1.2.1, §5.4.1.3.2, §5.4.1.3.7.
+	PendingNGKSI byte
+	KAUSF        []byte
+	KSEAF        []byte
 
 	// Subscription data (from UDM)
 	AllowedNSSAI []SNSSAISubscribed
@@ -395,6 +406,20 @@ type Manager struct {
 	db     store.Store
 	cache  store.Cache
 	logger *slog.Logger
+
+	// releaseSMContext releases one SM context at the SMF. Set via
+	// SetSMContextReleaser by the wiring in cmd/amf; nil = no SMF client
+	// configured (tests, dev without a stack), in which case the startup
+	// release is skipped. Injected rather than importing an SBI client here:
+	// the context package must not depend on the SBI layer.
+	// Ref: TS 23.007 §16, TS 29.502 §5.2.2.3.3.
+	releaseSMContext func(ctx context.Context, smContextRef string) error
+}
+
+// SetSMContextReleaser installs the callback LoadFromStore uses to release the
+// SM contexts of purged UEs at the SMF. Must be called before LoadFromStore.
+func (m *Manager) SetSMContextReleaser(fn func(ctx context.Context, smContextRef string) error) {
+	m.releaseSMContext = fn
 }
 
 // AMFIdentity identifies this AMF instance.
@@ -428,6 +453,12 @@ func NewManager(id AMFIdentity, db store.Store, cache store.Cache, logger *slog.
 // reload contexts into the in-memory maps: after a restart all gNB SCTP
 // associations are lost, so every UE context is effectively stale. UEs will
 // re-register, creating fresh contexts.
+//
+// Before purging it releases those contexts' SM contexts at the SMF: the rows
+// are the AMF's only record of which PDU sessions exist, so dropping them
+// without telling the SMF orphans an SMF session, a UPF PFCP session and a UE
+// IP per PDU session, permanently, on every restart.
+// Ref: TS 23.007 §16 (restoration of data in the AMF).
 func (m *Manager) LoadFromStore(ctx context.Context) error {
 	if m.db == nil {
 		return nil
@@ -437,6 +468,8 @@ func (m *Manager) LoadFromStore(ctx context.Context) error {
 	if err != nil {
 		m.logger.Warn("amf: could not read max TMSI before purge", "error", err)
 	}
+
+	m.releaseStaleSMContexts(ctx)
 
 	purged, err := m.db.PurgeAllUEContexts(ctx)
 	if err != nil {
@@ -457,6 +490,59 @@ func (m *Manager) LoadFromStore(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// releaseStaleSMContexts releases, at the SMF, the SM contexts of every UE
+// context persisted by a previous AMF run. Called by LoadFromStore immediately
+// before the rows are purged — after the purge the AMF has no record of which
+// PDU sessions existed, so this is the last chance to free them.
+//
+// Best-effort by design: a failure here must not stop the AMF from starting
+// (the SMF may still be booting, or a session may already be gone), so every
+// error is logged and the purge proceeds. Deleting an unknown smContextRef is
+// harmless — the SMF answers 204 and logs "session not found".
+//
+// Ref: TS 23.007 §16, TS 23.502 §4.3.4, TS 29.502 §5.2.2.3.3.
+func (m *Manager) releaseStaleSMContexts(ctx context.Context) {
+	if m.releaseSMContext == nil {
+		return // no SMF client wired (tests, dev without a stack)
+	}
+	records, err := m.db.ListAllUEContexts(ctx)
+	if err != nil {
+		m.logger.Warn("amf: could not list stale UE contexts — SM contexts may leak at the SMF",
+			"error", err)
+		return
+	}
+
+	var released, failed int
+	for _, rec := range records {
+		for _, sess := range rec.PDUSessions {
+			if sess.SMFInstanceID == "" {
+				continue
+			}
+			if err := m.releaseSMContext(ctx, sess.SMFInstanceID); err != nil {
+				failed++
+				m.logger.Warn("amf: releasing stale SM context failed — SMF/UPF session may leak",
+					"supi", rec.SUPI,
+					"pdu_session_id", sess.PDUSessionID,
+					"smContextRef", sess.SMFInstanceID,
+					"error", err,
+					"spec_ref", "TS 29.502 §5.2.2.3.3",
+				)
+				continue
+			}
+			released++
+		}
+	}
+	if released > 0 || failed > 0 {
+		m.logger.Info("amf: released stale SM contexts from previous run",
+			"released", released,
+			"failed", failed,
+			"interface", "Nsmf",
+			"direction", "OUT",
+			"spec_ref", "TS 23.007 §16",
+		)
+	}
 }
 
 // PersistUE writes the UE context to PostgreSQL. No-op when store is nil.

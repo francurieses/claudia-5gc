@@ -27,6 +27,7 @@ func buildTestICSRWithSessions(rfsp int, pduSessions []PDUSessionSetupItemCxtReq
 		"001", "01",
 		0x80, 1, 0x01,
 		[]amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
+		0, 0, // subscribed UE-AMBR absent → builder falls back to 1 Gbps
 		rfsp,
 		pduSessions,
 	)
@@ -65,6 +66,51 @@ func TestBuildInitialContextSetupRequest_WithRFSP(t *testing.T) {
 	}
 	if !foundRFSP {
 		t.Fatal("IndexToRFSP IE (id=31) not found in InitialContextSetupRequest")
+	}
+}
+
+// TestBuildInitialContextSetupRequest_IEOrder pins the ProtocolIE-Container to
+// TS 38.413 Table 9.2.2.1-1 tabular order. A real Nokia RAN rejects the whole
+// PDU with abstract-syntax-error-reject on any out-of-order IE. The regression
+// this guards: IndexToRFSP (id=31, position 15) must precede NAS-PDU (id=38,
+// position 17) — an earlier build appended them reversed. Ref: TS 38.413 §8.1.
+func TestBuildInitialContextSetupRequest_IEOrder(t *testing.T) {
+	raw := buildTestICSR(1) // rfsp>0 and nasPDU non-empty → both tail IEs present
+	if raw == nil {
+		t.Fatal("encoder returned nil")
+	}
+	pdu, err := libngap.Decoder(raw)
+	if err != nil {
+		t.Fatalf("NGAP decode failed: %v", err)
+	}
+	req := pdu.InitiatingMessage.Value.InitialContextSetupRequest
+	if req == nil {
+		t.Fatal("InitialContextSetupRequest is nil")
+	}
+
+	// Expected order of the IEs this builder emits, per the spec table.
+	wantOrder := []int64{
+		ngapType.ProtocolIEIDAMFUENGAPID,               // 10
+		ngapType.ProtocolIEIDRANUENGAPID,               // 85
+		ngapType.ProtocolIEIDUEAggregateMaximumBitRate, // 110
+		ngapType.ProtocolIEIDGUAMI,                     // 28
+		ngapType.ProtocolIEIDAllowedNSSAI,              // 0
+		ngapType.ProtocolIEIDUESecurityCapabilities,    // 119
+		ngapType.ProtocolIEIDSecurityKey,               // 94
+		ngapType.ProtocolIEIDIndexToRFSP,               // 31 — must come BEFORE NAS-PDU
+		ngapType.ProtocolIEIDNASPDU,                    // 38
+	}
+	var got []int64
+	for _, ie := range req.ProtocolIEs.List {
+		got = append(got, ie.Id.Value)
+	}
+	if len(got) != len(wantOrder) {
+		t.Fatalf("IE count = %d, want %d (got ids %v)", len(got), len(wantOrder), got)
+	}
+	for i := range wantOrder {
+		if got[i] != wantOrder[i] {
+			t.Fatalf("IE order violated at position %d: got id=%d, want id=%d\nfull order: %v", i, got[i], wantOrder[i], got)
+		}
 	}
 }
 

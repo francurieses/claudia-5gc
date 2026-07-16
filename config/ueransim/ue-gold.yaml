@@ -35,9 +35,13 @@ sessions:
 configured-nssai:
   - sst: 1
     sd: 0x000002
+  - sst: 1
+    sd: 0x000001
 default-nssai:
   - sst: 1
     sd: 0x000002
+  - sst: 1
+    sd: 0x000001
 integrity:
   IA1: false
   IA2: true

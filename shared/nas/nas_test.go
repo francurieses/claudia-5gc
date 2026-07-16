@@ -431,8 +431,9 @@ func TestDecodeRegistrationRequest_Minimal(t *testing.T) {
 }
 
 func TestDecodeRegistrationRequest_WithNSSAI(t *testing.T) {
-	// Same combined byte as minimal + IEI 0x6D (RequestedNSSAI) with SST=0xAB, no SD
-	nssaiIE := []byte{0x6D, 0x02, 0x01, 0xAB} // IEI | len | S-NSSAI(len=1, SST=0xAB)
+	// Same combined byte as minimal + IEI 0x2F (RequestedNSSAI) with SST=0xAB, no SD
+	// Ref: TS 24.501 Table 8.2.6.1.1
+	nssaiIE := []byte{0x2F, 0x02, 0x01, 0xAB} // IEI | len | S-NSSAI(len=1, SST=0xAB)
 	body := append([]byte{0x11, 0x00, 0x01, 0x00}, nssaiIE...)
 	pdu := append([]byte{nas.PDMobilityManagement, 0x00, byte(nas.MsgTypeRegistrationRequest)}, body...)
 

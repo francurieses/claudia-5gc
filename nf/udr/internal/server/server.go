@@ -113,6 +113,13 @@ func New(addr string, tlsCfg TLSConfig, st store.Store, logger *slog.Logger) (*S
 	mux.HandleFunc("PATCH /nudr-dr/v2/policy-data/{supi}/sm-data",
 		s.handlePatchSmPolicyData)
 
+	// Internal provisioning API (not 3GPP). The management portal provisions
+	// slices by writing subscription_am directly; this lets it ask the UDR to
+	// re-derive the matching sm-data, so the slice→QoS mapping stays owned by
+	// the UDR instead of being duplicated in the portal.
+	mux.HandleFunc("POST /nudr-internal/v1/subscribers/{supi}/sync-sm-data",
+		s.handleSyncSMData)
+
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	// Load TLS config
@@ -461,6 +468,31 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-Id", corr)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// handleSyncSMData re-derives a subscriber's session management subscription
+// data from the slices in its AM subscription. Internal provisioning API — not
+// a 3GPP operation.
+//
+// The management portal writes subscription_am directly when it provisions a
+// slice; without this, sm-data kept the slice set it was seeded with, so a
+// portal-added slice had no DNNConfiguration and the SMF fell back to
+// OPERATOR_DEFAULT QoS. Ref: TS 29.503 §6.1.6.2.7.
+func (s *Server) handleSyncSMData(w http.ResponseWriter, r *http.Request) {
+	supi := r.PathValue("supi")
+	log := s.procedureLog(r, "SyncSMData", supi)
+
+	slices, err := store.SyncSMDataFromAM(s.store, supi)
+	if err != nil {
+		log.Error("sync sm-data failed", "error", err)
+		s.problem(w, http.StatusNotFound, "RESOURCE_URI_STRUCTURE_NOT_FOUND", err.Error())
+		return
+	}
+
+	log.Info("sm-data resynced from am-data", "direction", "OUT",
+		"slice_count", slices, "spec_ref", "TS 29.503 §6.1.6.2.7")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"supi": supi, "slices": slices})
 }
 
 func (s *Server) procedureLog(r *http.Request, procedure, supi string) *slog.Logger {
