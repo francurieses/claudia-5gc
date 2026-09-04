@@ -17,6 +17,26 @@ type PDUSessionEstablishmentRequest struct {
 	// ExtendedProtocolConfigOptions: optional IEI 0x7B (TLV-E, 2-byte length).
 	// Ref: §9.11.4.6
 	ExtendedProtocolConfigOptions []byte
+	// IPCPRequest is the parsed IPCP (RFC 1332) Configure-Request carried
+	// inside the (E)PCO container 0x8021, or nil if that container is absent
+	// or is not a Configure-Request. See ParseIPCPFromEPCO.
+	IPCPRequest *IPCPConfigureRequest
+	// RequestedPCOContainerIDs lists every (E)PCO container ID the UE sent,
+	// IN THE EXACT ORDER IT SENT THEM. The Accept must answer the containers
+	// it can answer in this same order: Open5GS builds its reply with a
+	// single pass over the UE's own list (src/smf/context.c, smf_pco_build,
+	// `for (i = 0; i < ue.num_of_id; i++)`), so the reply order mirrors the
+	// request order. Confirmed on a real Open5GS Accept captured to a Moto
+	// Edge 30 Pro (IPCP first, then DNS, then MTU — the order that phone
+	// asked in). See docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md §2b.
+	RequestedPCOContainerIDs []uint16
+	// PCOConfigProtocolOctet is octet 1 of the UE's (E)PCO IE
+	// (Ext | spare | configuration protocol, TS 24.008 §10.5.6.3). Open5GS
+	// echoes it back verbatim (`smf.ext = ue.ext;
+	// smf.configuration_protocol = ue.configuration_protocol`,
+	// context.c#L3361-3363) rather than hardcoding 0x80. Zero means the UE
+	// sent no (E)PCO.
+	PCOConfigProtocolOctet uint8
 }
 
 // PDU Session Establishment Accept (5GSM, TS 24.501 §8.3.2)
@@ -39,8 +59,14 @@ const (
 	IEIPDUAddress         uint8 = 0x29
 	IEISNSSAI5GSM         uint8 = 0x22 // S-NSSAI (TS 24.501 §9.11.4.8, Table 8.3.2.1.1)
 	IEIDNN5GSM            uint8 = 0x25
-	IEICause5GSM          uint8 = 0x37
-	IEISelectedSSCMode    uint8 = 0x0A
+	// IEICause5GSM is the 5GSM cause IE identifier (TV, 2 octets) in the
+	// PDU Session Establishment Accept — TS 24.501 Table 8.3.2.1.1, IEI
+	// 0x59. (Was 0x37 here, which is wrong and was never emitted; Open5GS
+	// encodes it as 0x59, lib/nas/5gs/encoder.c#L3052, and a real captured
+	// Open5GS Accept carries `59 32`. See
+	// docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md §3b.)
+	IEICause5GSM       uint8 = 0x59
+	IEISelectedSSCMode uint8 = 0x0A
 	// Modification Command optional IEs (TS 24.501 Table 8.3.7.1.1).
 	// Note: in the PDU Session Establishment Accept the QoS rules and Session-AMBR
 	// are mandatory LV-E/LV (no IEI); the IEIs below apply to the Modification
@@ -48,6 +74,15 @@ const (
 	IEIAuthorizedQoSRules    uint8 = 0x7A // Authorized QoS rules (TS 24.501 §9.11.4.13)
 	IEISessionAMBR           uint8 = 0x2A // Session-AMBR (TS 24.501 §9.11.4.14)
 	IEIAuthorizedQoSFlowDesc uint8 = 0x79 // Authorized QoS flow descriptions (TS 24.501 §9.11.4.12)
+)
+
+// 5GSM cause values emitted in the Establishment Accept when the granted PDU
+// session type is narrower than the one the UE requested (TS 24.501
+// §9.11.4.2, Table 9.11.4.2.1). Open5GS sets exactly these two, and only when
+// the UE asked for IPv4v6: src/smf/gsm-build.c#L216-226.
+const (
+	Cause5GSMPDUSessionTypeIPv4OnlyAllowed uint8 = 0x32 // #50
+	Cause5GSMPDUSessionTypeIPv6OnlyAllowed uint8 = 0x33 // #51
 )
 
 // PDU Session Type values
@@ -125,6 +160,13 @@ func DecodePDUSessionEstablishmentRequest(b []byte) (*PDUSessionEstablishmentReq
 			lo, _ := r.ReadByte()
 			l := int(hi)<<8 | int(lo)
 			msg.ExtendedProtocolConfigOptions, _ = r.ReadBytes(l)
+			msg.IPCPRequest = ParseIPCPFromEPCO(msg.ExtendedProtocolConfigOptions)
+			if len(msg.ExtendedProtocolConfigOptions) > 0 {
+				msg.PCOConfigProtocolOctet = msg.ExtendedProtocolConfigOptions[0]
+			}
+			for _, c := range parseEPCOContainerList(msg.ExtendedProtocolConfigOptions) {
+				msg.RequestedPCOContainerIDs = append(msg.RequestedPCOContainerIDs, c.ID)
+			}
 		case 0x55: // Maximum number of supported packet filters — TV, 3 octets total
 			_, _ = r.ReadBytes(2)
 		default:
@@ -288,26 +330,525 @@ func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
 	qfi, fiveQI uint8, dlMbps, ulMbps int,
 	snssai ...SNSSAI,
 ) ([]byte, error) {
+	return EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS(
+		addr, sscMode, dnn, qfi, fiveQI, dlMbps, ulMbps, nil, snssai...)
+}
+
+// ContainerIDDNSServerIPv4Address is the (E)PCO container ID for "DNS Server
+// IPv4 Address" (TS 24.008 §10.5.6.3, Table 10.5.154 / TS 24.301 Annex D).
+// The network echoes this container back in the Accept, filled with the
+// resolver address, for each one the UE requested (or unconditionally, which
+// every UE tested against — incl. stock Android — accepts).
+const ContainerIDDNSServerIPv4Address uint16 = 0x000D
+
+// EncodePCODNSIPv4 builds the (Extended) Protocol Configuration Options
+// content carrying one DNS Server IPv4 Address container per address in dns
+// (TS 24.008 §10.5.6.3). Non-IPv4 / nil addresses are skipped. Returns nil if
+// no valid IPv4 address is given, so callers can skip emitting the EPCO IE.
+//
+// Kept as its own entry point (DNS-only, no MTU) for callers/tests that want
+// the historical byte-for-byte output; EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS
+// itself calls the combined EncodePCODNSAndMTU below.
+func EncodePCODNSIPv4(dns ...net.IP) []byte {
+	return EncodePCODNSAndMTU(0, dns...)
+}
+
+// ContainerIDIPv4LinkMTU is the (E)PCO container ID for "IPv4 Link MTU"
+// (TS 24.008 §10.5.6.3, Table 10.5.154). The UE requests it with container
+// ID 0x000B ("IPv4 link MTU request", empty value) and the network answers
+// with 0x0010 carrying the negotiated 2-octet MTU. Reproduced against a
+// Pixel 6a on the live OTA core 2026-09-03: the UE's PDU SESSION
+// ESTABLISHMENT REQUEST ePco asked for 0x0010 and the Accept never answered
+// it (DNS-only fix landed first, MTU still missing).
+const ContainerIDIPv4LinkMTU uint16 = 0x0010
+
+// DefaultIPv4LinkMTU is the MTU (in octets) advertised to the UE via the
+// IPv4 Link MTU (E)PCO container. 1400 leaves headroom below the Ethernet
+// 1500-byte MTU for GTP-U/UDP/IP encapsulation overhead on the N3 path
+// (8 GTP-U + 8 UDP + 20 IP = 36 bytes minimum), matching common practice
+// (e.g. Open5GS defaults) — safe even when N3 itself rides another
+// encapsulated transport.
+const DefaultIPv4LinkMTU uint16 = 1400
+
+// EncodePCODNSAndMTU builds the (Extended) Protocol Configuration Options
+// content carrying the IPv4 Link MTU container (when mtu != 0) followed by
+// one DNS Server IPv4 Address container per address in dns (TS 24.008
+// §10.5.6.3). Non-IPv4 / nil DNS addresses are skipped. Returns nil if
+// there is nothing to emit (mtu == 0 and no valid DNS address), so callers
+// can skip emitting the EPCO IE entirely.
+//
+// Per Open5GS (src/smf/gsm-build.c, smf_pco_build): the network answers PCO
+// unconditionally rather than gating each container on the UE having
+// requested it — the containers a stock UE (including this Pixel 6a) does
+// not ask for are simply ignored by it.
+func EncodePCODNSAndMTU(mtu uint16, dns ...net.IP) []byte {
+	var containers []byte
+	if mtu != 0 {
+		containers = append(containers,
+			byte(ContainerIDIPv4LinkMTU>>8), byte(ContainerIDIPv4LinkMTU&0xFF),
+			2, byte(mtu>>8), byte(mtu&0xFF))
+	}
+	for _, ip := range dns {
+		v4 := ip.To4()
+		if v4 == nil {
+			continue
+		}
+		containers = append(containers,
+			byte(ContainerIDDNSServerIPv4Address>>8), byte(ContainerIDDNSServerIPv4Address&0xFF),
+			byte(len(v4)))
+		containers = append(containers, v4...)
+	}
+	if len(containers) == 0 {
+		return nil
+	}
+	// Octet 1: Ext(bit8)=1 | spare(bits 7-5)=000 | Configuration protocol(bits 4-1)=0000.
+	out := append([]byte{0x80}, containers...)
+	return out
+}
+
+// containerIDIPCP is the (E)PCO container ID for "PPP for use with IP PDP
+// type or IP PDN type" (TS 24.008 §10.5.6.3 Table 10.5.154,
+// OGS_PCO_PPP_FOR_USE_WITH_IP_PDP_TYPE_OR_IP_PDN_TYPE = 0). RFC 1332 IPCP
+// negotiation is carried inside this container. Matches Open5GS
+// OGS_PCO_ID_INTERNET_PROTOCOL_CONTROL_PROTOCOL, lib/proto/types.h:676
+// (https://github.com/open5gs/open5gs/blob/main/lib/proto/types.h#L676).
+const containerIDIPCP uint16 = 0x8021
+
+// IPCP codes we handle (RFC 1661 §5, Configuration Option negotiation).
+const (
+	ipcpCodeConfigureRequest uint8 = 1 // RFC 1661 §5.1
+	ipcpCodeConfigureAck     uint8 = 2 // RFC 1661 §5.2
+	ipcpCodeConfigureNak     uint8 = 3 // RFC 1661 §5.3
+)
+
+// IPCP option types for DNS delivery (RFC 1877 §1, "PPP IPCP DNS/NBNS Name
+// Server Addresses"). Matches Open5GS OGS_IPCP_OPT_PRIMARY_DNS /
+// OGS_IPCP_OPT_SECONDARY_DNS, lib/proto/types.h:691-692
+// (https://github.com/open5gs/open5gs/blob/main/lib/proto/types.h#L691-L692).
+const (
+	ipcpOptPrimaryDNS   uint8 = 129 // 0x81
+	ipcpOptSecondaryDNS uint8 = 131 // 0x83
+)
+
+// IPCPConfigureRequest is the UE's IPCP (RFC 1332) Configure-Request carried
+// inside (E)PCO container 0x8021. Populated by ParseIPCPFromEPCO /
+// DecodePDUSessionEstablishmentRequest when that container is present with
+// IPCP code 1 (Configure-Request, RFC 1661 §5.1).
+//
+// Reproduced against a Pixel 6a (Shannon modem) on the live OTA core
+// 2026-09-03: the phone's PDU SESSION ESTABLISHMENT REQUEST ePco carried a
+// 0x8021 container with IPCP Configure-Request options 0x81 (Primary-DNS)
+// and 0x83 (Secondary-DNS, RFC 1877 §1), and the phone's DataCallResponse
+// showed dnses=[] even though the Accept's plain 0x000D DNS container
+// (TS 24.008 §10.5.6.3) was present and correctly formed on the wire — this
+// modem appears to source DNS only from an IPCP reply, not from 0x000D.
+type IPCPConfigureRequest struct {
+	// Identifier is the IPCP identifier (RFC 1661 §5.1) that must be echoed
+	// back unchanged in the Configure-Ack.
+	Identifier uint8
+	// WantsPrimaryDNS/WantsSecondaryDNS report whether the UE's
+	// Configure-Request contained IPCP option 129/131 (RFC 1877 §1),
+	// regardless of the placeholder value it sent (typically 0.0.0.0).
+	WantsPrimaryDNS   bool
+	WantsSecondaryDNS bool
+}
+
+// parseIPCPConfigureRequest parses one (E)PCO container's raw value as an
+// IPCP packet — code(1) identifier(1) length(2, big-endian) + options,
+// RFC 1332 §3 / RFC 1661 §5 — and returns the Configure-Request info when
+// code == 1. Returns nil (not an error) for any other code, or when the
+// value is too short to hold a valid IPCP header.
+func parseIPCPConfigureRequest(value []byte) *IPCPConfigureRequest {
+	if len(value) < 4 || value[0] != ipcpCodeConfigureRequest {
+		return nil
+	}
+	req := &IPCPConfigureRequest{Identifier: value[1]}
+	l := int(value[2])<<8 | int(value[3])
+	if l > len(value) {
+		l = len(value) // tolerate an overrun declared length
+	}
+	opts := value[4:l]
+	for len(opts) >= 2 {
+		optType, optLen := opts[0], int(opts[1])
+		if optLen < 2 || optLen > len(opts) {
+			break
+		}
+		switch optType {
+		case ipcpOptPrimaryDNS:
+			req.WantsPrimaryDNS = true
+		case ipcpOptSecondaryDNS:
+			req.WantsSecondaryDNS = true
+		}
+		opts = opts[optLen:]
+	}
+	return req
+}
+
+// epcoContainer is one decoded (E)PCO container: its 2-octet ID and raw value.
+type epcoContainer struct {
+	ID    uint16
+	Value []byte
+}
+
+// parseEPCOContainerList walks a decoded (E)PCO IE value (TS 24.008
+// §10.5.6.3: one octet of Ext/spare/configuration-protocol, then containers
+// of ID(2B big-endian) + length(1B) + value) and returns the containers IN
+// THE ORDER THEY APPEAR. Order matters: the Accept answers them in the same
+// order (see BuildEPCOReply).
+func parseEPCOContainerList(epco []byte) []epcoContainer {
+	var out []epcoContainer
+	if len(epco) < 1 {
+		return out
+	}
+	b := epco[1:] // skip the Ext/spare/configuration-protocol octet
+	for len(b) >= 3 {
+		id := uint16(b[0])<<8 | uint16(b[1])
+		l := int(b[2])
+		if 3+l > len(b) {
+			break
+		}
+		out = append(out, epcoContainer{ID: id, Value: b[3 : 3+l]})
+		b = b[3+l:]
+	}
+	return out
+}
+
+// parseEPCOContainers is parseEPCOContainerList keyed by container ID, for
+// callers that only need lookup (order is lost — do not use it to build a
+// reply).
+func parseEPCOContainers(epco []byte) map[uint16][]byte {
+	out := make(map[uint16][]byte)
+	for _, c := range parseEPCOContainerList(epco) {
+		out[c.ID] = c.Value
+	}
+	return out
+}
+
+// ParseIPCPFromEPCO extracts the UE's IPCP Configure-Request (container
+// 0x8021) from a decoded (E)PCO value — e.g.
+// PDUSessionEstablishmentRequest.ExtendedProtocolConfigOptions — or nil if
+// the container is absent or is not a Configure-Request.
+func ParseIPCPFromEPCO(epco []byte) *IPCPConfigureRequest {
+	value, ok := parseEPCOContainers(epco)[containerIDIPCP]
+	if !ok {
+		return nil
+	}
+	return parseIPCPConfigureRequest(value)
+}
+
+// EncodeIPCPConfigAckContainer builds the (E)PCO container 0x8021 carrying
+// an IPCP Configure-Ack (RFC 1661 §5.2, code 2) in reply to the UE's
+// Configure-Request: identifier echoed unchanged, with options 129/131
+// (RFC 1877 §1) populated for whichever of primary/secondary DNS the UE
+// requested. Returns nil if req is nil or neither DNS option applies (no
+// requested option, or no address available for it) — callers then omit the
+// container.
+//
+// Matches verified Open5GS behavior (src/smf/context.c, smf_pco_build,
+// case OGS_PCO_ID_INTERNET_PROTOCOL_CONTROL_PROTOCOL, lines ~3404-3460:
+// https://github.com/open5gs/open5gs/blob/main/src/smf/context.c#L3404-L3460):
+// Open5GS replies with IPCP code 2 (Configure-Ack) — NOT a Configure-Nak
+// (code 3) — copying the UE's identifier and substituting the SMF's own DNS
+// addresses into whichever of options 129/131 the request contained
+// (checked via ipcp_contains_option, same file lines 3300-3326, "stolen
+// from osmo-ggsn"). This function reproduces that: Ack, not Nak.
+func EncodeIPCPConfigAckContainer(req *IPCPConfigureRequest, primary, secondary net.IP) []byte {
+	if req == nil {
+		return nil
+	}
+	var opts []byte
+	if req.WantsPrimaryDNS {
+		if v4 := primary.To4(); v4 != nil {
+			opts = append(opts, ipcpOptPrimaryDNS, 6)
+			opts = append(opts, v4...)
+		}
+	}
+	if req.WantsSecondaryDNS {
+		if v4 := secondary.To4(); v4 != nil {
+			opts = append(opts, ipcpOptSecondaryDNS, 6)
+			opts = append(opts, v4...)
+		}
+	}
+	if len(opts) == 0 {
+		return nil
+	}
+	ipcpLen := 4 + len(opts) // code+identifier+length(2) + options
+	// Empirically tested against the Pixel 6a on the live OTA core
+	// 2026-09-04: both code=2 (Configure-Ack, this line) and code=3
+	// (Configure-Nak, RFC 1661 §5.3) were sent — byte-correct on the wire,
+	// verified via SMF debug logging (identifier echoed, options 0x81/0x83
+	// populated with real DNS addresses) — and produced IDENTICAL results:
+	// DataCallResponse.dnses=[] either way. So the IPCP reply code is not
+	// the fix; kept as Ack to match verified Open5GS behavior (see doc
+	// comment above) since there is no evidence Nak does anything this
+	// modem/RIL combination actually uses. See
+	// evidence/ota-attach-debug-2026-09-03.md for the negative result.
+	ipcp := []byte{ipcpCodeConfigureAck, req.Identifier, byte(ipcpLen >> 8), byte(ipcpLen & 0xFF)}
+	ipcp = append(ipcp, opts...)
+
+	container := []byte{byte(containerIDIPCP >> 8), byte(containerIDIPCP & 0xFF), byte(len(ipcp))}
+	return append(container, ipcp...)
+}
+
+// (E)PCO container IDs this encoder can answer, beyond
+// ContainerIDDNSServerIPv4Address (0x000D), ContainerIDIPv4LinkMTU (0x0010)
+// and containerIDIPCP (0x8021). Values from TS 24.008 §10.5.6.3
+// Table 10.5.154; names/behavior mirror Open5GS lib/proto/types.h#L679-687.
+const (
+	// ContainerIDDNSServerIPv6Address — "DNS Server IPv6 Address Request".
+	// Answered with one 16-octet container per configured IPv6 resolver;
+	// omitted entirely when none is configured (Open5GS context.c, case
+	// OGS_PCO_ID_DNS_SERVER_IPV6_ADDRESS_REQUEST: gated on smf.dns6[]).
+	ContainerIDDNSServerIPv6Address uint16 = 0x0003
+	// containerIDMSSupportLocalAddrTFT — "MS support of local address in TFT
+	// indicator". Open5GS echoes it back with a ZERO-length value
+	// (context.c, case OGS_PCO_ID_MS_SUPPORT_LOCAL_ADDR_TFT_INDICATOR:
+	// len = 0, data = 0), so we do the same.
+	containerIDMSSupportLocalAddrTFT uint16 = 0x0011
+)
+
+// EPCOReplyConfig is everything BuildEPCOReply needs to answer a UE's (E)PCO.
+type EPCOReplyConfig struct {
+	// ConfigProtocolOctet is octet 1 of the UE's own (E)PCO IE, echoed back
+	// (Open5GS context.c#L3361-3363). 0 falls back to 0x80 (Ext=1, config
+	// protocol 0000).
+	ConfigProtocolOctet uint8
+	// RequestedIDs are the container IDs the UE asked for, in ITS order.
+	// Empty means the UE sent no (E)PCO — see the legacy fallback below.
+	RequestedIDs []uint16
+	// IPCP is the UE's IPCP Configure-Request (container 0x8021), or nil.
+	IPCP *IPCPConfigureRequest
+	// DNSv4/DNSv6 are the resolvers to hand out; MTU is the IPv4 link MTU
+	// (0 = not configured, container omitted).
+	DNSv4 []net.IP
+	DNSv6 []net.IP
+	MTU   uint16
+}
+
+// BuildEPCOReply builds the (Extended) Protocol Configuration Options IE value
+// for a PDU Session Establishment Accept, answering the containers the UE
+// requested IN THE UE'S OWN REQUEST ORDER.
+//
+// This reproduces Open5GS smf_pco_build (src/smf/context.c#L3331-L3573):
+// a single pass over the UE's container list, appending one (or more) reply
+// containers per recognized ID and skipping the rest. Per-ID semantics, all
+// verified against that function:
+//
+//   - 0x8021 IPCP        — Configure-Ack (code 2), identifier echoed, only the
+//     DNS options (0x81/0x83) the UE's own request carried.
+//   - 0x000D DNS IPv4    — one flat 4-octet container PER configured resolver
+//     (one request → two containers when two are set).
+//   - 0x0003 DNS IPv6    — same, 16 octets each; omitted when none configured.
+//   - 0x0010 IPv4 MTU    — 2-octet big-endian MTU when configured.
+//   - 0x0011 local-addr-in-TFT — echoed back with a zero-length value.
+//   - anything else (0x0005 MS-supports-BCM, 0x000A IP-alloc-via-NAS, P-CSCF,
+//     ...) — omitted, exactly like Open5GS's `/` TODO `/` + `ogs_warn` arms.
+//
+// Why order matters: ClaudIA used to emit a FIXED MTU → DNS → DNS → IPCP-last
+// list regardless of what the UE asked for. A Pixel 6a (Shannon modem) that
+// puts IPCP FIRST in its request got dnses=[] and never validated the network,
+// while the same phone works on Open5GS. See
+// docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md §6 finding #1.
+//
+// Legacy fallback: when RequestedIDs is empty (caller has no decoded UE
+// request — the old DNS/IPCP-only entry points), the historical fixed
+// MTU → DNS → IPCP order is emitted so those call sites and their golden-hex
+// tests stay byte-identical.
+//
+// Returns nil when there is nothing to answer, so the caller omits the IE.
+func BuildEPCOReply(cfg EPCOReplyConfig) []byte {
+	var primary, secondary net.IP
+	if len(cfg.DNSv4) > 0 {
+		primary = cfg.DNSv4[0]
+	}
+	if len(cfg.DNSv4) > 1 {
+		secondary = cfg.DNSv4[1]
+	}
+
+	if len(cfg.RequestedIDs) == 0 {
+		return EncodePCODNSMTUAndIPCP(cfg.MTU,
+			EncodeIPCPConfigAckContainer(cfg.IPCP, primary, secondary), cfg.DNSv4...)
+	}
+
+	appendContainer := func(dst []byte, id uint16, value []byte) []byte {
+		dst = append(dst, byte(id>>8), byte(id&0xFF), byte(len(value)))
+		return append(dst, value...)
+	}
+
+	var containers []byte
+	for _, id := range cfg.RequestedIDs {
+		switch id {
+		case containerIDIPCP:
+			// EncodeIPCPConfigAckContainer already emits the full
+			// ID+len+value container (or nil when unanswerable).
+			if c := EncodeIPCPConfigAckContainer(cfg.IPCP, primary, secondary); c != nil {
+				containers = append(containers, c...)
+			}
+		case ContainerIDDNSServerIPv4Address:
+			for _, ip := range cfg.DNSv4 {
+				if v4 := ip.To4(); v4 != nil {
+					containers = appendContainer(containers, id, v4)
+				}
+			}
+		case ContainerIDDNSServerIPv6Address:
+			for _, ip := range cfg.DNSv6 {
+				if v6 := ip.To16(); v6 != nil && ip.To4() == nil {
+					containers = appendContainer(containers, id, v6)
+				}
+			}
+		case ContainerIDIPv4LinkMTU:
+			if cfg.MTU != 0 {
+				containers = appendContainer(containers, id,
+					[]byte{byte(cfg.MTU >> 8), byte(cfg.MTU & 0xFF)})
+			}
+		case containerIDMSSupportLocalAddrTFT:
+			containers = appendContainer(containers, id, nil)
+		default:
+			// Unrecognized / unimplemented — omitted, as Open5GS does.
+		}
+	}
+	if len(containers) == 0 {
+		return nil
+	}
+	ext := cfg.ConfigProtocolOctet
+	if ext == 0 {
+		ext = 0x80
+	}
+	return append([]byte{ext}, containers...)
+}
+
+// EncodePCODNSMTUAndIPCP is EncodePCODNSAndMTU plus an optional pre-built
+// (E)PCO container (e.g. from EncodeIPCPConfigAckContainer) appended after
+// the MTU/DNS containers. extra may be nil/empty.
+func EncodePCODNSMTUAndIPCP(mtu uint16, extra []byte, dns ...net.IP) []byte {
+	base := EncodePCODNSAndMTU(mtu, dns...)
+	if len(extra) == 0 {
+		return base
+	}
+	if base == nil {
+		// No MTU/DNS containers but extra is present: still need the
+		// Ext/spare/configuration-protocol octet.
+		base = []byte{0x80}
+	}
+	return append(base, extra...)
+}
+
+// EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS is
+// EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr plus an optional list of
+// IPv4 DNS resolvers, carried in the EPCO IE (IEI 0x7B, TLV-E) per Table
+// 8.3.2.1.1 — placed before the DNN IE. dns may be nil/empty, in which case no
+// EPCO IE is emitted (byte-identical to the non-DNS variant).
+//
+// Without this, a UE that cannot resolve names treats the PDU session as
+// having "no internet" even when the IP path itself is healthy — reproduced
+// against a Pixel 6a on the live OTA core 2026-09-03 (RIL DataCallResponse
+// .dnses = [] with the accept otherwise unchanged).
+func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS(
+	addr PDUAddressInfo, sscMode uint8, dnn string,
+	qfi, fiveQI uint8, dlMbps, ulMbps int,
+	dns []net.IP,
+	snssai ...SNSSAI,
+) ([]byte, error) {
+	return EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNSIPCP(
+		addr, sscMode, dnn, qfi, fiveQI, dlMbps, ulMbps, dns, nil, snssai...)
+}
+
+// EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNSIPCP is
+// EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS plus optional IPCP
+// (RFC 1332) DNS delivery: when ipcpReq is non-nil (the UE's request carried
+// an (E)PCO container 0x8021 IPCP Configure-Request), the EPCO also gets an
+// IPCP Configure-Ack container built by EncodeIPCPConfigAckContainer, using
+// the same dns[0]/dns[1] as primary/secondary. dns may still be emitted via
+// plain container 0x000D as before — some UEs (e.g. this Pixel 6a) need
+// both.
+func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNSIPCP(
+	addr PDUAddressInfo, sscMode uint8, dnn string,
+	qfi, fiveQI uint8, dlMbps, ulMbps int,
+	dns []net.IP,
+	ipcpReq *IPCPConfigureRequest,
+	snssai ...SNSSAI,
+) ([]byte, error) {
+	var req *PDUSessionEstablishmentRequest
+	if ipcpReq != nil {
+		req = &PDUSessionEstablishmentRequest{IPCPRequest: ipcpReq}
+	}
+	return EncodeEstablishmentAcceptBody(EstablishmentAcceptParams{
+		Addr: addr, SSCMode: sscMode, DNN: dnn,
+		QFI: qfi, FiveQI: fiveQI, DLMbps: dlMbps, ULMbps: ulMbps,
+		DNSv4: dns, MTU: DefaultIPv4LinkMTU,
+		Request: req, SNSSAI: snssai,
+	})
+}
+
+// EstablishmentAcceptParams is the full input to
+// EncodePDUSessionEstablishmentAccept. Request carries the UE's own decoded
+// PDU SESSION ESTABLISHMENT REQUEST (nil when the caller has none) and drives
+// two things the older positional entry points could not express: the (E)PCO
+// container ORDER (see BuildEPCOReply) and the 5GSM cause emitted when the
+// granted PDU session type is narrower than the requested one.
+type EstablishmentAcceptParams struct {
+	Addr           PDUAddressInfo
+	SSCMode        uint8
+	DNN            string
+	QFI, FiveQI    uint8
+	DLMbps, ULMbps int
+	DNSv4          []net.IP
+	DNSv6          []net.IP
+	MTU            uint16
+	SNSSAI         []SNSSAI
+	Request        *PDUSessionEstablishmentRequest
+}
+
+// EncodeEstablishmentAcceptBody encodes the 5GSM PDU SESSION
+// ESTABLISHMENT ACCEPT body (everything after the EPD|PSI|PTI|MT header) in
+// the IE order of TS 24.501 Table 8.3.2.1.1:
+//
+//	selected PDU session type + SSC mode (V, ½+½)
+//	authorized QoS rules                 (LV-E)
+//	Session-AMBR                         (LV)
+//	5GSM cause            IEI 0x59       (TV)     — on a session-type downgrade
+//	PDU address           IEI 0x29       (TLV)
+//	S-NSSAI               IEI 0x22       (TLV)
+//	authorized QoS flow descriptions IEI 0x79 (TLV-E)
+//	Extended PCO          IEI 0x7B       (TLV-E)
+//	DNN                   IEI 0x25       (TLV)
+//
+// Note EPCO (0x7B) comes BEFORE DNN (0x25). ClaudIA used to emit DNN first
+// (and a unit test asserted that EPCO was the last IE in the body, citing
+// this same table). Open5GS's encoder (lib/nas/5gs/encoder.c#L3120-3148 and
+// the struct order in lib/nas/5gs/message.h), pycrate's independent
+// from-spec TS 24.501 codec, and a real captured Open5GS Accept all put EPCO
+// before DNN. See docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md §2a/§3b
+// and finding #2.
+func EncodeEstablishmentAcceptBody(p EstablishmentAcceptParams) ([]byte, error) {
 	out := make([]byte, 0, 120)
 
-	out = append(out, ((sscMode&0x0F)<<4)|(addr.SessionType&0x0F))
+	out = append(out, ((p.SSCMode&0x0F)<<4)|(p.Addr.SessionType&0x0F))
 
-	qosRules := BuildDefaultQoSRules(qfi)
+	qosRules := BuildDefaultQoSRules(p.QFI)
 	out = append(out, byte(len(qosRules)>>8), byte(len(qosRules)&0xFF))
 	out = append(out, qosRules...)
 
-	ambr := buildSessionAMBR(dlMbps, ulMbps)
+	ambr := buildSessionAMBR(p.DLMbps, p.ULMbps)
 	out = append(out, byte(len(ambr)))
 	out = append(out, ambr...)
 
-	if pdnAddr := buildPDUAddressIE(addr); pdnAddr != nil {
+	// 5GSM cause (optional, IEI 0x59, TV 2 octets). Emitted only when the UE
+	// asked for IPv4v6 and the network granted a single address family —
+	// exactly Open5GS's condition (src/smf/gsm-build.c#L216-226) — so the UE
+	// knows the downgrade is deliberate and must not retry the other family.
+	if cause := downgradeCause5GSM(p.Request, p.Addr.SessionType); cause != 0 {
+		out = append(out, IEICause5GSM, cause)
+	}
+
+	if pdnAddr := buildPDUAddressIE(p.Addr); pdnAddr != nil {
 		out = append(out, IEIPDUAddress)
 		out = append(out, byte(len(pdnAddr)))
 		out = append(out, pdnAddr...)
 	}
 
-	if len(snssai) > 0 {
-		s := snssai[0]
+	if len(p.SNSSAI) > 0 {
+		s := p.SNSSAI[0]
 		if s.SD != SDNotPresent {
 			out = append(out, IEISNSSAI5GSM, 4, s.SST,
 				byte(s.SD>>16), byte(s.SD>>8), byte(s.SD))
@@ -317,23 +858,53 @@ func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
 	}
 
 	// Authorized QoS flow descriptions (IEI 0x79, TLV-E) — carries the 5QI for QFI.
-	// Per Table 8.3.2.1.1 this IE precedes the DNN IE.
-	if fiveQI > 0 {
-		flowDesc := BuildQoSFlowDescriptions(qfi, fiveQI, ulMbps, dlMbps)
+	if p.FiveQI > 0 {
+		flowDesc := BuildQoSFlowDescriptions(p.QFI, p.FiveQI, p.ULMbps, p.DLMbps)
 		out = append(out, IEIAuthorizedQoSFlowDesc)
 		out = append(out, byte(len(flowDesc)>>8), byte(len(flowDesc)&0xFF))
 		out = append(out, flowDesc...)
 	}
 
+	// EPCO (optional, IEI 0x7B, TLV-E) — answers the UE's own container list
+	// in the UE's own order (BuildEPCOReply). Precedes DNN per Table 8.3.2.1.1.
+	cfg := EPCOReplyConfig{DNSv4: p.DNSv4, DNSv6: p.DNSv6, MTU: p.MTU}
+	if p.Request != nil {
+		cfg.ConfigProtocolOctet = p.Request.PCOConfigProtocolOctet
+		cfg.RequestedIDs = p.Request.RequestedPCOContainerIDs
+		cfg.IPCP = p.Request.IPCPRequest
+	}
+	if epco := BuildEPCOReply(cfg); epco != nil {
+		out = append(out, IEIEPCO)
+		out = append(out, byte(len(epco)>>8), byte(len(epco)&0xFF))
+		out = append(out, epco...)
+	}
+
 	// DNN (optional, IEI 0x25) — value in APN label format (TS 23.003 §9.1).
-	if dnn != "" {
-		apnBytes := encodeAPN(dnn)
+	if p.DNN != "" {
+		apnBytes := encodeAPN(p.DNN)
 		out = append(out, IEIDNN5GSM)
 		out = append(out, byte(len(apnBytes)))
 		out = append(out, apnBytes...)
 	}
 
 	return out, nil
+}
+
+// downgradeCause5GSM returns the 5GSM cause value to put in the Accept when
+// the UE requested an IPv4v6 PDU session and the network granted only one
+// address family, or 0 when no cause IE applies. Ref: TS 24.501 §9.11.4.2
+// (#50/#51), Open5GS src/smf/gsm-build.c#L216-226.
+func downgradeCause5GSM(req *PDUSessionEstablishmentRequest, granted uint8) uint8 {
+	if req == nil || req.PDUSessionType == nil || *req.PDUSessionType != PDUSessionTypeIPv4v6 {
+		return 0
+	}
+	switch granted {
+	case PDUSessionTypeIPv4:
+		return Cause5GSMPDUSessionTypeIPv4OnlyAllowed
+	case PDUSessionTypeIPv6:
+		return Cause5GSMPDUSessionTypeIPv6OnlyAllowed
+	}
+	return 0
 }
 
 // BuildDefaultQoSRules builds a default QoS rule matching all traffic on the given QFI.

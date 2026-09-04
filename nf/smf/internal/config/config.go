@@ -65,7 +65,18 @@ type DNNConfig struct {
 	// Empty = the DNN is IPv4-only (IPv6 requests are downgraded to IPv4).
 	// Ref: TS 23.501 §5.8.2.2.
 	UEIPv6Prefix string `yaml:"ue_ipv6_prefix"`
+	// DNS is the list of IPv4 DNS resolver addresses advertised to the UE in
+	// the (Extended) Protocol Configuration Options of the PDU Session
+	// Establishment Accept (TS 24.008 §10.5.6.3, container ID 0x000D "DNS
+	// Server IPv4 Address"). Defaulted in Load() when empty — Android (and
+	// most UEs) treat an empty PCO DNS list as "no internet" even when the
+	// user-plane IP path itself works, since connectivity validation needs a
+	// resolver to reach the captive-portal check host.
+	DNS []string `yaml:"dns"`
 }
+
+// DefaultDNSServers matches Open5GS's smf.yaml default PCO DNS list.
+var DefaultDNSServers = []string{"8.8.8.8", "8.8.4.4"}
 
 func Load() (*Config, error) {
 	cfgPath := os.Getenv("CONFIG_PATH")
@@ -122,6 +133,14 @@ func Load() (*Config, error) {
 	// Fall back to legacy single-pool config when DNNs is still empty.
 	if len(cfg.DNNs) == 0 {
 		cfg.DNNs = []DNNConfig{{Name: "internet", UEIPPool: cfg.UEIPPool}}
+	}
+
+	// Default DNS per DNN when the operator/per-NF YAML did not set one, so a
+	// UE always gets resolvers in the PCO instead of silently going without.
+	for i := range cfg.DNNs {
+		if len(cfg.DNNs[i].DNS) == 0 {
+			cfg.DNNs[i].DNS = append([]string(nil), DefaultDNSServers...)
+		}
 	}
 
 	return cfg, nil

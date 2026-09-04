@@ -372,6 +372,18 @@ func main() {
 		"served_tacs", cfg.ServedTACs,
 		"spec_ref", "TS 24.501 §9.11.3.9",
 	)
+	// 5GS network feature support (IEI 0x21): IMS VoPS-3GPP-access bit.
+	// Default true unless operator.ims_vops_supported: false in config YAML.
+	// Ref: TS 24.501 §9.11.3.5, §8.2.7.1
+	imsVoPS := true
+	if cfg.Operator.IMSVoPSSupported != nil {
+		imsVoPS = *cfg.Operator.IMSVoPSSupported
+	}
+	regHandler.WithIMSVoPS3GPP(imsVoPS)
+	logger.Info("IMS VoPS-3GPP-access bit configured",
+		"ims_vops_3gpp", imsVoPS,
+		"spec_ref", "TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)",
+	)
 	if cfg.Security.NullCiphering {
 		regHandler.WithNullSecurity(true)
 		logger.Warn("NAS null ciphering active: NEA0 (no encryption) + best-available NIA — plain-text NAS — DEBUG ONLY",
@@ -1143,6 +1155,12 @@ type Config struct {
 		// Set to -1 to omit the IE entirely (not recommended).
 		// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2
 		DefaultRFSP int `yaml:"default_rfsp"`
+		// IMSVoPSSupported sets the IMS VoPS-3GPP-access bit in the "5GS network
+		// feature support" IE (IEI 0x21) of every Registration Accept. nil =
+		// default true (ClaudIA's SMF advertises an "ims" DNN). Set false if no
+		// IMS DNN is actually reachable, matching Open5GS's no_ims config knob.
+		// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
+		IMSVoPSSupported *bool `yaml:"ims_vops_supported"`
 	} `yaml:"operator"`
 }
 

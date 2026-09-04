@@ -846,3 +846,86 @@ func TestRegistrationAccept_TAIList(t *testing.T) {
 		t.Fatalf("TAIList roundtrip: got %x, want %x", got.TAIList, taiList)
 	}
 }
+
+// ---- 5GS network feature support (TS 24.501 §9.11.3.5, IEI 0x21) -----------
+
+func TestNewNetworkFeatureSupport_IMSVoPSBit(t *testing.T) {
+	// Bit 1 (LSB) of the first content octet is the IMS VoPS-3GPP-access
+	// indicator; all other bits are 0 (ClaudIA implements no other feature in
+	// this IE). Ref: TS 24.501 §9.11.3.5.
+	got := nas.NewNetworkFeatureSupport(true)
+	want := []byte{0x01, 0x00}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("NewNetworkFeatureSupport(true): got %x, want %x", got, want)
+	}
+
+	got = nas.NewNetworkFeatureSupport(false)
+	want = []byte{0x00, 0x00}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("NewNetworkFeatureSupport(false): got %x, want %x", got, want)
+	}
+}
+
+func TestRegistrationAccept_NetworkFeatureSupport(t *testing.T) {
+	// Regression: before this fix, RegistrationAccept.NetworkFeatureSupport
+	// was declared in the struct (and documented with IEI 0x21) but
+	// EncodeRegistrationAccept never wrote it — the field was silently
+	// dropped on every Registration Accept ClaudIA ever sent, unlike
+	// Open5GS's gmm-build.c which sends this IE unconditionally.
+	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1 (IEI 0x21), §9.11.3.5
+	nfs := nas.NewNetworkFeatureSupport(true)
+	ra := &nas.RegistrationAccept{
+		RegistrationResult:    0x01,
+		NetworkFeatureSupport: nfs,
+	}
+	pdu := &nas.Message{
+		Header: nas.Header{
+			ExtendedProtocolDiscriminator: nas.PDMobilityManagement,
+			MessageType:                   nas.MsgTypeRegistrationAccept,
+		},
+		Body: ra,
+	}
+	encoded, err := nas.Encode(pdu)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	// TLV on the wire: 0x21 | length | value octets.
+	wantTLV := append([]byte{0x21, byte(len(nfs))}, nfs...)
+	if !bytes.Contains(encoded, wantTLV) {
+		t.Fatalf("IEI 0x21 (network feature support) TLV %x not found in encoded Registration Accept: %x",
+			wantTLV, encoded)
+	}
+
+	decoded, err := nas.Decode(encoded)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	got, ok := decoded.Body.(*nas.RegistrationAccept)
+	if !ok {
+		t.Fatalf("expected *RegistrationAccept, got %T", decoded.Body)
+	}
+	if !bytes.Equal(got.NetworkFeatureSupport, nfs) {
+		t.Fatalf("NetworkFeatureSupport roundtrip: got %x, want %x", got.NetworkFeatureSupport, nfs)
+	}
+}
+
+func TestRegistrationAccept_NetworkFeatureSupport_AbsentWhenEmpty(t *testing.T) {
+	// An empty/nil NetworkFeatureSupport must not emit the IEI 0x21 TLV at all.
+	ra := &nas.RegistrationAccept{RegistrationResult: 0x01}
+	pdu := &nas.Message{
+		Header: nas.Header{
+			ExtendedProtocolDiscriminator: nas.PDMobilityManagement,
+			MessageType:                   nas.MsgTypeRegistrationAccept,
+		},
+		Body: ra,
+	}
+	encoded, err := nas.Encode(pdu)
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	for _, b := range encoded {
+		if b == 0x21 {
+			t.Fatalf("unexpected IEI 0x21 byte in encoded Registration Accept with no NetworkFeatureSupport: %x", encoded)
+		}
+	}
+}

@@ -200,27 +200,35 @@ type RegistrationAccept struct {
 	RejectedNSSAI []byte
 	// IEI 0x31 — Configured NSSAI
 	ConfiguredNSSAI *NSSAI
-	// IEI 0x21 — Network feature support
+	// IEI 0x21 — 5GS network feature support (TS 24.501 §9.11.3.5). TLV, 1-3
+	// content octets. Only the first octet is populated by this encoder today
+	// (IMS VoPS-3GPP bit, bit 1); see NewNetworkFeatureSupport.
 	NetworkFeatureSupport []byte
 	// IEI 0x50 — PDU session status
 	PDUSessionStatus []byte
 	// IEI 0x26 — PDU session reactivation result
 	PDUSessionReactivationResult []byte
-	// IEI 0x72 — LADN information
+	// IEI 0x79 — LADN information (TS 24.501 §9.11.3.30; was wrongly commented
+	// 0x72 — that IEI is unassigned in Table 8.2.7.1.1). Not yet encoded.
 	LADNInformation []byte
-	// IEI 0x2C — Service area list
+	// IEI 0x27 — Service area list (TS 24.501 §9.11.3.49; was wrongly commented
+	// 0x2C — that IEI is "Disaster return wait range" in Rel-17+). Not yet encoded.
 	ServiceAreaList []byte
 	// T3512 timer value
 	T3512Value *byte
-	// IEI 0x6A — Non-3GPP deregistration timer
+	// IEI 0x5D — Non-3GPP deregistration timer (TS 24.501 §9.11.2.9; was wrongly
+	// commented 0x6A — that IEI is T3324 in Table 8.2.7.1.1). Not yet encoded.
 	Non3GPPDeregTimer *byte
 	// T3502 value
 	T3502Value *byte
 	// Emergency number list
 	EmergencyNumberList []byte
-	// IEI 0x35 — Extended emergency number list
+	// IEI 0x7A — Extended emergency number list (TS 24.501 §9.11.3.65; was
+	// wrongly commented 0x35 — that IEI is "5GS additional request result" in
+	// Rel-17+ Table 8.2.7.1.1). Not yet encoded.
 	ExtendedEmergencyNumberList []byte
-	// IEI 0x9A — Network slicing indication
+	// IEI 0x90 (TV, half-octet) — Network slicing indication (TS 24.501
+	// §9.11.3.36; was wrongly commented 0x9A). Not yet encoded.
 	NetworkSlicingIndication *byte
 }
 
@@ -262,6 +270,23 @@ func EncodeGPRSTimer3(seconds int) byte {
 		mins = 1
 	}
 	return byte(5<<5) | byte(mins)
+}
+
+// NewNetworkFeatureSupport builds the 2-octet content of the "5GS network
+// feature support" IE (IEI 0x21) with only the IMS VoPS-3GPP-access bit set
+// (bit 1 of the first content octet), mirroring Open5GS's default builder
+// (src/amf/gmm-build.c gmm_build_registration_accept, which sets this bit to 1
+// unless the operator has configured no_ims). All other bits (MPS indicator,
+// IWK-without-N26, emergency service indicators, IMS VoPS over non-3GPP, and
+// the second octet's CIoT/coverage bits) are left at 0 — ClaudIA does not
+// implement those features.
+// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 Table 8.2.7.1.1 (IEI 0x21)
+func NewNetworkFeatureSupport(imsVoPS3GPP bool) []byte {
+	var octet1 byte
+	if imsVoPS3GPP {
+		octet1 |= 0x01 // bit 1: IMS VoPS-3GPP-access indicator
+	}
+	return []byte{octet1, 0x00}
 }
 
 // EncodeTAIList encodes a 5GS tracking area identity list containing a single
@@ -329,6 +354,13 @@ func EncodeRegistrationAccept(ra *RegistrationAccept) ([]byte, error) {
 		out = append(out, nssaiBytes...)
 	}
 
+	// IEI 0x21 — 5GS network feature support (TLV, 1-3 content octets).
+	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
+	if len(ra.NetworkFeatureSupport) > 0 {
+		out = append(out, 0x21, byte(len(ra.NetworkFeatureSupport)))
+		out = append(out, ra.NetworkFeatureSupport...)
+	}
+
 	// IEI 0x5E — T3512 value (TLV: IEI + 1-byte length + 1-byte GPRS Timer 3 value)
 	// Spec says TV (length=2) but UERANSIM v3.2.8 decodes it as TLV (reads length byte first).
 	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.48
@@ -385,6 +417,10 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
 			nssai, _ := DecodeNSSAI(nssaiBytes)
 			ra.ConfiguredNSSAI = &nssai
+		case 0x21: // 5GS network feature support — TLV (1-byte length, 1-3 content octets)
+			l, _ := rdr.ReadByte()
+			nfsBytes, _ := rdr.ReadBytes(int(l))
+			ra.NetworkFeatureSupport = nfsBytes
 		case 0x5E: // T3512 value — TLV (1-byte length + 1-byte GPRS Timer 3 value)
 			l, _ := rdr.ReadByte()
 			valB, _ := rdr.ReadBytes(int(l))
