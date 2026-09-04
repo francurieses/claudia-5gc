@@ -121,8 +121,21 @@ func (p *IPPool) Allocate() (net.IP, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	network := p.subnet.IP.Mask(p.subnet.Mask)
+	// Conventional gateway/TUN address: network + 1 (".1"). Never hand this
+	// out to a UE — some UPF deployments bind their DN-side TUN interface
+	// there, and even when they don't (this one uses .254, see
+	// nf/upf/config/dev.yaml), .1 is the address most UE/OS stacks and
+	// documentation assume is the router, so reserving it is cheap insurance.
+	// Live OTA session 2026-09-03: the allocator handed the very first UE
+	// (Pixel 6a) address .1 with zero exclusions besides the network address
+	// itself — found while debugging "no internet" after PDU session setup.
+	gateway := make(net.IP, len(network))
+	copy(gateway, network)
+	incIP(gateway)
+
 	for ip := p.subnet.IP.Mask(p.subnet.Mask); p.subnet.Contains(ip); incIP(ip) {
-		if !p.allocated[ip.String()] && !ip.Equal(p.subnet.IP) {
+		if !p.allocated[ip.String()] && !ip.Equal(p.subnet.IP) && !ip.Equal(gateway) {
 			p.allocated[ip.String()] = true
 			return ip, nil
 		}
@@ -134,6 +147,26 @@ func (p *IPPool) Release(ip net.IP) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.allocated, ip.String())
+}
+
+// dnsServersFor returns the configured IPv4 DNS resolvers for the given DNN,
+// parsed from config.Config.DNNs[i].DNS. Returns nil (no EPCO DNS IE emitted)
+// if the DNN is unknown or has no valid IPv4 entries — Config.Load already
+// defaults every DNN's DNS list, so this is normally non-empty.
+func (s *Server) dnsServersFor(dnn string) []net.IP {
+	for _, d := range s.cfg.DNNs {
+		if d.Name != dnn {
+			continue
+		}
+		var out []net.IP
+		for _, a := range d.DNS {
+			if ip := net.ParseIP(a).To4(); ip != nil {
+				out = append(out, ip)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func incIP(ip net.IP) {
@@ -382,11 +415,20 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	n1SmMsg, _ := base64.StdEncoding.DecodeString(n1SmMsgB64)
 	// n1SmMsg is the full 5GSM message (EPD|PSI|PTI|MT|body); the decoder
 	// expects the body only. We extract the requested PDU session type to drive
-	// IPv6/IPv4v6 prefix delegation (TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11).
+	// IPv6/IPv4v6 prefix delegation (TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11),
+	// and keep the whole decoded request: the Accept's ePCO must answer the
+	// UE's own container list IN THE UE'S OWN ORDER (nas.BuildEPCOReply,
+	// mirroring Open5GS smf_pco_build) — a Pixel 6a / Shannon modem that puts
+	// IPCP (0x8021) first got dnses=[] when we answered it last. The decoded
+	// request also carries the requested PDU session type, which drives both
+	// IPv6 prefix delegation and the 5GSM cause #50/#51 on a downgrade.
+	// See docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md.
 	var requestedType *uint8
+	var pduReq *nas.PDUSessionEstablishmentRequest
 	if len(n1SmMsg) > 4 {
-		if pduReq, err := nas.DecodePDUSessionEstablishmentRequest(n1SmMsg[4:]); err == nil {
-			requestedType = pduReq.PDUSessionType
+		if decoded, err := nas.DecodePDUSessionEstablishmentRequest(n1SmMsg[4:]); err == nil {
+			pduReq = decoded
+			requestedType = decoded.PDUSessionType
 		}
 	}
 
@@ -481,15 +523,23 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	smPolicyID, policyQoS := s.createSMPolicy(r.Context(), supi, dnn, ueIPv4Str, slice, subQoS)
 
 	// N1SM: PDU Session Establishment Accept body (AMF wraps in DL NAS Transport).
-	// Carries the QoS rules (QFI=1 default flow) and the QoS flow descriptions
-	// with the authorized 5QI (TS 24.501 §9.11.4.12/§9.11.4.13).
-	n1SmResp, _ := nas.EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
-		nas.PDUAddressInfo{SessionType: grantedType, IPv4: ip, IPv6IID: v6IID},
-		nas.SSCMode1, dnn,
-		1 /* QFI=1 for default flow */, policyQoS.FiveQI,
-		policyQoS.AMBRDLMbps, policyQoS.AMBRULMbps,
-		nas.SNSSAI{SST: slice.SST, SD: nas.SDFromString(slice.SD)},
-	)
+	// Carries the QoS rules (QFI=1 default flow), the QoS flow descriptions
+	// with the authorized 5QI (TS 24.501 §9.11.4.12/§9.11.4.13), and the DNN's
+	// DNS resolvers in the EPCO so the UE doesn't sit at "no internet" purely
+	// for lack of a resolver (Config.Load defaults this per DNN when unset).
+	n1SmResp, _ := nas.EncodeEstablishmentAcceptBody(nas.EstablishmentAcceptParams{
+		Addr:    nas.PDUAddressInfo{SessionType: grantedType, IPv4: ip, IPv6IID: v6IID},
+		SSCMode: nas.SSCMode1,
+		DNN:     dnn,
+		QFI:     1, // QFI=1 for the default flow
+		FiveQI:  policyQoS.FiveQI,
+		DLMbps:  policyQoS.AMBRDLMbps,
+		ULMbps:  policyQoS.AMBRULMbps,
+		DNSv4:   s.dnsServersFor(dnn),
+		MTU:     nas.DefaultIPv4LinkMTU,
+		SNSSAI:  []nas.SNSSAI{{SST: slice.SST, SD: nas.SDFromString(slice.SD)}},
+		Request: pduReq,
+	})
 	n1SmRespB64 := base64.StdEncoding.EncodeToString(n1SmResp)
 
 	// N2SM: Resource Setup Request Transfer — tells gNB the 5QI for the QoS flow.

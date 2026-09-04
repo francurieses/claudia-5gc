@@ -7,7 +7,14 @@ amf_set_id: 1
 served_tacs:
     - 1
 features:
-    ursp_enabled: true
+    # Disabled 2026-09-03 (lab-11 OTA debug): the PCF-side MANAGE UE POLICY
+    # COMMAND encoder has two off-by-N length-field bugs (nf/pcf/internal/policy/ursp.go
+    # lines 109 and 115 — see labs/lab-11-nr-sa-n78-ocudu/evidence/ota-attach-debug-2026-09-03.md)
+    # that produce a malformed UE policy container. A real UE (Pixel 6a) may choke on
+    # it. Disabling URSP delivery removes the post-Registration-Complete DL NAS
+    # Transport push entirely so PDU session establishment can be tested without it.
+    # Re-enable once nf/pcf/internal/policy/ursp.go is fixed and re-verified.
+    ursp_enabled: false
 metrics:
     address: 0.0.0.0:9101
 nf_instance_id: 00000000-0000-4001-8000-000000000001
