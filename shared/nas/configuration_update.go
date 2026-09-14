@@ -28,6 +28,12 @@ type ConfigurationUpdateCommand struct {
 	TAIList []byte
 	// IEI 0x15 — Allowed NSSAI (TLV, 1-byte length)
 	AllowedNSSAI *NSSAI
+	// IEI 0x43 — Full name for network (TLV, 1-byte length). The operator name
+	// a handset shows on its status bar. Ref: TS 24.501 §9.11.3.35
+	FullNameForNetwork string
+	// IEI 0x45 — Short name for network (TLV, 1-byte length). The abbreviated
+	// form, used where the full name does not fit. Ref: TS 24.501 §9.11.3.36
+	ShortNameForNetwork string
 	// IEI 0x31 — Configured NSSAI (TLV, 1-byte length)
 	ConfiguredNSSAI *NSSAI
 	// IEI 0x9A — Network slicing indication (TV, 1 byte, high nibble 0x9)
@@ -72,6 +78,26 @@ func EncodeConfigurationUpdateCommand(c *ConfigurationUpdateCommand) ([]byte, er
 		nssaiBytes := EncodeNSSAI(*c.AllowedNSSAI)
 		out = append(out, 0x15, byte(len(nssaiBytes)))
 		out = append(out, nssaiBytes...)
+	}
+
+	// IEI 0x43 — Full name for network (TLV, 1-byte length)
+	// Order matters: TS 24.501 Table 8.2.19.1.1 places both network-name IEs
+	// after the Allowed NSSAI and before the Configured NSSAI.
+	if c.FullNameForNetwork != "" {
+		nameBytes, err := EncodeNetworkName(0x43, c.FullNameForNetwork)
+		if err != nil {
+			return nil, fmt.Errorf("nas: full name for network: %w", err)
+		}
+		out = append(out, nameBytes...)
+	}
+
+	// IEI 0x45 — Short name for network (TLV, 1-byte length)
+	if c.ShortNameForNetwork != "" {
+		nameBytes, err := EncodeNetworkName(0x45, c.ShortNameForNetwork)
+		if err != nil {
+			return nil, fmt.Errorf("nas: short name for network: %w", err)
+		}
+		out = append(out, nameBytes...)
 	}
 
 	// IEI 0x31 — Configured NSSAI (TLV, 1-byte length)
@@ -129,6 +155,18 @@ func DecodeConfigurationUpdateCommand(b []byte) (*ConfigurationUpdateCommand, er
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
 			nssai, _ := DecodeNSSAI(nssaiBytes)
 			c.AllowedNSSAI = &nssai
+		case 0x43: // Full name for network — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			nameBytes, _ := rdr.ReadBytes(int(l))
+			if n, err := DecodeNetworkName(nameBytes); err == nil {
+				c.FullNameForNetwork = n.Text
+			}
+		case 0x45: // Short name for network — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			nameBytes, _ := rdr.ReadBytes(int(l))
+			if n, err := DecodeNetworkName(nameBytes); err == nil {
+				c.ShortNameForNetwork = n.Text
+			}
 		case 0x31: // Configured NSSAI — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))

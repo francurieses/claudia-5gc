@@ -429,6 +429,17 @@ func main() {
 	}
 	nasHandler := nasmsg.NewHandler(sender, regHandler, logger)
 
+	// Operator name shown on the handset. Delivered in a Configuration Update
+	// Command after Registration Complete. Ref: TS 24.501 §8.2.19
+	netFullName, netShortName := networkNamesFromEnv(
+		cfg.Operator.NetworkFullName, cfg.Operator.NetworkShortName)
+	if netFullName != "" || netShortName != "" {
+		nasHandler.WithNetworkName(netFullName, netShortName)
+		logger.Info("network name delivery enabled",
+			"full_name", netFullName, "short_name", netShortName,
+			"spec_ref", "TS 24.501 §8.2.19")
+	}
+
 	// SMS over NAS: forward UL NAS Transport SMS containers (PCT=0x02) to the SMSF
 	// via Nsmsf_SMService_UplinkSMS. Enabled when the SMSF peer is configured.
 	// Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4
@@ -1161,6 +1172,17 @@ type Config struct {
 		// IMS DNN is actually reachable, matching Open5GS's no_ims config knob.
 		// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
 		IMSVoPSSupported *bool `yaml:"ims_vops_supported"`
+		// NetworkFullName is the operator name pushed to every UE in a
+		// Configuration Update Command once registration completes, as the
+		// "Full name for network" IE (IEI 0x43). Empty = push nothing.
+		// Overridden by the NETWORK_NAME environment variable.
+		// Ref: TS 24.501 §8.2.19, §9.11.3.35
+		NetworkFullName string `yaml:"network_full_name"`
+		// NetworkShortName is the abbreviated form, sent as the "Short name for
+		// network" IE (IEI 0x45). Empty = fall back to NetworkFullName.
+		// Overridden by the NETWORK_SHORT_NAME environment variable.
+		// Ref: TS 24.501 §8.2.19, §9.11.3.36
+		NetworkShortName string `yaml:"network_short_name"`
 	} `yaml:"operator"`
 }
 
@@ -1179,6 +1201,20 @@ func urspEnabledFromEnv(configVal *bool) bool {
 		return *configVal
 	}
 	return true
+}
+
+// networkNamesFromEnv resolves the operator name pushed to UEs. Precedence for
+// each half: the environment variable, then the config file, then empty (push
+// nothing). A configured full name with no short name reuses the full name, so
+// a handset that only reads the short one still gets something.
+// Ref: TS 24.501 §9.11.3.35, §9.11.3.36
+func networkNamesFromEnv(cfgFull, cfgShort string) (full, short string) {
+	full = getEnvDefault("NETWORK_NAME", cfgFull)
+	short = getEnvDefault("NETWORK_SHORT_NAME", cfgShort)
+	if short == "" {
+		short = full
+	}
+	return full, short
 }
 
 // urspDisabledReason explains why URSP delivery is off, for the startup log.
