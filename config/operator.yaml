@@ -1,16 +1,31 @@
-# Installed by sdr-labs lab-11-nr-sa-n78-ocudu.
-# One DNN, one slice: every seeded subscriber is data-only.
-# ClaudIA's UDR (nf/udr/cmd/udr/main.go) builds its slice profiles from this
-# list; with a single entry the cyclic multi-slice assignment collapses to
-# "internet only" for all UE_COUNT subscribers.
 dnns:
-    - description: Public internet access (eMBB) -- the only service in this lab
+    - description: Public internet access (eMBB)
       n6_network: 172.30.6.0/24
       name: internet
       ue_ip_pool: 10.60.0.0/24
+    - description: IMS voice and multimedia services (URLLC/eMBB)
+      n6_network: 172.30.7.0/24
+      name: ims
+      ue_ip_pool: 10.61.0.0/24
+    - description: Gaming service
+      n6_network: 172.30.8.0/24
+      name: gaming
+      ue_ip_pool: 10.62.0.0/24
+    - description: Gold service
+      n6_network: 172.30.9.0/24
+      name: gold
+      ue_ip_pool: 10.63.0.0/24
 plmn:
     mcc: "001"
     mnc: "01"
 snssais:
     - sd: "000001"
+      sst: 1
+    - sd: "000002"
+      sst: 1
+    - sd: "000001"
+      sst: 2
+    - sd: "000001"
+      sst: 3
+    - sd: "001234"
       sst: 1

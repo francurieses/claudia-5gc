@@ -137,6 +137,12 @@ services:
       # core up without URSP (the AMF makes no N15 call and delivers no UE policy
       # container). Default: enabled. See `make ueransim-ursp` / `make ueransim-no-ursp`.
       URSP_ENABLED: "${URSP_ENABLED:-true}"
+      # Operator name pushed to every UE in a Configuration Update Command
+      # after Registration Complete (TS 24.501 §8.2.19, IEIs 0x43 / 0x45).
+      # Empty = send no name, which is the historic behaviour. Falls back to
+      # operator.network_full_name / network_short_name in the AMF config file.
+      NETWORK_NAME: "${NETWORK_NAME:-}"
+      NETWORK_SHORT_NAME: "${NETWORK_SHORT_NAME:-}"
     labels:
       logging.5gc/nf: "AMF"
     depends_on:
