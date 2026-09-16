@@ -169,6 +169,13 @@ type RegistrationHandler struct {
 	// even if absent here. Configured via nf/amf/config/dev.yaml "served_tacs".
 	// Ref: TS 24.501 §9.11.3.9, TS 23.501 §5.3.2.3
 	servedTACs []uint32
+	// imsVoPS3GPP controls the IMS VoPS-3GPP-access bit in the "5GS network
+	// feature support" IE (IEI 0x21) sent in every Registration Accept.
+	// Defaults to true in NewRegistrationHandler (ClaudIA's SMF advertises an
+	// "ims" DNN); override with WithIMSVoPS3GPP. Matches Open5GS's default
+	// (gmm-build.c sets this bit to 1 unless operator config sets no_ims).
+	// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
+	imsVoPS3GPP bool
 }
 
 // NewRegistrationHandler builds a handler wired to the AMF's NF clients.
@@ -192,6 +199,7 @@ func NewRegistrationHandler(
 		plmnMNC:        mnc,
 		servingNetName: snName,
 		abba:           nas.ABBA{0x00, 0x00},
+		imsVoPS3GPP:    true,
 	}
 }
 
@@ -249,6 +257,16 @@ func (h *RegistrationHandler) WithT3512(secs int) {
 // Ref: TS 24.501 §9.11.3.9, TS 23.501 §5.3.2.3
 func (h *RegistrationHandler) WithServedTACs(tacs []uint32) {
 	h.servedTACs = tacs
+}
+
+// WithIMSVoPS3GPP sets the IMS VoPS-3GPP-access bit advertised in the "5GS
+// network feature support" IE (IEI 0x21) of every Registration Accept.
+// Defaults to true (set in NewRegistrationHandler). Set false if the
+// deployment has no IMS DNN reachable, to avoid a phone attempting VoNR
+// registration against a network that cannot serve it.
+// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
+func (h *RegistrationHandler) WithIMSVoPS3GPP(supported bool) {
+	h.imsVoPS3GPP = supported
 }
 
 // buildTAIList builds the 5GS tracking area identity list for ue's
@@ -618,6 +636,24 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	ue.SecurityCtx.KNASint = kdf.KNASint(kamf, integAlg)
 	ue.SecurityCtx.KNASenc = kdf.KNASenc(kamf, cipherAlg)
 	ue.SecurityCtx.NGKSI = ue.PendingNGKSI // must match the ngKSI sent in the Authentication Request / SMC
+
+	// Taking a new 5G NAS security context into use resets both NAS COUNTs to 0.
+	// Ref: TS 33.501 §6.4.3.1 / TS 24.501 §4.4.3.1.
+	//
+	// This is not redundant with the zero value of a freshly allocated UEContext.
+	// A real handset that never sees its Registration Accept retransmits the
+	// Registration Request over the SAME still-open NGAP association, which
+	// re-enters authentication on the SAME *amfctx.UEContext. Without this reset
+	// the new KAMF/KNASint/KNASenc derived just above would be used with the
+	// COUNTs left over from the abandoned attempt, while the UE — correctly
+	// obeying the SHT=0x03 "with new security context" SecurityModeCommand that
+	// follows — restarts its own COUNTs at 0. Every MAC from that point is
+	// computed over a COUNT the peer does not expect, so the UE silently
+	// discards the Registration Accept and re-registers from SUCI. That failure
+	// looks exactly like a radio problem and is not one.
+	ue.SecurityCtx.DownlinkCount = 0
+	ue.SecurityCtx.UplinkCount = 0
+
 	ue.SecurityCtx.Active = true
 
 	log.Info("NAS security context established, sending SecurityModeCommand",
@@ -873,6 +909,9 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
 		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
+		// IEI 0x21: 5GS network feature support (IMS VoPS-3GPP bit only).
+		// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
+		NetworkFeatureSupport: nas.NewNetworkFeatureSupport(h.imsVoPS3GPP),
 		// URSP intentionally omitted — delivered via DL NAS TRANSPORT after registration.
 	}
 	// IEI 0x5E: T3512 Periodic Registration Timer (GPRS Timer 3 encoding).
@@ -1022,6 +1061,9 @@ func (h *RegistrationHandler) BuildRegistrationUpdateAccept(
 		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
 		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
+		// IEI 0x21: 5GS network feature support — same as Initial Registration.
+		// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
+		NetworkFeatureSupport: nas.NewNetworkFeatureSupport(h.imsVoPS3GPP),
 	}
 	if h.t3512Secs > 0 {
 		t3512 := nas.EncodeGPRSTimer3(h.t3512Secs)

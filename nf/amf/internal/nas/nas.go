@@ -85,6 +85,13 @@ type Handler struct {
 	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7
 	onUEReachable func(ue *amfctx.UEContext)
 
+	// networkFullName / networkShortName are the operator name this AMF pushes
+	// to every UE in a Configuration Update Command once registration completes.
+	// Empty = push nothing, which is the behaviour before this was configurable.
+	// Ref: TS 24.501 §8.2.19, §9.11.3.35, §9.11.3.36
+	networkFullName  string
+	networkShortName string
+
 	// pendingLPP holds one pending LPPResult channel per AMF-UE-NGAP-ID.
 	// Inserted by SendDownlinkLPP; resolved (and deleted) by handleULLPP when
 	// the matching UL NAS Transport (payload container type 0x03) arrives
@@ -166,6 +173,21 @@ func (h *Handler) SetUEReachableHandler(fn func(ue *amfctx.UEContext)) {
 // Ref: TS 23.502 §4.13.3, TS 29.540 §5.2.4
 func (h *Handler) WithSMSFClient(c SMSFClient) {
 	h.smsfClient = c
+}
+
+// WithNetworkName sets the operator name delivered to every UE after
+// registration completes. full is the "Full name for network" IE and short the
+// "Short name for network" IE; either may be empty. When both are empty no
+// Configuration Update Command is sent, which is the behaviour of an AMF that
+// never had this configured.
+//
+// This is the only 5G SA mechanism by which the network itself can set the
+// label a handset shows. The alternatives live on the card (EF_SPN) or in the
+// handset's own PLMN table, and neither is reachable from the core.
+// Ref: TS 24.501 §8.2.19, §9.11.3.35, §9.11.3.36
+func (h *Handler) WithNetworkName(full, short string) {
+	h.networkFullName = full
+	h.networkShortName = short
 }
 
 // HandleNASMessage is called by the NGAP layer when a NAS PDU arrives.
@@ -655,11 +677,49 @@ func (h *Handler) handleRegistrationComplete(
 		}
 	}
 
+	// Push the operator name now that the UE is registered and CM-CONNECTED.
+	// No-op unless a name is configured. Ref: TS 24.501 §8.2.19
+	h.sendNetworkNameConfigUpdate(ue)
+
 	// Network Slice-Specific Authentication: kick off the first slice's EAP exchange
 	// for any S-NSSAI withheld in Phase3 (subjectToNssaa). No-op when none are pending.
 	// Ref: TS 23.502 §4.2.9.2, TS 24.501 §5.4.7.
 	h.StartNSSAA(ctx, ue)
 	return nil
+}
+
+// sendNetworkNameConfigUpdate delivers the operator name to the UE in a
+// Configuration Update Command. It is a no-op when no name is configured.
+//
+// The ACK bit is deliberately NOT set. TS 24.501 §9.11.3.18 has the UE reply
+// with a Configuration Update Complete only when asked, and nothing here needs
+// that confirmation: a name push carries no state the AMF must reconcile. Not
+// asking also means a handset that ignores the name cannot leave a procedure
+// half-finished.
+//
+// Whether the name reaches the status bar is up to the handset. The modem may
+// prefer the SIM's EF_SPN or its own PLMN table over what the network sends.
+// Ref: TS 24.501 §8.2.19, §9.11.3.35, §9.11.3.36
+func (h *Handler) sendNetworkNameConfigUpdate(ue *amfctx.UEContext) {
+	if h.networkFullName == "" && h.networkShortName == "" {
+		return
+	}
+	cmd := &nas.ConfigurationUpdateCommand{
+		FullNameForNetwork:  h.networkFullName,
+		ShortNameForNetwork: h.networkShortName,
+	}
+	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+		nas.MsgTypeConfigurationUpdateCommand, cmd); err != nil {
+		h.logger.Warn("network name Configuration Update Command send failed",
+			"procedure", "NetworkName", "supi", ue.SUPI, "error", err,
+			"spec_ref", "TS 24.501 §8.2.19")
+		return
+	}
+	h.logger.Info("Configuration Update Command sent with network name",
+		"procedure", "NetworkName", "supi", ue.SUPI,
+		"full_name", h.networkFullName, "short_name", h.networkShortName,
+		"interface", "N1", "direction", "OUT",
+		"spec_ref", "TS 24.501 §8.2.19")
 }
 
 // StartNSSAA sends the NETWORK SLICE-SPECIFIC AUTHENTICATION COMMAND for the first

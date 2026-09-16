@@ -634,7 +634,23 @@ func (s *Server) Start(ctx context.Context) error {
 
 // handleGNBConn reads NGAP PDUs from a gNB connection.
 func (s *Server) handleGNBConn(ctx context.Context, conn *sctp.SCTPConn) {
-	remoteAddr := conn.RemoteAddr().String()
+	// conn.RemoteAddr() returns a nil net.Addr (not a typed nil — the
+	// ishidawataru/sctp implementation does `return nil` on error) when the
+	// kernel can no longer report peer addresses for this association, e.g.
+	// a bare SCTP association that was opened and closed again before any
+	// NGAP data was exchanged (a liveness/preflight probe, or a connection
+	// reset mid-handshake). Calling .String() on that nil interface panics
+	// with a nil pointer dereference. Treat it as "nothing to clean up" and
+	// bail out before registering a GNBContext.
+	ra := conn.RemoteAddr()
+	if ra == nil {
+		s.logger.Info("gNB connection closed before remote address could be resolved — treating as bare probe, no NGAP data exchanged",
+			"interface", "N2",
+		)
+		conn.Close()
+		return
+	}
+	remoteAddr := ra.String()
 	log := s.logger.With("gnb_addr", remoteAddr)
 	log.Info("gNB connected", "direction", "IN", "interface", "N2")
 

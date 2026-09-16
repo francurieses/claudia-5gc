@@ -23,6 +23,18 @@ const (
 	gtpuMinHdr  = 8  // flags(1) + msgType(1) + length(2) + TEID(4)
 	gtpuExtHdr  = 12 // + seqNum(2) + nPDUNum(1) + extHdrType(1) when E/S/PN flags set
 	msgTypeTPDU = 0xFF
+
+	// extHdrTypePDUSessionContainer is the Next Extension Header Type value
+	// for the PDU Session Container (TS 38.415 §5.5.2.1, TS 29.281 §5.2.1
+	// Table 5.2.1-3). NG-U (N3) requires this on EVERY GTP-U packet, both
+	// directions, so the receiving gNB/UPF can map the flow to a QoS Flow
+	// (QFI) and, for DL, know which DRB to schedule it on.
+	extHdrTypePDUSessionContainer = 0x85
+	// pduSessionContainerDL is the PDU Type nibble for "DL PDU SESSION
+	// INFORMATION" (TS 38.415 Table 5.5.2.1-2): upper nibble of the
+	// container's first content octet, low nibble carries PPP/RQI/spare (all
+	// 0 here — no paging policy, no reflective QoS).
+	pduSessionContainerDL = 0x00
 )
 
 // TUNEntry associates a DNN name and its UE subnet CIDR with an open TUN device.
@@ -324,21 +336,50 @@ func (s *Server) buildICMPReply(ipPkt []byte, ihl int, icmpReq []byte) []byte {
 }
 
 // sendGTPU encapsulates innerIP in a GTP-U T-PDU and sends it to the gNB.
+// buildDLPDUSessionContainer builds the mandatory NG-U extension block that
+// must follow the 8-byte mandatory GTP-U header on every DL packet: seqNum(2,
+// unused=0) | N-PDU(1, unused=0) | nextExtHdrType(1) | ext-len(1, 4-octet
+// units) | PDU Session Container content(2) | next-ext-hdr-type(1, end=0).
+// Ref: TS 29.281 §5.2.1, TS 38.415 §5.5.2.1.
+//
+// Without this, the packet is well-formed GTP-U (TS 29.281) but incomplete
+// NG-U (TS 38.415) — reproduced against a live gNB 2026-09-03: every DL
+// packet the UPF sent was logged and accepted at the UDP/GTP-U layer, then
+// dropped by the gNB with "Incomplete PDU at NG-U interface: missing or
+// invalid PDU session container", so no reply ever reached the UE despite the
+// PDU session, PFCP rules, and UL path all being correct.
+func buildDLPDUSessionContainer(qfi uint8) []byte {
+	return []byte{
+		0x00, 0x00, // Sequence Number (unused for T-PDU on N3, TS 29.281 §5.2.1 NOTE 1)
+		0x00,                          // N-PDU Number (unused)
+		extHdrTypePDUSessionContainer, // Next Extension Header Type
+		0x01,                          // this extension header's length: 1 * 4 = 4 octets
+		pduSessionContainerDL,         // PDU Type (DL, bits 8-5) | spare/PPP/RQI (bits 4-1) = 0
+		qfi & 0x3F,                    // spare(2 bits)=0 | QFI (6 bits)
+		0x00,                          // Next Extension Header Type = no more extensions
+	}
+}
+
 func (s *Server) sendGTPU(sess *pfcp.Session, innerIP []byte) {
 	gnbAddr := &net.UDPAddr{IP: sess.GNBIP, Port: gtpuPort}
 
+	ext := buildDLPDUSessionContainer(sess.QER.QFI)
+
 	hdr := make([]byte, gtpuMinHdr)
-	hdr[0] = 0x30 // version=1, PT=1, E=0, S=0, PN=0
+	hdr[0] = 0x34 // version=1, PT=1, E=1 (extension headers present), S=0, PN=0
 	hdr[1] = msgTypeTPDU
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(innerIP)))
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(ext)+len(innerIP)))
 	binary.BigEndian.PutUint32(hdr[4:8], sess.DLTEID)
 
-	pkt := append(hdr, innerIP...)
+	pkt := make([]byte, 0, len(hdr)+len(ext)+len(innerIP))
+	pkt = append(pkt, hdr...)
+	pkt = append(pkt, ext...)
+	pkt = append(pkt, innerIP...)
 	if _, err := s.conn.WriteToUDP(pkt, gnbAddr); err != nil {
 		s.logger.Error("GTP-U send", "error", err, "gnb", gnbAddr)
 		return
 	}
-	s.logger.Info("GTP-U DL sent", "dlTEID", sess.DLTEID, "gnbIP", sess.GNBIP, "len", len(innerIP))
+	s.logger.Info("GTP-U DL sent", "dlTEID", sess.DLTEID, "gnbIP", sess.GNBIP, "qfi", sess.QER.QFI, "len", len(innerIP))
 }
 
 // ipChecksum computes the one's complement checksum over data.
