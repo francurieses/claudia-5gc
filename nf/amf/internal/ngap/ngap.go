@@ -63,7 +63,7 @@ func rejectForUnknownTMSI(msgType nas.MessageType, typeKnown bool) (pdu []byte, 
 		// initial registration with its SUCI, which the AMF can resolve.
 		// Plain NAS: EPD | SHT=0x00 | MT=0x44 (RegistrationReject) | cause
 		return []byte{nas.PDMobilityManagement, 0x00,
-			byte(nas.MsgTypeRegistrationReject), byte(nas.CauseImplicitlyDeregistered)},
+				byte(nas.MsgTypeRegistrationReject), byte(nas.CauseImplicitlyDeregistered)},
 			"RegistrationReject", "TS 24.501 §5.5.1.3.5"
 	}
 	// Service Request / Control Plane Service Request, or a type that could not
@@ -71,7 +71,7 @@ func rejectForUnknownTMSI(msgType nas.MessageType, typeKnown bool) (pdu []byte, 
 	// derived by the network" makes the UE clear its stale GUTI and re-register.
 	// Plain NAS: EPD | SHT=0x00 | MT=0x4D (ServiceReject) | cause
 	return []byte{nas.PDMobilityManagement, 0x00,
-		byte(nas.MsgTypeServiceReject), byte(nas.CauseUEIdentityNotDerived)},
+			byte(nas.MsgTypeServiceReject), byte(nas.CauseUEIdentityNotDerived)},
 		"ServiceReject", "TS 24.501 §5.6.1.5.2"
 }
 
@@ -205,6 +205,17 @@ const (
 	// Integer value 50 confirmed from TS 38.413 Table 9.1-1 and free5gc ngapType.
 	// Ref: TS 38.413 §8.17.3.
 	ProcUplinkUEAssociatedNRPPaTransport ProcedureCode = 50
+
+	// ProcWriteReplaceWarning is the NGAP procedure code for Write-Replace
+	// Warning (AMF→gNB, Class 1, non-UE-associated PWS broadcast). Correlated
+	// by (MessageIdentifier, SerialNumber) only — no UE-NGAP-ID pair.
+	// Ref: TS 38.413 §8.9.1, Table 9.1-1.
+	ProcWriteReplaceWarning ProcedureCode = 51
+	// ProcPWSCancel is the NGAP procedure code for PWS Cancel (AMF→gNB,
+	// Class 1, non-UE-associated PWS broadcast stop). Correlated by
+	// (MessageIdentifier, SerialNumber) only — no UE-NGAP-ID pair.
+	// Ref: TS 38.413 §8.9.2, Table 9.1-1.
+	ProcPWSCancel ProcedureCode = 32
 )
 
 // Criticality per TS 38.413 §9.1.
@@ -375,6 +386,15 @@ type Server struct {
 
 	// timerCfg holds the timer durations for UE lifecycle management.
 	timerCfg TimerConfig
+
+	// pws holds active/completed Public Warning System broadcasts keyed by
+	// (MessageIdentifier, SerialNumber) — the only correlation available for
+	// these non-UE-associated Class 1 procedures. Guarded by pwsMu, not the
+	// general s.mu (avoids contending with the gNB registry lock on every
+	// Write-Replace Warning Response/PWS Cancel Response).
+	// Ref: TS 38.413 §8.9; TS 23.041 §9.3.2.
+	pwsMu sync.Mutex
+	pws   map[PWSKey]*PWSBroadcast
 }
 
 // NewServer constructs the NGAP SCTP server. NASHandler can be nil and set later
@@ -388,6 +408,7 @@ func NewServer(addr string, mgr *amfctx.Manager, nas NASHandler, cfg AMFConfig, 
 		logger:      logger.With("component", "ngap"),
 		gnbs:        make(map[string]*GNBContext),
 		pendingN2HO: make(map[int64]*n2HandoverState),
+		pws:         make(map[PWSKey]*PWSBroadcast),
 	}
 }
 
@@ -687,6 +708,11 @@ func (s *Server) handleGNBConn(ctx context.Context, conn *sctp.SCTPConn) {
 			}
 		}
 
+		// Mark any in-flight PWS broadcast/cancel entries for this gNB as
+		// failed so a dropped SCTP association doesn't leave them "pending"
+		// forever. Ref: TS 38.412 §7.
+		s.markPWSGNBFailed(remoteAddr)
+
 		conn.Close()
 		s.mu.Lock()
 		delete(s.gnbs, remoteAddr)
@@ -816,6 +842,14 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 		if msg.Type == 0 { // InitiatingMessage from gNB
 			// Ref: TS 38.413 §8.7.6 (UE Radio Capability Info Indication)
 			s.handleUERadioCapabilityInfoIndication(ctx, gnb, msg)
+		}
+	case ProcWriteReplaceWarning:
+		if msg.Type == 1 { // SuccessfulOutcome: Write-Replace Warning Response from gNB
+			s.handleWriteReplaceWarningResponse(ctx, gnb, msg)
+		}
+	case ProcPWSCancel:
+		if msg.Type == 1 { // SuccessfulOutcome: PWS Cancel Response from gNB
+			s.handlePWSCancelResponse(ctx, gnb, msg)
 		}
 	default:
 		log.Warn("unhandled NGAP procedure", "proc", msg.ProcedureCode)

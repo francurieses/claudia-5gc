@@ -98,6 +98,20 @@ type Server struct {
 	pfcpSeq   atomic.Uint32 // PFCP sequence number
 	// db is optional; nil = in-memory only (dev without Docker / unit tests).
 	db store.Store
+	// secondaryAuthDNNs marks which DNNs require DN-AAA secondary
+	// authentication/authorization at PDU Session Establishment. A DNN
+	// absent here establishes without any EAP round (TS 23.501 §5.6.6).
+	secondaryAuthDNNs map[string]bool
+	// dnAAA is the SMF's seam onto the Data Network AAA server (N6). Default
+	// is the in-core simulated implementation; tests may substitute their own.
+	dnAAA DNAAAClient
+	// pendingAuth holds in-flight secondary-authentication state, keyed by
+	// smContextRef. Ref: TS 23.502 §4.3.2.3.
+	pendingAuth   map[string]*pendingSecondaryAuth
+	pendingAuthMu sync.Mutex
+	// n1n2Push defaults to s.pushN1N2Message; overridable in tests to capture
+	// the NAS bytes pushed towards the UE without needing a live mTLS AMF peer.
+	n1n2Push func(ctx context.Context, supi string, psi uint8, n1SmMsg, n2SmInfo []byte, n2SmInfoType string) (string, error)
 }
 
 type IPPool struct {
@@ -230,16 +244,35 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		httpClient = sbi.NewH2CClient()
 	}
 
-	s := &Server{
-		cfg:        cfg,
-		logger:     logger.With("nf", "SMF"),
-		httpClient: httpClient,
-		mgmtHTTP:   &http.Client{Timeout: 15 * time.Second},
-		sessions:   make(map[string]*Session),
-		ipPools:    ipPools,
-		ipv6Pools:  ipv6Pools,
-		db:         db,
+	// Secondary authentication (TS 23.501 §5.6.6): per-DNN gate + the
+	// simulated DN-AAA's dev/test "unreachable" knob.
+	secondaryAuthDNNs := make(map[string]bool)
+	dnAAAUnreachableDNNs := make(map[string]bool)
+	for _, dnn := range cfg.DNNs {
+		if dnn.SecondaryAuth {
+			secondaryAuthDNNs[dnn.Name] = true
+			logger.Info("SMF: DNN requires secondary DN-AAA authentication",
+				"dnn", dnn.Name, "spec_ref", "TS 23.501 §5.6.6")
+		}
+		if dnn.DNAAAUnreachable {
+			dnAAAUnreachableDNNs[dnn.Name] = true
+		}
 	}
+
+	s := &Server{
+		cfg:               cfg,
+		logger:            logger.With("nf", "SMF"),
+		httpClient:        httpClient,
+		mgmtHTTP:          &http.Client{Timeout: 15 * time.Second},
+		sessions:          make(map[string]*Session),
+		ipPools:           ipPools,
+		ipv6Pools:         ipv6Pools,
+		db:                db,
+		secondaryAuthDNNs: secondaryAuthDNNs,
+		dnAAA:             newSimulatedDNAAAClient(dnAAAUnreachableDNNs),
+		pendingAuth:       make(map[string]*pendingSecondaryAuth),
+	}
+	s.n1n2Push = s.pushN1N2Message
 	if db != nil {
 		if err := s.loadFromStore(context.Background()); err != nil {
 			logger.Warn("SMF: failed to load sessions from store — starting empty", "error", err)
@@ -341,10 +374,22 @@ func (s *Server) persistSession(ctx context.Context, ref string, sess *Session) 
 	if s.db == nil {
 		return
 	}
+	// net.IP.String() returns the literal text "<nil>" for a nil/zero-length
+	// IP (a well-known Go stdlib gotcha) — that must never reach the store.
+	// A pure IPv6/IPv6-only session has no sess.UEIP (IPv4) at all, so fall
+	// back to the derived full IPv6 address (delegated /64 + IID) instead of
+	// leaving the column blank, which would also drop the session from the
+	// portal's `WHERE ue_ip != ''` session list.
+	ueIPStr := ""
+	if sess.UEIP != nil {
+		ueIPStr = sess.UEIP.String()
+	} else if v6, err := ueIPv6Address(sess.UEIPv6Prefix); err == nil {
+		ueIPStr = v6.String()
+	}
 	rec := &store.SessionRecord{
 		SUPI:   sess.SUPI,
 		DNN:    sess.DNN,
-		UEIP:   sess.UEIP.String(),
+		UEIP:   ueIPStr,
 		ULTEID: sess.ULTEID,
 		SEID:   sess.SEID,
 		SST:    sess.SliceID.SST,
@@ -415,15 +460,22 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	n1SmMsg, _ := base64.StdEncoding.DecodeString(n1SmMsgB64)
 	// n1SmMsg is the full 5GSM message (EPD|PSI|PTI|MT|body); the decoder
 	// expects the body only. We extract the requested PDU session type to drive
-	// IPv6/IPv4v6 prefix delegation (TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11),
-	// and keep the whole decoded request: the Accept's ePCO must answer the
-	// UE's own container list IN THE UE'S OWN ORDER (nas.BuildEPCOReply,
-	// mirroring Open5GS smf_pco_build) — a Pixel 6a / Shannon modem that puts
-	// IPCP (0x8021) first got dnses=[] when we answered it last. The decoded
-	// request also carries the requested PDU session type, which drives both
-	// IPv6 prefix delegation and the 5GSM cause #50/#51 on a downgrade.
-	// See docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md.
+	// IPv6/IPv4v6 prefix delegation (TS 23.501 §5.8.2.2, TS 24.501 §9.11.4.11).
+	// The PTI (octet 3) is echoed on every 5GSM response for this session,
+	// including the secondary-authentication AUTH COMMAND/RESULT/ACCEPT/REJECT
+	// messages below (TS 24.501 §9.6).
+	var pti uint8
+	if len(n1SmMsg) > 2 {
+		pti = n1SmMsg[2]
+	}
 	var requestedType *uint8
+	// Keep the whole decoded request: the Accept's ePCO must answer the UE's
+	// own container list IN THE UE'S OWN ORDER (nas.BuildEPCOReply, mirroring
+	// Open5GS smf_pco_build) — a Pixel 6a / Shannon modem that puts IPCP
+	// (0x8021) first got dnses=[] when we answered it last. The decoded request
+	// also carries the requested PDU session type, which drives both IPv6
+	// prefix delegation and the 5GSM cause #50/#51 on a downgrade.
+	// See docs/ACCEPT-DIFF-open5gs-vs-claudia-2026-09-04.md.
 	var pduReq *nas.PDUSessionEstablishmentRequest
 	if len(n1SmMsg) > 4 {
 		if decoded, err := nas.DecodePDUSessionEstablishmentRequest(n1SmMsg[4:]); err == nil {
@@ -505,6 +557,49 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	// Per-session identifiers (unique across all sessions)
 	ulTEID := s.nextTEID.Add(1)
 	seid := s.nextSEID.Add(1)
+
+	// Secondary authentication gate (TS 23.501 §5.6.6, TS 23.502 §4.3.2.3): if
+	// the DNN requires DN-AAA authorization, hold the session in
+	// PENDING_SECONDARY_AUTH instead of proceeding straight to PCF/N4/Accept.
+	// The address material already allocated above is reserved for this
+	// session and released on rejection. A DNN without secondary_auth falls
+	// straight through to the unchanged flow below (no regression).
+	if s.secondaryAuthRequired(dnn) {
+		pending := &pendingSecondaryAuth{
+			SmContextRef: smContextRef,
+			SUPI:         supi,
+			DNN:          dnn,
+			PDUSessionID: uint8(pduSessionID),
+			PTI:          pti,
+			Slice:        slice,
+			GrantedType:  grantedType,
+			IPv4:         ip,
+			V6Prefix:     v6Prefix,
+			V6IID:        v6IID,
+			PCORequest:   pduReq,
+			ULTEID:       ulTEID,
+			SEID:         seid,
+		}
+		s.startSecondaryAuth(r.Context(), pending)
+
+		span.SetAttributes(
+			attribute.String("sm_context_ref", smContextRef),
+			attribute.Bool("secondary_auth_pending", true),
+		)
+		span.SetStatus(codes.Ok, "")
+		log.Info("Nsmf_PDUSession_CreateSMContext: secondary auth pending, deferring Accept",
+			"smContextRef", smContextRef, "dnn", dnn, "supi", supi,
+			"direction", "OUT", "spec_ref", "TS 23.502 §4.3.2.3",
+		)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Location", "/nsmf-pdusession/v1/sm-contexts/"+smContextRef)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"smContextRef": smContextRef,
+		})
+		return
+	}
 
 	// Fetch the subscribed default QoS from UDM over N10 first; it is reported
 	// to the PCF as subsDefQos/subsSessAmbr, and used directly when the PCF is
@@ -592,19 +687,19 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	metrics.PDUSessionsActive.WithLabelValues("SMF", dnn).Inc()
 
 	if pduTypeNeedsIPv6(grantedType) {
-		// The /64 delivery (Router Advertisement on the per-DNN TUN) and the IPv6
-		// UE-IP in the PFCP PDR are on the hard-stop UPF data-plane / PFCP
-		// session-management path (escalated, UPF-001). Until that lands the IPv6
-		// leg has no user-plane forwarding. Ref: TS 23.501 §5.8.2.2.
-		log.Warn("IPv6 user plane pending UPF data-plane work",
+		// The IPv6 UE-IP is installed in the PFCP PDR (UE IP Address IE, V6 flag)
+		// and the UPF starts a per-session Router Advertisement advertiser for the
+		// delegated /64 on the DNN's user plane (human sign-off 2026-07-22, same
+		// PFCP-path exception precedent as UPF-001). Ref: TS 23.501 §5.8.2.2.
+		log.Info("IPv6 user plane installed at UPF",
 			"pdu_session_type", grantedType, "ipv6_prefix", v6PrefixStr,
-			"dataplane", "pending-upf-001", "spec_ref", "TS 23.501 §5.8.2.2")
+			"spec_ref", "TS 23.501 §5.8.2.2.2")
 	}
 
-	// Establish the PFCP session with the UPF (IPv4 user plane) asynchronously.
-	// IPv6-only sessions have no IPv4 PDR to install and their v6 user plane is
-	// escalated (UPF-001), so the PFCP path is left untouched in that case.
-	if ip != nil {
+	// Establish the PFCP session with the UPF whenever the session carries any
+	// UE address (IPv4, IPv6-only or IPv4v6) — the granted-type-aware UE IP
+	// Address IE built in sendPFCPSessionEstablishment covers all three cases.
+	if ip != nil || pduTypeNeedsIPv6(grantedType) {
 		go s.sendPFCPSessionEstablishment(context.Background(), sess)
 	}
 
@@ -833,6 +928,19 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			"n2SmInfo": base64.StdEncoding.EncodeToString(n2SmInfo),
 		})
 		return
+	}
+
+	// PDU SESSION AUTHENTICATION COMPLETE (0xC6): the UE's EAP-Response relayed
+	// by the AMF during secondary authentication. Dispatched before the
+	// general n1SmMsg branches below since it answers via the pushed-message
+	// path (N1N2MessageTransfer), not a same-call response.
+	// Ref: TS 23.502 §4.3.2.3, TS 24.501 §8.3.6.
+	if n1SmMsgB64, _ := body["n1SmMsg"].(string); n1SmMsgB64 != "" {
+		if n1SmMsgBytes, err := base64.StdEncoding.DecodeString(n1SmMsgB64); err == nil &&
+			len(n1SmMsgBytes) >= 4 && nas.MessageType(n1SmMsgBytes[3]) == nas.MsgTypePDUSessionAuthenticationComplete {
+			s.handleSecondaryAuthComplete(w, r, smContextRef, n1SmMsgBytes)
+			return
+		}
 	}
 
 	// PDU Session Modification: n1SmMsg present with 5GSM ModificationRequest (0xC9).
@@ -1599,8 +1707,30 @@ func problem(w http.ResponseWriter, status int, cause, detail string) {
 	})
 }
 
+// usageReportingURRID is the single Usage Reporting Rule ID installed per PDU
+// session for active usage reporting (volume-threshold + periodic). The SMF
+// installs exactly one URR per session for the MVP. Ref: TS 29.244 §7.5.2.4.
+const usageReportingURRID uint32 = 1
+
+// reportingTriggersPerioVolth is the Reporting Triggers IE bitmask enabling
+// both the periodic (PERIO) and volume-threshold (VOLTH) triggers. TS 29.244
+// §8.2.41 Figure 8.2.41-1 places PERIO at bit 1 (0x01) and VOLTH at bit 2
+// (0x02) of octet 1. go-pfcp's NewReportingTriggers(uint16) constructor
+// stores the argument big-endian, so octet 1 lands in the HIGH byte of the
+// uint16 — verified by round-trip against ie.HasPERIO()/ie.HasVOLTH() in
+// TestSendPFCPSessionEstablishmentInstallsURR.
+const reportingTriggersPerioVolth uint16 = 0x0300
+
+// volumeThresholdFlagTOVOL selects the Total Volume field in the Volume
+// Threshold IE (as opposed to separate uplink/downlink thresholds).
+// Ref: TS 29.244 §8.2.13.
+const volumeThresholdFlagTOVOL uint8 = 0x01
+
 // sendPFCPSessionEstablishment sends a PFCP Session Establishment Request to UPF.
 // Tells UPF: packets arriving on N3 with TEID=sess.ULTEID belong to UE sess.UEIP.
+// Also installs a Usage Reporting Rule (Create URR, TS 29.244 §7.5.2.4) so the
+// UPF measures and actively reports volume/duration usage (TS 29.244 §5.2.2.4)
+// back to the SMF's persistent PFCP receiver — see pfcp_report.go.
 // Ref: TS 29.244 §6.3.2
 func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session) {
 	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
@@ -1615,6 +1745,15 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 	}
 	defer conn.Close()
 
+	// UE IP Address IE (TS 29.244 §8.2.62), granted-type aware: bit1=V6
+	// (0x01), bit2=V4 (0x02). IPv4 default path is byte-identical to before
+	// (flags 0x02, empty v6 field). Ref: TS 23.501 §5.8.2.2.
+	ueIPIE, ueIPv6, err := buildUEIPAddressIE(sess)
+	if err != nil {
+		s.logger.Error("PFCP: build UE IP Address IE", "error", err, "seid", sess.SEID)
+		return
+	}
+
 	seq := s.pfcpSeq.Add(1)
 	req := pfcpmsg.NewSessionEstablishmentRequest(
 		0, 0, 0, seq, 0,
@@ -1627,7 +1766,7 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 				pfcpie.NewSourceInterface(pfcpie.SrcInterfaceAccess),
 				// F-TEID: UPF listens for GTP-U on N3 IP with UL TEID
 				pfcpie.NewFTEID(0x01, sess.ULTEID, net.ParseIP(s.cfg.UPFN3Addr), nil, 0),
-				pfcpie.NewUEIPAddress(0x02, sess.UEIP.String(), "", 0, 0),
+				ueIPIE,
 				// Network Instance carries the DNN so the UPF can select the
 				// correct N6 interface for this session's traffic.
 				// Ref: TS 29.244 §6.3.3.14, TS 23.501 §5.6.5
@@ -1636,6 +1775,10 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			pfcpie.NewOuterHeaderRemoval(0, 0),
 			pfcpie.NewFARID(1),
 			pfcpie.NewQERID(1),
+			// URR ID list within the PDR — links this PDR to the Usage
+			// Reporting Rule below so the UPF measures traffic it forwards.
+			// Ref: TS 29.244 §7.5.2.2.
+			pfcpie.NewURRID(usageReportingURRID),
 		),
 		pfcpie.NewCreateFAR(
 			pfcpie.NewFARID(1),
@@ -1649,6 +1792,16 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			pfcpie.NewGateStatus(0, 0), // UL/DL OPEN
 			pfcpie.NewMBR(uint64(sess.AMBRULMbps)*1000, uint64(sess.AMBRDLMbps)*1000),
 			pfcpie.NewQFI(1),
+		),
+		// Usage Reporting Rule — active usage reporting (volume-threshold +
+		// periodic), consumed by the SMF's persistent PFCP receiver
+		// (pfcp_report.go). Ref: TS 29.244 §7.5.2.4, §5.2.2.4.
+		pfcpie.NewCreateURR(
+			pfcpie.NewURRID(usageReportingURRID),
+			pfcpie.NewMeasurementMethod(0, 1, 1), // event=0, volum=1, durat=1
+			pfcpie.NewReportingTriggers(reportingTriggersPerioVolth),
+			pfcpie.NewVolumeThreshold(volumeThresholdFlagTOVOL, s.cfg.N4.VolumeThresholdBytes, 0, 0),
+			pfcpie.NewMeasurementPeriod(time.Duration(s.cfg.N4.MeasurementPeriodSeconds)*time.Second),
 		),
 	)
 
@@ -1664,9 +1817,11 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 	}
 
 	s.logger.Info("PFCP SessionEstablishment sent",
-		"seid", sess.SEID, "ulTEID", sess.ULTEID, "ueIP", sess.UEIP,
+		"seid", sess.SEID, "ulTEID", sess.ULTEID, "ueIP", sess.UEIP, "ueIPv6", ueIPv6,
 		"qer_qfi", 1, "qer_mbr_ul_kbps", sess.AMBRULMbps*1000, "qer_mbr_dl_kbps", sess.AMBRDLMbps*1000,
-		"spec_ref", "TS 29.244 §7.5.2.5")
+		"urr_id", usageReportingURRID, "vol_threshold_bytes", s.cfg.N4.VolumeThresholdBytes,
+		"meas_period_s", s.cfg.N4.MeasurementPeriodSeconds,
+		"spec_ref", "TS 29.244 §7.5.2.4")
 
 	// Read response (best-effort, no retransmission for now)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))

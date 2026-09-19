@@ -420,7 +420,7 @@ var defaultTemplates = []PolicyTemplate{
 
 // Migrate creates portal-managed tables that are not part of the core 5GC schema.
 func (s *Store) Migrate(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `
+	if _, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS portal_policy_templates (
 		    id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
 		    name        TEXT NOT NULL,
@@ -429,6 +429,29 @@ func (s *Store) Migrate(ctx context.Context) error {
 		    precedence  INT  NOT NULL DEFAULT 100,
 		    rules_json  JSONB NOT NULL DEFAULT '[]',
 		    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`); err != nil {
+		return err
+	}
+	// pws_broadcasts — the Cell Broadcast Centre (CBC) store of record for active
+	// Public Warning System messages (TS 23.041). 3GPP puts the durable warning
+	// state at the CBC, not the AMF (a stateless relay), so the portal — which
+	// plays the CBC — persists it here. Survives AMF restart; the portal can
+	// re-drive (resend) the active warnings to re-establish them at the gNBs.
+	_, err := s.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS pws_broadcasts (
+		    message_identifier   INT NOT NULL,
+		    serial_number        INT NOT NULL,
+		    data_coding_scheme   INT NOT NULL DEFAULT 15,
+		    language             TEXT NOT NULL DEFAULT '',
+		    warning_type         TEXT NOT NULL DEFAULT '',
+		    repetition_period    INT NOT NULL DEFAULT 4096,
+		    number_of_broadcasts INT NOT NULL DEFAULT 1,
+		    message_text         TEXT NOT NULL DEFAULT '',
+		    warning_area_tacs    INT[] NOT NULL DEFAULT '{}',
+		    cancelled            BOOLEAN NOT NULL DEFAULT FALSE,
+		    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		    cancelled_at         TIMESTAMPTZ,
+		    PRIMARY KEY (message_identifier, serial_number)
 		)`)
 	return err
 }
@@ -520,4 +543,118 @@ func (s *Store) UpsertTemplate(ctx context.Context, t PolicyTemplate) error {
 func (s *Store) DeleteTemplate(ctx context.Context, id string) error {
 	_, err := s.pool.Exec(ctx, `DELETE FROM portal_policy_templates WHERE id = $1`, id)
 	return err
+}
+
+// ---- Public Warning System (CBC store of record — TS 23.041) --------------
+
+// PWSBroadcast is one Public Warning System warning message the portal (acting
+// as the Cell Broadcast Centre) has broadcast, persisted so it survives an AMF
+// restart and can be re-driven to the gNBs. Mirrors the fields the AMF mgmt
+// API POST /amf/v1/pws/broadcast accepts, so a stored record fully reconstructs
+// the request. Ref: TS 23.041, TS 38.413 §8.9.
+type PWSBroadcast struct {
+	MessageIdentifier  int        `json:"message_identifier"`
+	SerialNumber       int        `json:"serial_number"`
+	DataCodingScheme   int        `json:"data_coding_scheme"`
+	Language           string     `json:"language"`
+	WarningType        string     `json:"warning_type"`
+	RepetitionPeriod   int        `json:"repetition_period"`
+	NumberOfBroadcasts int        `json:"number_of_broadcasts"`
+	MessageText        string     `json:"message_text"`
+	WarningAreaTACs    []int32    `json:"warning_area_tacs"`
+	Cancelled          bool       `json:"cancelled"`
+	CreatedAt          time.Time  `json:"created_at"`
+	CancelledAt        *time.Time `json:"cancelled_at,omitempty"`
+}
+
+// UpsertPWSBroadcast records a broadcast (or replaces an existing one keyed by
+// message identifier + serial number — the "Write-Replace" semantics of
+// TS 23.041). A (re-)broadcast resets the cancelled flag and refreshes
+// created_at, since it re-establishes the warning at the RAN.
+func (s *Store) UpsertPWSBroadcast(ctx context.Context, b PWSBroadcast) error {
+	tacs := b.WarningAreaTACs
+	if tacs == nil {
+		tacs = []int32{}
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO pws_broadcasts (
+		    message_identifier, serial_number, data_coding_scheme, language,
+		    warning_type, repetition_period, number_of_broadcasts, message_text,
+		    warning_area_tacs, cancelled, created_at, cancelled_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,NOW(),NULL)
+		ON CONFLICT (message_identifier, serial_number) DO UPDATE SET
+		    data_coding_scheme   = EXCLUDED.data_coding_scheme,
+		    language             = EXCLUDED.language,
+		    warning_type         = EXCLUDED.warning_type,
+		    repetition_period    = EXCLUDED.repetition_period,
+		    number_of_broadcasts = EXCLUDED.number_of_broadcasts,
+		    message_text         = EXCLUDED.message_text,
+		    warning_area_tacs    = EXCLUDED.warning_area_tacs,
+		    cancelled            = FALSE,
+		    created_at           = NOW(),
+		    cancelled_at         = NULL`,
+		b.MessageIdentifier, b.SerialNumber, b.DataCodingScheme, b.Language,
+		b.WarningType, b.RepetitionPeriod, b.NumberOfBroadcasts, b.MessageText, tacs)
+	if err != nil {
+		return fmt.Errorf("store: UpsertPWSBroadcast: %w", err)
+	}
+	return nil
+}
+
+// MarkPWSCancelled flags a stored broadcast cancelled. No error if the row does
+// not exist (the cancel is still relayed to the AMF regardless).
+func (s *Store) MarkPWSCancelled(ctx context.Context, messageIdentifier, serialNumber int) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE pws_broadcasts SET cancelled = TRUE, cancelled_at = NOW()
+		WHERE message_identifier = $1 AND serial_number = $2`,
+		messageIdentifier, serialNumber)
+	if err != nil {
+		return fmt.Errorf("store: MarkPWSCancelled: %w", err)
+	}
+	return nil
+}
+
+// ListPWSBroadcasts returns every stored warning, newest first.
+func (s *Store) ListPWSBroadcasts(ctx context.Context) ([]PWSBroadcast, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT message_identifier, serial_number, data_coding_scheme, language,
+		       warning_type, repetition_period, number_of_broadcasts, message_text,
+		       warning_area_tacs, cancelled, created_at, cancelled_at
+		FROM pws_broadcasts ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: ListPWSBroadcasts: %w", err)
+	}
+	defer rows.Close()
+	var out []PWSBroadcast
+	for rows.Next() {
+		var b PWSBroadcast
+		if err := rows.Scan(&b.MessageIdentifier, &b.SerialNumber, &b.DataCodingScheme,
+			&b.Language, &b.WarningType, &b.RepetitionPeriod, &b.NumberOfBroadcasts,
+			&b.MessageText, &b.WarningAreaTACs, &b.Cancelled, &b.CreatedAt, &b.CancelledAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// GetPWSBroadcast returns one stored warning, or nil if not found.
+func (s *Store) GetPWSBroadcast(ctx context.Context, messageIdentifier, serialNumber int) (*PWSBroadcast, error) {
+	var b PWSBroadcast
+	err := s.pool.QueryRow(ctx, `
+		SELECT message_identifier, serial_number, data_coding_scheme, language,
+		       warning_type, repetition_period, number_of_broadcasts, message_text,
+		       warning_area_tacs, cancelled, created_at, cancelled_at
+		FROM pws_broadcasts WHERE message_identifier = $1 AND serial_number = $2`,
+		messageIdentifier, serialNumber).Scan(
+		&b.MessageIdentifier, &b.SerialNumber, &b.DataCodingScheme, &b.Language,
+		&b.WarningType, &b.RepetitionPeriod, &b.NumberOfBroadcasts, &b.MessageText,
+		&b.WarningAreaTACs, &b.Cancelled, &b.CreatedAt, &b.CancelledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: GetPWSBroadcast: %w", err)
+	}
+	return &b, nil
 }

@@ -1,18 +1,57 @@
-import { useState, useMemo } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import type { ReactNode } from 'react'
 import {
-  Play, Square, RotateCcw, FileDown, Pause, PlayCircle,
-  Trash2, ArrowUpDown, Radio, X, Network,
+  ArrowUpDown,
+  FileDown,
+  Network,
+  Pause,
+  Play,
+  PlayCircle,
+  Radio,
+  RotateCcw,
+  Square,
+  Trash2,
 } from 'lucide-react'
 import {
-  getPCAPStatus, getPCAPFiles,
-  pcapStart, pcapStop, pcapPause, pcapResume, pcapRotate,
-  pcapDownloadURL, pcapDeleteFile, pcapBulkDelete, pcapBulkDownload,
+  getPCAPStatus,
+  getPCAPFiles,
+  pcapStart,
+  pcapStop,
+  pcapPause,
+  pcapResume,
+  pcapRotate,
+  pcapDownloadURL,
+  pcapDeleteFile,
+  pcapBulkDelete,
+  pcapBulkDownload,
 } from '../lib/api'
-import PageHeader from '../components/PageHeader'
-import type { PCAPStatus, PCAPFile } from '../lib/api'
+import type { PCAPFile, PCAPStatus } from '../lib/api'
+import { formatBytes } from '../lib/format'
+import {
+  Badge,
+  Button,
+  Card,
+  Checkbox,
+  ConfirmDialog,
+  DegradedState,
+  ErrorState,
+  IconButton,
+  Loading,
+  PageHeader,
+  Table,
+  TableBody,
+  TableCell,
+  TableEmptyRow,
+  TableHead,
+  TableHeaderCell,
+  TableRow,
+  Tabs,
+  useToast,
+} from '../components/ui'
+import type { BadgeVariant, TabItem } from '../components/ui'
 
-// NF display metadata
+// NF display metadata — one tab per capture sidecar.
 interface NFMeta {
   id: string
   label: string
@@ -21,68 +60,72 @@ interface NFMeta {
 }
 
 const NF_LIST: NFMeta[] = [
-  { id: 'core', label: 'CORE',  description: 'All 5GC networks — sbi · n2 · n4 · n3', group: 'core' },
-  { id: 'nrf',  label: 'NRF',   description: 'NF Registration & Discovery',           group: 'nf' },
-  { id: 'amf',  label: 'AMF',   description: 'Access & Mobility Management',           group: 'nf' },
-  { id: 'ausf', label: 'AUSF',  description: 'Authentication Server',                  group: 'nf' },
-  { id: 'udm',  label: 'UDM',   description: 'Unified Data Management',                group: 'nf' },
-  { id: 'udr',  label: 'UDR',   description: 'Unified Data Repository',                group: 'nf' },
-  { id: 'smf',  label: 'SMF',   description: 'Session Management',                     group: 'nf' },
-  { id: 'pcf',  label: 'PCF',   description: 'Policy Control',                         group: 'nf' },
-  { id: 'upf',  label: 'UPF',   description: 'User Plane (N3/N4)',                     group: 'nf' },
-  { id: 'nssf', label: 'NSSF',  description: 'Network Slice Selection',                group: 'nf' },
-  { id: 'smsf', label: 'SMSF',  description: 'SMS Function',                           group: 'nf' },
-  { id: 'bsf',  label: 'BSF',   description: 'Binding Support',                        group: 'nf' },
-  { id: 'nef',  label: 'NEF',   description: 'Network Exposure',                       group: 'nf' },
-  { id: 'lmf',  label: 'LMF',   description: 'Location Management (Nlmf)',              group: 'nf' },
+  { id: 'core', label: 'CORE', description: 'All 5GC networks — sbi · n2 · n4 · n3', group: 'core' },
+  { id: 'nrf', label: 'NRF', description: 'NF Registration & Discovery', group: 'nf' },
+  { id: 'amf', label: 'AMF', description: 'Access & Mobility Management', group: 'nf' },
+  { id: 'ausf', label: 'AUSF', description: 'Authentication Server', group: 'nf' },
+  { id: 'udm', label: 'UDM', description: 'Unified Data Management', group: 'nf' },
+  { id: 'udr', label: 'UDR', description: 'Unified Data Repository', group: 'nf' },
+  { id: 'smf', label: 'SMF', description: 'Session Management', group: 'nf' },
+  { id: 'pcf', label: 'PCF', description: 'Policy Control', group: 'nf' },
+  { id: 'upf', label: 'UPF', description: 'User Plane (N3/N4)', group: 'nf' },
+  { id: 'nssf', label: 'NSSF', description: 'Network Slice Selection', group: 'nf' },
+  { id: 'smsf', label: 'SMSF', description: 'SMS Function', group: 'nf' },
+  { id: 'bsf', label: 'BSF', description: 'Binding Support', group: 'nf' },
+  { id: 'nef', label: 'NEF', description: 'Network Exposure', group: 'nf' },
+  { id: 'lmf', label: 'LMF', description: 'Location Management (Nlmf)', group: 'nf' },
 ]
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
-// Dot indicator: pulsing green = capturing, yellow = paused, dim gray = stopped
-function StatusDot({ capturing, paused }: { capturing: boolean; paused: boolean }) {
-  if (capturing) {
-    return (
-      <span className="relative flex h-2 w-2">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-green-500" />
-      </span>
-    )
+/**
+ * Capture state → semantic badge. Always colour + icon + text, so the state is
+ * readable without colour (WCAG 1.4.1).
+ */
+function statusBadge(status: PCAPStatus | undefined): { variant: BadgeVariant; icon: ReactNode; label: string } {
+  if (status?.capturing) {
+    return { variant: 'success', icon: <Radio size={12} />, label: 'Capturing' }
   }
-  if (paused) return <span className="h-2 w-2 rounded-full bg-yellow-400 inline-block" />
-  return <span className="h-2 w-2 rounded-full bg-gray-600 inline-block" />
+  if (status?.paused) {
+    return { variant: 'warning', icon: <Pause size={12} />, label: 'Paused' }
+  }
+  return { variant: 'neutral', icon: <Square size={12} />, label: 'Stopped' }
 }
 
-interface CaptureWindowProps {
+/** Compact per-tab marker — shown only for a live capture (REC / PAUSED). */
+function tabBadge(status: PCAPStatus | undefined): ReactNode {
+  if (status?.capturing) return <Badge label="REC" variant="success" icon={<Radio size={10} />} />
+  if (status?.paused) return <Badge label="PAUSED" variant="warning" icon={<Pause size={10} />} />
+  return null
+}
+
+interface CapturePanelProps {
   meta: NFMeta
   status: PCAPStatus | undefined
-  onClose: () => void
+  pending: Record<string, boolean>
   onStart: () => void
   onStop: () => void
   onPause: () => void
   onResume: () => void
   onRotate: () => void
-  pending: Record<string, boolean>
 }
 
-function CaptureWindow({
-  meta, status, onClose,
-  onStart, onStop, onPause, onResume, onRotate,
-  pending,
-}: CaptureWindowProps) {
-  const capturing = status?.capturing ?? false
-  const paused    = status?.paused    ?? false
-  const fileCount = status?.files     ?? 0
-
+function CapturePanel({ meta, status, pending, onStart, onStop, onPause, onResume, onRotate }: CapturePanelProps) {
   const qc = useQueryClient()
+  const { toast } = useToast()
   const [sortNewest, setSortNewest] = useState(true)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [confirmBulk, setConfirmBulk] = useState(false)
+  const [confirmFile, setConfirmFile] = useState<string | null>(null)
 
-  const { data: files = [], isLoading } = useQuery({
+  const capturing = status?.capturing ?? false
+  const paused = status?.paused ?? false
+  const fileCount = status?.files ?? 0
+  const badge = statusBadge(status)
+
+  const { data: files = [], isLoading, isError, error, refetch } = useQuery({
     queryKey: ['pcap-files', meta.id],
     queryFn: () => getPCAPFiles(meta.id),
     refetchInterval: 5_000,
@@ -93,241 +136,280 @@ function CaptureWindow({
     qc.invalidateQueries({ queryKey: ['pcap-files', meta.id] })
   }
 
+  const actionFailed = (verb: string) => (err: unknown) =>
+    toast({ variant: 'error', title: `${verb} failed`, description: errMessage(err), duration: 0 })
+
   const deleteMut = useMutation({
     mutationFn: (filename: string) => pcapDeleteFile(meta.id, filename),
     onSuccess: invalidate,
+    onError: actionFailed('Delete'),
   })
   const bulkDeleteMut = useMutation({
     mutationFn: (fileList: string[]) => pcapBulkDelete(meta.id, fileList),
-    onSuccess: () => { setSelected(new Set()); invalidate() },
+    onSuccess: () => {
+      setSelected(new Set())
+      invalidate()
+    },
+    onError: actionFailed('Bulk delete'),
   })
   const bulkDownloadMut = useMutation({
     mutationFn: (fileList: string[]) => pcapBulkDownload(meta.id, fileList),
+    onError: actionFailed('Download'),
   })
 
-  const sorted = useMemo(() => (
-    [...files].sort((a: PCAPFile, b: PCAPFile) => {
-      const d = new Date(b.mod_time).getTime() - new Date(a.mod_time).getTime()
-      return sortNewest ? d : -d
+  const sorted = useMemo(
+    () =>
+      [...files].sort((a: PCAPFile, b: PCAPFile) => {
+        const d = new Date(b.mod_time).getTime() - new Date(a.mod_time).getTime()
+        return sortNewest ? d : -d
+      }),
+    [files, sortNewest],
+  )
+
+  const allSelected = sorted.length > 0 && sorted.every((f: PCAPFile) => selected.has(f.name))
+  const someSelected = !allSelected && sorted.some((f: PCAPFile) => selected.has(f.name))
+
+  const toggle = (name: string) =>
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(name)) next.delete(name)
+      else next.add(name)
+      return next
     })
-  ), [files, sortNewest])
 
-  const allSelected  = sorted.length > 0 && sorted.every((f: PCAPFile) => selected.has(f.name))
-  const someSelected = selected.size > 0
-
-  const toggle = (name: string) => {
-    const next = new Set(selected)
-    next.has(name) ? next.delete(name) : next.add(name)
-    setSelected(next)
+  const downloadFile = (name: string) => {
+    const a = document.createElement('a')
+    a.href = pcapDownloadURL(meta.id, name)
+    a.download = name
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
   }
 
   return (
-    <div className="flex flex-col h-full bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
-      {/* Window title bar */}
-      <div className={`flex items-center justify-between px-4 py-3 border-b border-gray-700 shrink-0 ${
-        meta.id === 'core' ? 'bg-blue-950/60' : 'bg-gray-800/60'
-      }`}>
-        <div className="flex items-center gap-2.5">
-          {meta.id === 'core'
-            ? <Network size={14} className="text-blue-400" />
-            : <Radio size={14} className="text-gray-400" />
-          }
-          <span className="text-sm font-bold text-white">{meta.label}</span>
-          <span className="text-xs text-gray-400">{meta.description}</span>
+    <div className="flex flex-col gap-4">
+      {/* Header + capture controls */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-fg">
+            {meta.label}
+            <span className="ml-2 font-normal text-muted-fg">{meta.description}</span>
+          </h2>
+          <p className="mt-0.5 text-xs text-muted-fg">
+            {fileCount} file{fileCount === 1 ? '' : 's'} saved · Rotate seals the current file without stopping the
+            capture
+          </p>
         </div>
-        <div className="flex items-center gap-3">
-          <StatusDot capturing={capturing} paused={paused} />
-          <span className="text-xs text-gray-500">
-            {capturing ? 'Capturing' : paused ? 'Paused' : 'Stopped'}
-          </span>
-          <button
-            onClick={onClose}
-            className="text-gray-500 hover:text-gray-300 transition-colors"
-            title="Close"
-          >
-            <X size={14} />
-          </button>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge label={badge.label} variant={badge.variant} icon={badge.icon} />
+
+          {!capturing && !paused && (
+            <Button size="sm" icon={<Play size={14} />} loading={pending.start} onClick={onStart}>
+              Start
+            </Button>
+          )}
+          {capturing && (
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Pause size={14} />}
+              loading={pending.pause}
+              onClick={onPause}
+            >
+              Pause
+            </Button>
+          )}
+          {paused && (
+            <Button size="sm" icon={<PlayCircle size={14} />} loading={pending.resume} onClick={onResume}>
+              Resume
+            </Button>
+          )}
+          {capturing && (
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<RotateCcw size={14} />}
+              loading={pending.rotate}
+              onClick={onRotate}
+              title="Seal the current file and start a new one without losing data"
+            >
+              Rotate file
+            </Button>
+          )}
+          {(capturing || paused) && (
+            <Button
+              size="sm"
+              variant="destructive"
+              icon={<Square size={14} />}
+              loading={pending.stop}
+              onClick={onStop}
+            >
+              Stop
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* Controls row */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-800 shrink-0 flex-wrap">
-        {!capturing && !paused && (
-          <button
-            onClick={onStart}
-            disabled={pending.start}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs rounded disabled:opacity-50 transition-colors"
-          >
-            <Play size={12} /> Start
-          </button>
-        )}
-        {capturing && (
-          <button
-            onClick={onPause}
-            disabled={pending.pause}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-yellow-600 hover:bg-yellow-500 text-white text-xs rounded disabled:opacity-50 transition-colors"
-          >
-            <Pause size={12} /> Pause
-          </button>
-        )}
-        {paused && (
-          <button
-            onClick={onResume}
-            disabled={pending.resume}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs rounded disabled:opacity-50 transition-colors"
-          >
-            <PlayCircle size={12} /> Resume
-          </button>
-        )}
-        {(capturing || paused) && (
-          <button
-            onClick={onStop}
-            disabled={pending.stop}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-red-700 hover:bg-red-600 text-white text-xs rounded disabled:opacity-50 transition-colors"
-          >
-            <Square size={12} /> Stop
-          </button>
-        )}
-        {capturing && (
-          <button
-            onClick={onRotate}
-            disabled={pending.rotate}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded disabled:opacity-50 transition-colors"
-            title="Seal current file and start a new one without losing data"
-          >
-            <RotateCcw size={12} /> Rotate file
-          </button>
-        )}
-
-        <div className="ml-auto text-xs text-gray-500">
-          {fileCount} file{fileCount !== 1 ? 's' : ''} saved
-        </div>
-      </div>
-
-      {/* Bulk action bar */}
-      {someSelected && (
-        <div className="flex items-center gap-3 px-4 py-2 bg-blue-900/25 border-b border-blue-800/40 shrink-0">
-          <span className="text-xs text-blue-300">{selected.size} selected</span>
-          <button
-            onClick={() => bulkDownloadMut.mutate(Array.from(selected))}
-            disabled={bulkDownloadMut.isPending}
-            className="flex items-center gap-1.5 px-3 py-1 bg-blue-700 hover:bg-blue-600 text-white text-xs rounded disabled:opacity-50"
-          >
-            <FileDown size={11} />
-            {bulkDownloadMut.isPending ? 'Preparing…' : `Download (${selected.size})`}
-          </button>
-          <button
-            onClick={() => {
-              if (window.confirm(`Delete ${selected.size} file(s)?`)) {
-                bulkDeleteMut.mutate(Array.from(selected))
-              }
-            }}
-            disabled={bulkDeleteMut.isPending}
-            className="flex items-center gap-1.5 px-3 py-1 bg-red-800 hover:bg-red-700 text-white text-xs rounded disabled:opacity-50"
-          >
-            <Trash2 size={11} />
-            {bulkDeleteMut.isPending ? 'Deleting…' : `Delete (${selected.size})`}
-          </button>
-          <button onClick={() => setSelected(new Set())} className="ml-auto text-xs text-gray-500 hover:text-gray-300">
-            Clear
-          </button>
-        </div>
+      {/* Bulk actions */}
+      {selected.size > 0 && (
+        <Card className="border-info-border bg-info-surface">
+          <div className="flex flex-wrap items-center gap-3 text-info-fg">
+            <span className="text-xs font-medium">{selected.size} selected</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<FileDown size={14} />}
+              loading={bulkDownloadMut.isPending}
+              onClick={() => bulkDownloadMut.mutate(Array.from(selected))}
+            >
+              Download ({selected.size})
+            </Button>
+            <Button
+              size="sm"
+              variant="destructive"
+              icon={<Trash2 size={14} />}
+              loading={bulkDeleteMut.isPending}
+              onClick={() => setConfirmBulk(true)}
+            >
+              Delete ({selected.size})
+            </Button>
+            <Button size="sm" variant="ghost" className="ml-auto" onClick={() => setSelected(new Set())}>
+              Clear
+            </Button>
+          </div>
+        </Card>
       )}
 
-      {/* File table — scrollable */}
-      <div className="flex-1 overflow-auto min-h-0">
-        <table className="w-full text-sm">
-          <thead className="sticky top-0 bg-gray-900 z-10">
-            <tr className="border-b border-gray-800 text-gray-500 text-xs uppercase">
-              <th className="px-3 py-2 w-8">
-                <input
-                  type="checkbox"
+      {/* Capture files */}
+      {isError ? (
+        <ErrorState
+          title="Could not list capture files"
+          description={errMessage(error)}
+          action={
+            <Button variant="secondary" size="sm" icon={<RotateCcw size={14} />} onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      ) : (
+        <Table caption={`PCAP files for ${meta.label}`}>
+          <TableHead>
+            <TableRow>
+              <TableHeaderCell className="w-10">
+                <Checkbox
+                  aria-label="Select all files"
                   checked={allSelected}
-                  onChange={() => setSelected(allSelected ? new Set() : new Set(sorted.map((f: PCAPFile) => f.name)))}
+                  indeterminate={someSelected}
                   disabled={sorted.length === 0}
-                  className="rounded border-gray-600 bg-gray-800 cursor-pointer"
+                  onChange={next =>
+                    setSelected(next ? new Set(sorted.map((f: PCAPFile) => f.name)) : new Set())
+                  }
                 />
-              </th>
-              <th className="px-3 py-2 text-left">
+              </TableHeaderCell>
+              <TableHeaderCell aria-sort={sortNewest ? 'descending' : 'ascending'}>
                 <button
+                  type="button"
                   onClick={() => setSortNewest(v => !v)}
-                  className="flex items-center gap-1 hover:text-gray-300 transition-colors"
+                  title={sortNewest ? 'Sorted newest first' : 'Sorted oldest first'}
+                  className="inline-flex items-center gap-1 transition-colors hover:text-fg"
                 >
-                  File <ArrowUpDown size={10} />
+                  File <ArrowUpDown size={10} aria-hidden="true" />
                 </button>
-              </th>
-              <th className="px-3 py-2 text-left">Size</th>
-              <th className="px-3 py-2 text-left">Modified</th>
-              <th className="px-3 py-2 w-16" />
-            </tr>
-          </thead>
-          <tbody>
+              </TableHeaderCell>
+              <TableHeaderCell>Size</TableHeaderCell>
+              <TableHeaderCell>Modified</TableHeaderCell>
+              <TableHeaderCell className="text-right">Actions</TableHeaderCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {isLoading ? (
-              <tr>
-                <td colSpan={5} className="px-4 py-8 text-center text-gray-600 text-xs">Loading…</td>
-              </tr>
+              <TableEmptyRow colSpan={5}>
+                <Loading rows={3} label="Loading capture files…" />
+              </TableEmptyRow>
             ) : sorted.length === 0 ? (
-              <tr>
-                <td colSpan={5} className="px-4 py-8 text-center text-gray-600 text-xs">
-                  No files yet. Start capture, then rotate to seal a file.
-                </td>
-              </tr>
-            ) : sorted.map((f: PCAPFile) => (
-              <tr
-                key={f.name}
-                className={`border-b border-gray-800/40 hover:bg-gray-800/30 transition-colors ${
-                  selected.has(f.name) ? 'bg-blue-900/10' : ''
-                }`}
-              >
-                <td className="px-3 py-2.5">
-                  <input
-                    type="checkbox"
-                    checked={selected.has(f.name)}
-                    onChange={() => toggle(f.name)}
-                    className="rounded border-gray-600 bg-gray-800 cursor-pointer"
-                  />
-                </td>
-                <td className="px-3 py-2.5 font-mono text-xs text-blue-300 max-w-xs truncate">{f.name}</td>
-                <td className="px-3 py-2.5 text-xs text-gray-400 whitespace-nowrap">{formatBytes(f.size_bytes)}</td>
-                <td className="px-3 py-2.5 text-xs text-gray-500 whitespace-nowrap">
-                  {new Date(f.mod_time).toLocaleString()}
-                </td>
-                <td className="px-3 py-2.5">
-                  <div className="flex items-center justify-end gap-3">
-                    <a
-                      href={pcapDownloadURL(meta.id, f.name)}
-                      download={f.name}
-                      className="text-blue-500 hover:text-blue-300 transition-colors"
-                      title="Download"
-                    >
-                      <FileDown size={13} />
-                    </a>
-                    <button
-                      onClick={() => {
-                        if (window.confirm(`Delete ${f.name}?`)) deleteMut.mutate(f.name)
-                      }}
-                      disabled={deleteMut.isPending}
-                      className="text-gray-600 hover:text-red-400 disabled:opacity-40 transition-colors"
-                      title="Delete"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+              <TableEmptyRow colSpan={5}>
+                No files yet. Start capture, then rotate to seal a file.
+              </TableEmptyRow>
+            ) : (
+              sorted.map((f: PCAPFile) => (
+                <TableRow key={f.name} className={selected.has(f.name) ? 'bg-info-surface/60' : undefined}>
+                  <TableCell>
+                    <Checkbox
+                      aria-label={`Select ${f.name}`}
+                      checked={selected.has(f.name)}
+                      onChange={() => toggle(f.name)}
+                    />
+                  </TableCell>
+                  <TableCell mono className="max-w-xs truncate">
+                    {f.name}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-fg">
+                    {formatBytes(f.size_bytes)}
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-fg">
+                    {new Date(f.mod_time).toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex items-center justify-end gap-1">
+                      <IconButton
+                        label={`Download ${f.name}`}
+                        variant="ghost"
+                        onClick={() => downloadFile(f.name)}
+                      >
+                        <FileDown size={14} />
+                      </IconButton>
+                      <IconButton
+                        label={`Delete ${f.name}`}
+                        variant="ghost"
+                        onClick={() => setConfirmFile(f.name)}
+                      >
+                        <Trash2 size={14} />
+                      </IconButton>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      )}
+
+      <ConfirmDialog
+        open={confirmBulk}
+        destructive
+        title={`Delete ${selected.size} file${selected.size === 1 ? '' : 's'}?`}
+        description="Deleted capture files cannot be recovered."
+        confirmLabel={`Delete (${selected.size})`}
+        loading={bulkDeleteMut.isPending}
+        onConfirm={() =>
+          bulkDeleteMut.mutate(Array.from(selected), { onSuccess: () => setConfirmBulk(false) })
+        }
+        onCancel={() => setConfirmBulk(false)}
+      />
+
+      <ConfirmDialog
+        open={confirmFile !== null}
+        destructive
+        title="Delete capture file?"
+        description={confirmFile ? `${confirmFile} will be permanently removed.` : undefined}
+        confirmLabel="Delete"
+        loading={deleteMut.isPending}
+        onConfirm={() => {
+          if (confirmFile) deleteMut.mutate(confirmFile, { onSuccess: () => setConfirmFile(null) })
+        }}
+        onCancel={() => setConfirmFile(null)}
+      />
     </div>
   )
 }
 
 export default function PCAP() {
   const qc = useQueryClient()
-  const [openNF, setOpenNF] = useState<string | null>(null)
+  const { toast } = useToast()
+  const [openNF, setOpenNF] = useState('core')
 
-  const { data: statuses = [] } = useQuery({
+  const { data: statuses = [], isLoading, isError, error, refetch } = useQuery({
     queryKey: ['pcap-status'],
     queryFn: getPCAPStatus,
     refetchInterval: 5_000,
@@ -337,128 +419,90 @@ export default function PCAP() {
 
   const invalidateStatus = () => qc.invalidateQueries({ queryKey: ['pcap-status'] })
 
-  const startMut  = useMutation({ mutationFn: pcapStart,  onSuccess: invalidateStatus })
-  const stopMut   = useMutation({ mutationFn: pcapStop,   onSuccess: invalidateStatus })
-  const pauseMut  = useMutation({ mutationFn: pcapPause,  onSuccess: invalidateStatus })
-  const resumeMut = useMutation({ mutationFn: pcapResume, onSuccess: invalidateStatus })
-  const rotateMut = useMutation({ mutationFn: pcapRotate, onSuccess: invalidateStatus })
+  const actionFailed = (verb: string) => (err: unknown) =>
+    toast({ variant: 'error', title: `${verb} failed`, description: errMessage(err), duration: 0 })
+
+  const startMut = useMutation({ mutationFn: pcapStart, onSuccess: invalidateStatus, onError: actionFailed('Start') })
+  const stopMut = useMutation({ mutationFn: pcapStop, onSuccess: invalidateStatus, onError: actionFailed('Stop') })
+  const pauseMut = useMutation({ mutationFn: pcapPause, onSuccess: invalidateStatus, onError: actionFailed('Pause') })
+  const resumeMut = useMutation({
+    mutationFn: pcapResume,
+    onSuccess: invalidateStatus,
+    onError: actionFailed('Resume'),
+  })
+  const rotateMut = useMutation({
+    mutationFn: pcapRotate,
+    onSuccess: invalidateStatus,
+    onError: actionFailed('Rotate'),
+  })
 
   const pending = {
-    start:  startMut.isPending,
-    stop:   stopMut.isPending,
-    pause:  pauseMut.isPending,
+    start: startMut.isPending,
+    stop: stopMut.isPending,
+    pause: pauseMut.isPending,
     resume: resumeMut.isPending,
     rotate: rotateMut.isPending,
   }
 
-  const openMeta = NF_LIST.find(n => n.id === openNF) ?? null
+  const tabs: TabItem[] = NF_LIST.map(nf => {
+    const st = getStatus(nf.id)
+    return {
+      id: nf.id,
+      label: nf.label,
+      icon: nf.group === 'core' ? <Network size={14} /> : <Radio size={14} />,
+      badge: tabBadge(st),
+      content: (
+        <CapturePanel
+          key={nf.id}
+          meta={nf}
+          status={st}
+          pending={pending}
+          onStart={() => startMut.mutate(nf.id)}
+          onStop={() => stopMut.mutate(nf.id)}
+          onPause={() => pauseMut.mutate(nf.id)}
+          onResume={() => resumeMut.mutate(nf.id)}
+          onRotate={() => rotateMut.mutate(nf.id)}
+        />
+      ),
+    }
+  })
 
   const activeCount = statuses.filter(s => s.capturing || s.paused).length
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
-      <div className="px-6 pt-6 pb-4 shrink-0">
-        <PageHeader
-          title="PCAP Capture"
-          subtitle="Start tcpdump on demand — off by default"
+    <div className="p-6">
+      <PageHeader
+        eyebrow="Operations"
+        title="PCAP Capture"
+        subtitle="Start tcpdump on demand — off by default"
+        action={
+          <Badge
+            label={
+              activeCount > 0
+                ? `${activeCount} capture${activeCount === 1 ? '' : 's'} running`
+                : 'All captures stopped'
+            }
+            variant={activeCount > 0 ? 'success' : 'neutral'}
+            icon={activeCount > 0 ? <Radio size={12} /> : <Square size={12} />}
+          />
+        }
+      />
+
+      {isLoading ? (
+        <Loading label="Loading capture status…" />
+      ) : isError ? (
+        <DegradedState
+          title="Capture status unavailable"
+          description={`The portal could not read the capture sidecar status: ${errMessage(error)}. Sidecar control needs the Docker socket (CLAUDE.md §10).`}
+          action={
+            <Button variant="secondary" size="sm" icon={<RotateCcw size={14} />} onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
         />
-        {activeCount > 0 && (
-          <div className="mt-2 flex items-center gap-2 text-xs text-green-400">
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500" />
-            </span>
-            {activeCount} capture{activeCount !== 1 ? 's' : ''} running
-          </div>
-        )}
-      </div>
-
-      {/* Two-column layout: NF selector | capture window */}
-      <div className="flex flex-1 min-h-0 px-6 pb-6 gap-4">
-
-        {/* ── Left: NF selector ─────────────────────────────────── */}
-        <div className="w-52 shrink-0 flex flex-col gap-1 overflow-y-auto">
-
-          {/* CORE entry */}
-          {NF_LIST.filter(n => n.group === 'core').map(nf => {
-            const st = getStatus(nf.id)
-            const active = openNF === nf.id
-            return (
-              <button
-                key={nf.id}
-                onClick={() => setOpenNF(active ? null : nf.id)}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md text-left transition-colors border ${
-                  active
-                    ? 'bg-blue-900/40 border-blue-700/60 text-white'
-                    : 'bg-gray-900 border-gray-800 hover:border-gray-700 text-gray-300 hover:text-white'
-                }`}
-              >
-                <Network size={13} className={active ? 'text-blue-400' : 'text-gray-500'} />
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs font-bold">{nf.label}</div>
-                  <div className="text-[10px] text-gray-500 truncate">All networks</div>
-                </div>
-                <StatusDot capturing={st?.capturing ?? false} paused={st?.paused ?? false} />
-              </button>
-            )
-          })}
-
-          <div className="border-t border-gray-800 my-1" />
-
-          {/* Per-NF entries */}
-          {NF_LIST.filter(n => n.group === 'nf').map(nf => {
-            const st = getStatus(nf.id)
-            const active = openNF === nf.id
-            return (
-              <button
-                key={nf.id}
-                onClick={() => setOpenNF(active ? null : nf.id)}
-                className={`w-full flex items-center gap-3 px-3 py-2 rounded-md text-left transition-colors border ${
-                  active
-                    ? 'bg-gray-800 border-gray-600 text-white'
-                    : 'border-transparent hover:bg-gray-800/50 hover:border-gray-700/50 text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-xs font-semibold">{nf.label}</div>
-                  <div className="text-[10px] text-gray-600 truncate">{nf.description}</div>
-                </div>
-                <StatusDot capturing={st?.capturing ?? false} paused={st?.paused ?? false} />
-              </button>
-            )
-          })}
-
-          <div className="pt-2 text-[10px] text-gray-700 text-center leading-tight">
-            <RotateCcw size={9} className="inline mr-1" />
-            Rotate seals the current<br />file without stopping
-          </div>
-        </div>
-
-        {/* ── Right: capture window ─────────────────────────────── */}
-        <div className="flex-1 min-w-0">
-          {openMeta ? (
-            <CaptureWindow
-              key={openMeta.id}
-              meta={openMeta}
-              status={getStatus(openMeta.id)}
-              onClose={() => setOpenNF(null)}
-              onStart={() => startMut.mutate(openMeta.id)}
-              onStop={() => stopMut.mutate(openMeta.id)}
-              onPause={() => pauseMut.mutate(openMeta.id)}
-              onResume={() => resumeMut.mutate(openMeta.id)}
-              onRotate={() => rotateMut.mutate(openMeta.id)}
-              pending={pending}
-            />
-          ) : (
-            <div className="flex flex-col items-center justify-center h-full rounded-lg border border-dashed border-gray-800 text-gray-600">
-              <Radio size={32} className="mb-3 opacity-30" />
-              <p className="text-sm">Select a network function</p>
-              <p className="text-xs mt-1 text-gray-700">Choose from the list to control capture and browse files</p>
-            </div>
-          )}
-        </div>
-
-      </div>
+      ) : (
+        <Tabs label="PCAP capture sidecar" tabs={tabs} value={openNF} onChange={setOpenNF} />
+      )}
     </div>
   )
 }

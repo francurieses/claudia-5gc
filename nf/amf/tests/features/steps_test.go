@@ -79,6 +79,11 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 
 	// Service Request UP re-activation (TS 23.502 §4.2.3) — E2E-gated steps.
 	initServiceRequestSteps(sc)
+
+	// Public Warning System (TS 38.413 §8.9) — real in-process steps against
+	// the AMF NGAP PWS registry + codec; gNB response fan-in is E2E-gated
+	// (see public_warning_system_steps_test.go file header for why).
+	initPWSSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

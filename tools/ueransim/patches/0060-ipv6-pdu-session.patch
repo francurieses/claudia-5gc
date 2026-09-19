@@ -1,0 +1,483 @@
+diff --git a/src/gnb/gtp/task.cpp b/src/gnb/gtp/task.cpp
+index 0475dcb..dc2f41b 100644
+--- a/src/gnb/gtp/task.cpp
++++ b/src/gnb/gtp/task.cpp
+@@ -180,11 +180,15 @@ void GtpTask::handleUeContextDelete(int ueId)
+ 
+ void GtpTask::handleUplinkData(int ueId, int psi, OctetString &&pdu)
+ {
+-    const uint8_t *data = pdu.data();
+-
+-    // ignore non IPv4 packets
+-    if ((data[0] >> 4 & 0xF) != 4)
+-        return;
++    // 5GC Rel-17 mod: stock UERANSIM silently dropped any non-IPv4 uplink
++    // packet here (IP version nibble != 4) — the last of several artificial
++    // IPv4-only guards found while adding IPv6/IPv4v6 PDU session support
++    // (see tools/ueransim/patches/0060-ipv6-pdu-session.patch). GTP-U
++    // encapsulation below is payload-agnostic, so no IP-version check is
++    // needed at all; removed rather than widened to "4 or 6" so Ethernet/
++    // Unstructured PDU sessions (out of scope) aren't silently misrouted
++    // either — those session types are already rejected earlier in the
++    // session-setup path (gnb/ngap/session.cpp).
+ 
+     uint64_t sessionInd = MakeSessionResInd(ueId, psi);
+ 
+diff --git a/src/gnb/ngap/session.cpp b/src/gnb/ngap/session.cpp
+index 21f3547..3746905 100644
+--- a/src/gnb/ngap/session.cpp
++++ b/src/gnb/ngap/session.cpp
+@@ -215,9 +215,13 @@ void NgapTask::receiveSessionResourceSetupRequest(int amfId, ASN_NGAP_PDUSession
+ 
+ std::optional<NgapCause> NgapTask::setupPduSessionResource(NgapUeContext *ue, PduSessionResource *resource)
+ {
+-    if (resource->sessionType != PduSessionType::IPv4)
++    // 5GC Rel-17 mod: IPv6 and IPv4v6 are now supported alongside IPv4 (TS 23.501
++    // §5.8.2.2). The gNB's GTP-U forwarding is payload-agnostic (opaque bytes keyed
++    // by TEID), so only the session-type check itself needs relaxing here.
++    if (resource->sessionType != PduSessionType::IPv4 && resource->sessionType != PduSessionType::IPv6 &&
++        resource->sessionType != PduSessionType::IPv4v6)
+     {
+-        m_logger->err("PDU session resource could not setup: Only IPv4 is supported");
++        m_logger->err("PDU session resource could not setup: PDU session type is not supported");
+         return NgapCause::RadioNetwork_unspecified;
+     }
+ 
+diff --git a/src/lib/app/cli_cmd.cpp b/src/lib/app/cli_cmd.cpp
+index e9a1037..8732311 100644
+--- a/src/lib/app/cli_cmd.cpp
++++ b/src/lib/app/cli_cmd.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "cli_cmd.hpp"
+ 
++#include <algorithm>
++#include <cctype>
+ #include <optional>
+ #include <sstream>
+ #include <utility>
+@@ -311,9 +313,20 @@ static std::unique_ptr<UeCliCommand> UeCliParseImpl(const std::string &subCmd, c
+             CMD_ERR("PDU session type is expected")
+         if (options.positionalCount() > 15)
+             CMD_ERR("Only one PDU session type is expected")
++        // 5GC Rel-17 mod: accept IPv4, IPv6, and IPv4v6 session types (TS 24.501 §9.11.4.10.1;
++        // previously only IPv4 was accepted here).
+         std::string type = options.getPositional(0);
+-        if (type != "IPv4" && type != "ipv4" && type != "IPV4" && type != "Ipv4" && type != "IpV4")
+-            CMD_ERR("Only IPv4 is supported for now")
++        std::string typeLower = type;
++        std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(),
++                       [](unsigned char c) { return std::tolower(c); });
++        if (typeLower == "ipv4")
++            cmd->sessionType = nas::EPduSessionType::IPV4;
++        else if (typeLower == "ipv6")
++            cmd->sessionType = nas::EPduSessionType::IPV6;
++        else if (typeLower == "ipv4v6")
++            cmd->sessionType = nas::EPduSessionType::IPV4V6;
++        else
++            CMD_ERR("Invalid PDU session type, possible values are: \"IPv4\", \"IPv6\", \"IPv4v6\"")
+         cmd->isEmergency = options.hasFlag('e', "emergency");
+         if (cmd->isEmergency)
+         {
+diff --git a/src/lib/app/cli_cmd.hpp b/src/lib/app/cli_cmd.hpp
+index 52747af..cb80235 100644
+--- a/src/lib/app/cli_cmd.hpp
++++ b/src/lib/app/cli_cmd.hpp
+@@ -13,6 +13,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include <lib/nas/enums.hpp>
+ #include <utils/common_types.hpp>
+ 
+ namespace app
+@@ -74,6 +75,8 @@ struct UeCliCommand
+     std::optional<SingleSlice> sNssai{};
+     std::optional<std::string> apn{};
+     bool isEmergency{};
++    // 5GC Rel-17 mod: requested PDU session type (IPv4 | IPv6 | IPv4v6)
++    nas::EPduSessionType sessionType{nas::EPduSessionType::IPV4};
+ 
+     // 5GC Rel-17 mod: PS_MODIFY
+     int psModifyPsi{};
+diff --git a/src/ue/app/cmd_handler.cpp b/src/ue/app/cmd_handler.cpp
+index e2cbc48..e87a98d 100644
+--- a/src/ue/app/cmd_handler.cpp
++++ b/src/ue/app/cmd_handler.cpp
+@@ -186,7 +186,9 @@ void UeCmdHandler::handleCmdImpl(NmUeCliCommand &msg)
+     }
+     case app::UeCliCommand::PS_ESTABLISH: {
+         SessionConfig config;
+-        config.type = nas::EPduSessionType::IPV4;
++        // 5GC Rel-17 mod: honour the requested PDU session type (IPv4/IPv6/IPv4v6)
++        // instead of always forcing IPv4.
++        config.type = msg.cmd->sessionType;
+         config.isEmergency = msg.cmd->isEmergency;
+         config.apn = msg.cmd->apn;
+         config.sNssai = msg.cmd->sNssai;
+diff --git a/src/ue/app/task.cpp b/src/ue/app/task.cpp
+index 6c766b6..da0b00e 100644
+--- a/src/ue/app/task.cpp
++++ b/src/ue/app/task.cpp
+@@ -159,8 +159,13 @@ void UeAppTask::setupTunInterface(const PduSession *pduSession)
+         return;
+     }
+ 
+-    if (pduSession->pduAddress->sessionType != nas::EPduSessionType::IPV4 ||
+-        pduSession->sessionType != nas::EPduSessionType::IPV4)
++    // 5GC Rel-17 mod: IPv6 and IPv4v6 are now supported alongside IPv4
++    // (TS 23.501 §5.8.2.2); Ethernet/Unstructured remain unsupported. Keep the
++    // original cross-check that both session-type signals agree.
++    auto sessionType = pduSession->pduAddress->sessionType;
++    if (sessionType != pduSession->sessionType ||
++        (sessionType != nas::EPduSessionType::IPV4 && sessionType != nas::EPduSessionType::IPV6 &&
++         sessionType != nas::EPduSessionType::IPV4V6))
+     {
+         m_logger->err("Connection could not setup. PDU session type is not supported.");
+         return;
+@@ -194,13 +199,64 @@ void UeAppTask::setupTunInterface(const PduSession *pduSession)
+         return;
+     }
+ 
+-    std::string ipAddress = utils::OctetStringToIp(pduSession->pduAddress->pduAddressInformation);
++    // 5GC Rel-17 mod: branch TUN configuration by granted session type. IPv4
++    // keeps the exact original path (byte-for-byte unchanged). IPv6/IPv4v6
++    // configure SLAAC instead of a static address: the PDU Address IE only
++    // ever carries the 8-octet interface identifier (TS 24.501 §9.11.4.10.1)
++    // — the /64 prefix arrives later via a Router Advertisement over the GTP-U
++    // tunnel (TS 23.501 §5.8.2.2.2), which the kernel combines with the token
++    // set here to form the full address.
++    const auto &addrInfo = pduSession->pduAddress->pduAddressInformation;
++    std::string logAddress;
+ 
+-    bool r = tun::TunConfigure(allocatedName, ipAddress, requestedNetmask, cons::TunMtu, m_base->config->configureRouting, error);
+-    if (!r || error.length() > 0)
++    if (sessionType == nas::EPduSessionType::IPV4)
+     {
+-        m_logger->err("TUN configuration failure [%s]", error.c_str());
+-        return;
++        std::string ipAddress = utils::OctetStringToIp(addrInfo);
++        bool r =
++            tun::TunConfigure(allocatedName, ipAddress, requestedNetmask, cons::TunMtu, m_base->config->configureRouting, error);
++        if (!r || error.length() > 0)
++        {
++            m_logger->err("TUN configuration failure [%s]", error.c_str());
++            return;
++        }
++        logAddress = ipAddress;
++    }
++    else
++    {
++        bool isV4V6 = sessionType == nas::EPduSessionType::IPV4V6;
++        OctetString iid = isV4V6 ? addrInfo.subCopy(0, 8) : addrInfo.copy();
++        std::string token = utils::Ipv6IidToToken(iid);
++
++        if (isV4V6)
++        {
++            OctetString v4 = addrInfo.subCopy(8, 4);
++            std::string ipAddress = utils::OctetStringToIp(v4);
++            bool r = tun::TunConfigure(allocatedName, ipAddress, requestedNetmask, cons::TunMtu,
++                                       m_base->config->configureRouting, error);
++            if (!r || error.length() > 0)
++            {
++                m_logger->err("TUN configuration failure [%s]", error.c_str());
++                return;
++            }
++            logAddress = ipAddress + " + ";
++        }
++        else
++        {
++            bool r = tun::TunConfigureUpOnly(allocatedName, cons::TunMtu, error);
++            if (!r || error.length() > 0)
++            {
++                m_logger->err("TUN configuration failure [%s]", error.c_str());
++                return;
++            }
++        }
++
++        bool r6 = tun::TunConfigureIpv6(allocatedName, token, error);
++        if (!r6 || error.length() > 0)
++        {
++            m_logger->err("TUN IPv6 configuration failure [%s]", error.c_str());
++            return;
++        }
++        logAddress += "IPv6 SLAAC token " + token + " (full /64 address pending Router Advertisement)";
+     }
+ 
+     auto *task = new TunTask(m_base, psi, fd);
+@@ -208,7 +264,7 @@ void UeAppTask::setupTunInterface(const PduSession *pduSession)
+     task->start();
+ 
+     m_logger->info("Connection setup for PDU session[%d] is successful, TUN interface[%s, %s] is up.", pduSession->psi,
+-                   allocatedName.c_str(), ipAddress.c_str());
++                   allocatedName.c_str(), logAddress.c_str());
+ }
+ 
+ } // namespace nr::ue
+diff --git a/src/ue/nas/sm/allocation.cpp b/src/ue/nas/sm/allocation.cpp
+index 7c08f20..8835ae9 100644
+--- a/src/ue/nas/sm/allocation.cpp
++++ b/src/ue/nas/sm/allocation.cpp
+@@ -14,7 +14,10 @@ namespace nr::ue
+ 
+ int NasSm::allocatePduSessionId(const SessionConfig &config)
+ {
+-    if (config.type != nas::EPduSessionType::IPV4)
++    // 5GC Rel-17 mod: IPv6 and IPv4v6 are now supported alongside IPv4
++    // (TS 23.501 §5.8.2.2); Ethernet/Unstructured PDU sessions remain unsupported.
++    if (config.type != nas::EPduSessionType::IPV4 && config.type != nas::EPduSessionType::IPV6 &&
++        config.type != nas::EPduSessionType::IPV4V6)
+     {
+         m_logger->debug("PDU session type [%s] is not supported", nas::utils::EnumToString(config.type));
+         return 0;
+diff --git a/src/ue/nas/sm/establishment.cpp b/src/ue/nas/sm/establishment.cpp
+index 4623a14..1fedff2 100644
+--- a/src/ue/nas/sm/establishment.cpp
++++ b/src/ue/nas/sm/establishment.cpp
+@@ -54,7 +54,10 @@ void NasSm::sendEstablishmentRequest(const SessionConfig &config)
+     }
+ 
+     /* Control the received config */
+-    if (config.type != nas::EPduSessionType::IPV4)
++    // 5GC Rel-17 mod: IPv6 and IPv4v6 are now supported alongside IPv4
++    // (TS 23.501 §5.8.2.2); Ethernet/Unstructured PDU sessions remain unsupported.
++    if (config.type != nas::EPduSessionType::IPV4 && config.type != nas::EPduSessionType::IPV6 &&
++        config.type != nas::EPduSessionType::IPV4V6)
+     {
+         m_logger->err("PDU session type [%s] is not supported", nas::utils::EnumToString(config.type));
+         return;
+@@ -115,7 +118,8 @@ void NasSm::sendEstablishmentRequest(const SessionConfig &config)
+     req->pduSessionId = psi;
+     req->integrityProtectionMaximumDataRate = MakeIntegrityMaxRate(m_base->config->integrityMaxRate);
+     req->pduSessionType = nas::IEPduSessionType{};
+-    req->pduSessionType->pduSessionType = nas::EPduSessionType::IPV4;
++    // 5GC Rel-17 mod: request the configured session type instead of always IPv4.
++    req->pduSessionType->pduSessionType = config.type;
+     req->sscMode = nas::IESscMode{};
+     req->sscMode->sscMode = nas::ESscMode::SSC_MODE_1;
+     req->extendedProtocolConfigurationOptions = std::move(iePco);
+diff --git a/src/ue/tun/config.cpp b/src/ue/tun/config.cpp
+index 190b3b7..44c13c5 100644
+--- a/src/ue/tun/config.cpp
++++ b/src/ue/tun/config.cpp
+@@ -159,6 +159,55 @@ static void TunSetIpAndUp(const char *ifName, const char *ipAddr, const char *ne
+     close(sockFd);
+ }
+ 
++// 5GC Rel-17 mod: bring an interface up and set its MTU, without touching any
++// address family — reused for the IPv6-only TUN setup path (no IPv4 address
++// to assign via SIOCSIFADDR).
++static void SetInterfaceUpAndMtu(const char *ifName, int mtu)
++{
++    ifreq ifr{};
++    memset(&ifr, 0, sizeof(struct ifreq));
++    strcpy(ifr.ifr_name, ifName);
++
++    int sockFd = socket(AF_INET, SOCK_DGRAM, 0);
++
++    if (ioctl(sockFd, SIOCGIFFLAGS, &ifr) < 0)
++    {
++        close(sockFd);
++        throw LibError("ioctl(SIOCGIFFLAGS)", errno);
++    }
++
++    ifr.ifr_mtu = mtu;
++    if (ioctl(sockFd, SIOCSIFMTU, &ifr) < 0)
++    {
++        close(sockFd);
++        throw LibError("ioctl(SIOCSIFMTU)", errno);
++    }
++
++    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
++    if (ioctl(sockFd, SIOCSIFFLAGS, &ifr) < 0)
++    {
++        close(sockFd);
++        throw LibError("ioctl(SIOCSIFFLAGS)", errno);
++    }
++
++    close(sockFd);
++}
++
++// 5GC Rel-17 mod: write a value to a per-interface IPv6 sysctl knob under
++// /proc/sys/net/ipv6/conf/<ifName>/<key>. "ifName" may also be "all" to touch
++// the container-wide master switch (some kernels force IPv6 off everywhere
++// via conf/all/disable_ipv6 regardless of the per-interface value).
++static void SetIpv6Sysctl(const std::string &ifName, const std::string &key, const std::string &value)
++{
++    std::string path = "/proc/sys/net/ipv6/conf/" + ifName + "/" + key;
++    std::ofstream ofs(path);
++    if (!ofs.is_open() || !ofs.good())
++        throw LibError("Could not open '" + path + "'");
++    ofs << value;
++    if (!ofs.good())
++        throw LibError("Could not write to '" + path + "'");
++}
++
+ static void ConfigureRtTables(const std::string &table_name)
+ {
+     std::ifstream ifs;
+@@ -379,4 +428,31 @@ void ConfigureTun(const char *tunName, const char *ipAddr, const char *netmask,
+     }
+ }
+ 
++void ConfigureTunUpOnly(const char *tunName, int mtu)
++{
++    // acquire the configuration lock
++    const std::lock_guard<std::mutex> lock(configMutex);
++
++    SetInterfaceUpAndMtu(tunName, mtu);
++}
++
++void ConfigureTunIpv6(const char *tunName, const std::string &token)
++{
++    // acquire the configuration lock
++    const std::lock_guard<std::mutex> lock(configMutex);
++
++    std::string ifName{tunName};
++
++    SetIpv6Sysctl("all", "disable_ipv6", "0");
++    SetIpv6Sysctl(ifName, "disable_ipv6", "0");
++    // Accept Router Advertisements regardless of forwarding state, and ensure
++    // SLAAC is on (both are the kernel default; set explicitly for robustness
++    // across container base images).
++    SetIpv6Sysctl(ifName, "accept_ra", "2");
++    SetIpv6Sysctl(ifName, "autoconf", "1");
++
++    std::string cmd = "ip -6 token set " + token + " dev " + ifName;
++    ExecStrict(cmd);
++}
++
+ } // namespace nr::ue::tun
+diff --git a/src/ue/tun/config.hpp b/src/ue/tun/config.hpp
+index 37b0455..c8e8d94 100644
+--- a/src/ue/tun/config.hpp
++++ b/src/ue/tun/config.hpp
+@@ -18,4 +18,15 @@ namespace nr::ue::tun
+ int AllocateTun(const char *ifPrefix, char **allocatedName);
+ void ConfigureTun(const char *tunName, const char *ipAddr, const char *netmask, int mtu, bool configureRoute);
+ 
++// 5GC Rel-17 mod: bring the TUN interface up (and set its MTU) without
++// assigning an IPv4 address — used for IPv6-only PDU sessions.
++void ConfigureTunUpOnly(const char *tunName, int mtu);
++
++// 5GC Rel-17 mod: enable IPv6 on the TUN interface and set the network-
++// assigned interface identifier as the SLAAC token (TS 23.501 §5.8.2.2.2,
++// RFC 4862 §5.3) so the kernel forms <RA prefix>::<token> once the Router
++// Advertisement is received over the GTP-U tunnel. Used for IPv6/IPv4v6 PDU
++// sessions; "token" must be a bare IPv6 literal, e.g. "::1".
++void ConfigureTunIpv6(const char *tunName, const std::string &token);
++
+ } // namespace nr::ue::tun
+diff --git a/src/ue/tun/tun.cpp b/src/ue/tun/tun.cpp
+index 48a154b..8f8770c 100644
+--- a/src/ue/tun/tun.cpp
++++ b/src/ue/tun/tun.cpp
+@@ -47,4 +47,34 @@ bool TunConfigure(const std::string &tunName, const std::string &ipAddress, cons
+     return true;
+ }
+ 
++bool TunConfigureUpOnly(const std::string &tunName, int mtu, std::string &error)
++{
++    try
++    {
++        tun::ConfigureTunUpOnly(tunName.c_str(), mtu);
++    }
++    catch (const LibError &e)
++    {
++        error = e.what();
++        return false;
++    }
++
++    return true;
++}
++
++bool TunConfigureIpv6(const std::string &tunName, const std::string &token, std::string &error)
++{
++    try
++    {
++        tun::ConfigureTunIpv6(tunName.c_str(), token);
++    }
++    catch (const LibError &e)
++    {
++        error = e.what();
++        return false;
++    }
++
++    return true;
++}
++
+ } // namespace nr::ue::tun
+diff --git a/src/ue/tun/tun.hpp b/src/ue/tun/tun.hpp
+index ee70a96..1f5050d 100644
+--- a/src/ue/tun/tun.hpp
++++ b/src/ue/tun/tun.hpp
+@@ -16,4 +16,10 @@ namespace nr::ue::tun
+ int TunAllocate(const char *namePrefix, std::string &allocatedName, std::string &error);
+ bool TunConfigure(const std::string &tunName, const std::string &ipAddress, const std::string &netmask, int mtu, bool configureRouting, std::string &error);
+ 
++// 5GC Rel-17 mod: bring a TUN interface up without an IPv4 address (IPv6-only sessions).
++bool TunConfigureUpOnly(const std::string &tunName, int mtu, std::string &error);
++
++// 5GC Rel-17 mod: enable IPv6 + SLAAC token on a TUN interface (IPv6/IPv4v6 sessions).
++bool TunConfigureIpv6(const std::string &tunName, const std::string &token, std::string &error);
++
+ } // namespace nr::ue::tun
+diff --git a/src/utils/common.cpp b/src/utils/common.cpp
+index 17e8579..0e93174 100644
+--- a/src/utils/common.cpp
++++ b/src/utils/common.cpp
+@@ -276,9 +276,37 @@ std::string utils::OctetStringToIp(const OctetString &address)
+         sprintf(buffer, "%d.%d.%d.%d", address.getI(0), address.getI(1), address.getI(2), address.getI(3));
+         return std::string{buffer};
+     }
++    // 5GC Rel-17 mod: PDU Address IE for IPv6 (8 octets, the interface
++    // identifier only) and IPv4v6 (8-octet IID + 4-octet IPv4) per TS 24.501
++    // §9.11.4.10.1. There is no /64 prefix here — it arrives via Router
++    // Advertisement — so this is display-only, not a routable address.
++    if (address.length() == 8)
++        return "iid " + utils::Ipv6IidToToken(address);
++    if (address.length() == 12)
++    {
++        OctetString iid = address.subCopy(0, 8);
++        OctetString v4 = address.subCopy(8, 4);
++        char buffer[20] = {0};
++        sprintf(buffer, "%d.%d.%d.%d", v4.getI(0), v4.getI(1), v4.getI(2), v4.getI(3));
++        return std::string{buffer} + " + iid " + utils::Ipv6IidToToken(iid);
++    }
+     return address.toHexString();
+ }
+ 
++std::string utils::Ipv6IidToToken(const OctetString &iid)
++{
++    char buffer[64] = {0};
++    if (iid.length() >= 8)
++    {
++        int g0 = (iid.getI(0) << 8) | iid.getI(1);
++        int g1 = (iid.getI(2) << 8) | iid.getI(3);
++        int g2 = (iid.getI(4) << 8) | iid.getI(5);
++        int g3 = (iid.getI(6) << 8) | iid.getI(7);
++        sprintf(buffer, "::%x:%x:%x:%x", g0, g1, g2, g3);
++    }
++    return std::string{buffer};
++}
++
+ bool utils::IsRoot()
+ {
+     return geteuid() == 0;
+diff --git a/src/utils/common.hpp b/src/utils/common.hpp
+index 2176019..1ab2e3d 100644
+--- a/src/utils/common.hpp
++++ b/src/utils/common.hpp
+@@ -27,6 +27,12 @@ std::string VectorToHexString(const std::vector<uint8_t> &hex);
+ int GetIpVersion(const std::string &address);
+ OctetString IpToOctetString(const std::string &address);
+ std::string OctetStringToIp(const OctetString &address);
++// 5GC Rel-17 mod: format an 8-octet IPv6 interface identifier (TS 24.501
++// §9.11.4.10.1) as a bare "token" literal suitable for "ip -6 token set", e.g.
++// "::1". The kernel combines this with the prefix learned from the network's
++// Router Advertisement via SLAAC (TS 23.501 §5.8.2.2.2) — the PDU Address IE
++// never carries the /64 prefix itself.
++std::string Ipv6IidToToken(const OctetString &iid);
+ int64_t CurrentTimeMillis();
+ TimeStamp CurrentTimeStamp();
+ int NextId();

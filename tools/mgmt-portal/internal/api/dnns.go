@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/config"
+	"github.com/go-chi/chi/v5"
 )
 
 type dnnListResponse struct {
@@ -22,7 +22,9 @@ type addDNNRequest struct {
 }
 
 type updateDNNRequest struct {
-	Description string `json:"description"`
+	Description  string `json:"description"`
+	UEIPv6Prefix string `json:"ue_ipv6_prefix"`
+	Restart      bool   `json:"restart"`
 }
 
 func (d Deps) handleListDNNs(w http.ResponseWriter, r *http.Request) {
@@ -129,9 +131,9 @@ func (d Deps) handleAddDNN(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
-		"dnn":          req.DNNInfo,
-		"docker_net":   dockerNetName,
-		"restarted":    restarted,
+		"dnn":           req.DNNInfo,
+		"docker_net":    dockerNetName,
+		"restarted":     restarted,
 		"docker_errors": dockerErrors,
 	})
 }
@@ -143,11 +145,30 @@ func (d Deps) handleUpdateDNN(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := d.Config.UpdateDNNDescription(name, req.Description); err != nil {
+	if err := d.Config.UpdateDNN(name, req.Description, req.UEIPv6Prefix); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"name": name})
+
+	// The IPv6 prefix is consumed by SMF (pool allocation) and UPF (drift-guard
+	// log) at startup only — restart them so a changed prefix takes effect.
+	restarted := []string{}
+	dockerErrors := []string{}
+	if req.Restart && d.Docker != nil {
+		for _, nf := range []string{"upf", "smf"} {
+			if err := d.Docker.Restart(r.Context(), nf); err != nil {
+				dockerErrors = append(dockerErrors, fmt.Sprintf("restart %s: %s", nf, err))
+			} else {
+				restarted = append(restarted, nf)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":          name,
+		"restarted":     restarted,
+		"docker_errors": dockerErrors,
+	})
 }
 
 func (d Deps) handleDeleteDNN(w http.ResponseWriter, r *http.Request) {

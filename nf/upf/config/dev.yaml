@@ -4,21 +4,25 @@ dnns:
       tun_addr: 10.60.0.254/24
       tun_name: upfgtp0
       ue_ip_pool: 10.60.0.0/24
+      ue_ipv6_prefix: 2001:db8:60::/56
     - gateway_ip: 172.30.7.1
       name: ims
       tun_addr: 10.61.0.254/24
       tun_name: upfgtp1
       ue_ip_pool: 10.61.0.0/24
+      ue_ipv6_prefix: 2001:db8:61::/56
     - gateway_ip: 172.30.8.1
       name: gaming
       tun_addr: 10.62.0.254/24
       tun_name: upfgtp2
       ue_ip_pool: 10.62.0.0/24
+      ue_ipv6_prefix: 2001:db8:62::/56
     - gateway_ip: 172.30.9.1
       name: gold
       tun_addr: 10.63.0.254/24
       tun_name: upfgtp3
       ue_ip_pool: 10.63.0.0/24
+      ue_ipv6_prefix: 2001:db8:63::/56
 metrics:
     address: 0.0.0.0:9107
 n3:

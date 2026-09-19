@@ -97,31 +97,50 @@ func main() {
 			f.Close()
 			continue
 		}
+		// IPv6 N6 forwarding (TS 23.501 §5.8.2.2) for DNNs that delegate an
+		// IPv6 prefix — best-effort: a failure here leaves IPv4 N6 intact and
+		// only disables IPv6 egress for this DNN.
+		if dnn.UEIPv6Prefix != "" {
+			if err := tun.SetupIPv6(dnn.TunName, dnn.UEIPv6Prefix); err != nil {
+				logger.Error("TUN IPv6 setup failed — IPv6 N6 egress disabled for DNN",
+					"dnn", dnn.Name, "tun", dnn.TunName, "prefix", dnn.UEIPv6Prefix, "error", err)
+			} else {
+				logger.Info("N6 TUN IPv6 ready",
+					"dnn", dnn.Name, "dev", dnn.TunName, "ue_ipv6_prefix", dnn.UEIPv6Prefix)
+			}
+		}
 		logger.Info("N6 TUN ready",
 			"dnn", dnn.Name, "dev", dnn.TunName,
 			"addr", dnn.TunAddr, "ue_pool", dnn.UEIPPool)
 		tunEntries = append(tunEntries, gtpu.TUNEntry{
 			DNN:     dnn.Name,
 			Subnet:  dnn.UEIPPool,
+			Subnet6: dnn.UEIPv6Prefix,
 			TunFile: f,
 		})
 	}
 
+	// Per-DNN IPv6 anchor (TS 23.501 §5.8.2.2), mirroring the SMF's per-DNN
+	// IPv6 pool config — used by the PFCP server only as a config-drift
+	// guard/log around Router Advertisement delivery.
+	dnnIPv6Prefixes := make(map[string]string)
+	for _, dnn := range cfg.DNNs {
+		if dnn.UEIPv6Prefix != "" {
+			dnnIPv6Prefixes[dnn.Name] = dnn.UEIPv6Prefix
+		}
+	}
+
 	// PFCP server (N4)
 	pfcpCfg := pfcp.Config{
-		Address: cfg.N4.Address,
-		NodeIP:  cfg.N3.IP,
+		Address:         cfg.N4.Address,
+		NodeIP:          cfg.N3.IP,
+		DNNIPv6Prefixes: dnnIPv6Prefixes,
 	}
 	pfcpSrv, err := pfcp.New(pfcpCfg, logger, sessionTable)
 	if err != nil {
 		logger.Error("PFCP server creation failed", "error", err)
 		os.Exit(1)
 	}
-	go func() {
-		if err := pfcpSrv.Start(ctx); err != nil {
-			logger.Error("PFCP server error", "error", err)
-		}
-	}()
 
 	// GTP-U server (N3) — passes per-DNN TUN entries for N6 routing
 	gtpuCfg := gtpu.Config{
@@ -133,6 +152,21 @@ func main() {
 		logger.Error("GTP-U server creation failed", "error", err)
 		os.Exit(1)
 	}
+
+	// Wire the N4 (PFCP) / N3 (GTP-U) seam for IPv6 prefix delegation Router
+	// Advertisements (TS 23.501 §5.8.2.2.2) before either server starts
+	// receiving traffic: the PFCP server's per-session RA advertiser sends
+	// downlink via the GTP-U server, and the GTP-U server triggers a
+	// solicited RA back into PFCP when it decapsulates a Router Solicitation
+	// on the uplink.
+	pfcpSrv.SetRASender(gtpuSrv)
+	gtpuSrv.SetPFCPServer(pfcpSrv)
+
+	go func() {
+		if err := pfcpSrv.Start(ctx); err != nil {
+			logger.Error("PFCP server error", "error", err)
+		}
+	}()
 	go func() {
 		if err := gtpuSrv.Start(ctx); err != nil {
 			logger.Error("GTP-U server error", "error", err)

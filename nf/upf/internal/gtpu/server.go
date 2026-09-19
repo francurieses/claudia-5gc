@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/pfcp"
+	"github.com/francurieses/claudia-5gc/nf/upf/internal/ra"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
 
@@ -42,15 +43,17 @@ const (
 // Ref: TS 23.501 §5.6.5, TS 29.244 §6.3.3.14
 type TUNEntry struct {
 	DNN     string
-	Subnet  string // CIDR, e.g. "10.60.0.0/24"
+	Subnet  string // IPv4 UE pool CIDR, e.g. "10.60.0.0/24"
+	Subnet6 string // IPv6 delegated base prefix CIDR, e.g. "2001:db8:60::/56" (empty = IPv4-only DNN)
 	TunFile *os.File
 }
 
 // tunRoute is the pre-parsed form of TUNEntry used at runtime.
 type tunRoute struct {
-	dnn    string
-	subnet *net.IPNet
-	file   *os.File
+	dnn     string
+	subnet  *net.IPNet
+	subnet6 *net.IPNet // nil for IPv4-only DNNs
+	file    *os.File
 }
 
 // Config holds GTP-U server configuration.
@@ -67,6 +70,14 @@ type Server struct {
 	sessions *pfcp.SessionTable
 	n3IP     net.IP
 	tuns     []tunRoute // per-DNN TUN entries; empty = N6 disabled
+
+	// pfcpSrv is used only to trigger an immediate solicited Router
+	// Advertisement (TS 23.501 §5.8.2.2.2, RFC 4861 §6.2.6) when a Router
+	// Solicitation is decapsulated from the uplink. Nil disables that path
+	// without affecting normal GTP-U forwarding. Wired at startup via
+	// SetPFCPServer — the seam between the N3 (GTP-U) and N4 (PFCP)
+	// packages so pfcp need not import gtpu.
+	pfcpSrv *pfcp.Server
 }
 
 // New creates a GTP-U server with per-DNN TUN entries for N6 forwarding.
@@ -87,7 +98,15 @@ func New(cfg Config, logger *slog.Logger, sessions *pfcp.SessionTable, tunEntrie
 		if err != nil {
 			return nil, fmt.Errorf("gtpu: DNN %q subnet %q: %w", e.DNN, e.Subnet, err)
 		}
-		tuns = append(tuns, tunRoute{dnn: e.DNN, subnet: subnet, file: e.TunFile})
+		rt := tunRoute{dnn: e.DNN, subnet: subnet, file: e.TunFile}
+		if e.Subnet6 != "" {
+			_, subnet6, err := net.ParseCIDR(e.Subnet6)
+			if err != nil {
+				return nil, fmt.Errorf("gtpu: DNN %q IPv6 subnet %q: %w", e.DNN, e.Subnet6, err)
+			}
+			rt.subnet6 = subnet6
+		}
+		tuns = append(tuns, rt)
 	}
 
 	return &Server{
@@ -100,10 +119,36 @@ func New(cfg Config, logger *slog.Logger, sessions *pfcp.SessionTable, tunEntrie
 	}, nil
 }
 
-// tunRouteForIP returns the tunRoute whose subnet contains ip, or nil if none matches.
+// SetPFCPServer wires the PFCP server so a decapsulated Router Solicitation
+// can immediately trigger a unicast solicited Router Advertisement.
+// Ref: TS 23.501 §5.8.2.2.2.
+func (s *Server) SetPFCPServer(p *pfcp.Server) {
+	s.pfcpSrv = p
+}
+
+// SendDownlink implements pfcp.RASender: it encapsulates ipPkt (a Router
+// Advertisement built by the PFCP server) in GTP-U and sends it to sess's
+// gNB, reusing the same downlink path as ordinary user-plane traffic.
+// Ref: TS 23.501 §5.8.2.2.2.
+func (s *Server) SendDownlink(sess *pfcp.Session, ipPkt []byte) {
+	s.sendGTPU(sess, ipPkt)
+}
+
+// tunRouteForIP returns the tunRoute whose IPv4 subnet contains ip, or nil.
 func (s *Server) tunRouteForIP(ip net.IP) *tunRoute {
 	for i := range s.tuns {
 		if s.tuns[i].subnet.Contains(ip) {
+			return &s.tuns[i]
+		}
+	}
+	return nil
+}
+
+// tunRouteForIPv6 returns the tunRoute whose delegated IPv6 prefix contains ip,
+// or nil if none matches (or the matching DNN is IPv4-only).
+func (s *Server) tunRouteForIPv6(ip net.IP) *tunRoute {
+	for i := range s.tuns {
+		if s.tuns[i].subnet6 != nil && s.tuns[i].subnet6.Contains(ip) {
 			return &s.tuns[i]
 		}
 	}
@@ -198,7 +243,100 @@ func (s *Server) handlePacket(raddr *net.UDPAddr, pkt []byte) {
 	s.logger.Info("GTP-U T-PDU received",
 		"ulTEID", teid, "ueIP", sess.UEIP, "innerLen", len(inner))
 
+	// Uplink usage measurement (TS 29.244 §5.2.2.4, VOLUM method). Counts
+	// every uplink T-PDU regardless of downstream path (TUN-forwarded or
+	// ICMP-to-self both originate on N3 as uplink traffic).
+	sess.AddULVolume(len(inner))
+
+	// Branch by IP version. IPv6 (TS 23.501 §5.8.2.2): RS → Router
+	// Advertisement, echo-to-fe80::1 → inline reply, everything else → N6 TUN
+	// forwarding (handleInnerIPv6). IPv4 keeps its original decap/route path.
+	if len(inner) > 0 && inner[0]>>4 == 6 {
+		s.handleInnerIPv6(sess, inner)
+		return
+	}
+
 	s.processInnerIP(sess, inner)
+}
+
+// icmpv6TypeEchoRequest / icmpv6TypeEchoReply (RFC 4443 §4.1/§4.2) — the
+// ping test's message types. Not Neighbor Discovery, so kept local to gtpu
+// rather than in the ra package (which is scoped to RFC 4861 ND messages).
+const (
+	icmpv6TypeEchoRequest uint8 = 128
+	icmpv6TypeEchoReply   uint8 = 129
+)
+
+// handleInnerIPv6 routes a decapsulated uplink IPv6 packet:
+//   - ICMPv6 Router Solicitation (RFC 4861 §4.1) → immediate unicast Router
+//     Advertisement (§6.2.6)
+//   - ICMPv6 Echo Request to the RA's router address (fe80::1) → inline reply
+//     (the IPv6 equivalent of the IPv4 echo-to-N3-IP fast path; works even when
+//     N6 egress is not configured)
+//   - everything else → write to the DNN-specific TUN for kernel N6 forwarding
+//   - ip6tables MASQUERADE, mirroring processInnerIP for IPv4
+func (s *Server) handleInnerIPv6(sess *pfcp.Session, inner []byte) {
+	if ok, srcLL := ra.ParseRouterSolicitation(inner); ok {
+		s.logger.Info("Router Solicitation received", "ueIPv6", sess.UEIPv6, "src", srcLL,
+			"spec_ref", "RFC 4861 §4.1")
+		if s.pfcpSrv != nil {
+			s.pfcpSrv.TriggerSolicitedRA(context.Background(), sess, srcLL)
+		}
+		return
+	}
+
+	if len(inner) < 40 {
+		return
+	}
+	srcIP := net.IP(inner[8:24])
+	dstIP := net.IP(inner[24:40])
+
+	// ICMPv6 Echo Request to our own router address: reply inline.
+	if inner[6] == ra.NextHeaderICMPv6 && len(inner) >= 48 {
+		icmp := inner[40:]
+		if icmp[0] == icmpv6TypeEchoRequest && dstIP.Equal(ra.LinkLocalRouterAddr) {
+			s.logger.Info("ICMPv6 Echo Request received (router address)",
+				"ueIPv6", sess.UEIPv6, "src", srcIP,
+				"id", binary.BigEndian.Uint16(icmp[4:6]), "seq", binary.BigEndian.Uint16(icmp[6:8]))
+			if sess.DLTEID == 0 || sess.GNBIP == nil {
+				s.logger.Warn("GTP-U: DL tunnel not ready, dropping ICMPv6 reply", "ueIPv6", sess.UEIPv6)
+				return
+			}
+			s.sendGTPU(sess, s.buildICMPv6EchoReply(srcIP, dstIP, icmp))
+			return
+		}
+	}
+
+	// General IPv6 forwarding to N6: route to the TUN whose delegated prefix
+	// contains the UE source address (selecting by source keeps the lookup O(1)
+	// and needs no DNN string on the packet). The kernel then forwards out the
+	// N6 bridge and ip6tables MASQUERADEs the source. Ref: TS 23.501 §5.8.2.2.
+	rt := s.tunRouteForIPv6(srcIP)
+	if rt == nil {
+		s.logger.Debug("GTP-U no IPv6 TUN for UE prefix, dropping", "src", srcIP, "dst", dstIP,
+			"ueIPv6", sess.UEIPv6)
+		metrics.UPFPacketDropsTotal.WithLabelValues("no_route").Inc()
+		return
+	}
+	if _, err := rt.file.Write(inner); err != nil {
+		s.logger.Error("GTP-U IPv6 TUN write", "error", err, "src", srcIP, "dst", dstIP)
+	} else {
+		s.logger.Debug("GTP-U → TUN (IPv6)", "src", srcIP, "dst", dstIP, "len", len(inner))
+		metrics.UPFGTPPacketsTotal.WithLabelValues("uplink").Inc()
+		metrics.UPFGTPBytesTotal.WithLabelValues("uplink", rt.dnn).Add(float64(len(inner)))
+	}
+}
+
+// buildICMPv6EchoReply crafts an ICMPv6 Echo Reply (RFC 4443 §4.2) for the
+// given Echo Request, swapping source/destination and copying the
+// identifier/sequence/data verbatim. Ref: RFC 4443 §2.3 (checksum).
+func (s *Server) buildICMPv6EchoReply(reqSrc, reqDst net.IP, icmpReq []byte) []byte {
+	reply := make([]byte, len(icmpReq))
+	copy(reply, icmpReq)
+	reply[0] = icmpv6TypeEchoReply
+	reply[1] = 0 // code
+	binary.BigEndian.PutUint16(reply[2:4], ra.ICMPv6Checksum(reqDst, reqSrc, reply))
+	return ra.BuildIPv6Packet(reqDst, reqSrc, ra.NextHeaderICMPv6, ra.DefaultCurHopLimit, reply)
 }
 
 // processInnerIP routes the decapsulated inner IPv4 packet:
@@ -255,13 +393,31 @@ func (s *Server) startTUNReader(ctx context.Context, t tunRoute) {
 			s.logger.Error("TUN read error", "dnn", t.dnn, "error", err)
 			return
 		}
-		if n < 20 || buf[0]>>4 != 4 {
-			continue // not IPv4
+		if n < 1 {
+			continue
 		}
 
-		// buf[16:20] is dst IP — the UE IP after iptables conntrack DNAT
-		dstIP := net.IP(buf[16:20])
-		sess := s.sessions.GetByUEIP(dstIP)
+		// Look up the session by the packet's destination UE address (after
+		// conntrack un-DNAT): IPv4 dst at [16:20] matched exactly; IPv6 dst at
+		// [24:40] matched by delegated /64 (the UE's SLAAC IID is its own).
+		var sess *pfcp.Session
+		var dstIP net.IP
+		switch buf[0] >> 4 {
+		case 4:
+			if n < 20 {
+				continue
+			}
+			dstIP = net.IP(buf[16:20])
+			sess = s.sessions.GetByUEIP(dstIP)
+		case 6:
+			if n < 40 {
+				continue
+			}
+			dstIP = net.IP(buf[24:40])
+			sess = s.sessions.GetByUEIPv6Prefix(dstIP)
+		default:
+			continue
+		}
 		if sess == nil {
 			s.logger.Debug("TUN: no session for dst", "dnn", t.dnn, "dst", dstIP)
 			continue
@@ -335,7 +491,6 @@ func (s *Server) buildICMPReply(ipPkt []byte, ihl int, icmpReq []byte) []byte {
 	return reply
 }
 
-// sendGTPU encapsulates innerIP in a GTP-U T-PDU and sends it to the gNB.
 // buildDLPDUSessionContainer builds the mandatory NG-U extension block that
 // must follow the 8-byte mandatory GTP-U header on every DL packet: seqNum(2,
 // unused=0) | N-PDU(1, unused=0) | nextExtHdrType(1) | ext-len(1, 4-octet
@@ -360,6 +515,7 @@ func buildDLPDUSessionContainer(qfi uint8) []byte {
 	}
 }
 
+// sendGTPU encapsulates innerIP in a GTP-U T-PDU and sends it to the gNB.
 func (s *Server) sendGTPU(sess *pfcp.Session, innerIP []byte) {
 	gnbAddr := &net.UDPAddr{IP: sess.GNBIP, Port: gtpuPort}
 
@@ -379,6 +535,12 @@ func (s *Server) sendGTPU(sess *pfcp.Session, innerIP []byte) {
 		s.logger.Error("GTP-U send", "error", err, "gnb", gnbAddr)
 		return
 	}
+
+	// Downlink usage measurement (TS 29.244 §5.2.2.4, VOLUM method). This is
+	// the single choke point for all DL sends (TUN reader + ICMP responder),
+	// so counting here avoids double-counting session volume.
+	sess.AddDLVolume(len(innerIP))
+
 	s.logger.Info("GTP-U DL sent", "dlTEID", sess.DLTEID, "gnbIP", sess.GNBIP, "qfi", sess.QER.QFI, "len", len(innerIP))
 }
 

@@ -29,15 +29,33 @@ import (
 
 // nwSessionRequest is the body for POST /api/v1/qos/nw-sessions.
 type nwSessionRequest struct {
-	SUPI         string   `json:"supi"`
-	App          string   `json:"app"`        // application label (for the URSP rule / audit trail)
-	AppFQDNs     []string `json:"app_fqdns"`  // optional destination FQDNs identifying the app traffic
-	DNN          string   `json:"dnn"`        // target DNN for the additional session
-	SST          int      `json:"sst"`        // S-NSSAI SST
-	SD           string   `json:"sd"`         // S-NSSAI SD, 6 hex chars (e.g. "000001"); optional
-	FiveQI       int      `json:"5qi"`        // QoS for the new session
-	AMBRUplink   string   `json:"ambr_uplink"`   // e.g. "50 Mbps"; optional
-	AMBRDownlink string   `json:"ambr_downlink"` // e.g. "200 Mbps"; optional
+	SUPI           string   `json:"supi"`
+	App            string   `json:"app"`              // application label (for the URSP rule / audit trail)
+	AppFQDNs       []string `json:"app_fqdns"`        // optional destination FQDNs identifying the app traffic
+	DNN            string   `json:"dnn"`              // target DNN for the additional session
+	SST            int      `json:"sst"`              // S-NSSAI SST
+	SD             string   `json:"sd"`               // S-NSSAI SD, 6 hex chars (e.g. "000001"); optional
+	FiveQI         int      `json:"5qi"`              // QoS for the new session
+	AMBRUplink     string   `json:"ambr_uplink"`      // e.g. "50 Mbps"; optional
+	AMBRDownlink   string   `json:"ambr_downlink"`    // e.g. "200 Mbps"; optional
+	PDUSessionType string   `json:"pdu_session_type"` // "IPv4" | "IPv6" | "IPv4v6"; empty = IPv4 (TS 23.501 §5.8.2.2)
+}
+
+// normalizePDUSessionType validates a requested PDU session type against the
+// three UERANSIM-supported families and returns its canonical spelling.
+// Empty defaults to IPv4 (backward-compatible with pre-IPv6 callers).
+// Ref: TS 24.501 §9.11.4.11, TS 23.501 §5.8.2.2.
+func normalizePDUSessionType(t string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "", "ipv4":
+		return "IPv4", true
+	case "ipv6":
+		return "IPv6", true
+	case "ipv4v6", "ipv46":
+		return "IPv4v6", true
+	default:
+		return "", false
+	}
 }
 
 // nwSessionStep records the outcome of one orchestration step.
@@ -286,7 +304,8 @@ func (d Deps) stepPushPolicies(ctx context.Context, supi string) nwSessionStep {
 }
 
 // stepUEEstablish simulates the UE-side URSP evaluation by driving nr-cli:
-// ps-establish IPv4 [--sst N --sd N] --dnn <dnn>  (UERANSIM v3.2.8 syntax).
+// ps-establish <IPv4|IPv6|IPv4v6> [--sst N --sd N] --dnn <dnn>
+// (patched-UERANSIM syntax; IPv6/IPv4v6 need patch 0060-ipv6-pdu-session.patch).
 func (d Deps) stepUEEstablish(ctx context.Context, req nwSessionRequest) nwSessionStep {
 	start := time.Now()
 	step := nwSessionStep{Step: "ue_establish"}
@@ -312,7 +331,14 @@ func (d Deps) stepUEEstablish(ctx context.Context, req nwSessionRequest) nwSessi
 		return step
 	}
 
-	cmd := "ps-establish IPv4"
+	pduType, ok := normalizePDUSessionType(req.PDUSessionType)
+	if !ok {
+		step.Detail = fmt.Sprintf("invalid pdu_session_type %q: expected IPv4, IPv6, or IPv4v6", req.PDUSessionType)
+		step.DurationMs = time.Since(start).Milliseconds()
+		return step
+	}
+
+	cmd := "ps-establish " + pduType
 	if req.SST > 0 {
 		cmd += fmt.Sprintf(" --sst %d", req.SST)
 		if req.SD != "" {

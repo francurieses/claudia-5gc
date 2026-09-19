@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,33 +33,40 @@ type OperatorDNN struct {
 	UEIPPool    string `yaml:"ue_ip_pool" json:"ue_ip_pool"`
 	N6Network   string `yaml:"n6_network,omitempty" json:"n6_network,omitempty"`
 	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	// UEIPv6Prefix is the base IPv6 prefix (e.g. "2001:db8:60::/56") delegated
+	// per-session as /64s for IPv6/IPv4v6 PDU sessions on this DNN. Empty = the
+	// DNN is IPv4-only. Ref: TS 23.501 §5.8.2.2.
+	UEIPv6Prefix string `yaml:"ue_ipv6_prefix,omitempty" json:"ue_ipv6_prefix,omitempty"`
 }
 
 // SMFDNNEntry is a DNN entry as stored in smf/config/dev.yaml.
 type SMFDNNEntry struct {
-	Name     string `yaml:"name"`
-	UEIPPool string `yaml:"ue_ip_pool"`
+	Name         string `yaml:"name"`
+	UEIPPool     string `yaml:"ue_ip_pool"`
+	UEIPv6Prefix string `yaml:"ue_ipv6_prefix,omitempty"`
 }
 
 // UPFDNNEntry is a DNN entry as stored in upf/config/dev.yaml.
 type UPFDNNEntry struct {
-	Name      string `yaml:"name"`
-	UEIPPool  string `yaml:"ue_ip_pool"`
-	TunName   string `yaml:"tun_name"`
-	TunAddr   string `yaml:"tun_addr"`
-	GatewayIP string `yaml:"gateway_ip"`
+	Name         string `yaml:"name"`
+	UEIPPool     string `yaml:"ue_ip_pool"`
+	TunName      string `yaml:"tun_name"`
+	TunAddr      string `yaml:"tun_addr"`
+	GatewayIP    string `yaml:"gateway_ip"`
+	UEIPv6Prefix string `yaml:"ue_ipv6_prefix,omitempty"`
 }
 
 // DNNInfo is the merged view of a DNN across all config sources, used by the portal API.
 type DNNInfo struct {
-	Name        string `json:"name"`
-	UEIPPool    string `json:"ue_ip_pool"`
-	N6Network   string `json:"n6_network,omitempty"`
-	Description string `json:"description,omitempty"`
-	TunName     string `json:"tun_name,omitempty"`
-	TunAddr     string `json:"tun_addr,omitempty"`
-	GatewayIP   string `json:"gateway_ip,omitempty"`
-	DockerNet   string `json:"docker_network,omitempty"`
+	Name         string `json:"name"`
+	UEIPPool     string `json:"ue_ip_pool"`
+	N6Network    string `json:"n6_network,omitempty"`
+	Description  string `json:"description,omitempty"`
+	TunName      string `json:"tun_name,omitempty"`
+	TunAddr      string `json:"tun_addr,omitempty"`
+	GatewayIP    string `json:"gateway_ip,omitempty"`
+	DockerNet    string `json:"docker_network,omitempty"`
+	UEIPv6Prefix string `json:"ue_ipv6_prefix,omitempty"`
 }
 
 // Manager reads and writes slice and DNN configuration across NF config files.
@@ -234,6 +242,9 @@ func (m *Manager) writeOperatorDNNs(dnns []OperatorDNN) error {
 		if d.Description != "" {
 			item["description"] = d.Description
 		}
+		if d.UEIPv6Prefix != "" {
+			item["ue_ipv6_prefix"] = d.UEIPv6Prefix
+		}
 		items = append(items, item)
 	}
 	raw["dnns"] = items
@@ -271,13 +282,17 @@ func (m *Manager) WriteUPFDNNs(dnns []UPFDNNEntry) error {
 	}
 	items := make([]map[string]interface{}, 0, len(dnns))
 	for _, d := range dnns {
-		items = append(items, map[string]interface{}{
+		item := map[string]interface{}{
 			"name":       d.Name,
 			"ue_ip_pool": d.UEIPPool,
 			"tun_name":   d.TunName,
 			"tun_addr":   d.TunAddr,
 			"gateway_ip": d.GatewayIP,
-		})
+		}
+		if d.UEIPv6Prefix != "" {
+			item["ue_ipv6_prefix"] = d.UEIPv6Prefix
+		}
+		items = append(items, item)
 	}
 	raw["dnns"] = items
 	out, err := yaml.Marshal(raw)
@@ -318,10 +333,14 @@ func (m *Manager) WriteSMFDNNs(dnns []SMFDNNEntry) error {
 	}
 	items := make([]map[string]interface{}, 0, len(dnns))
 	for _, d := range dnns {
-		items = append(items, map[string]interface{}{
+		item := map[string]interface{}{
 			"name":       d.Name,
 			"ue_ip_pool": d.UEIPPool,
-		})
+		}
+		if d.UEIPv6Prefix != "" {
+			item["ue_ipv6_prefix"] = d.UEIPv6Prefix
+		}
+		items = append(items, item)
 	}
 	raw["dnns"] = items
 	out, err := yaml.Marshal(raw)
@@ -331,32 +350,48 @@ func (m *Manager) WriteSMFDNNs(dnns []SMFDNNEntry) error {
 	return os.WriteFile(path, out, 0644)
 }
 
-// GetAllDNNs returns the merged DNN view combining operator.yaml and UPF config.
+// GetAllDNNs returns the merged DNN view combining operator.yaml, UPF, and SMF config.
 func (m *Manager) GetAllDNNs() ([]DNNInfo, error) {
 	opDNNs, err := m.readOperatorDNNs()
 	if err != nil {
 		return nil, err
 	}
 	upfDNNs, _ := m.ReadUPFDNNs() // degrade gracefully if UPF config unavailable
+	smfDNNs, _ := m.ReadSMFDNNs()
 
 	upfByName := make(map[string]UPFDNNEntry, len(upfDNNs))
 	for _, u := range upfDNNs {
 		upfByName[u.Name] = u
 	}
+	smfByName := make(map[string]SMFDNNEntry, len(smfDNNs))
+	for _, s := range smfDNNs {
+		smfByName[s.Name] = s
+	}
 
 	result := make([]DNNInfo, 0, len(opDNNs))
 	for _, od := range opDNNs {
 		info := DNNInfo{
-			Name:        od.Name,
-			UEIPPool:    od.UEIPPool,
-			N6Network:   od.N6Network,
-			Description: od.Description,
-			DockerNet:   dockerNetName(od.Name),
+			Name:         od.Name,
+			UEIPPool:     od.UEIPPool,
+			N6Network:    od.N6Network,
+			Description:  od.Description,
+			DockerNet:    dockerNetName(od.Name),
+			UEIPv6Prefix: od.UEIPv6Prefix,
 		}
 		if u, ok := upfByName[od.Name]; ok {
 			info.TunName = u.TunName
 			info.TunAddr = u.TunAddr
 			info.GatewayIP = u.GatewayIP
+			if info.UEIPv6Prefix == "" {
+				info.UEIPv6Prefix = u.UEIPv6Prefix
+			}
+		}
+		// SMF is the pool-allocating authority for the IPv6 prefix; fall back to
+		// it when operator.yaml/UPF haven't been backfilled yet.
+		if info.UEIPv6Prefix == "" {
+			if s, ok := smfByName[od.Name]; ok {
+				info.UEIPv6Prefix = s.UEIPv6Prefix
+			}
 		}
 		result = append(result, info)
 	}
@@ -434,16 +469,23 @@ func (m *Manager) AddDNN(d DNNInfo, tunIdx int) error {
 		gwIP = gatewayFromN6Net(d.N6Network)
 	}
 
+	if d.UEIPv6Prefix != "" {
+		if err := validateIPv6Prefix(d.UEIPv6Prefix); err != nil {
+			return fmt.Errorf("config: invalid ue_ipv6_prefix: %w", err)
+		}
+	}
+
 	// operator.yaml
 	opDNNs, err := m.readOperatorDNNs()
 	if err != nil {
 		return err
 	}
 	opDNNs = append(opDNNs, OperatorDNN{
-		Name:        d.Name,
-		UEIPPool:    d.UEIPPool,
-		N6Network:   d.N6Network,
-		Description: d.Description,
+		Name:         d.Name,
+		UEIPPool:     d.UEIPPool,
+		N6Network:    d.N6Network,
+		Description:  d.Description,
+		UEIPv6Prefix: d.UEIPv6Prefix,
 	})
 	if err := m.writeOperatorDNNs(opDNNs); err != nil {
 		return fmt.Errorf("config: write operator.yaml: %w", err)
@@ -454,7 +496,7 @@ func (m *Manager) AddDNN(d DNNInfo, tunIdx int) error {
 	if err != nil {
 		return err
 	}
-	smfDNNs = append(smfDNNs, SMFDNNEntry{Name: d.Name, UEIPPool: d.UEIPPool})
+	smfDNNs = append(smfDNNs, SMFDNNEntry{Name: d.Name, UEIPPool: d.UEIPPool, UEIPv6Prefix: d.UEIPv6Prefix})
 	if err := m.WriteSMFDNNs(smfDNNs); err != nil {
 		return fmt.Errorf("config: write smf: %w", err)
 	}
@@ -465,11 +507,12 @@ func (m *Manager) AddDNN(d DNNInfo, tunIdx int) error {
 		return err
 	}
 	upfDNNs = append(upfDNNs, UPFDNNEntry{
-		Name:      d.Name,
-		UEIPPool:  d.UEIPPool,
-		TunName:   tunName,
-		TunAddr:   tunAddr,
-		GatewayIP: gwIP,
+		Name:         d.Name,
+		UEIPPool:     d.UEIPPool,
+		TunName:      tunName,
+		TunAddr:      tunAddr,
+		GatewayIP:    gwIP,
+		UEIPv6Prefix: d.UEIPv6Prefix,
 	})
 	return m.WriteUPFDNNs(upfDNNs)
 }
@@ -520,9 +563,18 @@ func (m *Manager) DeleteDNN(name string) error {
 	return m.WriteUPFDNNs(newUPF)
 }
 
-// UpdateDNNDescription updates the description of a DNN in operator.yaml only.
-// No NF restart is required for a description-only change.
-func (m *Manager) UpdateDNNDescription(name, description string) error {
+// UpdateDNN updates a DNN's description and/or IPv6 prefix across config files.
+// The description is display-only (operator.yaml) and needs no NF restart. The
+// IPv6 prefix is consumed by SMF (pool allocation) and UPF (drift-guard log), so
+// it is propagated to all three files; the caller restarts smf/upf to apply it.
+// An empty ipv6Prefix clears IPv6 support for the DNN (downgrades to IPv4-only).
+func (m *Manager) UpdateDNN(name, description, ipv6Prefix string) error {
+	if ipv6Prefix != "" {
+		if err := validateIPv6Prefix(ipv6Prefix); err != nil {
+			return fmt.Errorf("config: invalid ue_ipv6_prefix: %w", err)
+		}
+	}
+
 	opDNNs, err := m.readOperatorDNNs()
 	if err != nil {
 		return err
@@ -531,6 +583,7 @@ func (m *Manager) UpdateDNNDescription(name, description string) error {
 	for i := range opDNNs {
 		if opDNNs[i].Name == name {
 			opDNNs[i].Description = description
+			opDNNs[i].UEIPv6Prefix = ipv6Prefix
 			found = true
 			break
 		}
@@ -538,7 +591,54 @@ func (m *Manager) UpdateDNNDescription(name, description string) error {
 	if !found {
 		return fmt.Errorf("config: DNN %q not found", name)
 	}
-	return m.writeOperatorDNNs(opDNNs)
+	if err := m.writeOperatorDNNs(opDNNs); err != nil {
+		return fmt.Errorf("config: write operator.yaml: %w", err)
+	}
+
+	smfDNNs, err := m.ReadSMFDNNs()
+	if err != nil {
+		return err
+	}
+	for i := range smfDNNs {
+		if smfDNNs[i].Name == name {
+			smfDNNs[i].UEIPv6Prefix = ipv6Prefix
+			break
+		}
+	}
+	if err := m.WriteSMFDNNs(smfDNNs); err != nil {
+		return fmt.Errorf("config: write smf: %w", err)
+	}
+
+	upfDNNs, err := m.ReadUPFDNNs()
+	if err != nil {
+		return err
+	}
+	for i := range upfDNNs {
+		if upfDNNs[i].Name == name {
+			upfDNNs[i].UEIPv6Prefix = ipv6Prefix
+			break
+		}
+	}
+	return m.WriteUPFDNNs(upfDNNs)
+}
+
+// validateIPv6Prefix checks that cidr is a valid IPv6 base prefix from which the
+// SMF can delegate per-session /64s (TS 23.501 §5.8.2.2). Mirrors the constraint
+// enforced by nf/smf/internal/server/ipv6.go's IPv6Pool: length must be a
+// multiple of 8 in [8,64] so the /64 subnet id occupies whole octets.
+func validateIPv6Prefix(cidr string) error {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return err
+	}
+	if ip.To4() != nil {
+		return fmt.Errorf("%q is not an IPv6 prefix", cidr)
+	}
+	ones, _ := ipnet.Mask.Size()
+	if ones < 8 || ones > 64 || ones%8 != 0 {
+		return fmt.Errorf("IPv6 prefix length /%d must be a multiple of 8 in [8,64]", ones)
+	}
+	return nil
 }
 
 // ---- Helpers --------------------------------------------------------------

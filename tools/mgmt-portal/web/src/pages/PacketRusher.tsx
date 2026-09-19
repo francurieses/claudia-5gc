@@ -1,19 +1,31 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Play, Square, Pause, RefreshCw, Terminal,
-  Radio, CheckCircle, Circle, AlertCircle, Info, RotateCcw, Trash2,
+  Play, Square, Pause, RefreshCw, Terminal, Radio,
+  CheckCircle, CheckCircle2, Circle, XCircle, AlertCircle, Info, RotateCcw, Trash2,
 } from 'lucide-react'
 import {
   getPacketRusherStatus, prStart, prStop, prPause, prResume,
   type PacketRusherScenarioState,
 } from '../lib/api'
-import PageHeader from '../components/PageHeader'
-import Badge from '../components/Badge'
+import {
+  Badge, Button, Card, ErrorState, Input, Loading, PageHeader, Section, Tabs, useToast,
+} from '../components/ui'
+import type { BadgeVariant, TabItem } from '../components/ui'
 
 // ---- Types ------------------------------------------------------------------
 
 type Tab = 'packetrusher' | 'packetrusher-n2' | 'amf' | 'smf'
+
+interface StatusBadge {
+  label: string
+  variant: BadgeVariant
+  icon: ReactNode
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
 
 // ---- Mobility validation checkpoints ----------------------------------------
 //
@@ -197,9 +209,14 @@ function useChecklistStream(container: string | null, resetKey: number): LogLine
 
 // ---- Log display panel (independent stream, not tied to checklist) ----------
 
+type WSStatus = 'connecting' | 'open' | 'closed'
+
 const levelColor: Record<string, string> = {
-  error: 'text-red-400', warn: 'text-yellow-400', warning: 'text-yellow-400',
-  info: 'text-gray-300', debug: 'text-gray-500',
+  error: 'text-danger-fg',
+  warn: 'text-warning-fg',
+  warning: 'text-warning-fg',
+  info: 'text-log-fg',
+  debug: 'text-muted-fg',
 }
 
 const MOBILITY_KEYWORDS = [
@@ -208,11 +225,26 @@ const MOBILITY_KEYWORDS = [
   'ue registered', 'pdu session',
 ]
 
-function highlightMobility(text: string): JSX.Element {
+/**
+ * Highlight mobility events. `text-info-fg` is measured at 5.96:1 (light) /
+ * 7.41:1 (dark) against the log surface, so it stays AA on both themes.
+ */
+function highlightMobility(text: string): ReactNode {
   const lower = text.toLowerCase()
   const hit = MOBILITY_KEYWORDS.some(kw => lower.includes(kw))
-  if (hit) return <span className="text-cyan-300 font-semibold">{text}</span>
+  if (hit) return <span className="font-semibold text-info-fg">{text}</span>
   return <span>{text}</span>
+}
+
+function connectionStatus(status: WSStatus): StatusBadge {
+  switch (status) {
+    case 'open':
+      return { label: 'Connected', variant: 'success', icon: <CheckCircle2 size={12} /> }
+    case 'connecting':
+      return { label: 'Connecting', variant: 'info', icon: <RefreshCw size={12} className="animate-spin" /> }
+    default:
+      return { label: 'Disconnected', variant: 'danger', icon: <XCircle size={12} /> }
+  }
 }
 
 function LogPanel({ container, clearKey, onClear }: { container: string; clearKey: number; onClear: () => void }) {
@@ -221,11 +253,13 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
   const [paused, setPaused] = useState(false)
   const endRef              = useRef<HTMLDivElement>(null)
   const [frozen, setFrozen] = useState<LogLine[]>([])
+  const [status, setStatus] = useState<WSStatus>('connecting')
 
   // Reconnect WebSocket when the active tab (container) changes
   useEffect(() => {
     setLines([])
     setFrozen([])
+    setStatus('connecting')
 
     let dead = false
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -233,12 +267,20 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
     function connect() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${protocol}//${window.location.host}/ws/logs/${container}?tail=300`)
+      ws.onopen = () => {
+        if (!dead) setStatus('open')
+      }
       ws.onmessage = e => setLines(prev => {
         const next = [...prev, parseLogLine(e.data as string)]
         return next.length > 3000 ? next.slice(-3000) : next
       })
       ws.onclose = () => {
-        if (!dead) reconnectTimer = setTimeout(connect, 3000)
+        if (dead) return
+        setStatus('closed')
+        reconnectTimer = setTimeout(() => {
+          setStatus('connecting')
+          connect()
+        }, 3000)
       }
       return ws
     }
@@ -265,45 +307,61 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
 
   useEffect(() => { if (!paused) endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [filtered, paused])
 
+  const connection = connectionStatus(status)
+
   return (
-    <div className="bg-gray-950 rounded-lg border border-gray-700 flex flex-col">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-700 flex-shrink-0">
-        <div className="flex items-center gap-2">
-          <Terminal size={13} className="text-green-400" />
-          <span className="text-xs font-mono text-green-400">{container}</span>
-          <span className="text-xs text-gray-500">{filtered.length} lines</span>
-          {paused && <span className="text-xs text-yellow-400 font-semibold">PAUSED</span>}
+    <Card padded={false} className="flex flex-col overflow-hidden bg-log-bg">
+      <div className="flex flex-shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Terminal size={13} aria-hidden="true" className="text-log-fg" />
+          <span className="font-mono text-xs text-log-fg">{container}</span>
+          <Badge label={connection.label} variant={connection.variant} icon={connection.icon} />
+          <span className="text-xs text-muted-fg">{filtered.length} lines</span>
+          {paused && <Badge label="PAUSED" variant="warning" icon={<Pause size={12} />} />}
         </div>
-        <div className="flex items-center gap-2">
-          <input
-            type="text"
+        <div className="flex flex-wrap items-center gap-2">
+          <Input
+            aria-label={`Filter lines from ${container}`}
             placeholder="Filter…"
             value={filter}
             onChange={e => setFilter(e.target.value)}
-            className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-white w-36"
+            className="w-36 text-xs"
           />
-          <button onClick={() => setPaused(p => !p)} className="text-xs text-gray-400 hover:text-white">
+          <Button
+            size="sm"
+            variant="secondary"
+            icon={paused ? <Play size={12} /> : <Pause size={12} />}
+            onClick={() => setPaused(p => !p)}
+            aria-pressed={paused}
+          >
             {paused ? 'Resume' : 'Pause'}
-          </button>
-          <button onClick={onClear} className="text-xs text-gray-500 hover:text-white">Clear</button>
+          </Button>
+          <Button size="sm" variant="ghost" onClick={onClear}>
+            Clear
+          </Button>
         </div>
       </div>
-      <div className="font-mono text-xs p-3 h-64 overflow-y-auto">
+
+      <div className="log-surface h-64 overflow-y-auto p-3">
         {filtered.length === 0
-          ? <span className="text-gray-600">Waiting for logs from {container}…</span>
+          ? (
+            <span className="text-muted-fg">
+              {filter ? 'No lines match the filter.' : `Waiting for logs from ${container}…`}
+            </span>
+          )
           : filtered.map((l, i) => (
-              <div key={i} className={`leading-relaxed ${levelColor[l.level] ?? 'text-gray-300'}`}>
-                {l.ts && <span className="text-gray-600 mr-2">{new Date(l.ts).toISOString().slice(11, 23)}</span>}
-                {l.level && l.level !== 'info' && (
-                  <span className={`mr-1 uppercase text-[0.6rem] font-bold ${levelColor[l.level]}`}>{l.level}</span>
-                )}
-                {highlightMobility(l.msg)}
-              </div>
-            ))
+            <div key={i} className={`leading-relaxed ${levelColor[l.level] ?? 'text-log-fg'}`}>
+              {l.ts && <span className="mr-2 text-muted-fg">{new Date(l.ts).toISOString().slice(11, 23)}</span>}
+              {l.level && l.level !== 'info' && (
+                <span className={`mr-1 text-xs font-bold uppercase ${levelColor[l.level]}`}>{l.level}</span>
+              )}
+              {highlightMobility(l.msg)}
+            </div>
+          ))
         }
         <div ref={endRef} />
       </div>
-    </div>
+    </Card>
   )
 }
 
@@ -329,54 +387,59 @@ function Checklist({
 }) {
   const done  = checkpoints.filter(c => c.detected).length
   const total = checkpoints.length
+  const complete = done === total
 
   return (
-    <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-      <div className="flex items-center justify-between mb-3">
+    <Card>
+      <div className="mb-3 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">{title}</h3>
-          <span className={`text-xs font-semibold ${done === total ? 'text-green-400' : 'text-gray-500'}`}>
-            {done}/{total}
-          </span>
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-fg">{title}</h3>
+          <Badge
+            label={`${done}/${total}`}
+            variant={complete ? 'success' : 'neutral'}
+            icon={complete ? <CheckCircle2 size={12} /> : <Circle size={12} />}
+          />
         </div>
-        <button
+        <Button
+          size="sm"
+          variant="ghost"
+          icon={<RotateCcw size={10} />}
           onClick={onReset}
           title="Reset checklist for a new validation run"
-          className="flex items-center gap-1 px-2 py-0.5 text-[0.65rem] text-gray-500 hover:text-gray-300 hover:bg-gray-800 rounded"
         >
-          <RotateCcw size={10} /> Reset
-        </button>
+          Reset
+        </Button>
       </div>
-      <div className="space-y-2">
+      <ul className="space-y-2">
         {checkpoints.map(cp => (
-          <div key={cp.id} className="flex items-start gap-2">
+          <li key={cp.id} className="flex items-start gap-2">
             {cp.detected
-              ? <CheckCircle size={13} className="text-green-400 mt-0.5 flex-shrink-0" />
-              : <Circle     size={13} className="text-gray-600 mt-0.5 flex-shrink-0" />}
-            <div className="flex-1 min-w-0">
-              <span className={`text-xs ${cp.detected ? 'text-green-300' : 'text-gray-400'}`}>{cp.label}</span>
-              <span className="ml-2 text-[0.6rem] text-gray-600 font-mono">{cp.specRef}</span>
+              ? <CheckCircle size={13} aria-hidden="true" className="mt-0.5 flex-shrink-0 text-success-fg" />
+              : <Circle size={13} aria-hidden="true" className="mt-0.5 flex-shrink-0 text-muted-fg" />}
+            <div className="min-w-0 flex-1">
+              <span className={`text-xs ${cp.detected ? 'text-fg' : 'text-muted-fg'}`}>{cp.label}</span>
+              <span className="ml-2 font-mono text-xs text-muted-fg">{cp.specRef}</span>
             </div>
             {cp.detected && (
-              <span className="text-[0.6rem] text-green-500 font-semibold flex-shrink-0">DETECTED</span>
+              <span className="flex-shrink-0 text-xs font-semibold text-success-fg">DETECTED</span>
             )}
-          </div>
+          </li>
         ))}
-      </div>
-    </div>
+      </ul>
+    </Card>
   )
 }
 
 // ---- State badge + helpers --------------------------------------------------
 
-function stateBadge(state: string) {
+function prStatus(state: string): StatusBadge {
   switch (state) {
-    case 'running':   return <Badge label="running"     variant="green"  />
-    case 'paused':    return <Badge label="paused"      variant="yellow" />
-    case 'exited':    return <Badge label="exited"      variant="gray"   />
-    case 'created':   return <Badge label="ready"       variant="gray"   />
-    case 'not_found': return <Badge label="not created" variant="red"    />
-    default:          return <Badge label={state}       variant="gray"   />
+    case 'running':   return { label: 'running',     variant: 'success', icon: <CheckCircle2 size={12} /> }
+    case 'paused':    return { label: 'paused',      variant: 'warning', icon: <Pause size={12} /> }
+    case 'exited':    return { label: 'exited',      variant: 'neutral', icon: <Circle size={12} /> }
+    case 'created':   return { label: 'ready',       variant: 'neutral', icon: <Circle size={12} /> }
+    case 'not_found': return { label: 'not created', variant: 'danger',  icon: <XCircle size={12} /> }
+    default:          return { label: state,         variant: 'neutral', icon: <Circle size={12} /> }
   }
 }
 
@@ -401,7 +464,6 @@ interface ScenarioCardProps {
   onPause: () => void
   onResume: () => void
   isPending: boolean
-  error: string | null
 }
 
 function ScenarioCard({
@@ -409,111 +471,108 @@ function ScenarioCard({
   title, subtitle, specRef, command,
   logsActive, onToggleLog,
   onStart, onStop, onPause, onResume,
-  isPending, error,
+  isPending,
 }: ScenarioCardProps) {
   const running   = s.state === 'running'
   const paused    = s.state === 'paused'
   const startable = isStartable(s.state)
   const notFound  = s.state === 'not_found'
+  const status    = prStatus(s.state)
 
   return (
-    <div className={`bg-gray-900 rounded-lg border p-5 flex flex-col gap-3 ${
-      running ? 'border-green-700' : paused ? 'border-yellow-700' : 'border-gray-800'
-    }`}>
+    <Card className="flex flex-col gap-3">
       <div className="flex items-start justify-between gap-2">
-        <div>
-          <div className="flex items-center gap-2 mb-0.5">
-            <Radio size={14} className={running ? 'text-green-400' : paused ? 'text-yellow-400' : 'text-gray-500'} />
-            <span className="text-sm font-bold text-white">{title}</span>
+        <div className="min-w-0">
+          <div className="mb-0.5 flex items-center gap-2">
+            <Radio
+              size={14}
+              aria-hidden="true"
+              className={running ? 'text-success-fg' : paused ? 'text-warning-fg' : 'text-muted-fg'}
+            />
+            <span className="text-sm font-semibold text-fg">{title}</span>
           </div>
-          <p className="text-xs text-gray-400">{subtitle}</p>
-          <p className="text-xs text-gray-600 font-mono mt-0.5">{specRef}</p>
+          <p className="text-xs text-muted-fg">{subtitle}</p>
+          <p className="mt-0.5 font-mono text-xs text-muted-fg">{specRef}</p>
         </div>
-        {stateBadge(s.state)}
+        <Badge label={status.label} variant={status.variant} icon={status.icon} />
       </div>
 
-      <div className="text-xs text-gray-500 font-mono">
-        container: <span className="text-gray-400">{s.container}</span>
-        {s.uptime && <span className="ml-3 text-gray-600">up {s.uptime}</span>}
-        {s.status && <span className="ml-3 text-gray-600">{s.status}</span>}
-      </div>
+      <p className="font-mono text-xs text-muted-fg">
+        container: <span className="text-fg">{s.container}</span>
+        {s.uptime && <span className="ml-3">up {s.uptime}</span>}
+        {s.status && <span className="ml-3">{s.status}</span>}
+      </p>
 
-      <div className="bg-gray-950 rounded px-3 py-2 text-xs font-mono text-gray-500 leading-relaxed">
-        <span className="text-gray-600">cmd: </span>{command}
-      </div>
+      <p className="log-surface rounded-control border border-border px-3 py-2 leading-relaxed">
+        <span className="text-muted-fg">cmd: </span>{command}
+      </p>
 
       {peerRunning && !running && !paused && (
-        <div className="flex items-start gap-2 px-3 py-2 bg-blue-950/40 border border-blue-800/50 rounded text-xs text-blue-300">
-          <Info size={12} className="mt-0.5 flex-shrink-0" />
-          <span>
-            <span className="font-semibold">{peerName}</span> is running and holds the shared IPs.
-            Clicking <span className="font-semibold">Start</span> will stop it automatically.
-          </span>
+        <div className="flex items-start gap-2">
+          <Badge label="Peer running" variant="info" icon={<Info size={12} />} />
+          <p className="text-xs text-muted-fg">
+            <span className="font-semibold text-fg">{peerName}</span> is running and holds the shared IPs.
+            Starting this scenario stops it automatically.
+          </p>
         </div>
       )}
 
       {notFound && (
-        <div className="flex items-start gap-2 px-3 py-2 bg-yellow-950/40 border border-yellow-800/50 rounded text-xs text-yellow-300">
-          <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
-          <span>
-            Container not created. Run{' '}
-            <code className="bg-gray-800 px-1 rounded font-mono">
+        <div className="flex items-start gap-2">
+          <Badge label="Container not created" variant="warning" icon={<AlertCircle size={12} />} />
+          <p className="text-xs text-muted-fg">
+            Run{' '}
+            <code className="rounded bg-muted px-1 font-mono text-fg">
               make {s.scenario === 'xn' ? 'handover-test' : 'handover-n2-test'}
             </code>{' '}
             once to build the image.
-          </span>
-        </div>
-      )}
-
-      {error && (
-        <div className="flex items-center gap-2 px-3 py-2 bg-red-950/40 border border-red-800/50 rounded text-xs text-red-300">
-          <AlertCircle size={12} className="flex-shrink-0" />{error}
+          </p>
         </div>
       )}
 
       <div className="flex flex-wrap gap-2">
         {(startable || (peerRunning && !running && !paused)) && (
-          <button
-            onClick={onStart}
+          <Button
+            size="sm"
+            icon={<Play size={11} />}
+            loading={isPending}
             disabled={isPending || notFound}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs rounded"
+            onClick={onStart}
           >
-            {isPending ? <RefreshCw size={11} className="animate-spin" /> : <Play size={11} />}
             {peerRunning ? 'Stop other & Start' : 'Start'}
-          </button>
+          </Button>
         )}
         {running && (
           <>
-            <button onClick={onPause} disabled={isPending}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-yellow-700 hover:bg-yellow-600 disabled:opacity-40 text-white text-xs rounded">
-              <Pause size={11} /> Pause
-            </button>
-            <button onClick={onStop} disabled={isPending}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-red-800 hover:bg-red-700 disabled:opacity-40 text-white text-xs rounded">
-              <Square size={11} /> Stop
-            </button>
+            <Button size="sm" variant="secondary" icon={<Pause size={11} />} disabled={isPending} onClick={onPause}>
+              Pause
+            </Button>
+            <Button size="sm" variant="destructive" icon={<Square size={11} />} disabled={isPending} onClick={onStop}>
+              Stop
+            </Button>
           </>
         )}
         {paused && (
           <>
-            <button onClick={onResume} disabled={isPending}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-green-700 hover:bg-green-600 disabled:opacity-40 text-white text-xs rounded">
-              <Play size={11} /> Resume
-            </button>
-            <button onClick={onStop} disabled={isPending}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-red-800 hover:bg-red-700 disabled:opacity-40 text-white text-xs rounded">
-              <Square size={11} /> Stop
-            </button>
+            <Button size="sm" icon={<Play size={11} />} disabled={isPending} onClick={onResume}>
+              Resume
+            </Button>
+            <Button size="sm" variant="destructive" icon={<Square size={11} />} disabled={isPending} onClick={onStop}>
+              Stop
+            </Button>
           </>
         )}
-        <button onClick={onToggleLog}
-          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded ${
-            logsActive ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'
-          }`}>
-          <Terminal size={11} /> Logs
-        </button>
+        <Button
+          size="sm"
+          variant={logsActive ? 'primary' : 'secondary'}
+          icon={<Terminal size={11} />}
+          onClick={onToggleLog}
+          aria-expanded={logsActive}
+        >
+          Logs
+        </Button>
       </div>
-    </div>
+    </Card>
   )
 }
 
@@ -530,6 +589,7 @@ const LOG_TABS: { id: Tab; label: string }[] = [
 
 export default function PacketRusher() {
   const qc = useQueryClient()
+  const { toast } = useToast()
   const [activeLogTab, setActiveLogTab] = useState<Tab>('packetrusher')
   const [showLogs, setShowLogs]         = useState(false)
   const [clearKey, setClearKey]         = useState(0)
@@ -539,7 +599,16 @@ export default function PacketRusher() {
   const [xnResetKey, setXnResetKey] = useState(0)
   const [n2ResetKey, setN2ResetKey] = useState(0)
 
-  const { data, isLoading } = useQuery({
+  const actionFailed = (verb: string) => (err: unknown) =>
+    toast({ variant: 'error', title: `${verb} failed`, description: errMessage(err), duration: 0 })
+
+  const {
+    data,
+    isLoading,
+    isError,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['pr-status'],
     queryFn: getPacketRusherStatus,
     refetchInterval: 3_000,
@@ -550,22 +619,56 @@ export default function PacketRusher() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['pr-status'] })
       setXnResetKey(k => k + 1)
+      toast({ variant: 'success', title: 'Xn Handover started' })
     },
+    onError: actionFailed('Start Xn Handover'),
   })
-  const xnStopMut   = useMutation({ mutationFn: () => prStop('xn'),   onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
-  const xnPauseMut  = useMutation({ mutationFn: () => prPause('xn'),  onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
-  const xnResumeMut = useMutation({ mutationFn: () => prResume('xn'), onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
+  const xnStopMut   = useMutation({
+    mutationFn: () => prStop('xn'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pr-status'] })
+      toast({ variant: 'success', title: 'Xn Handover stopped' })
+    },
+    onError: actionFailed('Stop Xn Handover'),
+  })
+  const xnPauseMut  = useMutation({
+    mutationFn: () => prPause('xn'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }),
+    onError: actionFailed('Pause Xn Handover'),
+  })
+  const xnResumeMut = useMutation({
+    mutationFn: () => prResume('xn'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }),
+    onError: actionFailed('Resume Xn Handover'),
+  })
 
   const n2StartMut = useMutation({
     mutationFn: () => prStart('n2'),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['pr-status'] })
       setN2ResetKey(k => k + 1)
+      toast({ variant: 'success', title: 'N2 Handover started' })
     },
+    onError: actionFailed('Start N2 Handover'),
   })
-  const n2StopMut   = useMutation({ mutationFn: () => prStop('n2'),   onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
-  const n2PauseMut  = useMutation({ mutationFn: () => prPause('n2'),  onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
-  const n2ResumeMut = useMutation({ mutationFn: () => prResume('n2'), onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }) })
+  const n2StopMut   = useMutation({
+    mutationFn: () => prStop('n2'),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['pr-status'] })
+      toast({ variant: 'success', title: 'N2 Handover stopped' })
+    },
+    onError: actionFailed('Stop N2 Handover'),
+  })
+  const n2PauseMut  = useMutation({
+    mutationFn: () => prPause('n2'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }),
+    onError: actionFailed('Pause N2 Handover'),
+  })
+  const n2ResumeMut = useMutation({
+    mutationFn: () => prResume('n2'),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['pr-status'] }),
+    onError: actionFailed('Resume N2 Handover'),
+  })
 
   const xnState = data?.scenarios.find(s => s.scenario === 'xn') ?? {
     scenario: 'xn' as const, container: 'packetrusher', state: 'unknown', status: '', uptime: '',
@@ -579,9 +682,6 @@ export default function PacketRusher() {
 
   const xnPending = xnStartMut.isPending || xnStopMut.isPending || xnPauseMut.isPending || xnResumeMut.isPending
   const n2Pending = n2StartMut.isPending || n2StopMut.isPending || n2PauseMut.isPending || n2ResumeMut.isPending
-
-  const xnError = xnStartMut.error?.message ?? xnStopMut.error?.message ?? xnPauseMut.error?.message ?? xnResumeMut.error?.message ?? null
-  const n2Error = n2StartMut.error?.message ?? n2StopMut.error?.message ?? n2PauseMut.error?.message ?? n2ResumeMut.error?.message ?? null
 
   // --- Checklist streams -------------------------------------------------------
   //
@@ -611,154 +711,186 @@ export default function PacketRusher() {
 
   const openLog = (tab: Tab) => { setShowLogs(true); setActiveLogTab(tab) }
 
+  const clearAll = () => {
+    setClearKey(k => k + 1)
+    setXnResetKey(k => k + 1)
+    setN2ResetKey(k => k + 1)
+  }
+
+  const logTabs: TabItem[] = LOG_TABS.map(t => ({
+    id: t.id,
+    label: t.label,
+    content: (
+      <LogPanel
+        key={t.id}
+        container={t.id}
+        clearKey={clearKey}
+        onClear={() => setClearKey(k => k + 1)}
+      />
+    ),
+  }))
+
   return (
-    <div className="p-6">
+    <div className="space-y-6 p-6">
       <PageHeader
+        eyebrow="Test UEs"
         title="PacketRusher"
         subtitle="5G mobility testing — Xn and N2 Handover scenarios"
         action={
-          <div className="flex gap-2">
-            <button
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant={showLogs ? 'primary' : 'secondary'}
+              icon={<Terminal size={14} />}
+              aria-pressed={showLogs}
               onClick={() => setShowLogs(v => !v)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-md ${
-                showLogs ? 'bg-blue-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-white'
-              }`}
             >
-              <Terminal size={14} /> {showLogs ? 'Hide Logs' : 'Show Logs'}
-            </button>
-            <button
-              onClick={() => {
-                setClearKey(k => k + 1)
-                setXnResetKey(k => k + 1)
-                setN2ResetKey(k => k + 1)
-              }}
+              {showLogs ? 'Hide Logs' : 'Show Logs'}
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Trash2 size={14} />}
+              onClick={clearAll}
               title="Clear all log panels and reset mobility validation checklists"
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-md"
             >
-              <Trash2 size={14} /> Clear All
-            </button>
-            <button
-              onClick={() => qc.invalidateQueries({ queryKey: ['pr-status'] })}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-md"
+              Clear All
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<RefreshCw size={14} />}
+              loading={isLoading}
+              onClick={() => refetch()}
             >
-              <RefreshCw size={14} className={isLoading ? 'animate-spin' : ''} /> Refresh
-            </button>
+              Refresh
+            </Button>
           </div>
         }
       />
 
-      <div className="mb-3 flex items-start gap-2 px-3 py-2.5 bg-yellow-950/50 border border-yellow-700/60 rounded-lg text-xs text-yellow-200">
-        <AlertCircle size={13} className="mt-0.5 flex-shrink-0 text-yellow-400" />
-        <span>
-          <span className="font-semibold text-yellow-300">URSP incompatibility:</span>{' '}
-          PacketRusher does not support URSP policy delivery. If URSP is enabled in your build,
-          PacketRusher UEs will fail to register. To use these scenarios, disable URSP in{' '}
-          <code className="bg-yellow-900/50 px-1 rounded font-mono text-yellow-100">nf/amf/config/dev.yaml</code>{' '}
-          (<code className="bg-yellow-900/50 px-1 rounded font-mono text-yellow-100">ursp_enabled: false</code>)
-          and rebuild with <code className="bg-yellow-900/50 px-1 rounded font-mono text-yellow-100">make docker</code>.
-        </span>
-      </div>
+      {/* URSP incompatibility warning */}
+      <Card>
+        <div className="flex items-start gap-3">
+          <Badge label="URSP incompatibility" variant="warning" icon={<AlertCircle size={12} />} />
+          <p className="text-xs text-muted-fg">
+            PacketRusher does not support URSP policy delivery. If URSP is enabled in your build,
+            PacketRusher UEs will fail to register. To use these scenarios, disable URSP in{' '}
+            <code className="rounded bg-muted px-1 font-mono text-fg">nf/amf/config/dev.yaml</code>{' '}
+            (<code className="rounded bg-muted px-1 font-mono text-fg">ursp_enabled: false</code>)
+            and rebuild with <code className="rounded bg-muted px-1 font-mono text-fg">make docker</code>.
+          </p>
+        </div>
+      </Card>
 
-      <div className="mb-4 flex items-start gap-2 px-3 py-2 bg-gray-800/60 border border-gray-700 rounded-lg text-xs text-gray-400">
-        <Info size={12} className="mt-0.5 flex-shrink-0 text-blue-400" />
-        Both scenarios share network IPs (172.30.1.20 / 172.30.3.10) — only one can run at a time.
-        The portal auto-stops the other on Start. Checklists reset automatically on each run.
-      </div>
+      {/* Shared-IP constraint */}
+      <Card>
+        <div className="flex items-start gap-3">
+          <Badge label="Shared IPs" variant="info" icon={<Info size={12} />} />
+          <p className="text-xs text-muted-fg">
+            Both scenarios share network IPs (172.30.1.20 / 172.30.3.10) — only one can run at a time.
+            The portal auto-stops the other on Start. Checklists reset automatically on each run.
+          </p>
+        </div>
+      </Card>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
-        <ScenarioCard
-          s={xnState}
-          peerRunning={n2Running}
-          peerName="N2 Handover"
-          title="Xn Handover"
-          subtitle="Dual-gNB, source-initiated — no AMF preparation"
-          specRef="TS 23.502 §4.9.1.2 / TS 38.413 §8.4.2"
-          command="multi-ue-pdu -n 1 --timeBeforeXnHandover 5000"
-          logsActive={showLogs && activeLogTab === 'packetrusher'}
-          onToggleLog={() => openLog('packetrusher')}
-          onStart={() => xnStartMut.mutate()}
-          onStop={() => xnStopMut.mutate()}
-          onPause={() => xnPauseMut.mutate()}
-          onResume={() => xnResumeMut.mutate()}
-          isPending={xnPending}
-          error={xnError}
+      {/* Scenario cards */}
+      {isError ? (
+        <ErrorState
+          title="Failed to load PacketRusher status"
+          description={errMessage(error)}
+          action={
+            <Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
         />
-        <ScenarioCard
-          s={n2State}
-          peerRunning={xnRunning}
-          peerName="Xn Handover"
-          title="N2 Handover"
-          subtitle="AMF-mediated preparation — full NGAP HO flow"
-          specRef="TS 23.502 §4.9.1.3 / TS 38.413 §8.4.1"
-          command="multi-ue-pdu -n 1 --timeBeforeNgapHandover 5000"
-          logsActive={showLogs && activeLogTab === 'packetrusher-n2'}
-          onToggleLog={() => openLog('packetrusher-n2')}
-          onStart={() => n2StartMut.mutate()}
-          onStop={() => n2StopMut.mutate()}
-          onPause={() => n2PauseMut.mutate()}
-          onResume={() => n2ResumeMut.mutate()}
-          isPending={n2Pending}
-          error={n2Error}
-        />
-      </div>
-
-      {showLogs && (
-        <div className="mb-6">
-          <div className="flex gap-1 mb-2 border-b border-gray-800 pb-1">
-            {LOG_TABS.map(t => (
-              <button
-                key={t.id}
-                onClick={() => setActiveLogTab(t.id)}
-                className={`px-3 py-1.5 text-xs rounded-t transition-colors ${
-                  activeLogTab === t.id
-                    ? 'bg-gray-800 text-white border border-b-0 border-gray-700'
-                    : 'text-gray-500 hover:text-gray-300'
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-            <button
-              onClick={() => { setClearKey(k => k + 1); setXnResetKey(k => k + 1); setN2ResetKey(k => k + 1) }}
-              className="ml-auto flex items-center gap-1 text-xs text-gray-600 hover:text-gray-400 px-2"
-            >
-              <Trash2 size={11} /> Clear all
-            </button>
-          </div>
-          <LogPanel key={activeLogTab} container={activeLogTab} clearKey={clearKey} onClear={() => setClearKey(k => k + 1)} />
+      ) : isLoading ? (
+        <Loading rows={2} label="Loading scenarios…" />
+      ) : (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <ScenarioCard
+            s={xnState}
+            peerRunning={n2Running}
+            peerName="N2 Handover"
+            title="Xn Handover"
+            subtitle="Dual-gNB, source-initiated — no AMF preparation"
+            specRef="TS 23.502 §4.9.1.2 / TS 38.413 §8.4.2"
+            command="multi-ue-pdu -n 1 --timeBeforeXnHandover 5000"
+            logsActive={showLogs && activeLogTab === 'packetrusher'}
+            onToggleLog={() => openLog('packetrusher')}
+            onStart={() => xnStartMut.mutate()}
+            onStop={() => xnStopMut.mutate()}
+            onPause={() => xnPauseMut.mutate()}
+            onResume={() => xnResumeMut.mutate()}
+            isPending={xnPending}
+          />
+          <ScenarioCard
+            s={n2State}
+            peerRunning={xnRunning}
+            peerName="Xn Handover"
+            title="N2 Handover"
+            subtitle="AMF-mediated preparation — full NGAP HO flow"
+            specRef="TS 23.502 §4.9.1.3 / TS 38.413 §8.4.1"
+            command="multi-ue-pdu -n 1 --timeBeforeNgapHandover 5000"
+            logsActive={showLogs && activeLogTab === 'packetrusher-n2'}
+            onToggleLog={() => openLog('packetrusher-n2')}
+            onStart={() => n2StartMut.mutate()}
+            onStop={() => n2StopMut.mutate()}
+            onPause={() => n2PauseMut.mutate()}
+            onResume={() => n2ResumeMut.mutate()}
+            isPending={n2Pending}
+          />
         </div>
       )}
 
-      <div className="mb-2 flex items-center gap-2">
-        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Mobility Validation</h3>
-        <span className="text-xs text-gray-600">—</span>
-        <span className="text-xs text-gray-600">
-          Evaluated against PacketRusher + AMF logs for each scenario independently. Resets on Start or Reset button.
-        </span>
-      </div>
+      {/* Log viewer */}
+      {showLogs && (
+        <Section
+          bare
+          headingLevel={2}
+          title="Logs"
+          description="Live container streams. Mobility events (handover, path switch, registration) are highlighted."
+        >
+          <Tabs
+            label="Log source"
+            tabs={logTabs}
+            value={activeLogTab}
+            onChange={id => setActiveLogTab(id as Tab)}
+          />
+        </Section>
+      )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Checklist
-          checkpoints={xnChecks}
-          title="Xn Handover — TS 23.502 §4.9.1.2"
-          onReset={() => setXnResetKey(k => k + 1)}
-        />
-        <Checklist
-          checkpoints={n2Checks}
-          title="N2 Handover — TS 23.502 §4.9.1.3"
-          onReset={() => setN2ResetKey(k => k + 1)}
-        />
-      </div>
-
-      <div className="mt-6 p-4 bg-gray-900/50 border border-gray-800 rounded-lg">
-        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Quick Reference</p>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1 text-xs text-gray-600">
-          <span><span className="text-gray-400 font-mono">make handover-test</span> — build image + start Xn scenario (required once)</span>
-          <span><span className="text-gray-400 font-mono">make handover-n2-test</span> — start N2 scenario (reuses built image)</span>
-          <span><span className="text-gray-400 font-mono">make handover-down</span> — stop Xn profile containers</span>
-          <span><span className="text-gray-400 font-mono">make handover-n2-down</span> — stop N2 profile containers</span>
+      {/* Mobility validation */}
+      <Section
+        bare
+        headingLevel={2}
+        title="Mobility Validation"
+        description="Evaluated against PacketRusher + AMF logs for each scenario independently. Resets on Start or the Reset button."
+      >
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <Checklist
+            checkpoints={xnChecks}
+            title="Xn Handover — TS 23.502 §4.9.1.2"
+            onReset={() => setXnResetKey(k => k + 1)}
+          />
+          <Checklist
+            checkpoints={n2Checks}
+            title="N2 Handover — TS 23.502 §4.9.1.3"
+            onReset={() => setN2ResetKey(k => k + 1)}
+          />
         </div>
-      </div>
+      </Section>
+
+      {/* Quick reference */}
+      <Section bare headingLevel={2} title="Quick Reference">
+        <div className="grid grid-cols-1 gap-x-8 gap-y-1 text-xs text-muted-fg md:grid-cols-2">
+          <p><span className="font-mono text-fg">make handover-test</span> — build image + start Xn scenario (required once)</p>
+          <p><span className="font-mono text-fg">make handover-n2-test</span> — start N2 scenario (reuses built image)</p>
+          <p><span className="font-mono text-fg">make handover-down</span> — stop Xn profile containers</p>
+          <p><span className="font-mono text-fg">make handover-n2-down</span> — stop N2 profile containers</p>
+        </div>
+      </Section>
     </div>
   )
 }

@@ -3,9 +3,12 @@ import { useQuery } from '@tanstack/react-query'
 import { MapContainer, TileLayer, CircleMarker, Circle, Tooltip, useMap } from 'react-leaflet'
 import type { LatLngBoundsExpression } from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { CheckCircle2, RefreshCw, WifiOff } from 'lucide-react'
 import { getLocationSummary } from '../lib/api'
-import PageHeader from '../components/PageHeader'
-import Badge from '../components/Badge'
+import {
+  Badge, Button, Card, ErrorState, Loading, PageHeader, Table, TableBody, TableCell,
+  TableEmptyRow, TableHead, TableHeaderCell, TableRow, useChartTheme,
+} from '../components/ui'
 
 const MADRID: [number, number] = [40.4168, -3.7038]
 
@@ -40,7 +43,18 @@ function FitOnce({ points }: { points: [number, number][] }) {
 }
 
 export default function Location() {
-  const { data: locs = [], isLoading, error } = useQuery({
+  // Leaflet renders to a canvas and needs concrete colour values, not classes:
+  // resolve the token ramp at runtime so the marker/circle follow the theme
+  // (see STYLE_GUIDE §12 "Leaflet dark tiles"). `useChartTheme` re-evaluates
+  // when the `.dark` class flips.
+  const chart = useChartTheme()
+
+  const {
+    data: locs = [],
+    isLoading,
+    error,
+    refetch,
+  } = useQuery({
     queryKey: ['location-summary'],
     queryFn: getLocationSummary,
     refetchInterval: 3_000,
@@ -59,19 +73,28 @@ export default function Location() {
   const idleCount = locs.length - reachableCount
 
   return (
-    <div className="p-6">
+    <div className="space-y-6 p-6">
       <PageHeader
+        eyebrow="Test UEs"
         title="UE Location"
         subtitle="Live Cell-ID positioning via LMF (Nlmf_Location DetermineLocation — TS 29.572 §5.2.2.2)"
         action={
-          <div className="flex gap-2 text-xs">
-            <Badge label={`${reachableCount} located`} variant="green" />
-            <Badge label={`${idleCount} idle/unreachable`} variant="yellow" />
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              label={`${reachableCount} located`}
+              variant="success"
+              icon={<CheckCircle2 size={12} />}
+            />
+            <Badge
+              label={`${idleCount} idle/unreachable`}
+              variant="warning"
+              icon={<WifiOff size={12} />}
+            />
           </div>
         }
       />
 
-      <div className="h-[460px] rounded-lg border border-gray-800 overflow-hidden mb-6">
+      <Card padded={false} className="h-[460px] overflow-hidden">
         <MapContainer center={MADRID} zoom={12} className="h-full w-full" scrollWheelZoom>
           <TileLayer
             attribution='&copy; OpenStreetMap contributors'
@@ -86,13 +109,23 @@ export default function Location() {
                   <Circle
                     center={pos}
                     radius={l.accuracy_m}
-                    pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.12, weight: 1 }}
+                    pathOptions={{
+                      color: chart.series[0],
+                      fillColor: chart.series[0],
+                      fillOpacity: 0.12,
+                      weight: 1,
+                    }}
                   />
                 ) : null}
                 <CircleMarker
                   center={pos}
                   radius={7}
-                  pathOptions={{ color: '#16a34a', fillColor: '#22c55e', fillOpacity: 0.9, weight: 2 }}
+                  pathOptions={{
+                    color: chart.series[2],
+                    fillColor: chart.series[2],
+                    fillOpacity: 0.9,
+                    weight: 2,
+                  }}
                 >
                   <Tooltip>
                     <div className="text-xs">
@@ -108,70 +141,82 @@ export default function Location() {
             )
           })}
         </MapContainer>
-      </div>
+      </Card>
 
-      {error ? (
-        <div className="text-sm text-red-400 mb-4">Failed to load locations: {(error as Error).message}</div>
-      ) : null}
-      <p className="text-xs text-gray-600 mb-3">
+      <p className="text-xs text-muted-fg">
         Map tiles are served from OpenStreetMap and require outbound internet access. Coordinates are
         synthesized by the LMF from the serving NR cell (Cell-ID positioning carries no lat/lon on the wire).
       </p>
 
-      <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-800 text-gray-400 text-xs uppercase">
-              <th className="px-4 py-3 text-left">SUPI</th>
-              <th className="px-4 py-3 text-left">Status</th>
-              <th className="px-4 py-3 text-left">NR Cell</th>
-              <th className="px-4 py-3 text-left">TAC / PLMN</th>
-              <th className="px-4 py-3 text-left">Latitude</th>
-              <th className="px-4 py-3 text-left">Longitude</th>
-              <th className="px-4 py-3 text-left">Accuracy</th>
-              <th className="px-4 py-3 text-left">Updated</th>
-            </tr>
-          </thead>
-          <tbody>
+      {error ? (
+        <ErrorState
+          title="Failed to load UE locations"
+          description={(error as Error).message}
+          action={
+            <Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      ) : (
+        <Table caption="UE location summary">
+          <TableHead>
+            <TableRow>
+              <TableHeaderCell>SUPI</TableHeaderCell>
+              <TableHeaderCell>Status</TableHeaderCell>
+              <TableHeaderCell>NR Cell</TableHeaderCell>
+              <TableHeaderCell>TAC / PLMN</TableHeaderCell>
+              <TableHeaderCell>Latitude</TableHeaderCell>
+              <TableHeaderCell>Longitude</TableHeaderCell>
+              <TableHeaderCell>Accuracy</TableHeaderCell>
+              <TableHeaderCell>Updated</TableHeaderCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {isLoading ? (
-              <tr><td colSpan={8} className="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
+              <TableEmptyRow colSpan={8}>
+                <Loading rows={3} label="Loading UE locations…" />
+              </TableEmptyRow>
             ) : locs.length === 0 ? (
-              <tr><td colSpan={8} className="px-4 py-6 text-center text-gray-500">No registered UEs</td></tr>
+              <TableEmptyRow colSpan={8}>No registered UEs</TableEmptyRow>
             ) : (
               locs.map(l => (
-                <tr key={l.supi} className="border-b border-gray-800/50 hover:bg-gray-800/30">
-                  <td className="px-4 py-3 font-mono text-xs text-blue-300" title={l.supi}>
-                    {shortSupi(l.supi)}
-                  </td>
-                  <td className="px-4 py-3">
+                <TableRow key={l.supi}>
+                  <TableCell mono title={l.supi}>
+                    <span aria-hidden="true">{shortSupi(l.supi)}</span>
+                    <span className="sr-only">{l.supi}</span>
+                  </TableCell>
+                  <TableCell>
                     {l.reachable ? (
-                      <Badge label="LOCATED" variant="green" />
+                      <Badge label="LOCATED" variant="success" icon={<CheckCircle2 size={12} />} />
                     ) : (
-                      <Badge label={l.cause || GMM_STATES[l.gmm_state] || 'UNREACHABLE'} variant="yellow" />
+                      <Badge
+                        label={l.cause || GMM_STATES[l.gmm_state] || 'UNREACHABLE'}
+                        variant="warning"
+                        icon={<WifiOff size={12} />}
+                      />
                     )}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-xs text-gray-300">{l.nr_cell_id || '—'}</td>
-                  <td className="px-4 py-3 font-mono text-xs text-gray-400">
+                  </TableCell>
+                  <TableCell mono className="text-muted-fg">
+                    {l.nr_cell_id || '—'}
+                  </TableCell>
+                  <TableCell mono className="text-muted-fg">
                     {l.reachable ? `${l.tac || '—'} / ${l.plmn || '—'}` : '—'}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-xs text-gray-300">
-                    {l.latitude != null ? l.latitude.toFixed(5) : '—'}
-                  </td>
-                  <td className="px-4 py-3 font-mono text-xs text-gray-300">
-                    {l.longitude != null ? l.longitude.toFixed(5) : '—'}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-gray-400">
+                  </TableCell>
+                  <TableCell mono>{l.latitude != null ? l.latitude.toFixed(5) : '—'}</TableCell>
+                  <TableCell mono>{l.longitude != null ? l.longitude.toFixed(5) : '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-fg">
                     {l.accuracy_m ? `±${Math.round(l.accuracy_m)} m` : '—'}
-                  </td>
-                  <td className="px-4 py-3 text-xs text-gray-500">
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-fg">
                     {new Date(l.timestamp).toLocaleTimeString()}
-                  </td>
-                </tr>
+                  </TableCell>
+                </TableRow>
               ))
             )}
-          </tbody>
-        </table>
-      </div>
+          </TableBody>
+        </Table>
+      )}
     </div>
   )
 }

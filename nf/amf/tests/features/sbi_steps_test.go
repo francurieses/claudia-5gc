@@ -210,10 +210,18 @@ func (w *sbiWorld) problemCauseIs(cause string) error {
 	return nil
 }
 
+// sbiW is package-level (not a local var inside initAMFSBISteps) so the
+// shared "the response status is (\d+)" step in
+// public_warning_system_steps_test.go (sharedResponseStatusIs) can dispatch
+// to it. Godog silently resolves duplicate step regexes to the
+// first-registered match rather than erroring outside strict mode, so this
+// text is deliberately registered exactly once, not once per world.
+var sbiW = &sbiWorld{}
+
 // initAMFSBISteps registers all in-process AMF SBI steps. Called from
 // InitializeScenario in steps_test.go.
 func initAMFSBISteps(sc *godog.ScenarioContext) {
-	w := &sbiWorld{}
+	w := sbiW
 	sc.Before(func(ctx context.Context, _ *godog.Scenario) (context.Context, error) {
 		w.reset()
 		return ctx, nil
@@ -241,7 +249,9 @@ func initAMFSBISteps(sc *godog.ScenarioContext) {
 	sc.Step(`^the AMF emits an NGAP Paging for the UE$`, w.pagingEmitted)
 	sc.Step(`^the AMF does not emit a Paging$`, w.pagingNotEmitted)
 
-	// Shared assertions
-	sc.Step(`^the response status is (\d+)$`, w.statusIs)
+	// Shared assertions. "the response status is (\d+)" is registered once,
+	// in public_warning_system_steps_test.go (sharedResponseStatusIs), and
+	// dispatches to sbiW.statusIs or pwsW below depending on which world was
+	// active for the running scenario -- see that file for why.
 	sc.Step(`^the problem detail cause is "([^"]+)"$`, w.problemCauseIs)
 }

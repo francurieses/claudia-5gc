@@ -1,9 +1,27 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Play, Square, RotateCcw, Loader } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { CheckCircle2, Circle, Loader, Play, RefreshCw, RotateCcw, Square, XCircle } from 'lucide-react'
 import { getServices, startService, stopService, restartService } from '../lib/api'
-import PageHeader from '../components/PageHeader'
-import Badge from '../components/Badge'
+import {
+  Badge,
+  Button,
+  DegradedState,
+  EmptyState,
+  IconButton,
+  Loading,
+  PageHeader,
+  Spinner,
+  Table,
+  TableBody,
+  TableCell,
+  TableEmptyRow,
+  TableHead,
+  TableHeaderCell,
+  TableRow,
+  useToast,
+} from '../components/ui'
+import type { BadgeVariant } from '../components/ui'
 
 const NF_ORDER = ['nrf', 'amf', 'ausf', 'udm', 'udr', 'smf', 'pcf', 'upf', 'nssf',
   'postgres', 'redis', 'prometheus', 'loki', 'grafana', 'jaeger', 'mgmt-portal']
@@ -17,21 +35,65 @@ function sortSvcs(a: { name: string }, b: { name: string }) {
   return ai - bi
 }
 
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Map a Docker container state onto a semantic badge.
+ *
+ * Status is carried by colour **and** an icon **and** the text label, never by
+ * colour alone (WCAG 1.4.1 — see `web/STYLE_GUIDE.md` § Components/Badge).
+ * While a start/stop/restart mutation is in flight the pending verb replaces the
+ * state so the operator sees which action is running.
+ */
+function stateBadge(state: string, pendingLabel?: string): { variant: BadgeVariant; icon: ReactNode; label: string } {
+  if (pendingLabel) {
+    return {
+      variant: 'warning',
+      icon: <Loader size={12} className="animate-spin" />,
+      label: pendingLabel,
+    }
+  }
+  switch (state) {
+    case 'running':
+      return { variant: 'success', icon: <CheckCircle2 size={12} />, label: state }
+    case 'exited':
+    case 'dead':
+      return { variant: 'danger', icon: <XCircle size={12} />, label: state }
+    default:
+      return { variant: 'neutral', icon: <Circle size={12} />, label: state }
+  }
+}
+
 export default function Services() {
   const qc = useQueryClient()
+  const { toast } = useToast()
   const [pending, setPending] = useState<Record<string, string>>({})
 
-  const { data: services = [], isLoading, refetch } = useQuery({
+  const { data: services = [], isLoading, isError, error, refetch } = useQuery({
     queryKey: ['services'],
     queryFn: getServices,
     refetchInterval: 5_000,
   })
 
+  const clearPending = (name: string) =>
+    setPending(p => { const copy = { ...p }; delete copy[name]; return copy })
+
+  const failed = (verb: string) => (err: unknown, name: string) =>
+    toast({
+      variant: 'error',
+      title: `${verb} failed`,
+      description: `${name}: ${errMessage(err)}`,
+      duration: 0,
+    })
+
   const startMut = useMutation({
     mutationFn: (name: string) => startService(name),
     onMutate: (name) => setPending(p => ({ ...p, [name]: 'starting' })),
+    onError: failed('Start'),
     onSettled: (_, __, name) => {
-      setPending(p => { const copy = { ...p }; delete copy[name]; return copy })
+      clearPending(name)
       qc.invalidateQueries({ queryKey: ['services'] })
     },
   })
@@ -39,8 +101,9 @@ export default function Services() {
   const stopMut = useMutation({
     mutationFn: (name: string) => stopService(name),
     onMutate: (name) => setPending(p => ({ ...p, [name]: 'stopping' })),
+    onError: failed('Stop'),
     onSettled: (_, __, name) => {
-      setPending(p => { const copy = { ...p }; delete copy[name]; return copy })
+      clearPending(name)
       qc.invalidateQueries({ queryKey: ['services'] })
     },
   })
@@ -48,8 +111,9 @@ export default function Services() {
   const restartMut = useMutation({
     mutationFn: (name: string) => restartService(name),
     onMutate: (name) => setPending(p => ({ ...p, [name]: 'restarting' })),
+    onError: failed('Restart'),
     onSettled: (_, __, name) => {
-      setPending(p => { const copy = { ...p }; delete copy[name]; return copy })
+      clearPending(name)
       qc.invalidateQueries({ queryKey: ['services'] })
     },
   })
@@ -60,118 +124,108 @@ export default function Services() {
   return (
     <div className="p-6">
       <PageHeader
+        eyebrow="Runtime"
         title="Services"
-        subtitle={`${running} / ${services.length} containers running`}
+        subtitle={isError ? 'Container list unavailable' : `${running} / ${services.length} containers running`}
         action={
-          <button
-            onClick={() => refetch()}
-            className="flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-sm rounded-md"
-          >
-            <RotateCcw size={14} /> Refresh
-          </button>
+          <Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => refetch()}>
+            Refresh
+          </Button>
         }
       />
 
-      <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-gray-800 text-gray-400 text-xs uppercase">
-              <th className="px-4 py-3 text-left">Container</th>
-              <th className="px-4 py-3 text-left">Image</th>
-              <th className="px-4 py-3 text-left">State</th>
-              <th className="px-4 py-3 text-left">Status</th>
-              <th className="px-4 py-3 text-left">Uptime</th>
-              <th className="px-4 py-3 text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
+      {isError ? (
+        <DegradedState
+          title="Docker socket unavailable"
+          description={`The portal could not list containers: ${errMessage(error)}. Container control needs the Docker socket mounted (CLAUDE.md §10).`}
+          action={
+            <Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => refetch()}>
+              Retry
+            </Button>
+          }
+        />
+      ) : !isLoading && sorted.length === 0 ? (
+        <EmptyState
+          title="No containers found"
+          description="Docker returned no containers. Check that the Docker socket is mounted and the stack is running (CLAUDE.md §10)."
+          action={
+            <Button variant="secondary" size="sm" icon={<RefreshCw size={14} />} onClick={() => refetch()}>
+              Refresh
+            </Button>
+          }
+        />
+      ) : (
+        <Table caption="Containers">
+          <TableHead>
+            <TableRow>
+              <TableHeaderCell>Container</TableHeaderCell>
+              <TableHeaderCell>Image</TableHeaderCell>
+              <TableHeaderCell>State</TableHeaderCell>
+              <TableHeaderCell>Status</TableHeaderCell>
+              <TableHeaderCell>Uptime</TableHeaderCell>
+              <TableHeaderCell className="text-right">Actions</TableHeaderCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
             {isLoading ? (
-              <tr><td colSpan={6} className="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
-            ) : sorted.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-gray-500">
-                  No containers found. Is Docker socket mounted?
-                </td>
-              </tr>
+              <TableEmptyRow colSpan={6}>
+                <Loading rows={4} label="Loading containers…" />
+              </TableEmptyRow>
             ) : (
               sorted.map(svc => {
                 const p = pending[svc.name]
+                const badge = stateBadge(svc.state, p)
                 return (
-                  <tr key={svc.name} className="border-b border-gray-800/50 hover:bg-gray-800/30">
-                    <td className="px-4 py-3 font-medium text-white">{svc.name}</td>
-                    <td className="px-4 py-3 text-xs text-gray-400 font-mono truncate max-w-[200px]">
-                      {svc.image}
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge
-                        label={p ?? svc.state}
-                        variant={
-                          p ? 'yellow' :
-                          svc.state === 'running' ? 'green' :
-                          svc.state === 'exited' ? 'red' : 'gray'
-                        }
-                      />
-                    </td>
-                    <td className="px-4 py-3 text-xs text-gray-400">{svc.status}</td>
-                    <td className="px-4 py-3 text-xs text-gray-400">{svc.uptime || '—'}</td>
-                    <td className="px-4 py-3">
+                  <TableRow key={svc.name}>
+                    <TableCell className="font-medium text-fg">{svc.name}</TableCell>
+                    <TableCell mono className="max-w-[200px] truncate">{svc.image}</TableCell>
+                    <TableCell>
+                      <Badge label={badge.label} variant={badge.variant} icon={badge.icon} />
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-fg">{svc.status}</TableCell>
+                    <TableCell className="text-xs text-muted-fg">{svc.uptime || '—'}</TableCell>
+                    <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1.5">
                         {p ? (
-                          <Loader size={14} className="animate-spin text-gray-400" />
+                          <Spinner size={16} label={`${p}: ${svc.name}`} />
                         ) : (
                           <>
                             {svc.state !== 'running' && (
-                              <ActionBtn
+                              <IconButton
+                                label={`Start ${svc.name}`}
+                                variant="ghost"
                                 onClick={() => startMut.mutate(svc.name)}
-                                title="Start"
-                                icon={<Play size={12} />}
-                                color="text-green-400 hover:bg-green-900/30"
-                              />
+                              >
+                                <Play size={14} />
+                              </IconButton>
                             )}
                             {svc.state === 'running' && (
-                              <ActionBtn
+                              <IconButton
+                                label={`Stop ${svc.name}`}
+                                variant="ghost"
                                 onClick={() => stopMut.mutate(svc.name)}
-                                title="Stop"
-                                icon={<Square size={12} />}
-                                color="text-red-400 hover:bg-red-900/30"
-                              />
+                              >
+                                <Square size={14} />
+                              </IconButton>
                             )}
-                            <ActionBtn
+                            <IconButton
+                              label={`Restart ${svc.name}`}
+                              variant="ghost"
                               onClick={() => restartMut.mutate(svc.name)}
-                              title="Restart"
-                              icon={<RotateCcw size={12} />}
-                              color="text-yellow-400 hover:bg-yellow-900/30"
-                            />
+                            >
+                              <RotateCcw size={14} />
+                            </IconButton>
                           </>
                         )}
                       </div>
-                    </td>
-                  </tr>
+                    </TableCell>
+                  </TableRow>
                 )
               })
             )}
-          </tbody>
-        </table>
-      </div>
+          </TableBody>
+        </Table>
+      )}
     </div>
-  )
-}
-
-function ActionBtn({
-  onClick, title, icon, color,
-}: {
-  onClick: () => void
-  title: string
-  icon: React.ReactNode
-  color: string
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className={`p-1.5 rounded transition-colors ${color}`}
-    >
-      {icon}
-    </button>
   )
 }

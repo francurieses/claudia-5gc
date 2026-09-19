@@ -3,7 +3,48 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>ClaudIA 5GC Management Portal</title>
+
+    <!--
+      Anti-FOUC theme bootstrap — MUST be an inline, synchronous <script> placed
+      before any stylesheet so `html.dark` is set before first paint.
+      Contract (mirrored by `src/lib/theme.ts`):
+        - `localStorage.theme` ∈ {"light","dark"} wins (explicit user choice);
+        - otherwise the OS `prefers-color-scheme` decides (first visit).
+      Keep in sync with STORAGE_KEY in src/lib/theme.ts.
+    -->
+    <script>
+      ;(function () {
+        var root = document.documentElement
+        var dark = false
+        try {
+          var stored = localStorage.getItem('theme')
+          dark =
+            stored === 'dark' ||
+            (stored !== 'light' &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches)
+        } catch (e) {
+          // Storage blocked (private mode): fall back to the OS preference,
+          // exactly like a first visit — never throw, never force light.
+          try {
+            dark = window.matchMedia('(prefers-color-scheme: dark)').matches
+          } catch (e2) {
+            dark = false
+          }
+        }
+        root.classList.toggle('dark', dark)
+        root.style.colorScheme = dark ? 'dark' : 'light'
+      })()
+    </script>
+
+    <!-- Typography: Fira Sans (body) + Fira Code (mono). Projector-safe weights only. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@400;500;600;700&display=swap"
+    />
   </head>
   <body>
     <div id="root"></div>

@@ -39,7 +39,7 @@ the subscriber starts using a new application/service is **URSP steering**:
 > The **modified UERANSIM** in this repo implements URSP delivery + evaluation: step 3 is now a
 > real UE-side decision via `nr-cli <ue> -e "ursp-establish <dnn|app>"`, which picks the
 > S-NSSAI/DNN/SSC mode from the matched URSP rule. See
-> `docs/procedures/ueransim-modifications.md` (`tools/ueransim/patches/0010,0020`).
+> `tools/ueransim/FEATURES.md` (`tools/ueransim/patches/0010,0020`).
 
 ## 2. Sequence
 

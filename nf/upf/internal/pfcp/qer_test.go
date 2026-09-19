@@ -32,6 +32,20 @@ func startTestUPF(t *testing.T) (*Server, *SessionTable, *net.UDPAddr, context.C
 	}
 }
 
+// qerSnapshot returns a copy of the session's QER read under the table lock.
+// The UPF server mutates sess.QER from its own dispatch goroutine under
+// table.mu; the test must take the same lock to avoid a data race (the UDP
+// response does not establish a happens-before edge the race detector honours).
+func qerSnapshot(table *SessionTable, teid uint32) QERState {
+	table.mu.RLock()
+	defer table.mu.RUnlock()
+	s := table.byULTEID[teid]
+	if s == nil {
+		return QERState{}
+	}
+	return s.QER
+}
+
 func sendAndRecv(t *testing.T, addr *net.UDPAddr, msg pfcpmsg.Message) pfcpmsg.Message {
 	t.Helper()
 	conn, err := net.DialUDP("udp", nil, addr)
@@ -97,18 +111,18 @@ func TestSessionEstablishmentStoresQER(t *testing.T) {
 		t.Fatalf("expected SessionEstablishmentResponse, got %s", resp.MessageTypeName())
 	}
 
-	sess := table.GetByULTEID(ulTEID)
-	if sess == nil {
+	if table.GetByULTEID(ulTEID) == nil {
 		t.Fatal("session not stored")
 	}
-	if sess.QER.QERID != 1 || sess.QER.QFI != 1 {
-		t.Errorf("QER id/qfi: got %d/%d want 1/1", sess.QER.QERID, sess.QER.QFI)
+	qer := qerSnapshot(table, ulTEID)
+	if qer.QERID != 1 || qer.QFI != 1 {
+		t.Errorf("QER id/qfi: got %d/%d want 1/1", qer.QERID, qer.QFI)
 	}
-	if sess.QER.MBRULKbps != 100_000 || sess.QER.MBRDLKbps != 100_000 {
-		t.Errorf("QER MBR: got %d/%d want 100000/100000", sess.QER.MBRULKbps, sess.QER.MBRDLKbps)
+	if qer.MBRULKbps != 100_000 || qer.MBRDLKbps != 100_000 {
+		t.Errorf("QER MBR: got %d/%d want 100000/100000", qer.MBRULKbps, qer.MBRDLKbps)
 	}
-	if sess.QER.GateUL != 0 || sess.QER.GateDL != 0 {
-		t.Errorf("QER gates: got %d/%d want OPEN/OPEN (0/0)", sess.QER.GateUL, sess.QER.GateDL)
+	if qer.GateUL != 0 || qer.GateDL != 0 {
+		t.Errorf("QER gates: got %d/%d want OPEN/OPEN (0/0)", qer.GateUL, qer.GateDL)
 	}
 
 	// NW-initiated QoS modification: new MBR via Update QER.
@@ -125,7 +139,8 @@ func TestSessionEstablishmentStoresQER(t *testing.T) {
 	if _, ok := resp.(*pfcpmsg.SessionModificationResponse); !ok {
 		t.Fatalf("expected SessionModificationResponse, got %s", resp.MessageTypeName())
 	}
-	if sess.QER.MBRULKbps != 50_000 || sess.QER.MBRDLKbps != 200_000 {
-		t.Errorf("QER MBR after update: got %d/%d want 50000/200000", sess.QER.MBRULKbps, sess.QER.MBRDLKbps)
+	qer = qerSnapshot(table, ulTEID)
+	if qer.MBRULKbps != 50_000 || qer.MBRDLKbps != 200_000 {
+		t.Errorf("QER MBR after update: got %d/%d want 50000/200000", qer.MBRULKbps, qer.MBRDLKbps)
 	}
 }

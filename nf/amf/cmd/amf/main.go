@@ -917,6 +917,171 @@ func main() {
 		})
 	})
 
+	// ---- Public Warning System (PWS) — TS 38.413 §8.9 ----------------------
+	// The management portal plays the CBC role over this internal mgmt API;
+	// there is no standardized 3GPP CBC↔AMF wire protocol for 5GC (SBc-AP is
+	// EPC-only). Only the AMF↔gNB hop is spec-encoded NGAP.
+	// Ref: docs/procedures/PublicWarningSystem.md
+
+	// POST /amf/v1/pws/broadcast — CBC submits a Write-Replace Warning broadcast.
+	// Any omitted IE is filled with a 3GPP-legal MVP default (TS 23.041 §9.4).
+	// Returns 202 even with zero connected gNBs (TS 38.413 §8.9.1 note).
+	mgmtMux.HandleFunc("POST /amf/v1/pws/broadcast", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MessageIdentifier   *uint16 `json:"messageIdentifier"`
+			SerialNumber        *uint16 `json:"serialNumber"`
+			RepetitionPeriod    *int64  `json:"repetitionPeriod"`
+			NumberOfBroadcasts  *int64  `json:"numberOfBroadcastsRequested"`
+			WarningType         string  `json:"warningType"`         // 4 hex chars (2 octets), e.g. "1000"
+			WarningSecurityInfo string  `json:"warningSecurityInfo"` // 100 hex chars (50 octets); omitted ⇒ zero-filled
+			DataCodingScheme    *int    `json:"dataCodingScheme"`
+			Language            string  `json:"language"` // 2-char ISO 639 code for the UCS2 language-indication prefix (DCS 0x11); ignored for GSM7 coding-group DCS
+			MessageText         string  `json:"messageText"`
+			WarningAreaTACs     []int   `json:"warningAreaTacs"` // omitted ⇒ AMF's configured ServedTACs
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		params := ngap.WriteReplaceWarningParams{
+			RepetitionPeriod:       ngap.DefaultRepetitionPeriod,
+			NumberOfBroadcasts:     ngap.DefaultNumberOfBroadcasts,
+			LanguageISO639:         req.Language,
+			WarningMessageContents: []byte(req.MessageText),
+		}
+		if req.MessageIdentifier != nil {
+			params.MessageIdentifier = *req.MessageIdentifier
+		} else {
+			// TS 23.041 §9.4.1.2.2: ETWS primary-notification-scoped default.
+			params.MessageIdentifier = 0x1112
+		}
+		if req.SerialNumber != nil {
+			params.SerialNumber = *req.SerialNumber
+		} else {
+			params.SerialNumber = 1
+		}
+		if req.RepetitionPeriod != nil {
+			params.RepetitionPeriod = *req.RepetitionPeriod
+		}
+		if req.NumberOfBroadcasts != nil {
+			params.NumberOfBroadcasts = *req.NumberOfBroadcasts
+		}
+		if b, err := hex.DecodeString(req.WarningType); err == nil && len(b) == ngap.WarningTypeLength {
+			copy(params.WarningType[:], b)
+		} else {
+			// ETWS "Other" test value + emergency-user-alert/popup bits. TS 23.041 §9.4.1.2.6.
+			params.WarningType = [ngap.WarningTypeLength]byte{0x10, 0x00}
+		}
+		if b, err := hex.DecodeString(req.WarningSecurityInfo); err == nil && len(b) == ngap.WarningSecurityInfoLength {
+			copy(params.WarningSecurityInfo[:], b)
+		} // else leave zero-filled — dev placeholder, not a real signature (TS 23.041 §9.4.1.2.7)
+		if req.DataCodingScheme != nil {
+			params.DataCodingScheme = byte(*req.DataCodingScheme)
+		} else {
+			// TS 23.038 §5 Table 5: 0x00 means language "German", not
+			// unspecified — 0x0F (bits3-0=1111) is the "language unspecified"
+			// codepoint in the GSM7 language-indication coding group.
+			params.DataCodingScheme = 0x0F
+		}
+		if len(params.WarningMessageContents) == 0 {
+			params.WarningMessageContents = []byte("Emergency alert")
+		}
+
+		tacs := req.WarningAreaTACs
+		if len(tacs) == 0 {
+			for _, tac := range cfg.ServedTACs {
+				tacs = append(tacs, int(tac))
+			}
+		}
+		plmn := ngap.PLMNFromMCCMNC(cfg.PLMN.MCC, cfg.PLMN.MNC)
+		for _, tac := range tacs {
+			params.TAIs = append(params.TAIs, ngap.TAIForPaging{PLMN: plmn, TAC: uint32(tac)})
+		}
+
+		targeted, err := ngapSrv.SendWriteReplaceWarning(r.Context(), params)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		logger.Info("Write-Replace Warning broadcast submitted",
+			"message_identifier", params.MessageIdentifier,
+			"serial_number", params.SerialNumber,
+			"gnbs_targeted", targeted,
+			"procedure", "PublicWarningSystem",
+			"spec_ref", "TS 38.413 §8.9.1",
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messageIdentifier": params.MessageIdentifier,
+			"serialNumber":      params.SerialNumber,
+			"gnbs_targeted":     targeted,
+		})
+	})
+
+	// POST /amf/v1/pws/cancel — CBC stops an active broadcast.
+	// 202 if the (messageIdentifier, serialNumber) is known; 404 if unknown/
+	// already-completed (TS 23.041 §9.3.2 correlation failure).
+	mgmtMux.HandleFunc("POST /amf/v1/pws/cancel", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MessageIdentifier        uint16 `json:"messageIdentifier"`
+			SerialNumber             uint16 `json:"serialNumber"`
+			CancelAllWarningMessages bool   `json:"cancelAllWarningMessages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		targeted, err := ngapSrv.SendPWSCancel(r.Context(), req.MessageIdentifier, req.SerialNumber, req.CancelAllWarningMessages)
+		if errors.Is(err, ngap.ErrPWSBroadcastNotFound) {
+			http.Error(w, "unknown or already-completed broadcast", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		logger.Info("PWS Cancel submitted",
+			"message_identifier", req.MessageIdentifier,
+			"serial_number", req.SerialNumber,
+			"gnbs_targeted", targeted,
+			"procedure", "PublicWarningSystem",
+			"spec_ref", "TS 38.413 §8.9.2",
+		)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messageIdentifier": req.MessageIdentifier,
+			"serialNumber":      req.SerialNumber,
+			"gnbs_targeted":     targeted,
+		})
+	})
+
+	// GET /amf/v1/pws/broadcast — list every PWS broadcast the AMF has recorded.
+	mgmtMux.HandleFunc("GET /amf/v1/pws/broadcast", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ngapSrv.PWSList())
+	})
+
+	// GET /amf/v1/pws/broadcast/{messageId}/{serialNumber} — poll one broadcast's
+	// per-gNB completion status.
+	mgmtMux.HandleFunc("GET /amf/v1/pws/broadcast/{messageId}/{serialNumber}", func(w http.ResponseWriter, r *http.Request) {
+		msgID, err1 := strconv.ParseUint(r.PathValue("messageId"), 10, 16)
+		serial, err2 := strconv.ParseUint(r.PathValue("serialNumber"), 10, 16)
+		if err1 != nil || err2 != nil {
+			http.Error(w, "invalid messageId/serialNumber", http.StatusBadRequest)
+			return
+		}
+		status, ok := ngapSrv.PWSStatus(uint16(msgID), uint16(serial))
+		if !ok {
+			http.Error(w, "unknown broadcast", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(status)
+	})
+
 	// NW-initiated PDU Session Release: DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}
 	// Also handles GET /amf/v1/ue-contexts/ (Go's ServeMux redirects the no-slash
 	// form to this subtree root when a method-less subtree handler exists).

@@ -68,6 +68,12 @@ export interface UEContext {
 export interface MetricsSummary {
   ue_registered: number
   pdu_sessions: number
+  /**
+   * Instant 5-minute success rates (PORTAL-UI-21). `null` means the window had
+   * no data (or the ratio was NaN) — render "—", never a fake 0%/100%.
+   */
+  registration_success_pct: number | null
+  pdu_session_establishment_success_pct: number | null
   procedure_rates: Record<string, number>
   nf_up: Record<string, boolean>
 }
@@ -166,6 +172,51 @@ export const getUELocation = (supi: string) =>
 // ---- Metrics -------------------------------------------------------------
 
 export const getMetricsSummary = () => request<MetricsSummary>('GET', '/metrics/summary')
+
+/**
+ * Curated time-series metrics (PORTAL-UI-17). The keys MUST mirror the backend
+ * whitelist in `internal/api/metrics.go` (`rangeMetrics`) — the endpoint accepts
+ * one of these identifiers, never arbitrary PromQL.
+ */
+export type MetricsMetric =
+  | 'ue_registered'
+  | 'ue_registered_by_slice'
+  | 'amf_registrations'
+  | 'registration_success_rate'
+  | 'procedure_rates_by_result'
+  | 'sbi_request_rate'
+  | 'sbi_latency_p99'
+  | 'pdu_sessions_active'
+  | 'authentication_rate'
+  | 'upf_gtp_throughput'
+
+/** One `[unix_seconds, value]` sample of a range series. */
+export type MetricsRangePoint = [number, number]
+
+export interface MetricsRangeSeries {
+  /** Prometheus-style name, e.g. `procedure_rates_by_result{result="OK"}`. */
+  name: string
+  points: MetricsRangePoint[]
+}
+
+export interface MetricsRange {
+  metric: MetricsMetric
+  /** Effective downsample step in seconds (server-computed when omitted). */
+  step: number
+  series: MetricsRangeSeries[]
+}
+
+/**
+ * Range query over the curated metrics backend. `from`/`to` are sent as
+ * RFC3339; the server computes a downsampled step when none is given.
+ * Rejections are HTTP errors: 400 (unknown metric / malformed range / beyond
+ * retention), 502 (Prometheus error), 503 (Prometheus not configured).
+ */
+export const getMetricsRange = (metric: MetricsMetric, from: Date, to: Date, step?: number) => {
+  const params = new URLSearchParams({ metric, from: from.toISOString(), to: to.toISOString() })
+  if (step !== undefined) params.set('step', String(step))
+  return request<MetricsRange>('GET', `/metrics/range?${params.toString()}`)
+}
 
 // ---- PCAP ----------------------------------------------------------------
 
@@ -365,6 +416,7 @@ export interface DNNInfo {
   tun_addr?: string
   gateway_ip?: string
   docker_network?: string
+  ue_ipv6_prefix?: string
 }
 
 export interface DNNListResponse {
@@ -387,11 +439,17 @@ export interface DeleteDNNResult {
   docker_errors: string[]
 }
 
+export interface UpdateDNNResult {
+  name: string
+  restarted: string[]
+  docker_errors: string[]
+}
+
 export const getDNNs = () => request<DNNListResponse>('GET', '/dnns')
 export const addDNN = (dnn: Omit<DNNInfo, 'tun_name' | 'tun_addr' | 'gateway_ip' | 'docker_network'>, restart = false) =>
   request<AddDNNResult>('POST', '/dnns', { ...dnn, restart })
-export const updateDNN = (name: string, description: string) =>
-  request<{ name: string }>('PUT', `/dnns/${encodeURIComponent(name)}`, { description })
+export const updateDNN = (name: string, body: { description: string; ue_ipv6_prefix: string; restart: boolean }) =>
+  request<UpdateDNNResult>('PUT', `/dnns/${encodeURIComponent(name)}`, body)
 export const deleteDNN = (name: string, restart = false) =>
   request<DeleteDNNResult>('DELETE', `/dnns/${encodeURIComponent(name)}?restart=${restart}`)
 
@@ -474,6 +532,8 @@ export const getSubscriptionQoS = (supi: string) =>
 
 // ---- NW-triggered additional PDU session (URSP-based — TS 23.503 §6.6.2) ---
 
+export type PDUSessionType = 'IPv4' | 'IPv6' | 'IPv4v6'
+
 export interface NWSessionRequest {
   supi: string
   app: string
@@ -484,6 +544,7 @@ export interface NWSessionRequest {
   '5qi': number
   ambr_uplink?: string
   ambr_downlink?: string
+  pdu_session_type?: PDUSessionType
 }
 
 export interface NWSessionStep {
@@ -505,3 +566,63 @@ export interface NWSessionResult {
 
 export const triggerNWSession = (body: NWSessionRequest) =>
   request<NWSessionResult>('POST', '/qos/nw-sessions', body)
+
+// ---- Public Warning System (ETWS/CMAS — TS 38.413 §8.9, TS 23.041) --------
+
+export interface PWSBroadcastRequest {
+  messageIdentifier?: number
+  serialNumber?: number
+  repetitionPeriod?: number
+  numberOfBroadcastsRequested?: number
+  warningType?: string // 2-octet hex, e.g. "0000"
+  dataCodingScheme?: number
+  language?: string // ISO 639 code for the UCS2 language-indication prefix (DCS 0x11); ignored for GSM7 coding-group DCS
+  messageText?: string
+  warningAreaTacs?: number[]
+}
+
+export interface PWSBroadcastAck {
+  messageIdentifier: number
+  serialNumber: number
+  gnbs_targeted: number
+}
+
+export interface PWSArea {
+  mcc: string
+  mnc: string
+  tac: number
+}
+
+export interface PWSGNBStatus {
+  gnb_addr?: string
+  gnb_name?: string
+  completed?: boolean
+  cancelled?: boolean
+  failed?: boolean
+  areas?: PWSArea[]
+}
+
+export interface PWSBroadcastStatus {
+  message_identifier: number
+  serial_number: number
+  data_coding_scheme?: number
+  language?: string
+  warning_type?: string
+  message_text?: string
+  gnbs_targeted: number
+  gnbs_completed: number
+  gnbs_cancelled: number
+  cancelled: boolean
+  live?: boolean // AMF currently has runtime state for this warning (false after an AMF restart)
+  stored?: boolean // persisted in the CBC store of record
+  created_at?: string
+  per_gnb?: PWSGNBStatus[]
+}
+
+export const pwsBroadcast = (body: PWSBroadcastRequest) =>
+  request<PWSBroadcastAck>('POST', '/pws/broadcast', body)
+export const pwsCancel = (messageIdentifier: number, serialNumber: number) =>
+  request<PWSBroadcastAck>('POST', '/pws/cancel', { messageIdentifier, serialNumber })
+export const pwsResend = (messageIdentifier: number, serialNumber: number) =>
+  request<PWSBroadcastAck>('POST', '/pws/resend', { messageIdentifier, serialNumber })
+export const getPWSBroadcasts = () => request<PWSBroadcastStatus[]>('GET', '/pws/broadcast')

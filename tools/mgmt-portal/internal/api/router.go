@@ -2,7 +2,11 @@
 package api
 
 import (
+	"bytes"
+	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -79,6 +83,7 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 
 		// Metrics
 		r.Get("/metrics/summary", deps.handleMetricsSummary)
+		r.Get("/metrics/range", deps.handleMetricsRange)
 
 		// PCAP
 		r.Get("/pcap/status", deps.handlePCAPStatus)
@@ -116,6 +121,12 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		// NW-triggered additional PDU session (URSP-based — TS 23.503 §6.6.2)
 		r.Post("/qos/nw-sessions", deps.handleNWSessionTrigger)
 
+		// Public Warning System (ETWS/CMAS — TS 38.413 §8.9, TS 23.041)
+		r.Post("/pws/broadcast", deps.handlePWSBroadcast)
+		r.Get("/pws/broadcast", deps.handlePWSList)
+		r.Post("/pws/cancel", deps.handlePWSCancel)
+		r.Post("/pws/resend", deps.handlePWSResend) // re-drive a stored warning after AMF/gNB restart
+
 		// UE Location (Nlmf_Location DetermineLocation — TS 29.572 §5.2.2.2)
 		r.Get("/location/summary", deps.handleLocationSummary)
 		r.Get("/location/ue/{supi}", deps.handleGetUELocation)
@@ -145,8 +156,86 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 	// WebSocket log streaming
 	r.Get("/ws/logs/{container}", deps.handleLogsWS)
 
-	// Serve React SPA for all other routes
-	r.NotFound(http.FileServer(staticFS).ServeHTTP)
+	// Unmatched routes: serve the React SPA shell for deep links (F5), real
+	// static assets when present, JSON 404 for the API/WS namespaces.
+	r.NotFound(spaFallback(staticFS))
 
 	return r
+}
+
+// spaFallback handles every request no chi route matched — which includes
+// client-side routes such as /qos (chi's NotFound is invoked for unmatched
+// paths inside mounted subrouters too, so one handler covers /api/v1/…).
+//
+// Resolution order:
+//  1. API/WebSocket namespaces → always a machine-readable JSON 404. An
+//     unknown endpoint must not answer with the SPA shell (PRD problem #1 is
+//     about navigation, not about hiding API mistakes).
+//  2. A real asset on disk (hashed JS/CSS/fonts) → served as-is.
+//  3. A GET/HEAD navigation (Accept allows HTML) → index.html, so the
+//     client-side router can render the deep-linked view. `*/*` counts as
+//     accepting HTML so `curl` can be used to check deep links manually.
+//  4. Anything else → JSON 404.
+func spaFallback(staticFS http.FileSystem) http.HandlerFunc {
+	fileServer := http.FileServer(staticFS)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if isAPIPath(r.URL.Path) {
+			writeError(w, http.StatusNotFound, "not found")
+			return
+		}
+
+		if f, err := staticFS.Open(r.URL.Path); err == nil {
+			_ = f.Close()
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && acceptsHTML(r) {
+			serveSPAIndex(w, r, staticFS)
+			return
+		}
+
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+// isAPIPath reports whether p is inside the namespaces that must never fall
+// back to the SPA shell: the REST API and the WebSocket log stream.
+func isAPIPath(p string) bool {
+	return p == "/api" || strings.HasPrefix(p, "/api/") ||
+		p == "/ws" || strings.HasPrefix(p, "/ws/")
+}
+
+// acceptsHTML reports whether the Accept header allows an HTML response — the
+// signal a browser navigation sends and an XHR/fetch does not.
+func acceptsHTML(r *http.Request) bool {
+	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
+		mediaType := part
+		if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+			mediaType = mediaType[:i]
+		}
+		switch strings.TrimSpace(mediaType) {
+		case "text/html", "application/xhtml+xml", "*/*":
+			return true
+		}
+	}
+	return false
+}
+
+// serveSPAIndex writes the embedded index.html as the SPA shell. It 404s if the
+// asset is missing (an unbuilt dev bundle) rather than emitting an empty 200.
+func serveSPAIndex(w http.ResponseWriter, r *http.Request, staticFS http.FileSystem) {
+	f, err := staticFS.Open("/index.html")
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	defer f.Close() //nolint:errcheck
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read index.html")
+		return
+	}
+	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 }

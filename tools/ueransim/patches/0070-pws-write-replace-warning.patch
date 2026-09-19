@@ -1,0 +1,418 @@
+diff --git a/src/gnb/ngap/radio.cpp b/src/gnb/ngap/radio.cpp
+index 407e4cf..b8457be 100644
+--- a/src/gnb/ngap/radio.cpp
++++ b/src/gnb/ngap/radio.cpp
+@@ -24,6 +24,20 @@
+ #include <asn/ngap/ASN_NGAP_ProtocolIE-Field.h>
+ #include <asn/ngap/ASN_NGAP_ReportArea.h>
+ #include <asn/ngap/ASN_NGAP_UplinkUEAssociatedNRPPaTransport.h>
++#include <asn/ngap/ASN_NGAP_WriteReplaceWarningRequest.h>
++#include <asn/ngap/ASN_NGAP_WriteReplaceWarningResponse.h>
++#include <asn/ngap/ASN_NGAP_PWSCancelRequest.h>
++#include <asn/ngap/ASN_NGAP_PWSCancelResponse.h>
++#include <asn/ngap/ASN_NGAP_BroadcastCompletedAreaList.h>
++#include <asn/ngap/ASN_NGAP_BroadcastCancelledAreaList.h>
++#include <asn/ngap/ASN_NGAP_TAIBroadcastNR.h>
++#include <asn/ngap/ASN_NGAP_TAIBroadcastNR-Item.h>
++#include <asn/ngap/ASN_NGAP_TAICancelledNR.h>
++#include <asn/ngap/ASN_NGAP_TAICancelledNR-Item.h>
++#include <asn/ngap/ASN_NGAP_CompletedCellsInTAI-NR.h>
++#include <asn/ngap/ASN_NGAP_CompletedCellsInTAI-NR-Item.h>
++#include <asn/ngap/ASN_NGAP_CancelledCellsInTAI-NR.h>
++#include <asn/ngap/ASN_NGAP_CancelledCellsInTAI-NR-Item.h>
+ 
+ namespace nr::gnb
+ {
+@@ -498,4 +512,347 @@ void NgapTask::receiveDownlinkUEAssociatedNRPPaTransport(int amfId, ASN_NGAP_Dow
+     m_logger->info("Uplink UE-associated NRPPa Transport sent (E-CID APER)");
+ }
+ 
++// 5GC Rel-17 mod (0070): CBS Data Coding Scheme alphabet + GSM 7-bit default
++// alphabet decode, kept minimal (log-display only, not a full SMS/CBS stack)
++// but alphabet-correct so this gNB's log line matches what the CBC (portal)
++// actually broadcast. Mirrors nf/amf/internal/ngap/pws.go / shared/gsm7 —
++// keep both in sync if either changes. Ref: TS 23.038 §5, §6.1.2.2.1, §6.2.1.
++namespace
++{
++enum class CbsAlphabet
++{
++    GSM7,
++    EightBit,
++    UCS2
++};
++
++// TS 23.038 §5 CBS Data Coding Scheme coding-group table. Reserved/unhandled
++// groups fall back to GSM7 per the spec's own "any reserved coding shall be
++// assumed to be the GSM 7 bit default alphabet" instruction.
++CbsAlphabet CbsAlphabetFromDcs(uint8_t dcs)
++{
++    uint8_t group = dcs >> 4;
++    if (group == 0x0 || group == 0x2 || group == 0x3)
++        return CbsAlphabet::GSM7;
++    if (group == 0x1)
++        return (dcs & 0x0F) == 0 ? CbsAlphabet::GSM7 : CbsAlphabet::UCS2;
++    if (group >= 0x4 && group <= 0x7)
++    {
++        switch ((dcs >> 2) & 0x03)
++        {
++        case 0b01:
++            return CbsAlphabet::EightBit;
++        case 0b10:
++            return CbsAlphabet::UCS2;
++        default:
++            return CbsAlphabet::GSM7;
++        }
++    }
++    if (group == 0xF)
++        return (dcs & 0x04) ? CbsAlphabet::EightBit : CbsAlphabet::GSM7;
++    return CbsAlphabet::GSM7;
++}
++
++// CbsLanguageNameFromDcs mirrors shared/gsm7's LanguageNameFromCBSDCS: the
++// language a CBS DCS names via the GSM 7-bit language coding groups
++// (TS 23.038 §5, groups 0000/0010), or "" if the language is not in the DCS
++// (e.g. UCS2 0x11 carries it as an in-content prefix instead).
++const char *CbsLanguageNameFromDcs(uint8_t dcs)
++{
++    switch (dcs)
++    {
++    case 0x00: return "German";
++    case 0x01: return "English";
++    case 0x02: return "Italian";
++    case 0x03: return "French";
++    case 0x04: return "Spanish";
++    case 0x05: return "Dutch";
++    case 0x06: return "Swedish";
++    case 0x07: return "Danish";
++    case 0x08: return "Portuguese";
++    case 0x09: return "Finnish";
++    case 0x0A: return "Norwegian";
++    case 0x0B: return "Greek";
++    case 0x0C: return "Turkish";
++    case 0x0D: return "Hungarian";
++    case 0x0E: return "Polish";
++    case 0x0F: return "Unspecified";
++    case 0x20: return "Czech";
++    case 0x21: return "Hebrew";
++    case 0x22: return "Arabic";
++    case 0x23: return "Russian";
++    case 0x24: return "Icelandic";
++    default: return "";
++    }
++}
++
++// GSM 7 bit default alphabet basic table (TS 23.038 §6.2.1), ASCII-range
++// entries only — non-ASCII entries (è, é, Ä, …) fall back to '?' since this
++// helper only needs to produce a readable log line, not a byte-exact decode.
++// The escape code (0x1B) is displayed as a space (TS 23.038 §6.2.1 NOTE 1);
++// the extension table itself is not implemented here.
++char Gsm7SeptetToAscii(uint8_t septet)
++{
++    static const char kTable[128] = {
++        '@', '?', '$', '?', '?', '?', '?', '?', '?', '?', '\n', '?', '?', '\r', '?', '?',
++        '?', '_', '?', '?', '?', '?', '?', '?', '?', '?', '?', ' ' /*ESC*/, '?', '?', '?', '?',
++        ' ', '!', '"', '#', '?', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
++        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?',
++        '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O',
++        'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '?', '?', '?', '?', '?',
++        '?', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o',
++        'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '?', '?', '?', '?', '?',
++    };
++    return kTable[septet & 0x7F];
++}
++
++// TS 23.038 §6.1.2.2.1 septet unpacking, LSB-first — the exact inverse of
++// PackSeptets in shared/gsm7/gsm7.go.
++std::string Gsm7Unpack(const uint8_t *packed, size_t packedLen, int septetCount)
++{
++    std::string out;
++    out.reserve(septetCount);
++    for (int i = 0; i < septetCount; i++)
++    {
++        int bitPos = i * 7;
++        size_t bytePos = bitPos / 8;
++        int bitOffset = bitPos % 8;
++        uint8_t v = 0;
++        if (bytePos < packedLen)
++            v = packed[bytePos] >> bitOffset;
++        if (bitOffset > 1 && bytePos + 1 < packedLen)
++            v |= packed[bytePos + 1] << (8 - bitOffset);
++        out.push_back(Gsm7SeptetToAscii(v & 0x7F));
++    }
++    return out;
++}
++
++// UCS2: 2 bytes/char big-endian. BMP-only (no surrogate-pair handling); each
++// codepoint above ASCII is emitted as '?' so the log line stays valid UTF-8
++// without a full UTF-16->UTF-8 converter for what is a display-only path.
++std::string Ucs2Decode(const uint8_t *content, uint8_t usedLen)
++{
++    std::string out;
++    for (int j = 0; j + 1 < usedLen; j += 2)
++    {
++        uint16_t cp = (static_cast<uint16_t>(content[j]) << 8) | content[j + 1];
++        out.push_back(cp < 0x80 ? static_cast<char>(cp) : '?');
++    }
++    return out;
++}
++} // namespace
++
++// 5GC Rel-17 mod (0070): Public Warning System — Write-Replace Warning Request.
++// Decodes the ETWS/CMAS warning and answers with a Write-Replace Warning Response
++// carrying a BroadcastCompletedAreaList for this gNB's served NR cell.
++// Ref: TS 38.413 §8.9.1; TS 23.041.
++void NgapTask::receiveWriteReplaceWarningRequest(int amfId, ASN_NGAP_WriteReplaceWarningRequest *msg)
++{
++    auto *amf = findAmfContext(amfId);
++    if (amf == nullptr)
++        return;
++
++    auto *ieMsgId = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_MessageIdentifier);
++    auto *ieSerial = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_SerialNumber);
++    if (ieMsgId == nullptr || ieSerial == nullptr)
++    {
++        m_logger->err("Invalid Write-Replace Warning Request: missing MessageIdentifier/SerialNumber");
++        return;
++    }
++
++    int messageId = asn::GetBitStringInt<16>(ieMsgId->MessageIdentifier);
++    int serialNumber = asn::GetBitStringInt<16>(ieSerial->SerialNumber);
++
++    std::string warningType = "n/a";
++    auto *ieWarnType = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_WarningType);
++    if (ieWarnType != nullptr)
++        warningType = asn::GetOctetString(ieWarnType->WarningType).toHexString();
++
++    // DataCodingScheme (TS 23.038 §5) selects how WarningMessageContents' page
++    // bytes are interpreted. Default (no IE present) mirrors the AMF mgmt-API
++    // default: 0x0F, GSM7 language-unspecified.
++    uint8_t dcs = 0x0F;
++    auto *ieDcs = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_DataCodingScheme);
++    if (ieDcs != nullptr)
++        dcs = static_cast<uint8_t>(asn::GetBitStringInt<8>(ieDcs->DataCodingScheme));
++    CbsAlphabet alphabet = CbsAlphabetFromDcs(dcs);
++
++    // Language (TS 23.038 §5): named directly by the DCS for the GSM 7-bit
++    // coding groups; for UCS2 with DCS 0x11 it is a 2-octet ISO 639 prefix at
++    // the start of page 0, recovered during content decode below.
++    std::string language = CbsLanguageNameFromDcs(dcs);
++    const bool ucs2LangPrefix = (dcs == 0x11);
++
++    // WarningMessageContents wraps the text in the CBS Message Information Page
++    // structure (TS 23.041 §9.4.2.2.5): 1-octet Number-of-Pages, then that many
++    // (82-octet zero-padded content, 1-octet used-length) pages — the length
++    // octet is an *octet* count (TS 23.041 §9.3.20), not a character count,
++    // regardless of alphabet. Must mirror nf/amf/internal/ngap/pws.go's
++    // encode{GSM7,8Bit,UCS2}Pages exactly, or (for the framing) the first
++    // content byte gets misread as a page count (confirmed live via Wireshark
++    // flagging the un-wrapped form as a Malformed Packet), or (for the
++    // alphabet) the text decodes as packed-septet garbage instead of the
++    // broadcast text.
++    std::string warningText = "n/a";
++    auto *ieContents = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_WarningMessageContents);
++    if (ieContents != nullptr && ieContents->WarningMessageContents.buf != nullptr)
++    {
++        const uint8_t *buf = ieContents->WarningMessageContents.buf;
++        size_t size = ieContents->WarningMessageContents.size;
++        const size_t kPageContentLength = 82;
++        if (size >= 1)
++        {
++            int numPages = buf[0];
++            std::string decoded;
++            size_t off = 1;
++            for (int i = 0; i < numPages && off + kPageContentLength + 1 <= size; i++)
++            {
++                uint8_t usedLen = buf[off + kPageContentLength];
++                if (usedLen > kPageContentLength)
++                    usedLen = kPageContentLength;
++                const uint8_t *content = buf + off;
++                if (alphabet == CbsAlphabet::GSM7)
++                {
++                    // Octet-count -> septet-count is inherently ambiguous at
++                    // 8-septet boundaries (TS 23.041 §9.3.20 note in
++                    // shared/gsm7's UnpackSeptets doc); floor(n*8/7) matches
++                    // what a real dissector (Wireshark) derives.
++                    int septetCount = (usedLen * 8) / 7;
++                    if (septetCount > 93)
++                        septetCount = 93;
++                    decoded += Gsm7Unpack(content, usedLen, septetCount);
++                }
++                else if (alphabet == CbsAlphabet::UCS2)
++                {
++                    // On page 0 of a DCS 0x11 message, the first 2 octets are the
++                    // ISO 639 language prefix (2 GSM7 septets), not UCS2 body.
++                    size_t bodyStart = 0;
++                    if (i == 0 && ucs2LangPrefix && usedLen >= 2)
++                    {
++                        language = Gsm7Unpack(content, 2, 2);
++                        bodyStart = 2;
++                    }
++                    decoded += Ucs2Decode(content + bodyStart, static_cast<uint8_t>(usedLen - bodyStart));
++                }
++                else
++                {
++                    decoded.append(reinterpret_cast<const char *>(content), usedLen);
++                }
++                off += kPageContentLength + 1;
++            }
++            warningText = decoded;
++        }
++    }
++
++    if (language.empty())
++        language = "unspecified";
++
++    m_logger->info("Write-Replace Warning Request received (PWS): messageId[%d] serialNumber[%d] "
++                   "warningType[%s] dcs[0x%02X] language[%s] text[%s]",
++                   messageId, serialNumber, warningType.c_str(), dcs, language.c_str(), warningText.c_str());
++
++    // --- Build Write-Replace Warning Response (SuccessfulOutcome) ---
++    auto *ieRespMsgId = asn::New<ASN_NGAP_WriteReplaceWarningResponseIEs>();
++    ieRespMsgId->id = ASN_NGAP_ProtocolIE_ID_id_MessageIdentifier;
++    ieRespMsgId->criticality = ASN_NGAP_Criticality_reject;
++    ieRespMsgId->value.present = ASN_NGAP_WriteReplaceWarningResponseIEs__value_PR_MessageIdentifier;
++    asn::SetBitString(ieRespMsgId->value.choice.MessageIdentifier, octet4{messageId << 16}, 16);
++
++    auto *ieRespSerial = asn::New<ASN_NGAP_WriteReplaceWarningResponseIEs>();
++    ieRespSerial->id = ASN_NGAP_ProtocolIE_ID_id_SerialNumber;
++    ieRespSerial->criticality = ASN_NGAP_Criticality_reject;
++    ieRespSerial->value.present = ASN_NGAP_WriteReplaceWarningResponseIEs__value_PR_SerialNumber;
++    asn::SetBitString(ieRespSerial->value.choice.SerialNumber, octet4{serialNumber << 16}, 16);
++
++    auto *ieCompleted = asn::New<ASN_NGAP_WriteReplaceWarningResponseIEs>();
++    ieCompleted->id = ASN_NGAP_ProtocolIE_ID_id_BroadcastCompletedAreaList;
++    ieCompleted->criticality = ASN_NGAP_Criticality_ignore;
++    ieCompleted->value.present = ASN_NGAP_WriteReplaceWarningResponseIEs__value_PR_BroadcastCompletedAreaList;
++    auto &bcal = ieCompleted->value.choice.BroadcastCompletedAreaList;
++    bcal.present = ASN_NGAP_BroadcastCompletedAreaList_PR_tAIBroadcastNR;
++    bcal.choice.tAIBroadcastNR = asn::New<ASN_NGAP_TAIBroadcastNR>();
++
++    auto *taiItem = asn::New<ASN_NGAP_TAIBroadcastNR_Item>();
++    ngap_utils::ToPlmnAsn_Ref(m_base->config->plmn, taiItem->tAI.pLMNIdentity);
++    asn::SetOctetString3(taiItem->tAI.tAC, octet3{m_base->config->tac});
++    auto *cellItem = asn::New<ASN_NGAP_CompletedCellsInTAI_NR_Item>();
++    ngap_utils::ToPlmnAsn_Ref(m_base->config->plmn, cellItem->nR_CGI.pLMNIdentity);
++    asn::SetBitStringLong<36>(m_base->config->nci, cellItem->nR_CGI.nRCellIdentity);
++    asn::SequenceAdd(taiItem->completedCellsInTAI_NR, cellItem);
++    asn::SequenceAdd(*bcal.choice.tAIBroadcastNR, taiItem);
++
++    auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_WriteReplaceWarningResponse>(
++        {ieRespMsgId, ieRespSerial, ieCompleted});
++
++    m_logger->debug("Sending Write-Replace Warning Response: messageId[%d] serialNumber[%d]", messageId,
++                    serialNumber);
++    sendNgapNonUe(amfId, pdu);
++}
++
++// 5GC Rel-17 mod (0070): Public Warning System — PWS Cancel Request.
++// Stops the ongoing broadcast and answers with a PWS Cancel Response carrying a
++// BroadcastCancelledAreaList for this gNB's served NR cell. Ref: TS 38.413 §8.9.2.
++void NgapTask::receivePwsCancelRequest(int amfId, ASN_NGAP_PWSCancelRequest *msg)
++{
++    auto *amf = findAmfContext(amfId);
++    if (amf == nullptr)
++        return;
++
++    auto *ieMsgId = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_MessageIdentifier);
++    auto *ieSerial = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_SerialNumber);
++    if (ieMsgId == nullptr || ieSerial == nullptr)
++    {
++        m_logger->err("Invalid PWS Cancel Request: missing MessageIdentifier/SerialNumber");
++        return;
++    }
++
++    int messageId = asn::GetBitStringInt<16>(ieMsgId->MessageIdentifier);
++    int serialNumber = asn::GetBitStringInt<16>(ieSerial->SerialNumber);
++
++    bool cancelAll = false;
++    auto *ieCancelAll = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_CancelAllWarningMessages);
++    if (ieCancelAll != nullptr)
++        cancelAll = (ieCancelAll->CancelAllWarningMessages == ASN_NGAP_CancelAllWarningMessages_true);
++
++    m_logger->info("PWS Cancel Request received: messageId[%d] serialNumber[%d] cancelAll[%s]", messageId,
++                   serialNumber, cancelAll ? "true" : "false");
++
++    // --- Build PWS Cancel Response (SuccessfulOutcome) ---
++    auto *ieRespMsgId = asn::New<ASN_NGAP_PWSCancelResponseIEs>();
++    ieRespMsgId->id = ASN_NGAP_ProtocolIE_ID_id_MessageIdentifier;
++    ieRespMsgId->criticality = ASN_NGAP_Criticality_reject;
++    ieRespMsgId->value.present = ASN_NGAP_PWSCancelResponseIEs__value_PR_MessageIdentifier;
++    asn::SetBitString(ieRespMsgId->value.choice.MessageIdentifier, octet4{messageId << 16}, 16);
++
++    auto *ieRespSerial = asn::New<ASN_NGAP_PWSCancelResponseIEs>();
++    ieRespSerial->id = ASN_NGAP_ProtocolIE_ID_id_SerialNumber;
++    ieRespSerial->criticality = ASN_NGAP_Criticality_reject;
++    ieRespSerial->value.present = ASN_NGAP_PWSCancelResponseIEs__value_PR_SerialNumber;
++    asn::SetBitString(ieRespSerial->value.choice.SerialNumber, octet4{serialNumber << 16}, 16);
++
++    auto *ieCancelled = asn::New<ASN_NGAP_PWSCancelResponseIEs>();
++    ieCancelled->id = ASN_NGAP_ProtocolIE_ID_id_BroadcastCancelledAreaList;
++    ieCancelled->criticality = ASN_NGAP_Criticality_ignore;
++    ieCancelled->value.present = ASN_NGAP_PWSCancelResponseIEs__value_PR_BroadcastCancelledAreaList;
++    auto &bcancel = ieCancelled->value.choice.BroadcastCancelledAreaList;
++    bcancel.present = ASN_NGAP_BroadcastCancelledAreaList_PR_tAICancelledNR;
++    bcancel.choice.tAICancelledNR = asn::New<ASN_NGAP_TAICancelledNR>();
++
++    auto *taiItem = asn::New<ASN_NGAP_TAICancelledNR_Item>();
++    ngap_utils::ToPlmnAsn_Ref(m_base->config->plmn, taiItem->tAI.pLMNIdentity);
++    asn::SetOctetString3(taiItem->tAI.tAC, octet3{m_base->config->tac});
++    auto *cellItem = asn::New<ASN_NGAP_CancelledCellsInTAI_NR_Item>();
++    ngap_utils::ToPlmnAsn_Ref(m_base->config->plmn, cellItem->nR_CGI.pLMNIdentity);
++    asn::SetBitStringLong<36>(m_base->config->nci, cellItem->nR_CGI.nRCellIdentity);
++    cellItem->numberOfBroadcasts = 0;
++    asn::SequenceAdd(taiItem->cancelledCellsInTAI_NR, cellItem);
++    asn::SequenceAdd(*bcancel.choice.tAICancelledNR, taiItem);
++
++    auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_PWSCancelResponse>(
++        {ieRespMsgId, ieRespSerial, ieCancelled});
++
++    m_logger->debug("Sending PWS Cancel Response: messageId[%d] serialNumber[%d]", messageId, serialNumber);
++    sendNgapNonUe(amfId, pdu);
++}
++
+ } // namespace nr::gnb
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+index 4443f8f..37fa1e1 100644
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -35,6 +35,8 @@ extern "C"
+     struct ASN_NGAP_OverloadStop;
+     struct ASN_NGAP_PDUSessionResourceReleaseCommand;
+     struct ASN_NGAP_Paging;
++    struct ASN_NGAP_WriteReplaceWarningRequest;
++    struct ASN_NGAP_PWSCancelRequest;
+     struct ASN_NGAP_LocationReportingControl;
+     struct ASN_NGAP_DownlinkUEAssociatedNRPPaTransport;
+ }
+@@ -130,6 +132,10 @@ class NgapTask : public NtsTask
+     void handleRadioLinkFailure(int ueId);
+     void receivePaging(int amfId, ASN_NGAP_Paging *msg);
+ 
++    /* Public Warning System (ETWS/CMAS) — TS 38.413 §8.9 (5GC Rel-17 mod) */
++    void receiveWriteReplaceWarningRequest(int amfId, ASN_NGAP_WriteReplaceWarningRequest *msg);
++    void receivePwsCancelRequest(int amfId, ASN_NGAP_PWSCancelRequest *msg);
++
+     /* Location reporting (5GC Rel-17 mod) */
+     void receiveLocationReportingControl(int amfId, ASN_NGAP_LocationReportingControl *msg);
+ 
+diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
+index ce41b7a..23186ef 100644
+--- a/src/gnb/ngap/transport.cpp
++++ b/src/gnb/ngap/transport.cpp
+@@ -296,6 +296,16 @@ void NgapTask::handleSctpMessage(int amfId, uint16_t stream, const UniqueBuffer
+         case ASN_NGAP_InitiatingMessage__value_PR_Paging:
+             receivePaging(amf->ctxId, &value.choice.Paging);
+             break;
++        case ASN_NGAP_InitiatingMessage__value_PR_WriteReplaceWarningRequest:
++            // 5GC Rel-17 mod (0070): Public Warning System — decode the warning and
++            // answer with a Write-Replace Warning Response. Ref: TS 38.413 §8.9.1.
++            receiveWriteReplaceWarningRequest(amf->ctxId, &value.choice.WriteReplaceWarningRequest);
++            break;
++        case ASN_NGAP_InitiatingMessage__value_PR_PWSCancelRequest:
++            // 5GC Rel-17 mod (0070): PWS Cancel — stop the broadcast and answer with a
++            // PWS Cancel Response. Ref: TS 38.413 §8.9.2.
++            receivePwsCancelRequest(amf->ctxId, &value.choice.PWSCancelRequest);
++            break;
+         case ASN_NGAP_InitiatingMessage__value_PR_LocationReportingControl:
+             // 5GC Rel-17 mod: stock UERANSIM gNB has no LocationReportingControl handler
+             // (it logs "Unhandled NGAP initiating-message"), so the AMF's Location Reporting

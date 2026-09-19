@@ -2,13 +2,277 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  @apply bg-gray-950 text-gray-100;
+/*
+ * ClaudIA 5GC Management Portal — design tokens
+ * ---------------------------------------------------------------------------
+ * Single source of truth for the visual language. Every component MUST consume
+ * these semantic tokens (via the Tailwind names mapped in `tailwind.config.js`)
+ * instead of raw colour utilities such as `bg-gray-900`.
+ *
+ * Convention
+ *   - Values are space-separated sRGB channels so Tailwind can generate
+ *     opacity variants: `rgb(var(--c-bg) / <alpha-value>)` → `bg-bg/50`.
+ *   - Light theme is the default (`:root`); dark theme is a class override
+ *     (`.dark` on `<html>`). Both palettes MUST resolve to a complete set — no
+ *     token may be defined in only one theme.
+ *   - Contrast: all foreground tokens meet WCAG 2.1 AA (>=4.5:1 body text,
+ *     >=3:1 large text / UI boundaries) against their intended surface.
+ *     Verified pairs are recorded in `web/STYLE_GUIDE.md` § Contrast.
+ *   - The anti-FOUC bootstrap in `index.html` mirrors the `.dark` class
+ *     contract; keep the two in sync.
+ *
+ * Design direction: Minimalism / Swiss Style, high density, subtle motion.
+ * Typography: Fira Sans (body) + Fira Code (mono / identifiers / logs).
+ */
+
+@layer base {
+  :root {
+    color-scheme: light;
+
+    /* --- Surfaces & text --- */
+    --c-bg: 248 250 252; /* #F8FAFC */
+    --c-fg: 30 41 59; /* #1E293B */
+    --c-card: 255 255 255; /* #FFFFFF */
+    --c-card-fg: 30 41 59; /* #1E293B */
+    --c-muted: 233 239 248; /* #E9EFF8 */
+    --c-muted-fg: 71 85 105; /* #475569 */
+    --c-border: 226 232 240; /* #E2E8F0 */
+    --c-border-strong: 203 213 225; /* #CBD5E1 */
+    --c-input: 255 255 255; /* #FFFFFF */
+    --c-input-border: 100 116 139; /* #64748B — 4.8:1 on card (UI boundary) */
+
+    /* --- Focus --- */
+    --c-ring: 37 99 235; /* #2563EB */
+
+    /* --- Brand --- */
+    --c-primary: 37 99 235; /* #2563EB — fill for actions / active nav */
+    --c-primary-fg: 255 255 255; /* #FFFFFF — 5.2:1 on primary */
+    --c-primary-text: 29 78 216; /* #1D4ED8 — primary as *text*: 6.4:1 on bg, 6.9:1 on card, 5.8:1 on muted (the #2563EB fill is only 4.5:1 on light muted) */
+    --c-secondary: 59 130 246; /* #3B82F6 */
+    --c-secondary-fg: 15 23 42; /* #0F172A — 4.9:1 */
+    --c-accent: 234 88 12; /* #EA580C — fill / large figures only (3.4:1 on bg) */
+    --c-accent-fg: 15 23 42; /* #0F172A — 5.0:1 */
+    --c-accent-text: 154 52 18; /* #9A3412 — accent as *text*: 7.0:1 on bg, 7.3:1 on card, 6.3:1 on muted */
+
+    /* --- Destructive --- */
+    --c-destructive: 220 38 38; /* #DC2626 */
+    --c-destructive-fg: 255 255 255; /* #FFFFFF — 4.9:1 */
+
+    /* --- Status: success --- */
+    --c-success-fg: 21 128 61; /* #15803D — 4.8:1 on bg */
+    --c-success-surface: 220 252 231; /* #DCFCE7 */
+    --c-success-border: 134 239 172; /* #86EFAC */
+
+    /* --- Status: warning --- */
+    --c-warning-fg: 146 64 14; /* #92400E — 6.8:1 on bg, 6.4:1 on warning surface */
+    --c-warning-surface: 254 243 199; /* #FEF3C7 */
+    --c-warning-border: 252 211 77; /* #FCD34D */
+
+    /* --- Status: danger --- */
+    --c-danger-fg: 185 28 28; /* #B91C1C — 6.2:1 on bg */
+    --c-danger-surface: 254 226 226; /* #FEE2E2 */
+    --c-danger-border: 252 165 165; /* #FCA5A5 */
+
+    /* --- Status: info --- */
+    --c-info-fg: 29 78 216; /* #1D4ED8 — 6.4:1 on bg */
+    --c-info-surface: 219 234 254; /* #DBEAFE */
+    --c-info-border: 147 197 253; /* #93C5FD */
+
+    /* --- Log / terminal surface (inverted in light mode) --- */
+    --c-log-bg: 238 242 247; /* #EEF2F7 */
+    --c-log-fg: 30 41 59; /* #1E293B */
+
+    /* --- Scrim behind overlay drawers/dialogs (used with an alpha modifier) --- */
+    --c-overlay: 15 23 42; /* #0F172A */
+
+    /* --- Chart series (distinguishable without hue: see STYLE_GUIDE) --- */
+    --c-chart-1: 37 99 235; /* #2563EB */
+    --c-chart-2: 234 88 12; /* #EA580C */
+    --c-chart-3: 21 128 61; /* #15803D */
+    --c-chart-4: 124 58 237; /* #7C3AED */
+    --c-chart-5: 8 145 178; /* #0891B2 */
+  }
+
+  .dark {
+    color-scheme: dark;
+
+    /* --- Surfaces & text (derived dark palette, contrast-verified) --- */
+    --c-bg: 15 23 42; /* #0F172A */
+    --c-fg: 248 250 252; /* #F8FAFC */
+    --c-card: 27 35 54; /* #1B2336 */
+    --c-card-fg: 248 250 252; /* #F8FAFC */
+    --c-muted: 39 47 66; /* #272F42 */
+    --c-muted-fg: 148 163 184; /* #94A3B8 */
+    --c-border: 51 65 85; /* #334155 */
+    --c-border-strong: 71 85 105; /* #475569 */
+    --c-input: 27 35 54; /* #1B2336 */
+    --c-input-border: 100 116 139; /* #64748B — 3.3:1 on card (UI boundary) */
+
+    /* --- Focus --- */
+    --c-ring: 96 165 250; /* #60A5FA — 7.0:1 on bg */
+
+    /* --- Brand --- */
+    --c-primary: 37 99 235; /* #2563EB — fill; white label 5.2:1 */
+    --c-primary-fg: 255 255 255; /* #FFFFFF — 5.2:1 on primary */
+    --c-primary-text: 96 165 250; /* #60A5FA — the fill is only 3.5:1 as text on dark bg; use the light blue for text/links (7.0:1 on bg, 6.2:1 on card) */
+    --c-secondary: 59 130 246; /* #3B82F6 */
+    --c-secondary-fg: 15 23 42; /* #0F172A — 4.9:1 */
+    --c-accent: 234 88 12; /* #EA580C — fill / large figures */
+    --c-accent-fg: 15 23 42; /* #0F172A — 5.0:1 */
+    --c-accent-text: 251 146 60; /* #FB923C — accent as text: 7.9:1 on bg, 6.9:1 on card */
+
+    /* --- Destructive --- */
+    --c-destructive: 220 38 38; /* #DC2626 */
+    --c-destructive-fg: 255 255 255; /* #FFFFFF — 4.9:1 */
+
+    /* --- Status: success --- */
+    --c-success-fg: 74 222 128; /* #4ADE80 — 10.2:1 on bg */
+    --c-success-surface: 16 37 26; /* #10251A */
+    --c-success-border: 34 94 60; /* #225E3C */
+
+    /* --- Status: warning --- */
+    --c-warning-fg: 251 191 36; /* #FBBF24 — 10.7:1 on bg */
+    --c-warning-surface: 42 31 7; /* #2A1F07 */
+    --c-warning-border: 133 100 20; /* #856414 */
+
+    /* --- Status: danger --- */
+    --c-danger-fg: 248 113 113; /* #F87171 — 6.5:1 on bg */
+    --c-danger-surface: 42 15 15; /* #2A0F0F */
+    --c-danger-border: 153 27 27; /* #991B1B */
+
+    /* --- Status: info --- */
+    --c-info-fg: 96 165 250; /* #60A5FA — 7.0:1 on bg */
+    --c-info-surface: 14 30 51; /* #0E1E33 */
+    --c-info-border: 30 64 175; /* #1E40AF */
+
+    /* --- Log / terminal surface --- */
+    --c-log-bg: 11 17 32; /* #0B1120 */
+    --c-log-fg: 226 232 240; /* #E2E8F0 */
+
+    /* --- Scrim behind overlay drawers/dialogs (used with an alpha modifier) --- */
+    --c-overlay: 2 6 23; /* #020617 */
+
+    /* --- Chart series --- */
+    --c-chart-1: 96 165 250; /* #60A5FA */
+    --c-chart-2: 251 146 60; /* #FB923C */
+    --c-chart-3: 74 222 128; /* #4ADE80 */
+    --c-chart-4: 192 132 252; /* #C084FC */
+    --c-chart-5: 34 211 238; /* #22D3EE */
+  }
+
+  html {
+    @apply bg-bg;
+  }
+
+  body {
+    @apply bg-bg text-fg font-sans antialiased;
+  }
+
+  /*
+   * Focus visibility (WCAG 2.4.7 / 2.4.11). Never remove an outline without
+   * providing this replacement. Ring token flips per theme for 3:1 contrast.
+   */
+  :focus-visible {
+    outline: 2px solid rgb(var(--c-ring));
+    outline-offset: 2px;
+  }
+
+  /* Respect user motion preference (Q3): collapse all non-essential motion. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
 
-/* Terminal font for log view */
-.font-mono-terminal {
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
-  font-size: 0.8rem;
-  line-height: 1.5;
+@layer components {
+  /* Readable mono surfaces for logs / identifiers, theme-aware. */
+  .font-mono-terminal {
+    @apply font-mono;
+    font-size: 0.8rem;
+    line-height: 1.5;
+  }
+
+  .log-surface {
+    @apply bg-log-bg text-log-fg font-mono-terminal;
+  }
+
+}
+
+/*
+ * Leaflet map panel (Location page) — theme-aware vendor chrome.
+ *
+ * Decision (PORTAL-UI-14; STYLE_GUIDE §12 "Leaflet dark tiles"): keep the OSM
+ * tile layer as the single source of tiles and invert it in the dark theme
+ * with a CSS filter on the **tile pane only** — no dark tile-provider URL, so
+ * no extra network dependency, no attribution change and the same offline
+ * behaviour. Leaflet's own `.leaflet-tile { filter: inherit }` propagates the
+ * pane filter to the tiles; scoping it to the pane leaves the overlay,
+ * tooltip and control panes untouched, so markers/circles keep their token
+ * colours and stay readable in both themes.
+ *
+ * The remaining rules re-tint Leaflet's light-default chrome (zoom bar,
+ * attribution, tooltip + arrow) with tokens. The `.dark` prefix outranks the
+ * vendor selectors, so no `!important` is needed.
+ */
+.leaflet-container {
+  background: rgb(var(--c-muted));
+  font-family: inherit;
+}
+
+.dark .leaflet-tile-pane {
+  filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.9) saturate(0.75);
+}
+
+.dark .leaflet-container .leaflet-bar a {
+  background-color: rgb(var(--c-card));
+  border-bottom-color: rgb(var(--c-border));
+  color: rgb(var(--c-fg));
+}
+
+.dark .leaflet-container .leaflet-bar a:hover,
+.dark .leaflet-container .leaflet-bar a:focus {
+  background-color: rgb(var(--c-muted));
+}
+
+.dark .leaflet-container .leaflet-bar a.leaflet-disabled {
+  background-color: rgb(var(--c-muted));
+  color: rgb(var(--c-muted-fg));
+}
+
+.dark .leaflet-container .leaflet-control-attribution {
+  background: rgb(var(--c-card) / 0.85);
+  color: rgb(var(--c-muted-fg));
+}
+
+.dark .leaflet-control-attribution a {
+  color: rgb(var(--c-info-fg));
+}
+
+.dark .leaflet-container .leaflet-tooltip {
+  background-color: rgb(var(--c-card));
+  border-color: rgb(var(--c-border));
+  color: rgb(var(--c-fg));
+  box-shadow: 0 1px 3px rgb(var(--c-overlay) / 0.5);
+}
+
+.dark .leaflet-container .leaflet-tooltip-top:before {
+  border-top-color: rgb(var(--c-card));
+}
+
+.dark .leaflet-container .leaflet-tooltip-bottom:before {
+  border-bottom-color: rgb(var(--c-card));
+}
+
+.dark .leaflet-container .leaflet-tooltip-left:before {
+  border-left-color: rgb(var(--c-card));
+}
+
+.dark .leaflet-container .leaflet-tooltip-right:before {
+  border-right-color: rgb(var(--c-card));
 }

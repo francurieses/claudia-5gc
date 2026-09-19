@@ -108,6 +108,22 @@ var (
 		Help: "Total GTP-U packets dropped.",
 	}, []string{"reason"})
 
+	// UPFUsageReportsTotal counts PFCP Session Report Requests (Usage Report)
+	// emitted by the UPF for an installed URR. Label: trigger (VOLTH|PERIO).
+	// Ref: TS 29.244 §5.2.2.4, §7.5.5, §8.2.44.
+	UPFUsageReportsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_upf_usage_reports_total",
+		Help: "Total PFCP Session Report Requests (Usage Report) emitted by the UPF, labeled by trigger (VOLTH|PERIO).",
+	}, []string{"trigger"})
+
+	// UPFRouterAdvertisementsTotal counts IPv6 Router Advertisements sent by
+	// the UPF for delegated-prefix sessions. Label: trigger (periodic|solicited).
+	// Ref: TS 23.501 §5.8.2.2.2, TS 29.244 §8.2.62, RFC 4861.
+	UPFRouterAdvertisementsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_upf_router_advertisements_total",
+		Help: "Total IPv6 Router Advertisements sent by the UPF, labeled by trigger (periodic|solicited).",
+	}, []string{"trigger"})
+
 	// --- NRF Registry ---
 
 	// NFInstancesRegistered tracks NF instances currently registered in the NRF.
@@ -258,6 +274,21 @@ var (
 		Name: "fivegc_amf_lpp_transport_total",
 		Help: "Total NAS DL/UL NAS Transport messages carrying an opaque LPP container, by direction (UL/DL).",
 	}, []string{"direction"})
+
+	// --- SMF Secondary Authentication / DN-AAA (SMF-003) ---
+
+	// SMFSecondaryAuthPending is the number of secondary authentication EAP
+	// exchanges currently in flight at the SMF (PENDING_AUTH + AWAITING_AAA
+	// states combined) — i.e. PDU sessions whose Establishment Accept/Reject is
+	// gated on a DN-AAA EAP round-trip. Incremented when the SMF sends the PDU
+	// SESSION AUTHENTICATION COMMAND (EAP-Request/Identity); decremented on the
+	// terminal EAP-Success/EAP-Failure/unreachable outcome. A value that never
+	// drains indicates a stuck DN-AAA or a UE that never answered.
+	// Ref: TS 23.501 §5.6.6, TS 23.502 §4.3.2.3.
+	SMFSecondaryAuthPending = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fivegc_smf_secondary_auth_pending",
+		Help: "Number of secondary authentication (DN-AAA EAP) exchanges currently in flight at the SMF (TS 23.502 §4.3.2.3).",
+	})
 )
 
 // MetricsServer builds a standalone HTTP server for the /metrics endpoint.

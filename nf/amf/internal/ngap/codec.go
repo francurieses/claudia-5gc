@@ -119,6 +119,14 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 			if so.Value.HandoverRequestAcknowledge != nil {
 				msg.Value = extractHandoverRequestAcknowledge(so.Value.HandoverRequestAcknowledge)
 			}
+		case ngapType.ProcedureCodeWriteReplaceWarning: // PWS broadcast confirm (proc=51)
+			if so.Value.WriteReplaceWarningResponse != nil {
+				msg.Value = extractWriteReplaceWarningResponse(so.Value.WriteReplaceWarningResponse)
+			}
+		case ngapType.ProcedureCodePWSCancel: // PWS cancel confirm (proc=32)
+			if so.Value.PWSCancelResponse != nil {
+				msg.Value = extractPWSCancelResponse(so.Value.PWSCancelResponse)
+			}
 		}
 	case ngapType.NGAPPDUPresentUnsuccessfulOutcome:
 		uo := pdu.UnsuccessfulOutcome

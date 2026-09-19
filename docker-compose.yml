@@ -32,21 +32,33 @@ networks:
     ipam:
       config:
         - subnet: 172.30.3.0/24
+  # N6 (internet DNN). enable_ipv6 + a ULA subnet give the UPF an IPv6 default
+  # route out this bridge so IPv6/IPv4v6 PDU sessions can egress (TS 23.501
+  # §5.8.2.2): UE traffic (2001:db8:60::/56) is ip6tables-MASQUERADEd through
+  # the bridge gateway fd00:6::1 by the UPF's upfgtp0 TUN. Real public-IPv6
+  # egress additionally needs the Docker host to have IPv6 connectivity; the
+  # ULA at minimum makes the bridge gateway pingable end-to-end from the UE.
   n6-net:
     name: 5gc-n6
     driver: bridge
+    enable_ipv6: true
     ipam:
       config:
         - subnet: 172.30.6.0/24
+        - subnet: fd00:6::/64
+          gateway: fd00:6::1
   # N6 network for the "ims" DNN — IMS voice and multimedia UE traffic.
   # Gateway 172.30.7.1 is the Docker bridge; UPF TUN upfgtp1 MASQUERADEs through it.
   # To add a new DNN: copy this block, change name/subnet, attach UPF below.
   n6-ims-net:
     name: 5gc-n6-ims
     driver: bridge
+    enable_ipv6: true
     ipam:
       config:
         - subnet: 172.30.7.0/24
+        - subnet: fd00:7::/64
+          gateway: fd00:7::1
   obs-net:
     name: 5gc-obs
     driver: bridge
@@ -418,6 +430,11 @@ services:
     cap_add: [NET_ADMIN]
     sysctls:
       net.ipv4.ip_forward: "1"
+      # IPv6 N6 forwarding for IPv6/IPv4v6 PDU sessions (SMF-002, TS 23.501
+      # §5.8.2.2). disable_ipv6=0 is required because some Docker/WSL2 base
+      # images ship the container-wide IPv6 master switch off.
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.all.forwarding: "1"
     volumes:
       - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
       - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro

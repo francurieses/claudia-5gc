@@ -48,7 +48,7 @@ type PDUSessionEstablishmentAccept struct {
 	PDUAddress             net.IP  // Optional IEI 0x29
 	SNSSAI                 *SNSSAI // Optional IEI 0x22
 	DNN                    *string // Optional IEI 0x25
-	Cause5GSM              *uint8  // Optional IEI 0x37
+	Cause5GSM              *uint8  // Optional IEI 0x59
 }
 
 // 5GSM IE identifiers
@@ -324,7 +324,9 @@ type PDUAddressInfo struct {
 // EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr is the type-aware variant of
 // EncodePDUSessionEstablishmentAcceptBodyWithQoS: it encodes the granted PDU
 // session type and the matching PDU Address IE (IPv4, IPv6 IID, or IPv4v6
-// IID+IPv4) per TS 24.501 §9.11.4.10. Ref: TS 24.501 §8.3.2, TS 29.512 §5.2.2.2.
+// IID+IPv4) per TS 24.501 §9.11.4.10. The Accept answers the UE's PCO with at
+// least the IPv4 Link MTU container (see EncodeEstablishmentAcceptBody).
+// Ref: TS 24.501 §8.3.2, TS 29.512 §5.2.2.2.
 func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr(
 	addr PDUAddressInfo, sscMode uint8, dnn string,
 	qfi, fiveQI uint8, dlMbps, ulMbps int,
@@ -736,8 +738,8 @@ func EncodePCODNSMTUAndIPCP(mtu uint16, extra []byte, dns ...net.IP) []byte {
 // EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNS is
 // EncodePDUSessionEstablishmentAcceptBodyWithQoSAddr plus an optional list of
 // IPv4 DNS resolvers, carried in the EPCO IE (IEI 0x7B, TLV-E) per Table
-// 8.3.2.1.1 — placed before the DNN IE. dns may be nil/empty, in which case no
-// EPCO IE is emitted (byte-identical to the non-DNS variant).
+// 8.3.2.1.1 — placed before the DNN IE. dns may be nil/empty, in which case
+// the EPCO still carries the IPv4 Link MTU container.
 //
 // Without this, a UE that cannot resolve names treats the PDU session as
 // having "no internet" even when the IP path itself is healthy — reproduced
@@ -781,11 +783,13 @@ func EncodePDUSessionEstablishmentAcceptBodyWithQoSAddrDNSIPCP(
 }
 
 // EstablishmentAcceptParams is the full input to
-// EncodePDUSessionEstablishmentAccept. Request carries the UE's own decoded
+// EncodeEstablishmentAcceptBody. Request carries the UE's own decoded
 // PDU SESSION ESTABLISHMENT REQUEST (nil when the caller has none) and drives
 // two things the older positional entry points could not express: the (E)PCO
 // container ORDER (see BuildEPCOReply) and the 5GSM cause emitted when the
-// granted PDU session type is narrower than the requested one.
+// granted PDU session type is narrower than the requested one. EAPMessage is
+// the secondary-authentication EAP-Success carried in the EAP message IE
+// (IEI 0x78), nil/empty to omit.
 type EstablishmentAcceptParams struct {
 	Addr           PDUAddressInfo
 	SSCMode        uint8
@@ -796,6 +800,7 @@ type EstablishmentAcceptParams struct {
 	DNSv6          []net.IP
 	MTU            uint16
 	SNSSAI         []SNSSAI
+	EAPMessage     []byte
 	Request        *PDUSessionEstablishmentRequest
 }
 
@@ -809,6 +814,7 @@ type EstablishmentAcceptParams struct {
 //	5GSM cause            IEI 0x59       (TV)     — on a session-type downgrade
 //	PDU address           IEI 0x29       (TLV)
 //	S-NSSAI               IEI 0x22       (TLV)
+//	EAP message           IEI 0x78       (TLV-E)  — secondary auth only
 //	authorized QoS flow descriptions IEI 0x79 (TLV-E)
 //	Extended PCO          IEI 0x7B       (TLV-E)
 //	DNN                   IEI 0x25       (TLV)
@@ -855,6 +861,13 @@ func EncodeEstablishmentAcceptBody(p EstablishmentAcceptParams) ([]byte, error) 
 		} else {
 			out = append(out, IEISNSSAI5GSM, 1, s.SST)
 		}
+	}
+
+	// EAP message (IEI 0x78, TLV-E) — secondary authentication only. Per
+	// Table 8.3.2.1.1 this IE precedes the Authorized QoS flow descriptions
+	// IE (0x79) and the DNN IE (0x25).
+	if len(p.EAPMessage) > 0 {
+		out = append(out, EncodeEAPMessageTLVE(p.EAPMessage)...)
 	}
 
 	// Authorized QoS flow descriptions (IEI 0x79, TLV-E) — carries the 5QI for QFI.

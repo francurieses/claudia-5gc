@@ -1,0 +1,33 @@
+diff --git a/src/gnb/rrc/handler.cpp b/src/gnb/rrc/handler.cpp
+index 1111111..2222222 100644
+--- a/src/gnb/rrc/handler.cpp
++++ b/src/gnb/rrc/handler.cpp
+@@ -121,6 +121,6 @@ void GnbRrcTask::handlePaging(const asn::Unique<ASN_NGAP_FiveG_S_TMSI> &tmsi,
+     OctetString tmsiOctets{};
+     tmsiOctets.appendOctet2(bits::Ranged16({
+         {10, asn::GetBitStringInt<10>(tmsi->aMFSetID)},
+-        {6, asn::GetBitStringInt<10>(tmsi->aMFPointer)},
++        {6, asn::GetBitStringInt<6>(tmsi->aMFPointer)},
+     }));
+     tmsiOctets.append(asn::GetOctetString(tmsi->fiveG_TMSI));
+diff --git a/src/ue/nas/mm/radio.cpp b/src/ue/nas/mm/radio.cpp
+index 3333333..4444444 100644
+--- a/src/ue/nas/mm/radio.cpp
++++ b/src/ue/nas/mm/radio.cpp
+@@ -300,8 +300,14 @@ void NasMm::handlePaging(const std::vector<GutiMobileIdentity> &tmsiIds)
+         }
+     }
+ 
+-    if (!tmsiMatches)
+-        return;
++    if (!tmsiMatches)
++    {
++        // 5GC mod (0052): make the previously silent 5G-S-TMSI mismatch visible.
++        // Stock handlePaging returned with no trace when the paged identity did
++        // not match the stored GUTI, hiding gNB/AMF 5G-S-TMSI bit-packing bugs.
++        m_logger->debug("Ignoring received Paging: paged 5G-S-TMSI does not match stored GUTI");
++        return;
++    }
+ 
+     if (m_mmSubState == EMmSubState::MM_DEREGISTERED_ECALL_INACTIVE)
+     {

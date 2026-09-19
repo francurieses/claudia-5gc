@@ -53,6 +53,28 @@ type Config struct {
 	// Ref: TS 23.501 §5.6.5, TS 29.244 §6.3.3.14 (Network Instance IE)
 	// Adding a new DNN: append an entry and add matching entry in operator.yaml.
 	DNNs []DNNConfig `yaml:"dnns"`
+	// N4 configures the SMF's PFCP behaviour on N4 beyond the client sends
+	// (establishment/modification/deletion): the persistent Session Report
+	// receiver and the Usage Reporting Rule installed at establishment.
+	// Ref: TS 29.244 §5.2.2.4, §7.5.2.4, §7.5.5.
+	N4 N4Config `yaml:"n4"`
+}
+
+// N4Config holds PFCP (N4) usage-reporting configuration.
+// Ref: TS 29.244 §5.2.2.4 (URR handling), §7.5.5 (Session Report Request).
+type N4Config struct {
+	// ReportListen is the address the SMF's persistent PFCP receiver binds
+	// to for node-initiated messages (Session Report Request). This is the
+	// well-known N4 UDP port; every SMF instance must have one bound inside
+	// its own container. Ref: TS 29.244 §6.2.1.
+	ReportListen string `yaml:"report_listen"`
+	// VolumeThresholdBytes is the total-volume threshold (TOVOL) installed
+	// in the Create URR's Volume Threshold IE at PDU Session Establishment.
+	// Crossing it triggers a VOLTH Usage Report. Ref: TS 29.244 §8.2.13.
+	VolumeThresholdBytes uint64 `yaml:"volume_threshold_bytes"`
+	// MeasurementPeriodSeconds is the periodic reporting cadence installed
+	// in the Create URR's Measurement Period IE. Ref: TS 29.244 §8.2.42.
+	MeasurementPeriodSeconds int `yaml:"measurement_period_seconds"`
 }
 
 // DNNConfig holds the per-DNN IP pool configuration for the SMF.
@@ -65,6 +87,16 @@ type DNNConfig struct {
 	// Empty = the DNN is IPv4-only (IPv6 requests are downgraded to IPv4).
 	// Ref: TS 23.501 §5.8.2.2.
 	UEIPv6Prefix string `yaml:"ue_ipv6_prefix"`
+	// SecondaryAuth marks the DNN as requiring DN-specific secondary
+	// authentication/authorization with an external DN-AAA server during PDU
+	// Session Establishment. Default false — a DNN not listed here (or listed
+	// without this flag) establishes exactly as before (no EAP round).
+	// Ref: TS 23.501 §5.6.6, TS 23.502 §4.3.2.3.
+	SecondaryAuth bool `yaml:"secondary_auth"`
+	// DNAAAUnreachable is a dev/test knob that simulates an unreachable/
+	// timing-out DN-AAA for this DNN (TS 24.501 §9.11.4.2 unreachable/timeout
+	// error case). Only meaningful when SecondaryAuth is true.
+	DNAAAUnreachable bool `yaml:"dn_aaa_unreachable"`
 	// DNS is the list of IPv4 DNS resolver addresses advertised to the UE in
 	// the (Extended) Protocol Configuration Options of the PDU Session
 	// Establishment Accept (TS 24.008 §10.5.6.3, container ID 0x000D "DNS
@@ -98,6 +130,9 @@ func Load() (*Config, error) {
 	cfg.SBI.TLS.CAFile = "/etc/5gc/pki/ca.crt"
 	cfg.SBI.TLS.CertFile, cfg.SBI.TLS.KeyFile = "/etc/5gc/pki/smf.crt", "/etc/5gc/pki/smf.key"
 	cfg.Peers.NRF = "nrf:8000"
+	cfg.N4.ReportListen = "0.0.0.0:8805"
+	cfg.N4.VolumeThresholdBytes = 1000000 // 1 MB, TS 29.244 §8.2.13
+	cfg.N4.MeasurementPeriodSeconds = 60  // TS 29.244 §8.2.42
 
 	// Layer operator config (PLMN + slices + DNNs) between Go defaults and per-NF YAML.
 	if op, err := operatorcfg.LoadOperator(""); err != nil {

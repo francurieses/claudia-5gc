@@ -89,6 +89,17 @@ func main() {
 		}
 	}()
 
+	// ---- Persistent PFCP receiver (N4 Usage Reporting, UPF-001) ----------
+	// Additive to the existing PFCP client sends (establishment/modification/
+	// deletion): a persistent listener on the well-known N4 UDP port so the
+	// UPF can push node-initiated Session Report Requests.
+	// Ref: TS 29.244 §5.2.2.4, §6.2.1, §7.5.5.
+	go func() {
+		if err := sbiSrv.StartPFCPReceiver(ctx); err != nil {
+			logger.Error("SMF: PFCP receiver stopped", "error", err)
+		}
+	}()
+
 	// ---- NRF registration + heartbeat ------------------------------------
 	if cfg.Peers.NRF != "" {
 		var httpClient *http.Client
@@ -129,7 +140,7 @@ func main() {
 					ServiceName:       "nsmf-pdusession",
 					Scheme:            "https",
 					NFServiceStatus:   "REGISTERED",
-					Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
+					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
 				}},
 			}
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {

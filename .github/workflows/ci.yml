@@ -67,7 +67,17 @@ jobs:
       # Verifies every tools/ueransim/patches/*.patch (including 0041's NRPPa
       # APER codec) still applies cleanly against the pinned v3.2.8 tarball and
       # the gNB/UE/CLI compile — the CI-path equivalent of `make ueransim-build-only`.
-      - run: docker build -f tools/ueransim/Dockerfile -t 5gc/ueransim:ci .
+      - name: Build UERANSIM image (retry transient registry failures)
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if docker build -f tools/ueransim/Dockerfile -t 5gc/ueransim:ci .; then
+              exit 0
+            fi
+            echo "::warning::UERANSIM image build failed (attempt $attempt/5); retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::UERANSIM image build failed after 5 attempts"
+          exit 1
 
   docker:
     name: Build Docker image — ${{ matrix.nf }}
@@ -80,7 +90,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - run: make -C nf/${{ matrix.nf }} docker
+      # The 13 matrix jobs start at once and each resolves the same Docker Hub
+      # base images (golang:1.26.2-alpine, distroless). Anonymous-pull rate
+      # limiting makes auth.docker.io reset connections intermittently
+      # ("failed to fetch oauth token ... connection reset by peer"). Jitter to
+      # spread the token requests, then retry the build with backoff.
+      - name: Build image (retry transient registry failures)
+        run: |
+          sleep $((RANDOM % 15))
+          for attempt in 1 2 3 4 5; do
+            if make -C nf/${{ matrix.nf }} docker; then
+              exit 0
+            fi
+            echo "::warning::make docker for ${{ matrix.nf }} failed (attempt $attempt/5); retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::make docker for ${{ matrix.nf }} failed after 5 attempts"
+          exit 1
 
   compose-up:
     name: Smoke test — docker compose up
@@ -89,7 +115,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/gen-pki.sh
-      - run: docker compose --profile core up -d
+      - name: Compose up (retry transient registry failures)
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if docker compose --profile core up -d; then
+              exit 0
+            fi
+            docker compose --profile core down -v || true
+            echo "::warning::compose up failed (attempt $attempt/5); retrying"
+            sleep $((attempt * 10))
+          done
+          echo "::error::compose up failed after 5 attempts"
+          exit 1
       - run: sleep 10
       - run: docker compose ps
       - run: docker compose logs nrf

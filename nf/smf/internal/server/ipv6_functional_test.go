@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cucumber/godog"
+	pfcpie "github.com/wmnsk/go-pfcp/ie"
 
 	"github.com/francurieses/claudia-5gc/shared/nas"
 )
@@ -29,6 +30,10 @@ type ipv6World struct {
 	pool       *IPv6Pool
 	p1, p2, p3 *net.IPNet
 	baseNet    *net.IPNet
+
+	// data-plane scenarios: PFCP Create PDR UE IP Address IE (TS 29.244 §8.2.62)
+	sess *Session
+	ie   *pfcpie.IE
 }
 
 func typeValue(name string) (uint8, error) {
@@ -187,6 +192,134 @@ func (w *ipv6World) thirdReusesReleased() error {
 	return nil
 }
 
+// --- Data plane (SMF-002): PFCP Create PDR UE IP Address IE, TS 29.244 §8.2.62 ---
+
+func (w *ipv6World) sessionGrantedIPv4Only(typeName, v4 string) error {
+	t, err := typeValue(typeName)
+	if err != nil {
+		return err
+	}
+	w.sess = &Session{PDUSessionType: t, UEIP: net.ParseIP(v4)}
+	if w.sess.UEIP == nil {
+		return fmt.Errorf("invalid IPv4 address %q", v4)
+	}
+	return nil
+}
+
+func (w *ipv6World) sessionGrantedIPv6Only(typeName, prefix string) error {
+	t, err := typeValue(typeName)
+	if err != nil {
+		return err
+	}
+	w.sess = &Session{PDUSessionType: t, UEIPv6Prefix: prefix}
+	return nil
+}
+
+func (w *ipv6World) sessionGrantedIPv4v6(typeName, v4, prefix string) error {
+	t, err := typeValue(typeName)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(v4)
+	if ip == nil {
+		return fmt.Errorf("invalid IPv4 address %q", v4)
+	}
+	w.sess = &Session{PDUSessionType: t, UEIP: ip, UEIPv6Prefix: prefix}
+	return nil
+}
+
+// buildPFCPUEIPAddressIE calls the real production helper (buildUEIPAddressIE,
+// same package) so the scenario proves the wire encoding the SMF actually
+// sends to the UPF over N4 — not a re-implementation of the logic.
+func (w *ipv6World) buildPFCPUEIPAddressIE() error {
+	ie, _, err := buildUEIPAddressIE(w.sess)
+	if err != nil {
+		return err
+	}
+	w.ie = ie
+	return nil
+}
+
+func (w *ipv6World) ieFlagsAre(flagStr string) error {
+	var want byte
+	if _, err := fmt.Sscanf(flagStr, "0x%02x", &want); err != nil {
+		return err
+	}
+	fields, err := w.ie.UEIPAddress()
+	if err != nil {
+		return err
+	}
+	if fields.Flags != want {
+		return fmt.Errorf("UE IP Address IE flags = 0x%02x, want 0x%02x", fields.Flags, want)
+	}
+	return nil
+}
+
+func (w *ipv6World) ieCarriesIPv4OnlyNoIPv6(v4 string) error {
+	fields, err := w.ie.UEIPAddress()
+	if err != nil {
+		return err
+	}
+	want := net.ParseIP(v4)
+	if fields.IPv4Address == nil || !fields.IPv4Address.Equal(want) {
+		return fmt.Errorf("IE IPv4Address = %s, want %s", fields.IPv4Address, want)
+	}
+	if fields.IPv6Address != nil {
+		return fmt.Errorf("expected no IPv6Address in the IE, got %s", fields.IPv6Address)
+	}
+	return nil
+}
+
+func (w *ipv6World) ieCarriesIPv6OnlyNoIPv4(v6 string) error {
+	fields, err := w.ie.UEIPAddress()
+	if err != nil {
+		return err
+	}
+	want := net.ParseIP(v6)
+	if fields.IPv6Address == nil || !fields.IPv6Address.Equal(want) {
+		return fmt.Errorf("IE IPv6Address = %s, want %s", fields.IPv6Address, want)
+	}
+	if fields.IPv4Address != nil {
+		return fmt.Errorf("expected no IPv4Address in the IE, got %s", fields.IPv4Address)
+	}
+	return nil
+}
+
+func (w *ipv6World) ieCarriesBothAddresses(v4, v6 string) error {
+	fields, err := w.ie.UEIPAddress()
+	if err != nil {
+		return err
+	}
+	wantV4 := net.ParseIP(v4)
+	wantV6 := net.ParseIP(v6)
+	if fields.IPv4Address == nil || !fields.IPv4Address.Equal(wantV4) {
+		return fmt.Errorf("IE IPv4Address = %s, want %s", fields.IPv4Address, wantV4)
+	}
+	if fields.IPv6Address == nil || !fields.IPv6Address.Equal(wantV6) {
+		return fmt.Errorf("IE IPv6Address = %s, want %s", fields.IPv6Address, wantV6)
+	}
+	return nil
+}
+
+// ieBytesUnchanged proves the IPv4-only PFCP UE IP Address IE wire encoding
+// is byte-identical to the pre-IPv6 reference (flags 0x02, no V6 field) —
+// zero regression for the default UERANSIM flow.
+func (w *ipv6World) ieBytesUnchanged() error {
+	got, err := w.ie.Marshal()
+	if err != nil {
+		return err
+	}
+	ref := pfcpie.NewUEIPAddress(0x02, w.sess.UEIP.String(), "", 0, 0)
+	want, err := ref.Marshal()
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("UE IP Address IE bytes changed: got % x, want % x", got, want)
+	}
+	return nil
+}
+
 func InitializeScenario(ctx *godog.ScenarioContext) {
 	w := &ipv6World{}
 	ctx.Step(`^a DNN "([^"]*)" with an IPv4 pool and no IPv6 prefix$`, w.dnnIPv4Only)
@@ -200,6 +333,17 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 	ctx.Step(`^the two prefixes are distinct and inside the pool$`, w.distinctAndInside)
 	ctx.Step(`^the first prefix is released and a third is allocated$`, w.releaseFirstAllocThird)
 	ctx.Step(`^the third prefix reuses the released /64$`, w.thirdReusesReleased)
+
+	// Data plane: PFCP Create PDR UE IP Address IE (TS 29.244 §8.2.62, SMF-002).
+	ctx.Step(`^a PDU session granted type "([^"]*)" with UE IPv4 "([^"]*)" and UE IPv6 prefix "([^"]*)"$`, w.sessionGrantedIPv4v6)
+	ctx.Step(`^a PDU session granted type "([^"]*)" with UE IPv4 "([^"]*)"$`, w.sessionGrantedIPv4Only)
+	ctx.Step(`^a PDU session granted type "([^"]*)" with UE IPv6 prefix "([^"]*)"$`, w.sessionGrantedIPv6Only)
+	ctx.Step(`^the SMF builds the PFCP UE IP Address IE for the session$`, w.buildPFCPUEIPAddressIE)
+	ctx.Step(`^the UE IP Address IE flags are "([^"]*)"$`, w.ieFlagsAre)
+	ctx.Step(`^the UE IP Address IE carries IPv4 address "([^"]*)" and no IPv6 address$`, w.ieCarriesIPv4OnlyNoIPv6)
+	ctx.Step(`^the UE IP Address IE carries IPv6 address "([^"]*)" and no IPv4 address$`, w.ieCarriesIPv6OnlyNoIPv4)
+	ctx.Step(`^the UE IP Address IE carries IPv4 address "([^"]*)" and IPv6 address "([^"]*)"$`, w.ieCarriesBothAddresses)
+	ctx.Step(`^the UE IP Address IE bytes are unchanged from the pre-IPv6 wire encoding$`, w.ieBytesUnchanged)
 }
 
 func TestIPv6Features(t *testing.T) {

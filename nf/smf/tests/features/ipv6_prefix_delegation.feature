@@ -42,3 +42,28 @@ Feature: IPv6 / IPv4v6 PDU session prefix delegation
     Then the two prefixes are distinct and inside the pool
     When the first prefix is released and a third is allocated
     Then the third prefix reuses the released /64
+
+  # --- Data plane (SMF-002, human sign-off 2026-07-22): PFCP Create PDR
+  # UE IP Address IE (TS 29.244 §8.2.62) built from the granted PDU session
+  # type. These assert the real go-pfcp wire encoding (flags octet + address
+  # fields), not just the Go-level granted type, so they prove the bytes the
+  # UPF actually parses off the wire.
+
+  Scenario: IPv4-only session installs a PFCP UE IP Address IE with V4 flags (no regression)
+    Given a PDU session granted type "IPv4" with UE IPv4 "10.60.0.5"
+    When the SMF builds the PFCP UE IP Address IE for the session
+    Then the UE IP Address IE flags are "0x02"
+    And the UE IP Address IE carries IPv4 address "10.60.0.5" and no IPv6 address
+    And the UE IP Address IE bytes are unchanged from the pre-IPv6 wire encoding
+
+  Scenario: IPv6-only session installs a PFCP UE IP Address IE with V6 flags and the /64+IID address
+    Given a PDU session granted type "IPv6" with UE IPv6 prefix "2001:db8:61::/64"
+    When the SMF builds the PFCP UE IP Address IE for the session
+    Then the UE IP Address IE flags are "0x01"
+    And the UE IP Address IE carries IPv6 address "2001:db8:61::1" and no IPv4 address
+
+  Scenario: IPv4v6 session installs a PFCP UE IP Address IE with V4+V6 flags and both addresses
+    Given a PDU session granted type "IPv4v6" with UE IPv4 "10.60.0.7" and UE IPv6 prefix "2001:db8:61::/64"
+    When the SMF builds the PFCP UE IP Address IE for the session
+    Then the UE IP Address IE flags are "0x03"
+    And the UE IP Address IE carries IPv4 address "10.60.0.7" and IPv6 address "2001:db8:61::1"

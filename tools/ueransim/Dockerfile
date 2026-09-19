@@ -45,6 +45,14 @@ RUN wget -qO- \
 #   0051 — gNB AMF selection fallback for initial NAS messages without a
 #          Requested NSSAI (Service Request from CM-IDLE, secured Registration
 #          Update) — stock selectAmf drops them with "AMF selection failed"
+#   0052 — CN Paging fix: gNB RRC read aMFPointer (a 6-bit BIT STRING) with
+#          GetBitStringInt<10>, which returns 0 when sourceBitLength(6) < 10, so
+#          any AMF Pointer != 0 was relayed as 0 and the UE's 5G-S-TMSI compare
+#          silently failed (never "Responding to received Paging"). Fixed to
+#          <6> + a UE-side debug log on mismatch (TS 23.003 §2.10.1, TS 38.413 §9.2.8)
+#   0060 — IPv4/IPv6/IPv4v6 PDU session type selection (nr-cli ps-establish
+#          <type>, config sessions[].type); TUN IPv6 SLAAC via "ip -6 token"
+#          once the UPF's Router Advertisement arrives (TS 23.501 §5.8.2.2.2)
 COPY tools/ueransim/patches/ /patches/
 RUN set -e; for p in /patches/*.patch; do \
         echo "Applying $p"; \

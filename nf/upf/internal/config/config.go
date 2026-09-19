@@ -15,10 +15,18 @@ import (
 // Ref: TS 23.501 §5.6.5, TS 29.244 §6.3.3.14 (Network Instance)
 type DNNConfig struct {
 	Name      string `yaml:"name"`
-	UEIPPool  string `yaml:"ue_ip_pool"`  // CIDR for UE addresses (e.g., "10.60.0.0/24")
-	TunName   string `yaml:"tun_name"`    // TUN device name (e.g., "upfgtp0")
-	TunAddr   string `yaml:"tun_addr"`    // CIDR assigned to TUN (e.g., "10.60.0.254/24")
-	GatewayIP string `yaml:"gateway_ip"`  // N6 bridge gateway for internet egress
+	UEIPPool  string `yaml:"ue_ip_pool"` // CIDR for UE addresses (e.g., "10.60.0.0/24")
+	TunName   string `yaml:"tun_name"`   // TUN device name (e.g., "upfgtp0")
+	TunAddr   string `yaml:"tun_addr"`   // CIDR assigned to TUN (e.g., "10.60.0.254/24")
+	GatewayIP string `yaml:"gateway_ip"` // N6 bridge gateway for internet egress
+
+	// UEIPv6Prefix is the delegated IPv6 base prefix for this DNN (e.g. a
+	// /56 mirroring the SMF's per-DNN IPv6 pool), anchoring which per-DNN
+	// user plane a session's Router Advertisement belongs to and guarding
+	// that the DNN is IPv6-enabled. The advertiser primarily uses the /64
+	// that arrived in the PFCP UE IP Address IE (TS 29.244 §8.2.62); empty
+	// means the DNN has no IPv6 capability. Ref: TS 23.501 §5.8.2.2.
+	UEIPv6Prefix string `yaml:"ue_ipv6_prefix"`
 }
 
 // Config holds UPF runtime configuration.

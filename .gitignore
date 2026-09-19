@@ -3,6 +3,14 @@
 **/*.test
 **/*.out
 coverage.out
+# Root-level build output (compiled NF binaries must never be committed)
+/amf
+/pcf
+/smf
+/upf
+
+# Node tooling
+node_modules/
 
 # PKI — private keys are never committed
 pki/*.key
@@ -31,6 +39,10 @@ docker-compose.override.yml
 
 # Agentic development — session state (ephemeral, do not commit)
 dev/SESSION_LOG.md
+.tmp/
+.opencode/
+opencode.json
+
 
 # UERANSIM dev fork (throwaway source tree — the patch set is the committed artifact)
 tools/ueransim/.fork/

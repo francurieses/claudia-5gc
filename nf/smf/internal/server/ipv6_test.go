@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/francurieses/claudia-5gc/shared/nas"
+	pfcpie "github.com/wmnsk/go-pfcp/ie"
 )
 
 func TestSelectPDUSessionType(t *testing.T) {
@@ -98,6 +99,126 @@ func TestIPv6PoolReleaseReuse(t *testing.T) {
 	}
 	if third.String() != first.String() {
 		t.Errorf("expected released /64 %s to be reused, got %s", first, third)
+	}
+}
+
+func TestUEIPv6Address(t *testing.T) {
+	addr, err := ueIPv6Address("2001:db8:61:0::/64")
+	if err != nil {
+		t.Fatalf("ueIPv6Address: %v", err)
+	}
+	want := net.ParseIP("2001:db8:61::1")
+	if !addr.Equal(want) {
+		t.Errorf("ueIPv6Address = %s, want %s", addr, want)
+	}
+
+	if _, err := ueIPv6Address(""); err == nil {
+		t.Error("expected error for empty prefix")
+	}
+	if _, err := ueIPv6Address("not-a-prefix"); err == nil {
+		t.Error("expected error for garbage CIDR")
+	}
+}
+
+// TestBuildUEIPAddressIE_IPv4Unchanged proves the IPv4-only path is
+// byte-identical to the pre-IPv6 encoding: flags 0x02 (V4 only), empty v6
+// field. Zero regression for the default UERANSIM flow.
+func TestBuildUEIPAddressIE_IPv4Unchanged(t *testing.T) {
+	sess := &Session{
+		PDUSessionType: nas.PDUSessionTypeIPv4,
+		UEIP:           net.ParseIP("10.60.0.5"),
+	}
+	ie, v6, err := buildUEIPAddressIE(sess)
+	if err != nil {
+		t.Fatalf("buildUEIPAddressIE: %v", err)
+	}
+	if v6 != nil {
+		t.Errorf("expected nil UE IPv6 address for IPv4-only, got %s", v6)
+	}
+	fields, err := ie.UEIPAddress()
+	if err != nil {
+		t.Fatalf("UEIPAddress: %v", err)
+	}
+	if fields.Flags != 0x02 {
+		t.Errorf("flags = 0x%02x, want 0x02 (V4 only)", fields.Flags)
+	}
+	if !fields.IPv4Address.Equal(sess.UEIP) {
+		t.Errorf("IPv4Address = %s, want %s", fields.IPv4Address, sess.UEIP)
+	}
+	if fields.IPv6Address != nil {
+		t.Errorf("expected no IPv6Address field, got %s", fields.IPv6Address)
+	}
+
+	// Byte-exact reference: what the pre-IPv6 code path produced directly.
+	ref := pfcpie.NewUEIPAddress(0x02, sess.UEIP.String(), "", 0, 0)
+	got, _ := ie.Marshal()
+	want, _ := ref.Marshal()
+	if string(got) != string(want) {
+		t.Errorf("IPv4 UE IP Address IE bytes changed: got %x, want %x", got, want)
+	}
+}
+
+func TestBuildUEIPAddressIE_IPv6Only(t *testing.T) {
+	sess := &Session{
+		PDUSessionType: nas.PDUSessionTypeIPv6,
+		UEIPv6Prefix:   "2001:db8:61::/64",
+	}
+	ie, v6, err := buildUEIPAddressIE(sess)
+	if err != nil {
+		t.Fatalf("buildUEIPAddressIE: %v", err)
+	}
+	wantV6 := net.ParseIP("2001:db8:61::1")
+	if !v6.Equal(wantV6) {
+		t.Errorf("UE IPv6 address = %s, want %s", v6, wantV6)
+	}
+	fields, err := ie.UEIPAddress()
+	if err != nil {
+		t.Fatalf("UEIPAddress: %v", err)
+	}
+	if fields.Flags != 0x01 {
+		t.Errorf("flags = 0x%02x, want 0x01 (V6 only)", fields.Flags)
+	}
+	if fields.IPv4Address != nil {
+		t.Errorf("expected no IPv4Address field, got %s", fields.IPv4Address)
+	}
+	if !fields.IPv6Address.Equal(wantV6) {
+		t.Errorf("IPv6Address = %s, want %s", fields.IPv6Address, wantV6)
+	}
+}
+
+func TestBuildUEIPAddressIE_IPv4v6(t *testing.T) {
+	sess := &Session{
+		PDUSessionType: nas.PDUSessionTypeIPv4v6,
+		UEIP:           net.ParseIP("10.60.0.7"),
+		UEIPv6Prefix:   "2001:db8:61::/64",
+	}
+	ie, v6, err := buildUEIPAddressIE(sess)
+	if err != nil {
+		t.Fatalf("buildUEIPAddressIE: %v", err)
+	}
+	wantV6 := net.ParseIP("2001:db8:61::1")
+	if !v6.Equal(wantV6) {
+		t.Errorf("UE IPv6 address = %s, want %s", v6, wantV6)
+	}
+	fields, err := ie.UEIPAddress()
+	if err != nil {
+		t.Fatalf("UEIPAddress: %v", err)
+	}
+	if fields.Flags != 0x03 {
+		t.Errorf("flags = 0x%02x, want 0x03 (V4+V6)", fields.Flags)
+	}
+	if !fields.IPv4Address.Equal(sess.UEIP) {
+		t.Errorf("IPv4Address = %s, want %s", fields.IPv4Address, sess.UEIP)
+	}
+	if !fields.IPv6Address.Equal(wantV6) {
+		t.Errorf("IPv6Address = %s, want %s", fields.IPv6Address, wantV6)
+	}
+}
+
+func TestBuildUEIPAddressIE_MissingPrefixErrors(t *testing.T) {
+	sess := &Session{PDUSessionType: nas.PDUSessionTypeIPv6}
+	if _, _, err := buildUEIPAddressIE(sess); err == nil {
+		t.Error("expected error when IPv6 granted type has no delegated prefix")
 	}
 }
 

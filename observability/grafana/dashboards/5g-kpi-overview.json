@@ -1050,6 +1050,98 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 117},
+      "id": 109,
+      "title": "SMF — Secondary Authentication / DN-AAA (TS 23.502 §4.3.2.3)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Percentage of DN-AAA secondary authentication/authorization exchanges (TS 23.501 §5.6.6) that ended in EAP-Success. Sourced from fivegc_procedure_total{nf=\"SMF\",procedure=\"SecondaryAuthentication\"}.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 90}, {"color": "green", "value": 98}]},
+          "max": 100, "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 118},
+      "id": 39,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "Secondary Auth Success Rate",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "100 * (sum(rate(fivegc_procedure_total{nf=\"SMF\", procedure=\"SecondaryAuthentication\", result=\"OK\"}[5m])) or vector(0)) / (sum(rate(fivegc_procedure_total{nf=\"SMF\", procedure=\"SecondaryAuthentication\"}[5m])) > 0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Number of secondary authentication EAP exchanges currently in flight at the SMF (PENDING_AUTH + AWAITING_AAA — AUTH COMMAND sent, awaiting AUTH COMPLETE or the DN-AAA's terminal result). A value that never drains indicates a stuck DN-AAA or a UE that never answered. Sourced from fivegc_smf_secondary_auth_pending (TS 23.502 §4.3.2.3).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "unit": "short",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]}
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 118},
+      "id": 40,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
+      "title": "Secondary Auth Pending (DN-AAA in flight)",
+      "type": "stat",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "fivegc_smf_secondary_auth_pending",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Rate of SMF Secondary Authentication procedure completions per second, broken down by result: OK (DN-AAA EAP-Success, session established), REJECT (EAP-Failure, DN-AAA unreachable/timeout, or malformed EAP — ESTABLISHMENT REJECT with 5GSM cause #29). Sourced from fivegc_procedure_total{nf=\"SMF\",procedure=\"SecondaryAuthentication\"} (TS 23.502 §4.3.2.3, TS 24.501 §9.11.4.2).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 8},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "OK"},
+            "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]
+          },
+          {
+            "matcher": {"id": "byName", "options": "REJECT"},
+            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
+          }
+        ]
+      },
+      "gridPos": {"h": 8, "w": 16, "x": 8, "y": 118},
+      "id": 41,
+      "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
+      "title": "SMF Secondary Authentication Rate by Result",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (result)(rate(fivegc_procedure_total{nf=\"SMF\", procedure=\"SecondaryAuthentication\"}[2m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ]
     }
   ],
   "refresh": "10s",

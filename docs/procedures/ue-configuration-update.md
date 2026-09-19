@@ -22,7 +22,7 @@ mis-parse. The only spec-correct carrier is DL NAS TRANSPORT with payload contai
 > **modified UERANSIM** in this repo (`tools/ueransim/patches/0010-ue-policy-delivery.patch`)
 > decodes the MANAGE UE POLICY COMMAND, applies the URSP rules, and replies with MANAGE UE POLICY
 > COMPLETE — the AMF logs `MANAGE UE POLICY COMPLETE received`. See
-> `docs/procedures/ueransim-modifications.md`.
+> `tools/ueransim/FEATURES.md`.
 
 ---
 

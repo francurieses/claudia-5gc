@@ -10,13 +10,13 @@ For code conventions and workflow, see root `CLAUDE.md`.
 | NF | Status | Notes |
 |---|---|---|
 | NRF | ✅ | Register/Discover/Deregister + Heartbeat TTL eviction + OAuth2 HS256 JWT + mTLS; Redis backend (`REDIS_URL`) |
-| AMF | ✅ | Registration + PDU Session Establishment/Release/Modification; NAS security NIA2+NEA2; NSSAI validation + NSSF delegation; NSSAA slice auth (TS 23.502 §4.2.9 — EAP relay via AUSF, control plane); PostgreSQL UE contexts + Redis TMSI; timers T3512/MobileReachable/ImplicitDetach/PendingRemoval; inbound `namf-comm` SBI (:8001 mTLS+h2) — UEContextTransfer + N1N2MessageTransfer/CN Paging |
+| AMF | ✅ | Registration + PDU Session Establishment/Release/Modification; NAS security NIA2+NEA2; NSSAI validation + NSSF delegation; NSSAA slice auth (TS 23.502 §4.2.9 — EAP relay via AUSF, control plane); PostgreSQL UE contexts + Redis TMSI; timers T3512/MobileReachable/ImplicitDetach/PendingRemoval; inbound `namf-comm` SBI (:8001 mTLS+h2) — UEContextTransfer + N1N2MessageTransfer/CN Paging; Public Warning System (AMF-007, TS 38.413 §8.9) — NGAP Write-Replace Warning (ProcCode 51) / PWS Cancel (ProcCode 32) broadcast to every connected gNB, portal-driven CBC role via mgmt API (`:9002`), live-verified zero-malformed pcap |
 | AUSF | 🟡 | 5G-AKA happy path; EAP-AKA' (RFC 5448, `PUT …/eap-session`, key hierarchy in `shared/crypto/eapaka`); NSSAA EAP relay (`POST /nausf-nssaa/.../authenticate`, simulated AAA-S); SUCI null-scheme via UDM; Redis auth context store (TTL 5 min, `ausf:auth:{id}`) |
 | UDM | 🟡 | Auth + AM data (incl. subjectToNssaa flag) + UECM + SDM Subscribe/Notify; SUCI deconcealment implemented |
 | UDR | ✅ | PostgreSQL 16 + fallback in-memory; pgx/v5; auto-migrate; `UE_COUNT` seeded subscribers; policy data: UE Policy Set (URSP) + **SM Policy Data** (`/policy-data/{supi}/sm-data` GET/PUT/PATCH, TS 29.519 §5.6.2.4 — per-S-NSSAI/DNN authorized QoS, `subscription_sm_policy` JSONB) consumed by PCF over N36 |
-| SMF | ✅ | PDU Session Establishment + Modification (consults PCF SM Policy Update for QoS authorization on UE-requested + NW-initiated mod, TS 29.512 §5.2.2.3; fail-open if PCF absent); IPv4 allocation; IPv6/IPv4v6 prefix delegation (control plane — granted-type selection + /64+IID + PDU Address IE per TS 24.501 §9.11.4.10; UPF RA/PFCP v6 install escalated, SMF-002); N1SM/N2SM encoding e2e; 4 SNSSAIs on NRF; PostgreSQL sessions |
+| SMF | ✅ | PDU Session Establishment + Modification (consults PCF SM Policy Update for QoS authorization on UE-requested + NW-initiated mod, TS 29.512 §5.2.2.3; fail-open if PCF absent); IPv4 allocation; IPv6/IPv4v6 prefix delegation (full — control plane: granted-type selection + /64+IID + PDU Address IE per TS 24.501 §9.11.4.10; data plane: PFCP UE IP Address IE with V6 flag per TS 29.244 §8.2.62 in the Create PDR, SMF-002); N1SM/N2SM encoding e2e; 4 SNSSAIs on NRF; PostgreSQL sessions; **PFCP Usage Reporting consumer** — installs a Create URR (VOLUM+DURAT, PERIO+VOLTH, volume threshold + measurement period) at establishment, runs a persistent PFCP receiver (`StartPFCPReceiver` :8805) that consumes UPF Session Report Requests, logs total/UL/DL volume + duration + trigger, answers Session Report Response (Cause accepted / session-not-found); charging hook point (TS 29.244 §5.2.2.4; UPF-001); **Secondary Authentication / DN-AAA** — SMF acts as EAP authenticator during establishment for DNNs flagged `secondary_auth`, relaying EAP between the UE (5GSM AUTHENTICATION COMMAND/COMPLETE 0xC5/0xC6) and a simulated in-core DN-AAA (swappable `DNAAAClient` seam), EAP-Success → Accept + PFCP, EAP-Failure/unreachable → Establishment Reject 5GSM cause #29, no N4 (TS 23.501 §5.6.6, TS 23.502 §4.3.2.3; SMF-003) |
 | PCF | ✅ | SM Policy Control (N7, config-driven QoS/AMBR) + SM Policy **Update** (TS 29.512 §5.2.2.3 — authorizes/rejects requested 5QI + Session-AMBR via `authorized_5qi`/`max_session_ambr_mbps`); UE Policy Control N15 (TS 29.525) + URSP delivery (TS 24.526); per-subscriber UDR override (now write-through to UDR SM Policy Data over N36; read tier `UDR_POLICY_DATA` at SmPolicyControl_Create); config-default fallback |
-| UPF | ✅ | PFCP session table; GTP-U decap + ext. header skip; TUN `upfgtp0` + iptables MASQUERADE; e2e ping verified |
+| UPF | ✅ | PFCP session table; GTP-U decap + ext. header skip; TUN `upfgtp0` + iptables MASQUERADE; e2e ping verified; **PFCP Usage Reporting (URR)** — parses Create URR, per-session UL/DL volume+packet counting on the datapath, `runUsageReporter` sweep emits PFCP Session Report Request (Usage Report) on VOLTH/PERIO triggers to the SMF, VOLTH baseline re-armed after report (TS 29.244 §5.2.2.4, §7.5.5; UPF-001); **IPv6 Router Advertisement** — parses the PFCP UE IP Address IE V6 field (TS 29.244 §8.2.62) + PDI Network Instance into the session, runs a per-session RFC 4861 ICMPv6 RA advertiser (`nf/upf/internal/ra`, Prefix Information option L=1/A=1 /64, RFC 4443 checksum) delivered downlink over N3 GTP-U once the DL tunnel is known + unicast RA on a decapsulated Router Solicitation (TS 23.501 §5.8.2.2.2; SMF-002) |
 | NSSF | ✅ | Nnssf_NSSelection_Get; static NSSAI intersection; NRF registration; 8 unit tests |
 | SMSF | 🟡 | Nsmsf_SMService Activate/Deactivate/UplinkSMS (port 8009) + loopback DTE echo; AMF UL NAS Transport SMS relay; live UE leg out of scope (UERANSIM no SMS-over-NAS) |
 | BSF | ✅ | Nbsf_Management Register/DeRegister/Discovery (port 8010, mTLS+h2; TS 29.521 §5) — in-memory PcfBinding registry (ipv4/supi indices); NRF registration (nfType BSF); PCF registers/deregisters the binding on SM policy create/delete over Nbsf (SMF supplies UE `ipv4Address` in SmPolicyContextData); fivegc_bsf_bindings_active gauge. docker-compose wiring deferred (BSF-004) |
@@ -32,8 +32,8 @@ gap queue (reconciled against live code 2026-06-18):
 
 | Priority | Open gaps |
 |---|---|
-| P1 | ✅ AMF-002 UEContextTransfer (producer side — inbound namf-comm server now exists) · ✅ AMF-004 CN Paging + NW-Triggered Service Request (control-plane core; DL-data trigger simulated, real PFCP DDN = UPF-001) · ✅ UDM-001 Nudm_SDM Subscribe/Notify (subscribe CRUD + async notify fan-out; 3 godog scenarios) · ✅ PCF-001 AM Policy Association · ✅ AMF-003 Service Area Restriction · 🟡 SMF-002 IPv6/IPv4v6 prefix delegation (control plane done; UPF RA + IPv6 PFCP PDR escalated — hard stop) |
-| P2 | ~~PCF-002 SMPolicyControl Update~~ (DONE — Update op + QoS authorization; SMF consults on both modification paths) · ~~AUSF-001 EAP-AKA'~~ (DONE) · ~~AMF-005 NSSAA~~ (DONE — control plane; AAA-S simulated behind AUSF) · SMF-003 Secondary Auth/DN-AAA · ~~UDR-001 Policy Data resource~~ (DONE — SM Policy Data resource + PCF reads/write-throughs via Nudr_DR) · ~~SMSF-001 SMS over NAS~~ (DONE — new SMSF NF + AMF UL relay) · ~~BSF-001 Binding Support Function~~ (DONE — new BSF NF + PCF binding register/deregister on SM policy lifecycle; unblocks NEF-001) · ~~NEF-001 Network Exposure baseline~~ (DONE — new NEF NF; Nnef_AFsessionWithQoS → BSF Discovery → Npcf_PolicyAuthorization; OAuth2 northbound) · UPF-001 URR usage reporting (PFCP hard-stop) |
+| P1 | ✅ AMF-002 UEContextTransfer (producer side — inbound namf-comm server now exists) · ✅ AMF-004 CN Paging + NW-Triggered Service Request (control-plane core; DL-data trigger simulated, real PFCP DDN = UPF-001) · ✅ UDM-001 Nudm_SDM Subscribe/Notify (subscribe CRUD + async notify fan-out; 3 godog scenarios) · ✅ PCF-001 AM Policy Association · ✅ AMF-003 Service Area Restriction · ✅ SMF-002 IPv6/IPv4v6 prefix delegation (control plane + data plane; PFCP UE IP Address IE V6 + UPF RFC 4861 Router Advertisement, PFCP-path exception under human sign-off) |
+| P2 | ~~PCF-002 SMPolicyControl Update~~ (DONE — Update op + QoS authorization; SMF consults on both modification paths) · ~~AUSF-001 EAP-AKA'~~ (DONE) · ~~AMF-005 NSSAA~~ (DONE — control plane; AAA-S simulated behind AUSF) · ~~SMF-003 Secondary Auth/DN-AAA~~ (DONE — SMF EAP authenticator, DN-AAA simulated in-core, reject cause #29; 5GSM 0xC5/0xC6/0xC7 codecs) · ~~UDR-001 Policy Data resource~~ (DONE — SM Policy Data resource + PCF reads/write-throughs via Nudr_DR) · ~~SMSF-001 SMS over NAS~~ (DONE — new SMSF NF + AMF UL relay) · ~~BSF-001 Binding Support Function~~ (DONE — new BSF NF + PCF binding register/deregister on SM policy lifecycle; unblocks NEF-001) · ~~NEF-001 Network Exposure baseline~~ (DONE — new NEF NF; Nnef_AFsessionWithQoS → BSF Discovery → Npcf_PolicyAuthorization; OAuth2 northbound) · ~~UPF-001 URR usage reporting~~ (DONE — UPF emits PFCP Session Report on VOLTH/PERIO; SMF installs URR + consumes; live 27/27, pcap ✅, TS 29.244 §5.2.2.4) · ~~AMF-007 Public Warning System~~ (DONE — NGAP Write-Replace Warning/PWS Cancel broadcast to every gNB, portal CBC role, gNB patch 0070, live pcap zero-malformed after fixing the CBS page-framing of WarningMessageContents) |
 | P3 | NRF-001 NFListRetrieval + richer NFDiscover filters |
 
 Already implemented (were on the gap list, verified done): Mobility/Periodic Registration
@@ -41,19 +41,32 @@ Update (AMF), UE-requested PDU Session Modification (SMF), Xn + N2 Handover.
 
 ## Web Management Portal
 
-`http://localhost:8080` after `make portal`. See `tools/mgmt-portal/CLAUDE.md` for full stack.
+`http://localhost:8080` after `make portal`. See `tools/mgmt-portal/CLAUDE.md` for the full stack
+and `tools/mgmt-portal/web/STYLE_GUIDE.md` for the design system (source of truth for tokens,
+primitives and the three frontend enforcement commands).
+
+**Professional-view redesign complete (PORTAL-UI-01…19, 2026-09-16):** token-based light/dark
+theme (`localStorage.theme` overriding the OS, anti-FOUC bootstrap), domain-grouped IA (13 pages
+in 6 groups), a primitives layer (`web/src/components/ui/`) with a raw-palette-utility ban, SPA
+deep-link/F5 fallback in the Go router, Dashboard range charts over a curated Prometheus endpoint
+(no arbitrary PromQL), and a contrast-audited palette (38 pairs × 2 themes, enforced by
+`node web/scripts/contrast-audit.mjs`). WCAG 2.1 AA bar.
 
 | Page | Status |
 |--------|--------|
-| Dashboard | ✅ KPIs + grid of 9 NFs + active PDU sessions table |
-| Subscribers | ✅ PostgreSQL CRUD |
-| Network Slices | ✅ Add/remove S-NSSAIs + restart AMF/SMF/NSSF |
+| Dashboard | ✅ 6 KPI cards (4 operational counts + instant 5-min Initial-Registration and PDU-session-establishment success rates, "—" when a window has no data) + 6 3GPP-grounded metrics range charts (UEs registered, registration success %, procedure results by outcome, active PDU sessions, 5G-AKA authentications, N3 UL/DL throughput; 15 m/1 h/6 h/24 h + custom) + 9 NF cards + recent PDU sessions |
+| Subscribers | ✅ PostgreSQL CRUD + per-slice DNN + RFSP override + SQN-preserving edits |
+| Network Slices | ✅ S-NSSAI add/remove (+restart) + DNN lifecycle incl. IPv6 prefix |
 | Services | ✅ Start/Stop/Restart containers |
 | Sessions | ✅ PDU sessions + AMF UE contexts |
-| UERANSIM | ✅ Container grid + UEs table + ping + nr-cli + inline logs |
+| QoS | ✅ Live SMF QoS; modify flow; subscription inspector; E2E panel; NW-triggered additional PDU session (URSP) |
+| Policies | ✅ URSP templates + per-subscriber policies; apply/push (trigger UCU) |
+| UERANSIM | ✅ Scenarios + container grid + UEs table + ping + nr-cli + inline logs |
+| PacketRusher | ✅ Xn/N2 mobility scenarios + tabbed log viewer + mobility checklist |
 | Logs | ✅ WebSocket streaming Docker logs |
-| PCAP | ✅ Start/Stop sidecars + file download |
-| Policies | ✅ URSP rule CRUD + per-UE push (trigger UCU) |
+| PCAP | ✅ Sidecar start/stop/pause/resume/rotate + file list/download + bulk ops |
+| Public Warning | ✅ CBC console — compose, live per-gNB status, cancel, resend |
+| UE Location | ✅ LMF Cell-ID positions on a Leaflet map (dark-mode tiles) + table |
 
 ---
 

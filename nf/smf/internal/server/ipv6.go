@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/francurieses/claudia-5gc/shared/nas"
+	pfcpie "github.com/wmnsk/go-pfcp/ie"
 )
 
 // IPv6Pool delegates per-session /64 prefixes out of a configured shorter base
@@ -146,4 +147,47 @@ func pduTypeNeedsIPv4(t uint8) bool {
 
 func pduTypeNeedsIPv6(t uint8) bool {
 	return t == nas.PDUSessionTypeIPv6 || t == nas.PDUSessionTypeIPv4v6
+}
+
+// buildUEIPAddressIE builds the PFCP UE IP Address IE (TS 29.244 §8.2.62) for
+// a session's granted PDU session type. Flags octet: bit1 V6 (0x01), bit2 V4
+// (0x02). The IPv4-only path (flags 0x02, empty v6 field) is unchanged from
+// before IPv6 support was added — zero regression for the default UERANSIM
+// flow. Returns the IE and the computed UE IPv6 address (nil for IPv4-only).
+// Ref: TS 23.501 §5.8.2.2.
+func buildUEIPAddressIE(sess *Session) (*pfcpie.IE, net.IP, error) {
+	needV4 := pduTypeNeedsIPv4(sess.PDUSessionType)
+	needV6 := pduTypeNeedsIPv6(sess.PDUSessionType)
+
+	if !needV6 {
+		return pfcpie.NewUEIPAddress(0x02, sess.UEIP.String(), "", 0, 0), nil, nil
+	}
+
+	ueIPv6, err := ueIPv6Address(sess.UEIPv6Prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if needV4 {
+		return pfcpie.NewUEIPAddress(0x03, sess.UEIP.String(), ueIPv6.String(), 0, 0), ueIPv6, nil
+	}
+	return pfcpie.NewUEIPAddress(0x01, "", ueIPv6.String(), 0, 0), ueIPv6, nil
+}
+
+// ueIPv6Address computes the full 128-bit UE IPv6 address installed in the
+// PFCP UE IP Address IE (TS 29.244 §8.2.62): the delegated /64 network
+// address with the low 64 bits set to the same interface identifier the SMF
+// returned in the N1 PDU Address IE (defaultIID, "::1"). Ref: TS 23.501
+// §5.8.2.2.2.
+func ueIPv6Address(prefixCIDR string) (net.IP, error) {
+	if prefixCIDR == "" {
+		return nil, fmt.Errorf("smf: no IPv6 prefix delegated")
+	}
+	_, ipnet, err := net.ParseCIDR(prefixCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("smf: parse UE IPv6 prefix %q: %w", prefixCIDR, err)
+	}
+	addr := make(net.IP, net.IPv6len)
+	copy(addr, ipnet.IP.To16())
+	copy(addr[8:], defaultIID())
+	return addr, nil
 }
