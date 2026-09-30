@@ -118,5 +118,5 @@ session (`pdu_session_id`, `ue_ip`, `5qi`, `qos_source`).
 
 ## 6. Validation
 
-See root `CLAUDE.md` → *Feature Validation* → **NW-Triggered Additional PDU Session**, and
+See `docs/validation-commands.md` §15 → **NW-Triggered Additional PDU Session**, and
 the E2E checklist embedded in the portal panel (`/qos`).

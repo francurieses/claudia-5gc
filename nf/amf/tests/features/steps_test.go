@@ -9,8 +9,8 @@
 // E2E validation:
 //
 //	make ueransim
-//	./scripts/test-pdu-session-modification.sh
-//	# Check AMF logs: docker logs -f amf | grep PDUSessionModification
+//	# UE-requested modification needs a UE that sends 0xC9 (UERANSIM has no ps-modify);
+//	# check AMF logs: docker logs -f amf | grep PDUSessionModification
 //
 // Ref: TS 23.502 §4.3.3.1 (PDU Session Modification UE-requested)
 package features_test
@@ -25,7 +25,7 @@ import (
 // pendingIfNoE2E returns ErrPending unless E2E_TEST env is set.
 // This keeps the BDD scenarios documented and runnable without requiring
 // UERANSIM infrastructure in CI — each scenario is validated via
-// make ueransim + scripts/test-pdu-session-modification.sh.
+// a live stack (make ueransim) with a UE that can request the modification.
 func pendingIfNoE2E() error {
 	if os.Getenv("E2E_TEST") == "1" {
 		return nil // caller must implement the real E2E step

@@ -25,9 +25,25 @@ export interface TabsProps {
   label: string
   className?: string
   panelClassName?: string
+  /** Fill a flex-column parent: the panel takes the remaining height (`min-h-0`). */
+  fill?: boolean
+  /**
+   * Render every panel and hide the inactive ones, so state owned by a panel
+   * (WebSocket log buffers, running orchestrations) survives a tab switch.
+   */
+  keepMounted?: boolean
 }
 
-export default function Tabs({ tabs, value, onChange, label, className, panelClassName }: TabsProps) {
+export default function Tabs({
+  tabs,
+  value,
+  onChange,
+  label,
+  className,
+  panelClassName,
+  fill = false,
+  keepMounted = false,
+}: TabsProps) {
   const refs = useRef<Record<string, HTMLButtonElement | null>>({})
   const activeIndex = Math.max(
     0,
@@ -50,7 +66,7 @@ export default function Tabs({ tabs, value, onChange, label, className, panelCla
   const active = tabs[activeIndex]
 
   return (
-    <div className={className}>
+    <div className={cn(fill && 'flex min-h-0 flex-1 flex-col', className)}>
       <div role="tablist" aria-label={label} onKeyDown={onKeyDown} className="flex flex-wrap gap-1 border-b border-border">
         {tabs.map(tab => {
           const selected = tab.id === value
@@ -86,16 +102,20 @@ export default function Tabs({ tabs, value, onChange, label, className, panelCla
         })}
       </div>
 
-      {active?.content !== undefined && (
-        <div
-          id={`panel-${active.id}`}
-          role="tabpanel"
-          aria-labelledby={`tab-${active.id}`}
-          tabIndex={0}
-          className={cn('pt-4', panelClassName)}
-        >
-          {active.content}
-        </div>
+      {(keepMounted ? tabs : active ? [active] : []).map(tab =>
+        tab.content === undefined ? null : (
+          <div
+            key={tab.id}
+            id={`panel-${tab.id}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${tab.id}`}
+            hidden={tab.id !== active?.id}
+            tabIndex={0}
+            className={cn('pt-4', fill && 'flex min-h-0 flex-1 flex-col', panelClassName)}
+          >
+            {tab.content}
+          </div>
+        ),
       )}
     </div>
   )

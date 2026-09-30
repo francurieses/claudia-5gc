@@ -217,7 +217,7 @@ Grounded in the real code layout — no invented packages.
 
 ### Protocol-encoding rule (CLAUDE.md § Protocol Encoding Rules)
 
-PFCP (N4) is **TLV (IE Type + Length + Value)** per TS 29.244, encoded via `shared/pfcp` conventions —
+PFCP (N4) is **TLV (IE Type + Length + Value)** per TS 29.244, encoded via `wmnsk/go-pfcp` —
 here realised through `github.com/wmnsk/go-pfcp` `ie`/`message` (already the UPF's PFCP library). **No
 bespoke binary format.** PFCP is **UDP/8805** — there is **no SCTP** on N4 (SCTP is N2/NGAP only).
 

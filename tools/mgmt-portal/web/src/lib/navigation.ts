@@ -113,3 +113,7 @@ export function groupForPath(pathname: string): string | undefined {
 
   return match?.id
 }
+
+/** localStorage keys for the persisted sidebar state. */
+export const NAV_COLLAPSED_KEY = 'portal.nav.collapsed'
+export const NAV_GROUPS_KEY = 'portal.nav.groups'

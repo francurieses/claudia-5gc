@@ -224,7 +224,7 @@ Validation approach (criterion: served + registered/removed + discovery returns 
 - **Unit tests** (in-process, no stack): `store` Create/Delete/FindByQuery incl. duplicate-key
   → `EXISTING_BINDING_INFO_FOUND`, discovery miss → 404, missing query param → 400; handler
   201+Location header on Register, 204 on Deregister, 200 `PcfBinding` / 404 on Discovery.
-- **godog functional** (`nf/bsf/tests/features/binding-support.feature`, in-process server):
+- **godog functional** (`nf/bsf/tests/features/binding_support.feature`, in-process server):
   Register-then-Discover-by-IP returns the same `pcfFqdn`/`pcfId`; Deregister-then-Discover
   → 404; duplicate Register → 403; PCF SmPolicyCreate-then-Delete drives Register/Deregister
   against a fake BSF (PCF-side test reusing `nf/pcf/internal/server`).

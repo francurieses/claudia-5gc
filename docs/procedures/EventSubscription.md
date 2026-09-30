@@ -441,7 +441,7 @@ coordinate drifts across a test polygon over time.
 Audited against TS 29.572 §5.2.3 (EventSubscription Create/Get/Delete), §5.2.2.5
 (CancelLocation), §6.1.6.2.x (LocationNotification / GeographicArea), TS 23.273 §7.2
 step B2, TS 29.571 §5.2. **The Rel-17 `TS29572_Nlmf_Location.yaml` is NOT present
-locally** (`specs/3gpp-openapi/` holds only `README.md`; `make sync-specs` has not been
+locally** (`specs/3gpp-openapi/` holds only `README.md`; `make sync-openapi` has not been
 run). All field/enum findings below are therefore raised against the **TS prose +
 the existing DetermineLocation conformance precedent**, not a byte-diff of the YAML.
 They must be re-verified against the YAML when it is synced. No production Go was modified.
@@ -482,7 +482,7 @@ LMF is simultaneously the producer and (in LMF-003 scope) drives the only consum
 its own mock/portal sink, the custom envelope is internally self-consistent and the
 service is functional and testable. They are recorded as **deferred interop debt**: the
 enum/field names MUST be reconciled against `TS29572_Nlmf_Location.yaml` (run
-`make sync-specs`) before any external LCS/GMLC consumer (LMF-007, N56) is integrated.
+`make sync-openapi`) before any external LCS/GMLC consumer (LMF-007, N56) is integrated.
 This mirrors the DetermineLocation precedent, where `nlmfRequest`/`LocationData` are
 likewise LMF-internal shapes accepted into the matrix with an explicit deferral note.
 

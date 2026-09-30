@@ -8,6 +8,37 @@ Legend:
 - ⏳ Pending
 - ➖ Not applicable for this NF
 
+## Procedure design docs
+
+Design contract per procedure (sequence, IEs, causes). Matrix rows below cite these; a new procedure doc must be added here.
+
+| Doc | Title |
+|---|---|
+| [`DetermineLocation.md`](procedures/DetermineLocation.md) | Procedure: DetermineLocation (Nlmf_Location — UE Cell-ID Positioning) |
+| [`EventSubscription.md`](procedures/EventSubscription.md) | Procedure: EventSubscription (Nlmf_Location — Periodic + Area-of-Interest Reporting + CancelLocation) |
+| [`LPPRelay.md`](procedures/LPPRelay.md) | Procedure: LPPRelay (UE-assisted A-GNSS Positioning — LPP over NAS N1 Relay) |
+| [`NRPPaRelay.md`](procedures/NRPPaRelay.md) | Procedure: NRPPaRelay (E-CID Positioning — NRPPa over NGAP N2 Relay) |
+| [`PublicWarningSystem.md`](procedures/PublicWarningSystem.md) | Public Warning System — CBC control-plane + NGAP Write-Replace Warning / PWS Cancel |
+| [`SecondaryAuthentication.md`](procedures/SecondaryAuthentication.md) | Secondary Authentication / Authorization by a DN-AAA Server |
+| [`UsageReporting.md`](procedures/UsageReporting.md) | PFCP Usage Reporting — URR with Active Usage Reports (TS 29.244 §5.2.2.4 — UPF + SMF) |
+| [`am-policy-association.md`](procedures/am-policy-association.md) | AM Policy Association (TS 29.507 §4.2.2 — Npcf_AMPolicyControl) |
+| [`binding-support.md`](procedures/binding-support.md) | Binding Support Function — Nbsf_Management (TS 23.501 §6.2.16 / TS 29.521 §5) |
+| [`eap-aka-prime.md`](procedures/eap-aka-prime.md) | EAP-AKA' Authentication (TS 33.501 §6.1.3.1 — Nausf_UEAuthentication) |
+| [`initial-registration.md`](procedures/initial-registration.md) | Procedure: Initial Registration |
+| [`ipv6-prefix-delegation.md`](procedures/ipv6-prefix-delegation.md) | IPv6 / IPv4v6 PDU Session Prefix Delegation (TS 23.501 §5.8.2 — SMF + UPF) |
+| [`network-exposure.md`](procedures/network-exposure.md) | Network Exposure Function — Nnef_AFsessionWithQoS (TS 23.501 §6.2.5 / TS 29.522 §4.4.13) |
+| [`network-triggered-service-request.md`](procedures/network-triggered-service-request.md) | Procedure: CN Paging + Network-Triggered Service Request |
+| [`nssaa.md`](procedures/nssaa.md) | Network Slice-Specific Authentication and Authorization (NSSAA) |
+| [`nudm-sdm-subscribe.md`](procedures/nudm-sdm-subscribe.md) | Nudm_SDM Subscribe / Notify (TS 29.503 §5.3.2 / §5.3.3) |
+| [`nw-triggered-pdu-session.md`](procedures/nw-triggered-pdu-session.md) | Procedure: Network-Triggered Additional PDU Session (URSP-based) |
+| [`service-area-restriction.md`](procedures/service-area-restriction.md) | Service Area Restriction (TS 23.501 §5.3.4 — AMF + PCF) |
+| [`service-request.md`](procedures/service-request.md) | Procedure: UE-Triggered Service Request with User-Plane Re-activation |
+| [`sm-policy-control-update.md`](procedures/sm-policy-control-update.md) | SM Policy Association Update (TS 29.512 §5.2.2.3 — Npcf_SMPolicyControl_Update) |
+| [`sms-over-nas.md`](procedures/sms-over-nas.md) | SMS over NAS — SMSF (TS 23.502 §4.13, TS 29.540) |
+| [`udr-policy-data.md`](procedures/udr-policy-data.md) | UDR Policy Data Resource (TS 29.504 §5.2.13 / TS 29.519 — Nudr_DataRepository) |
+| [`ue-configuration-update.md`](procedures/ue-configuration-update.md) | URSP Delivery via the UE Policy Delivery Service |
+| [`ue-context-transfer.md`](procedures/ue-context-transfer.md) | Procedure: UE Context Transfer (Namf_Communication) |
+
 ## NRF (TS 29.510)
 
 | Service / Operation | Section | Status | Tests | Notes |
@@ -16,11 +47,11 @@ Legend:
 | `nnrf-nfm` NFUpdate | §5.2.2.3 | 🟡 | unit | Simplified PATCH (replace), no JSON Patch RFC 6902 |
 | `nnrf-nfm` NFDeregister | §5.2.2.4 | ✅ | unit | DELETE |
 | `nnrf-nfm` NFProfileRetrieve | §5.2.2.5 | ✅ | unit | GET single |
-| `nnrf-nfm` NFListRetrieval | §5.2.2.6 | ⏳ | — | |
+| `nnrf-nfm` NFListRetrieval | §5.2.2.6 | ✅ | — | `GET /nnrf-nfm/v1/nf-instances`; `?detail=true` inlines full NF profiles |
 | `nnrf-nfm` NFStatusSubscribe | §5.2.2.7 | ✅ | unit | `internal/registry/subscriptions.go`; AMF subscribes |
 | `nnrf-nfm` NFStatusUnsubscribe | §5.2.2.8 | ✅ | unit | DELETE subscription |
 | `nnrf-nfm` NFStatusNotify | §5.2.2.9 | ✅ | unit | mTLS HTTP/2 callback (NF_REGISTERED / NF_DEREGISTERED) |
-| `nnrf-disc` NFDiscover | §5.3.2.2 | 🟡 | unit | Only target-nf-type, requester-nf-type, service-names; missing snssais, dnn, tai filters... |
+| `nnrf-disc` NFDiscover | §5.3.2.2 | 🟡 | unit | target-nf-type, requester-nf-type, service-names, snssais, dnn filters; missing tai and other filters |
 | `nnrf-disc` SCPDomainRoutingInfoGet | §5.3.2.3 | ⏳ | — | |
 | OAuth2 Token endpoint | TS 33.501 §13.4.1 | ✅ | unit jwt | JWT HS256; soft enforcement (`OAUTH2_ENFORCE=true` for hard reject) |
 | Heartbeat / TTL eviction | §5.2.2.3.4 | ✅ | unit registry | JSON Patch PATCH → heartbeat; eviction goroutine; `shared/nrf.Client` with `StartHeartbeat`; wired in AMF |
@@ -85,7 +116,7 @@ Legend:
 | Feature | Section | Status | Notes |
 |---|---|---|---|
 | PFCP node: Heartbeat / Association | TS 29.244 §7.4 | ✅ | |
-| PFCP session: PDR/FAR/QER/URR/BAR | TS 29.244 §5.2 | ✅ | URR without active reporting |
+| PFCP session: PDR/FAR/QER/URR/BAR | TS 29.244 §5.2 | ✅ | URR active reporting: see the Usage Reporting row in the SMF section |
 | GTP-U encap/decap N3 | TS 29.281 | ✅ | Extension header skip (TS 38.415) for 5G gNBs |
 | GTP-U N9 (inter-UPF) | TS 29.281 | ⏳ | |
 | QoS per QFI/5QI | TS 23.501 §5.7 | ✅ | |
@@ -94,13 +125,13 @@ Legend:
 
 ## AUSF (TS 29.509, TS 33.501)
 
-🟡 5G-AKA happy path functional.
+🟡 5G-AKA + EAP-AKA' + NSSAA relay (AAA-S simulated).
 
 | Procedure | Section | Status | Notes |
 |---|---|---|---|
 | 5G-AKA initiation (→ UDM) | TS 33.501 §6.1.3.2 | ✅ | e2e UERANSIM |
 | RES* verification + KAUSF derivation | TS 33.501 Annex A | ✅ | KAUSF generated in UDM; AUSF forwards it |
-| SUCI deconcealment (delegated to UDM) | TS 33.501 §6.12 | ✅ | null-scheme; ECIES Profile A/B ⏳ |
+| SUCI deconcealment (delegated to UDM) | TS 33.501 §6.12 | ✅ | null-scheme + ECIES Profile A (X25519); Profile B ⏳ in UDM |
 | EAP-AKA' flow | TS 33.501 §6.1.3.1 | ✅ | AUSF EAP server: CK'/IK' key hierarchy (RFC 5448), EAP packet codec (AT_RAND/AT_AUTN/AT_KDF/AT_KDF_INPUT/AT_MAC/AT_RES), `PUT …/eap-session`; K_AUSF=EMSK[0:32]→K_SEAF. Golden-vector unit tests (RFC 5448 App. C Case 1) + 4 handler tests + 5 godog scenarios. Live N1 not exercised (UERANSIM has no EAP-AKA' peer). agentic_verified ✅ |
 | NSSAA EAP relay (Nausf_NSSAA) | TS 23.502 §4.2.9.2, TS 29.526 | 🟡 | `POST /nausf-nssaa/v1/{supi}/authenticate`: relays the UE EAP-Response to a **simulated AAA-S** (single EAP round: Identity → Success/Failure; rejects identity containing "reject"). Generic EAP framing in `shared/crypto/eap` (RFC 3748). 3 handler tests. No standalone NSSAAF NF / real external AAA-S. agentic_verified ✅ |
 
@@ -115,7 +146,7 @@ Legend:
 | Nudm_SDM Subscribe/Notify | §5.3.2 / §5.3.3 | ✅ | unit, feature (3 godog scenarios) | POST `/nudm-sdm/v2/{supi}/sdm-subscriptions` (201+Location); DELETE unsubscribe (204); async fan-out via `POST /nudm-mgmt/v1/{supi}/data-change` trigger; 3 scenarios pass (happy path, unsubscribe, missing callbackRef). agentic_verified ✅ |
 | Nudm_UECM Registration (AMF) | §5.3 | ✅ | PUT + DELETE (deregistration) |
 | Nudm_UECM Get | §5.3 | ⏳ | |
-| SUCI deconcealment (SIDF) | TS 33.501 §6.12 | ✅ | null-scheme; ECIES ⏳ |
+| SUCI deconcealment (SIDF) | TS 33.501 §6.12 | ✅ | null-scheme + ECIES Profile A (X25519); Profile B ⏳ |
 | Nudm_NIDDAU | §5.6 | ⏳ | |
 
 ## UDR (TS 29.504, TS 29.505)
@@ -153,24 +184,46 @@ Legend:
 
 ## NSSF (TS 29.531)
 
-⏳ Not started.
+✅ Operational.
+
+| Procedure | Clause | Status | Tests | Notes |
+|---|---|---|---|---|
+| `Nnssf_NSSelection` Get | §5.2.2.2 | ✅ | unit nssf (8) | `GET /nnssf-nsselection/v2/network-slice-information`; static NSSAI intersection with configured allowed slices |
+| `Nnssf_NSSAIAvailability` | §5.3 | ⏳ | — | |
+| NRF registration | TS 29.510 §5.2.2.2 | ✅ | — | nfType NSSF |
+
+## SMSF (TS 29.540)
+
+🟡 `Nsmsf_SMService` Activate/Deactivate/UplinkSMS — see the SMS rows in the gap table below.
+
+## BSF (TS 29.521)
+
+✅ `Nbsf_Management` Register/Deregister/Discovery — see the BSF rows in the gap table below.
+
+## NEF (TS 29.522)
+
+🟡 `Nnef_AFsessionWithQoS` Create/Get/Delete — see the NEF rows in the gap table below.
+
+## LMF (TS 29.572)
+
+🟡 `Nlmf_Location` DetermineLocation, EventSubscription, CancelLocation — see the Location rows in the gap table below.
 
 ## Cross-cutting specifications
 
-| Topic | Spec | Status |
-|---|---|---|
-| TLS 1.3 mutual between NFs | TS 33.501 §13 | ✅ (NRF verifies client cert; `sbi.NewMTLSClient` for NFs) |
+| Topic | Spec | Status | Tests | Notes |
+|---|---|---|---|---|
+| TLS 1.3 mutual between NFs | TS 33.501 §13 | ✅ | — | NRF verifies client cert; `sbi.NewMTLSClient` for NFs |
 | OAuth2 client_credentials | TS 33.501 §13.4.1 | ✅ | unit jwt | NRF issues JWT HS256; `shared/oauth2` BearerTransport; AMF wired; soft enforcement (OAUTH2_ENFORCE=true for hard reject) |
-| ProblemDetails RFC 7807 | TS 29.500 §5.2.7.2 | ✅ (in NRF) |
-| Correlation-Id propagation | (local convention) | ✅ (in NRF middleware) |
-| OpenAPI conformance check | TS 29.501 | ⏳ |
-| Wireshark-compatible PCAPs | (local convention) | ✅ (sidecar configured) |
+| ProblemDetails RFC 7807 | TS 29.500 §5.2.7.2 | ✅ | — | in NRF |
+| Correlation-Id propagation | (local convention) | ✅ | — | in NRF middleware |
+| OpenAPI conformance check | TS 29.501 | ⏳ | — | |
+| Wireshark-compatible PCAPs | (local convention) | ✅ | — | sidecar configured |
 
 ## Agentic Backlog — Gap Analysis
 
-Tracked gaps queued for autonomous development. `agentic_verified` = ✅ once an
-ORCHESTRATOR session has implemented and validated the procedure (see `AGENTS.md`,
-`dev/BACKLOG.md`). Reconciled against live code at bootstrap (2026-06-18).
+Tracked gaps queued for autonomous development (backlog IDs are internal tracking
+identifiers). `agentic_verified` = ✅ once an ORCHESTRATOR session has implemented and
+validated the procedure. Reconciled against live code at bootstrap (2026-06-18).
 
 Pre-existing procedures found already implemented (removed from the backlog): Mobility/
 Periodic Registration Update (AMF, §4.2.2.2.3/4), UE-requested PDU Session Modification
@@ -187,7 +240,7 @@ Periodic Registration Update (AMF, §4.2.2.2.3/4), UE-requested PDU Session Modi
 | EAP-AKA' | TS 33.501 §6.1.3.1 | AUSF, UDM | ✅ Done | AUSF-001 | ✅ |
 | Network Slice-Specific Auth & Auth (NSSAA) | TS 23.502 §4.2.9 | AMF, AUSF | 🟡 Control-plane | AMF-005 | ✅ |
 | Npcf_SMPolicyControl Update | TS 29.512 §5.2.2.3 | PCF, SMF | ✅ Update op + QoS authorization; SMF consults on both modification paths | PCF-002 | ✅ |
-| Secondary Authentication / DN-AAA | TS 23.502 §4.3.2.3 | SMF | ⏳ Missing | SMF-003 | ⏳ |
+| Secondary Authentication / DN-AAA | TS 23.502 §4.3.2.3 | SMF | ✅ Done — SMF as EAP authenticator, DN-AAA simulated (see SMF section) | SMF-003 | ✅ |
 | UDR Policy Data resource | TS 29.519 §5.6.2.4 | UDR, PCF | ✅ SM Policy Data resource (GET/PUT/PATCH) + ue-policy-set PATCH; PCF reads/write-throughs SM policy via Nudr_DR (N36); 6 PCF unit + 6 UDR unit + 4 BDD | UDR-001 | ✅ |
 | Converged Charging (CHF) | TS 32.290/291, §4.4 | **CHF (new)**, SMF | ⏳ Missing | CHF-001 | ⏳ |
 | SMS over NAS (SMSF) | TS 23.502 §4.13 | **SMSF (new)**, AMF | ✅ Nsmsf_SMService (Activate/Deactivate/UplinkSMS + internal MT trigger); NRF reg + UDM UECM; loopback DTE MO→MT echo via Namf N1N2MessageTransfer; AMF UL NAS Transport (PCT=0x02) → Nsmsf UplinkSMS; 11 smsf unit + 7 BDD. Live N1 UE leg out of scope (UERANSIM has no SMS) | SMSF-001 | 🟡 |
@@ -202,7 +255,7 @@ Periodic Registration Update (AMF, §4.2.2.2.3/4), UE-requested PDU Session Modi
 | Npcf_PolicyAuthorization Create/Delete (thin) | TS 29.514 §5.2.2.2 / §5.2.2.4 | PCF, NEF | 🟡 POST /npcf-policyauthorization/v1/app-sessions → 201 + Location (mints appSessionId, stores AppSessionContext); DELETE …/{appSessionId} → 204 / 404. NOTE: authorized qosReference logged but NOT yet bound to an SM-policy DNN-scoped override (UE-IP→SUPI resolution deferred); full §5.2.2.x lifecycle (Update/Subscribe/Notify) out of scope | NEF-001 | ✅ |
 | PFCP Usage Reporting (URR) | TS 29.244 §5.2.2.4 | UPF, SMF | 🟡 Implemented | UPF-001 (Session 18) | ✅ agentic_verified |
 | ULCL / I-UPF (edge) | TS 23.501 §5.6.4 | UPF, SMF | ⏳ Missing | UPF-002 (hard-stop) | ⏳ |
-| NFListRetrieval + richer NFDiscover filters | TS 29.510 §5.2.2.6 | NRF | ⏳ Missing | NRF-001 | ⏳ |
+| NFListRetrieval + richer NFDiscover filters | TS 29.510 §5.2.2.6 | NRF | 🟡 NFListRetrieval + snssais/dnn filters done; tai filter pending | NRF-001 | ⏳ |
 | Service Communication Proxy (SCP) | TS 23.501 §6.2.19 | **SCP (new)** | ⏳ Missing | SCP-001 | ⏳ |
 | Network Data Analytics (NWDAF) | TS 23.288 | **NWDAF (new)** | ⏳ Missing | NWDAF-001 | ⏳ |
 | N32 Roaming Interconnect (SEPP) | TS 23.501 §4.2.4, TS 29.573, TS 33.501 §13.2 | **SEPP (new)** | ⏳ Missing | SEPP-001 | ⏳ |

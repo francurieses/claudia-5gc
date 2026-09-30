@@ -41,6 +41,28 @@ jobs:
       - name: Build all NFs without workspace
         run: GOWORK=off go build ./nf/... ./shared/...
 
+  docs-lint:
+    name: Docs drift — code vs documentation (warning-only)
+    runs-on: ubuntu-22.04
+    # Non-blocking while the linter beds in (see docs/DOC_MAP.md). Flip to a required
+    # check by removing `continue-on-error` once it has been green for a few weeks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Docs drift linter (strict)
+        run: |
+          if [ ! -x scripts/docs-lint.sh ]; then
+            echo "docs-lint not shipped in this repo — skipping"; exit 0
+          fi
+          BASE_ARG=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_ARG="--diff origin/${{ github.base_ref }}"
+          fi
+          ./scripts/docs-lint.sh --strict $BASE_ARG
+
   nrppa-codec:
     name: shared/nrppa — golden-byte + ProcedureCode regression
     runs-on: ubuntu-22.04

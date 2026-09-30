@@ -35,6 +35,12 @@ export type { BadgeProps, BadgeVariant } from './Badge'
 export { Table, TableBody, TableCell, TableEmptyRow, TableHead, TableHeaderCell, TableRow } from './Table'
 export type { TableCellProps, TableProps } from './Table'
 
+export { default as Page } from './Page'
+export type { PageProps } from './Page'
+
+export { default as LogSurface } from './LogSurface'
+export type { LogSurfaceProps } from './LogSurface'
+
 export { default as Tabs } from './Tabs'
 export type { TabItem, TabsProps } from './Tabs'
 

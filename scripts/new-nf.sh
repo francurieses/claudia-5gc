@@ -30,6 +30,6 @@ find "$DST" -type f -exec sed -i \
 
 echo "==> created nf/$NF_LOWER"
 echo "Next steps:"
-echo "  1. cd nf/$NF_LOWER && edit CLAUDE.md"
+echo "  1. cd nf/$NF_LOWER and implement the NF (see CONTRIBUTING.md — Adding a New Network Function)"
 echo "  2. add '$NF_LOWER' to NFS in /Makefile"
 echo "  3. add service '$NF_LOWER' in /docker-compose.yml"

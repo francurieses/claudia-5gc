@@ -292,7 +292,7 @@ Validation approach (same posture as BSF-001 — no live UERANSIM)
 - **Unit tests** (in-process): northbound Create returns `201` + `Location`; missing UE addr
   → `400`; missing `qosReference` → `400`; BSF discovery miss → `404`; PCF `403` propagated;
   unknown `subscriptionId` on Get/Delete → `404`; missing/invalid token → `401`/`403`.
-- **godog functional** (`nf/nef/tests/features/network-exposure.feature`, in-process server
+- **godog functional** (`nf/nef/tests/features/network_exposure.feature`, in-process server
   with **mock NRF / mock BSF / mock PCF**): Create → BSF Discovery returns a `PcfBinding` →
   NEF POSTs `AppSessionContext` to the mock PCF → `201`; Delete drives the PCF app-session
   Delete; discovery-miss path returns `404`. PCF-side: the thin `app-sessions` Create/Delete

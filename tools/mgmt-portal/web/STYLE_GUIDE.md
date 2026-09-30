@@ -210,7 +210,7 @@ figures that sit in a column (counters, TEIDs, byte sizes).
 | Table cell | `px-4 py-2.5` (body), `px-4 py-3` (header) |
 | Control height | `h-8` sm / `h-10` md / `h-11` lg (44 px touch target) |
 
-**Layout:** app shell = fixed sidebar (`w-64`) + scrollable `main`; below `lg` the sidebar
+**Layout:** app shell = `h-dvh` (`html/body/#root` are `height:100%; overflow:hidden`, so the document never scrolls) with a sidebar (`w-64`; collapsible icon rail on `lg+`, persisted in `localStorage` `portal.nav.collapsed`/`portal.nav.groups`; compact under `max-height: 780px`) + `main` (`relative min-h-0 overflow-y-auto`, the sole page scroller; thin scrollbars via `.scroll-thin`). `ui/Page` (`scroll`|`fill`) sets a view's scroll mode; below `lg` the sidebar
 becomes an overlay drawer. Pages compose top-down: `PageHeader` → grid of `Card`/`StatCard`
 → `Section`s. Tables scroll horizontally inside their own container (`Table`), never the page.
 
@@ -366,7 +366,8 @@ PORTAL-UI-19; a page that still uses one no longer compiles.
 
 Use `mono` for identifiers/IPs/TEIDs, `caption` for the accessible name,
 `TableEmptyRow` for the in-place empty case (or `<DegradedState>` above the table when the
-data source is unavailable).
+data source is unavailable). `<Table fill>` makes the table fill a `Page fill` view and scroll
+internally; `<TableHead sticky>` pins the header row.
 
 `Table` brings its own card chrome — place it directly in the page (with an `h2`/`h3`
 above it), or inside `<Section bare>`/`<Card padded={false}>`; do not nest it inside a
@@ -382,6 +383,11 @@ PacketRusher / Logs-style multi-viewer surfaces.
       tabs={[{ id: 'pr', label: 'PacketRusher', content: <LogPanel /> },
              { id: 'amf', label: 'AMF', content: <LogPanel /> }]} />
 ```
+
+Props: `fill` (panel fills the remaining height of a `Page fill` view) and `keepMounted`
+(inactive panels stay mounted, hidden — use when a tab holds polling/log state). Bind the
+active tab to the URL with `lib/useTabParam.ts` (`?tab=` deep links). Log tails use
+`ui/LogSurface` + `lib/useStickToBottom.ts` (container-scoped scroll, "Jump to latest").
 
 ### Disclosure
 
@@ -609,7 +615,7 @@ Run this against any new/changed view:
 
 ## 10. Enforcement
 
-Three checks, all runnable from `tools/mgmt-portal/web`. No lint plugin or test runner is
+Four checks, all runnable from `tools/mgmt-portal/web`. No lint plugin or test runner is
 added — the plan was accepted with these commands plus the per-page `CLAUDE.md` §5 behaviour
 checklists as the regression control.
 
@@ -645,6 +651,23 @@ pair list deliberately does not cover are review-blocking:
 - `success-fg` on a log surface (use `text-fg`/`text-log-fg` there — § 3 caveat).
 - `primary-fg` (white) on anything other than `primary`; `accent-fg` on anything other than
   `accent`.
+
+**4 — no scroll-API / viewport-height escapes (single-scroll shell).**
+
+```bash
+grep -rnE 'scrollIntoView|h-screen|100vh' src --include='*.tsx' --include='*.ts' --include='*.css'
+```
+
+**Expected:** no output (clean at the single-scroll-shell change). Tails use
+`lib/useStickToBottom.ts`; the shell height is `h-dvh`.
+
+**Layout checklist (review-blocking):**
+
+- No document scroll: `document.documentElement.scrollHeight <= innerHeight` at any viewport.
+- At most one scroll region per view (`<main>`, or one inner region on `Page fill` views).
+- Scroll regions are focusable (`tabIndex=0` + accessible name) so they are keyboard-operable.
+- `<main>` stays `relative min-h-0 overflow-y-auto` (Tailwind `sr-only` is `position:absolute` and
+  escapes clipping without a positioned scroll container).
 
 **Recorded result (PORTAL-UI-02, primitives layer):**
 

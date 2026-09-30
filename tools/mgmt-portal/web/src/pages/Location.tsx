@@ -7,7 +7,7 @@ import { CheckCircle2, RefreshCw, WifiOff } from 'lucide-react'
 import { getLocationSummary } from '../lib/api'
 import {
   Badge, Button, Card, ErrorState, Loading, PageHeader, Table, TableBody, TableCell,
-  TableEmptyRow, TableHead, TableHeaderCell, TableRow, useChartTheme,
+  Page, TableEmptyRow, TableHead, TableHeaderCell, TableRow, useChartTheme,
 } from '../components/ui'
 
 const MADRID: [number, number] = [40.4168, -3.7038]
@@ -26,6 +26,19 @@ function shortSupi(supi: string): string {
 
 // FitOnce fits the map to all located UEs the first time they appear, then leaves the
 // view under user control (so markers can drift without the map snapping around).
+// Leaflet renders grey tiles when its container is resized (split pane, window
+// resize, sidebar rail toggle) unless told to re-measure.
+function ResizeSync() {
+  const map = useMap()
+  useEffect(() => {
+    const el = map.getContainer()
+    const ro = new ResizeObserver(() => map.invalidateSize())
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [map])
+  return null
+}
+
 function FitOnce({ points }: { points: [number, number][] }) {
   const map = useMap()
   const done = useRef(false)
@@ -73,7 +86,7 @@ export default function Location() {
   const idleCount = locs.length - reachableCount
 
   return (
-    <div className="space-y-6 p-6">
+    <Page mode="fill" className="gap-4">
       <PageHeader
         eyebrow="Test UEs"
         title="UE Location"
@@ -94,12 +107,14 @@ export default function Location() {
         }
       />
 
-      <Card padded={false} className="h-[460px] overflow-hidden">
+      <div className="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(24rem,45%)]">
+      <Card padded={false} className="h-72 overflow-hidden lg:h-full lg:min-h-[16rem]">
         <MapContainer center={MADRID} zoom={12} className="h-full w-full" scrollWheelZoom>
           <TileLayer
             attribution='&copy; OpenStreetMap contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+          <ResizeSync />
           <FitOnce points={points} />
           {located.map(l => {
             const pos: [number, number] = [l.latitude as number, l.longitude as number]
@@ -143,6 +158,7 @@ export default function Location() {
         </MapContainer>
       </Card>
 
+      <div className="flex min-h-0 flex-col gap-2">
       <p className="text-xs text-muted-fg">
         Map tiles are served from OpenStreetMap and require outbound internet access. Coordinates are
         synthesized by the LMF from the serving NR cell (Cell-ID positioning carries no lat/lon on the wire).
@@ -159,8 +175,8 @@ export default function Location() {
           }
         />
       ) : (
-        <Table caption="UE location summary">
-          <TableHead>
+        <Table fill caption="UE location summary">
+          <TableHead sticky>
             <TableRow>
               <TableHeaderCell>SUPI</TableHeaderCell>
               <TableHeaderCell>Status</TableHeaderCell>
@@ -217,6 +233,8 @@ export default function Location() {
           </TableBody>
         </Table>
       )}
-    </div>
+      </div>
+      </div>
+    </Page>
   )
 }

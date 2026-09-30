@@ -15,7 +15,7 @@ of them (N2 and N3); all other interfaces remain internal.
                       ┌──────────────────────────────────────────────────┐
                       │                 5GC Server                        │
                       │                                                    │
-  gNB ──── N2 (NGAP) ──► AMF  :38412/TCP  (172.30.1.0/24 in dev)         │
+  gNB ──── N2 (NGAP) ──► AMF  :38412/SCTP (172.30.1.0/24 in dev)         │
        ──── N3 (GTP-U) ──► UPF  :2152/UDP   (172.30.3.100 in dev)        │
                       │    │                                               │
                       │    └── N6 (TUN upfgtp0) ──► Internet / DN         │
@@ -147,7 +147,7 @@ ngap:
 **docker-compose.yml** publishes this port to the host:
 ```yaml
 ports:
-  - "38412:38412"   # host_port:container_port
+  - "38412:38412/sctp"   # host_port:container_port
 ```
 
 ### What to configure on the gNB
@@ -159,11 +159,9 @@ ports:
 | PLMN | match §2 |
 | Slices | match §5 |
 
-> **SCTP note**: The current implementation uses TCP with a 4-byte length prefix instead of real
-> SCTP (SCTP requires kernel modules and special socket handling).  Most commercial and OSS gNBs
-> expect real SCTP on port 38412.  To enable SCTP replace the TCP listener in
-> `nf/amf/internal/ngap/server.go` with `github.com/ishidawataru/sctp`.  Until then, UERANSIM with
-> `ignoreStreamIds: true` and PacketRusher work because they tolerate TCP.
+> **SCTP note**: N2 is real SCTP (`github.com/ishidawataru/sctp`, `nf/amf/internal/ngap/ngap.go`),
+> and every NGAP DATA chunk is sent with PPID 60 (TS 38.412 §7).  The Docker host needs the
+> `sctp` kernel module loaded (`sudo modprobe sctp`).
 
 ---
 
@@ -389,18 +387,16 @@ allows them:
 
 | Port | Protocol | NF | Interface | Must be reachable by |
 |------|----------|----|-----------|----------------------|
-| 38412 | TCP* | AMF | N2 NGAP | gNB |
+| 38412 | SCTP | AMF | N2 NGAP | gNB |
 | 2152 | UDP | UPF | N3 GTP-U | gNB |
 | 8805 | UDP | UPF | N4 PFCP | SMF (internal) |
 | 8080 | TCP | Portal | Management UI | operator browser |
 | 8000–8007 | TCP | NFs | SBI HTTPS | internal only |
 | 9100–9109 | TCP | NFs | Prometheus | internal / monitoring |
 
-\* TCP stub, not real SCTP — see §6.
-
 ```bash
 # Open N2 and N3 on the host firewall (example — adjust for your distro/cloud):
-sudo iptables -A INPUT -p tcp --dport 38412 -j ACCEPT
+sudo iptables -A INPUT -p sctp --dport 38412 -j ACCEPT
 sudo iptables -A INPUT -p udp --dport 2152  -j ACCEPT
 ```
 
@@ -452,8 +448,7 @@ Use this as a pre-flight list before bringing the core up against a real gNB.
 
 - [ ] gNB AMF IP → set to server host IP
 - [ ] gNB AMF port → `38412`
-- [ ] Host firewall allows TCP 38412 inbound
-- [ ] (optional) Replace TCP stub with real SCTP in `nf/amf/internal/ngap/server.go`
+- [ ] Host firewall allows SCTP 38412 inbound; `sctp` kernel module loaded on the host
 
 ### N3 (UPF GTP-U) change
 

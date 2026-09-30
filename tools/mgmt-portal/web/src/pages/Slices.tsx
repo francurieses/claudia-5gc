@@ -8,9 +8,9 @@ import {
 import {
   Badge, Button, Card, Checkbox, ConfirmDialog, ErrorState, Field, IconButton, Input, Loading,
   PageHeader, Section, Select, Table, TableBody, TableCell, TableEmptyRow, TableHead,
-  TableHeaderCell, TableRow, useToast,
-} from '../components/ui'
+  TableHeaderCell, TableRow, useToast, Tabs } from '../components/ui'
 import type { SelectOption } from '../components/ui'
+import { useTabParam } from '../lib/useTabParam'
 
 const SST_NAMES: Record<number, string> = { 1: 'eMBB', 2: 'URLLC', 3: 'MIoT', 4: 'V2X' }
 
@@ -77,6 +77,7 @@ function restartNotice(restarted: string[] | undefined): string {
 }
 
 export default function Slices() {
+  const [tab, setTab] = useTabParam(['slices', 'dnns'] as const, 'slices')
   const qc = useQueryClient()
   const { toast } = useToast()
 
@@ -311,6 +312,16 @@ export default function Slices() {
         }
       />
 
+      <Tabs
+        label="Slices view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'slices',
+            label: 'S-NSSAI',
+            content: (
+              <div className="space-y-6">
       {/* Add slice form */}
       {showSliceForm && (
         <Card className="max-w-sm">
@@ -428,6 +439,14 @@ export default function Slices() {
         </Table>
       )}
 
+              </div>
+            ),
+          },
+          {
+            id: 'dnns',
+            label: 'DNNs',
+            content: (
+              <div className="space-y-6">
       {/* ================================================================
           DATA NETWORKS (DNNs)
       ================================================================ */}
@@ -641,6 +660,11 @@ export default function Slices() {
         )}
       </Section>
 
+              </div>
+            ),
+          },
+        ]}
+      />
       {/* Delete slice — cascade into AMF/SMF/NSSF config, optionally restarting */}
       <ConfirmDialog
         open={deleteSliceTarget !== null}

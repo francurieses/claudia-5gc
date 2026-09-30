@@ -1,7 +1,10 @@
 # UERANSIM — Modified Features & Command Reference
 
 Stock UERANSIM v3.2.8 lacks UE-side support for several 5GC Rel-17 procedures.
-This build applies four patches on top of the upstream tarball to close those gaps.
+This build applies the patch set in `tools/ueransim/patches/` on top of the upstream tarball to
+close those gaps. This file describes **what each patch adds** and is the **command reference**
+for the new `nr-cli` verbs (URSP / QoS modification, patches 0001–0030); the later patches add no
+`nr-cli` commands.
 Everything below is available after `make ueransim` (or any profile that builds
 `5gc/ueransim:dev`).
 
@@ -46,6 +49,53 @@ leg of the modification flow.
 
 This is the protocol layer that `ps-modify` (UE-requested) and the NW-initiated
 QoS flow both rely on.
+
+### Patch 0040 — Location reporting (gNB)
+Stock gNB drops NGAP `LocationReportingControl` as an unhandled initiating message.
+The patched gNB replies with a `LocationReport` carrying the serving NR-CGI + TAI
+(TS 38.413 §8.12), enabling the live LMF Cell-ID positioning path.
+
+### Patch 0041 — NRPPa transport (gNB)
+gNB handles `DownlinkUEAssociatedNRPPaTransport` (ProcCode 8) — decodes the `shared/nrppa`
+APER E-CID messages and answers over `UplinkUEAssociatedNRPPaTransport` (ProcCode 50):
+PositioningInformation and E-CIDMeasurementInitiation responses plus the measurement report
+with the AP position (TS 38.455). Enables live E-CID positioning.
+
+### Patch 0042 — LPP / A-GNSS (UE)
+UE-side LPP endpoint over NAS payload container type `0x03` (TS 24.501 §9.11.3.40,
+TS 37.355): answers RequestCapabilities, stores ProvideAssistanceData (reference time +
+quantized reference location) and answers RequestLocationInformation with synthetic GNSS
+code-phase measurements. `LPP_GNSS_NONE=1` makes the UE report no A-GNSS capability, which
+exercises the LMF fallback to E-CID.
+
+### Patch 0050 — Network-initiated deregistration → re-registration (UE)
+Implements the stock v3.2.8 TODO in `NasMm::receiveDeregistrationRequest`: on "re-registration
+required" the UE returns to `MM-DEREGISTERED` and starts a fresh registration
+(TS 24.501 §5.5.2.3.2), then re-establishes PDU sessions. Without it a portal subscriber
+edit leaves the UE stuck.
+
+### Patch 0051 — gNB AMF selection without Requested NSSAI
+Initial NAS messages that carry no NSSAI (Service Request from CM-IDLE, secured
+Registration Update, Deregistration) left `requestedSliceType == -1` and stock `selectAmf`
+dropped them ("Could not find a suitable AMF"). Fallback: any AMF that completed NG Setup
+(TS 23.501 §6.3.5).
+
+### Patch 0052 — Paging AMF Pointer bit-string fix
+The gNB RRC decoded the 6-bit `aMFPointer` with `GetBitStringInt<10>`, which returned 0,
+so the 5G-S-TMSI never matched and CN Paging was silently ignored. Now decoded as `<6>`
+(TS 38.413 §9.3.3.19).
+
+### Patch 0060 — IPv6 / IPv4v6 PDU sessions
+Removes the five artificial "IPv4 only" guards in stock UERANSIM (PDU type selection,
+address decode, TUN configuration, RA handling and the GTP-U uplink IP-version filter)
+and adds an IPv6 TUN path. Needed for SMF-002 prefix delegation E2E. Details in
+`docs/procedures/ipv6-prefix-delegation.md`.
+
+### Patch 0070 — PWS: Write-Replace Warning / PWS Cancel (gNB)
+gNB handles NGAP Write-Replace Warning Request (ProcCode 51) and PWS Cancel Request
+(ProcCode 32), decodes the CBS page structure per the DataCodingScheme (GSM7 / 8-bit /
+UCS2 + language prefix) and answers with BroadcastCompletedAreaList / BroadcastCancelledAreaList
+(TS 38.413 §8.9). Enables live PWS E2E (`docs/procedures/PublicWarningSystem.md`).
 
 ---
 

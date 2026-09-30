@@ -15,6 +15,7 @@ import {
 } from '../components/ui'
 import type { BadgeVariant } from '../components/ui'
 import { cn } from '../lib/cn'
+import { useStickToBottom } from '../lib/useStickToBottom'
 
 const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'lmf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf']
 
@@ -69,7 +70,7 @@ export default function Logs() {
   const [filter, setFilter] = useState('')
   const [connState, setConnState] = useState<ConnState>('connecting')
   const wsRef = useRef<WebSocket | null>(null)
-  const endRef = useRef<HTMLDivElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
   const pausedRef = useRef(false)
 
   pausedRef.current = paused
@@ -127,11 +128,7 @@ export default function Logs() {
   }, [container])
 
   // Auto-scroll while streaming (suspended while paused so the operator can read).
-  useEffect(() => {
-    if (!paused) {
-      endRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [lines, paused])
+  const { atBottom, jumpToLatest } = useStickToBottom(logRef, lines, paused)
 
   const filtered = filter
     ? lines.filter(l => l.raw.toLowerCase().includes(filter.toLowerCase()))
@@ -155,7 +152,7 @@ export default function Logs() {
   const conn = CONN[connState]
 
   return (
-    <div className="flex h-full flex-col p-6">
+    <div className="flex h-full min-h-0 flex-col p-6">
       <PageHeader
         eyebrow="Operations"
         title="Logs"
@@ -223,7 +220,14 @@ export default function Logs() {
       )}
 
       {/* monospace log surface — theme-aware via --c-log-bg / --c-log-fg */}
-      <div className="log-surface max-h-[600px] min-h-[400px] flex-1 overflow-y-auto rounded-card border border-border p-3">
+      <div className="relative flex min-h-[12rem] flex-1 flex-col">
+      <div
+        ref={logRef}
+        role="log"
+        aria-label={`Logs for ${container}`}
+        tabIndex={0}
+        className="log-surface scroll-thin min-h-0 flex-1 overflow-y-auto rounded-card border border-border p-3"
+      >
         {filtered.length === 0 ? (
           <p className="text-xs text-muted-fg">
             {filter && lines.length > 0 ? (
@@ -252,7 +256,12 @@ export default function Logs() {
             </div>
           ))
         )}
-        <div ref={endRef} />
+      </div>
+      {!atBottom && (
+        <div className="absolute bottom-3 right-5">
+          <Button size="sm" onClick={jumpToLatest}>Jump to latest</Button>
+        </div>
+      )}
       </div>
     </div>
   )

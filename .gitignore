@@ -40,8 +40,10 @@ docker-compose.override.yml
 # Agentic development — session state (ephemeral, do not commit)
 dev/SESSION_LOG.md
 .tmp/
-.opencode/
-opencode.json
+# OpenCode: track agents + config; ignore deps and the bundled ui-ux-pro-max skill data
+.opencode/node_modules/
+.opencode/agent/.agents/
+.opencode/agent/.claude/
 
 
 # UERANSIM dev fork (throwaway source tree — the patch set is the committed artifact)

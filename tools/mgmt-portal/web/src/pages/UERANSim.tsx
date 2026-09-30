@@ -13,10 +13,12 @@ import {
 import { formatHex32 } from '../lib/format'
 import {
   Badge, Button, Card, Dialog, EmptyState, ErrorState, Field, IconButton, Input, Loading,
-  PageHeader, Section, SegmentedControl, Select, Spinner, Table, TableBody, TableCell,
+  PageHeader, Section, SegmentedControl, Select, Spinner, Table, Tabs, TableBody, TableCell,
   TableEmptyRow, TableHead, TableHeaderCell, TableRow, useToast,
 } from '../components/ui'
 import type { BadgeVariant, SelectOption } from '../components/ui'
+import { useStickToBottom } from '../lib/useStickToBottom'
+import { useTabParam } from '../lib/useTabParam'
 
 // ---- Status → semantic badge (colour + icon + text; never colour-only) ------
 
@@ -91,7 +93,7 @@ function LogPanel({ container, onClose }: { container: string; onClose: () => vo
   const [filter, setFilter] = useState('')
   const [status, setStatus] = useState<WSStatus>('connecting')
   const wsRef = useRef<WebSocket | null>(null)
-  const endRef = useRef<HTMLDivElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     wsRef.current?.close()
@@ -133,7 +135,7 @@ function LogPanel({ container, onClose }: { container: string; onClose: () => vo
     }
   }, [container])
 
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [lines])
+  useStickToBottom(logRef, lines)
 
   const filtered = filter
     ? lines.filter(l => l.raw.toLowerCase().includes(filter.toLowerCase()))
@@ -172,7 +174,7 @@ function LogPanel({ container, onClose }: { container: string; onClose: () => vo
         </div>
       </div>
 
-      <div className="log-surface h-56 overflow-y-auto p-3">
+      <div ref={logRef} role="log" aria-label={`Logs for ${container}`} tabIndex={0} className="log-surface scroll-thin h-56 overflow-y-auto p-3">
         {filtered.length === 0 ? (
           <span className="text-muted-fg">
             {filter ? 'No lines match the filter.' : `Waiting for logs from ${container}…`}
@@ -188,7 +190,6 @@ function LogPanel({ container, onClose }: { container: string; onClose: () => vo
             </div>
           ))
         )}
-        <div ref={endRef} />
       </div>
     </Card>
   )
@@ -875,6 +876,7 @@ function errMessage(err: unknown): string {
 }
 
 export default function UERANSim() {
+  const [tab, setTab] = useTabParam(['scenarios', 'containers', 'ues'] as const, 'scenarios')
   const qc = useQueryClient()
   const { toast } = useToast()
   const [logContainer, setLogContainer] = useState<string | null>(null)
@@ -995,6 +997,17 @@ export default function UERANSim() {
         }
       />
 
+      <Tabs
+        keepMounted
+        label="UERANSIM view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'scenarios',
+            label: 'Scenarios',
+            content: (
+              <div className="space-y-6">
       {/* Test Scenarios */}
       <Section
         bare
@@ -1035,6 +1048,14 @@ export default function UERANSim() {
         )}
       </Section>
 
+              </div>
+            ),
+          },
+          {
+            id: 'containers',
+            label: 'Containers',
+            content: (
+              <div className="space-y-6">
       {/* Container grid */}
       <Section
         bare
@@ -1079,6 +1100,14 @@ export default function UERANSim() {
         <LogPanel container={logContainer} onClose={() => setLogContainer(null)} />
       )}
 
+              </div>
+            ),
+          },
+          {
+            id: 'ues',
+            label: 'UEs',
+            content: (
+              <div className="space-y-6">
       {/* Registered UEs */}
       <Section
         bare
@@ -1138,6 +1167,11 @@ export default function UERANSim() {
           Use <span className="font-mono">NR-CLI</span> to send commands: ps-establish, ps-release, ps-modify, ursp-show, ursp-match, ursp-establish, deregister.
         </p>
       )}
+              </div>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

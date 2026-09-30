@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom'
-import { ChevronDown, Menu, X } from 'lucide-react'
+import { ChevronDown, Menu, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Subscribers from './pages/Subscribers'
 import Slices from './pages/Slices'
@@ -16,7 +16,14 @@ import Location from './pages/Location'
 import PublicWarning from './pages/PublicWarning'
 import ThemeToggle from './components/ThemeToggle'
 import { IconButton, useFocusTrap } from './components/ui'
-import { ALL_GROUP_IDS, NAV_GROUPS, groupForPath } from './lib/navigation'
+import {
+  ALL_GROUP_IDS,
+  NAV_COLLAPSED_KEY,
+  NAV_GROUPS,
+  NAV_GROUPS_KEY,
+  groupForPath,
+} from './lib/navigation'
+import { usePersistentState } from './lib/usePersistentState'
 
 /** Page components keyed by route path — mirrors `NAV_ROUTES`. */
 const PAGES: Record<string, () => JSX.Element> = {
@@ -37,9 +44,12 @@ const PAGES: Record<string, () => JSX.Element> = {
 
 function AppShell() {
   const location = useLocation()
-  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() =>
+  const [openGroups, setOpenGroups] = usePersistentState<Record<string, boolean>>(
+    NAV_GROUPS_KEY,
     Object.fromEntries(ALL_GROUP_IDS.map(id => [id, true])),
   )
+  // Icon-rail mode applies on `lg`+ only; the drawer below `lg` is always full width.
+  const [collapsed, setCollapsed] = usePersistentState<boolean>(NAV_COLLAPSED_KEY, false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const menuButtonRef = useRef<HTMLButtonElement>(null)
 
@@ -49,7 +59,7 @@ function AppShell() {
   useEffect(() => {
     if (!activeGroup) return
     setOpenGroups(prev => (prev[activeGroup] ? prev : { ...prev, [activeGroup]: true }))
-  }, [activeGroup])
+  }, [activeGroup, setOpenGroups])
 
   // Navigate ⇒ the overlay drawer has done its job.
   useEffect(() => {
@@ -68,7 +78,7 @@ function AppShell() {
   const drawerRef = useFocusTrap<HTMLElement>({ enabled: drawerOpen, onEscape: closeDrawer })
 
   return (
-    <div className="flex h-screen overflow-hidden bg-bg text-fg">
+    <div className="flex h-dvh overflow-hidden bg-bg text-fg">
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-primary focus:px-3 focus:py-2 focus:text-sm focus:text-primary-fg"
@@ -91,6 +101,8 @@ function AppShell() {
         ref={drawerRef}
         id="primary-navigation"
         className={`fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-border bg-card transition-transform duration-200 lg:static lg:z-auto lg:translate-x-0 ${
+          collapsed ? 'lg:w-14' : ''
+        } ${
           drawerOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -101,7 +113,7 @@ function AppShell() {
           </IconButton>
         </div>
 
-        <nav aria-label="Primary" className="flex-1 overflow-y-auto p-2">
+        <nav aria-label="Primary" className="scroll-thin flex-1 overflow-y-auto p-2">
           {NAV_GROUPS.map(group => {
             const open = openGroups[group.id] ?? true
             const isActiveGroup = activeGroup === group.id
@@ -114,9 +126,9 @@ function AppShell() {
                   onClick={() => setOpenGroups(prev => ({ ...prev, [group.id]: !open }))}
                   aria-expanded={open}
                   aria-controls={panelId}
-                  className={`flex w-full items-center justify-between gap-2 rounded-control px-3 py-1.5 text-xs font-semibold uppercase tracking-wider transition-colors hover:text-fg ${
-                    isActiveGroup ? 'text-fg' : 'text-muted-fg'
-                  }`}
+                  className={`flex w-full items-center justify-between gap-2 rounded-control px-3 py-1.5 text-xs font-semibold uppercase tracking-wider transition-colors hover:text-fg [@media(max-height:780px)]:py-1 ${
+                    collapsed ? 'lg:hidden' : ''
+                  } ${isActiveGroup ? 'text-fg' : 'text-muted-fg'}`}
                 >
                   <span className="truncate">{group.label}</span>
                   <ChevronDown
@@ -126,15 +138,19 @@ function AppShell() {
                   />
                 </button>
 
-                {open && (
+                {(open || collapsed) && (
                   <div id={panelId} className="mt-0.5 space-y-0.5">
                     {group.items.map(({ to, label, icon: Icon, end }) => (
                       <NavLink
                         key={to}
                         to={to}
                         end={end}
+                        aria-label={label}
+                        title={label}
                         className={({ isActive }) =>
-                          `flex items-center gap-3 rounded-control px-3 py-2 text-sm transition-colors ${
+                          `flex items-center gap-3 rounded-control px-3 py-2 text-sm transition-colors [@media(max-height:780px)]:py-1.5 ${
+                            collapsed ? 'lg:justify-center lg:px-0' : ''
+                          } ${
                             isActive
                               ? 'bg-primary text-primary-fg'
                               : 'text-muted-fg hover:bg-muted hover:text-fg'
@@ -142,7 +158,7 @@ function AppShell() {
                         }
                       >
                         <Icon size={16} aria-hidden="true" className="flex-shrink-0" />
-                        <span className="truncate">{label}</span>
+                        <span className={`truncate ${collapsed ? 'lg:hidden' : ''}`}>{label}</span>
                       </NavLink>
                     ))}
                   </div>
@@ -152,12 +168,25 @@ function AppShell() {
           })}
         </nav>
 
-        <div className="flex-shrink-0 border-t border-border p-3">
-          <p className="text-xs text-muted-fg">Rel-17 · dev</p>
+        <div
+          className={`flex flex-shrink-0 items-center justify-between border-t border-border p-3 ${
+            collapsed ? 'lg:justify-center lg:p-2' : ''
+          }`}
+        >
+          <p className={`text-xs text-muted-fg ${collapsed ? 'lg:hidden' : ''}`}>Rel-17 · dev</p>
+          <IconButton
+            label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
+            variant="ghost"
+            aria-pressed={collapsed}
+            className="hidden lg:inline-flex"
+            onClick={() => setCollapsed(c => !c)}
+          >
+            {collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </IconButton>
         </div>
       </aside>
 
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex h-14 flex-shrink-0 items-center gap-3 border-b border-border bg-card px-4">
           <IconButton
             ref={menuButtonRef}
@@ -180,7 +209,7 @@ function AppShell() {
           <ThemeToggle />
         </header>
 
-        <main id="main-content" tabIndex={-1} className="flex-1 overflow-y-auto">
+        <main id="main-content" tabIndex={-1} className="relative min-h-0 flex-1 overflow-y-auto">
           <Routes>
             {Object.entries(PAGES).map(([path, Page]) => (
               <Route key={path} path={path} element={<Page />} />

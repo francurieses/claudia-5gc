@@ -160,6 +160,22 @@
     --c-chart-5: 34 211 238; /* #22D3EE */
   }
 
+  /*
+   * The document never scrolls: <main> (or one inner region) is the single
+   * scroll owner. Modal's scroll lock saves/restores the inline
+   * body.style.overflow, so it stays compatible with this rule.
+   */
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html,
+  body {
+    overflow: hidden;
+  }
+
   html {
     @apply bg-bg;
   }
@@ -191,6 +207,12 @@
 }
 
 @layer components {
+  /* Thin, token-coloured scrollbar for the scroll regions that remain. */
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--c-border-strong)) transparent;
+  }
+
   /* Readable mono surfaces for logs / identifiers, theme-aware. */
   .font-mono-terminal {
     @apply font-mono;

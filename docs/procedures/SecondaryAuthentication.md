@@ -228,7 +228,7 @@ establishment path in `server.go` (`handleCreateSMContext`, TS 29.502 §5.2.2.3.
   `sbi.NewMTLSClient`). The UE's AUTH COMPLETE arrives back as an `UpdateSMContext` modify call —
   extend `handleUpdateSMContext` to recognise a `0xC6` body (it already branches on `0xC9`
   Modification Request).
-- **N4 timing.** PFCP Session Establishment (`sendPFCPSessionEstablishment`, N4, `shared/pfcp` TLV
+- **N4 timing.** PFCP Session Establishment (`sendPFCPSessionEstablishment`, N4, `wmnsk/go-pfcp` TLV
   per TS 29.244) fires **only** in the `AUTHORIZED` transition. On `REJECTED`, release the
   allocated UE IP (`IPPool.Release`) and never create the N4 session.
 - **Logging.** Use `logging.NewProcedureLogger(ctx, "SecondaryAuthentication")`; NF `SMF`,

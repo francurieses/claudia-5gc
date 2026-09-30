@@ -47,7 +47,7 @@ docker network connect 5gc-n2 ueransim-gnb  # or your container name
 
 ```bash
 docker ps | grep amf
-# Look for: 0.0.0.0:38412->38412/tcp
+# Look for: 0.0.0.0:38412->38412/sctp
 
 docker logs amf | tail -20
 # Look for lines about "SCTP listen" or "N2"
@@ -163,7 +163,7 @@ Wireshark **DOES SEE TCP/TLS packets**, but:
    IP Address: 172.30.0.2 (or your NRF's IP)
    Port: 8000
    Protocol: http
-   Key File: /home/franc/proyectos/5gc-rel17/pki/nrf.key
+   Key File: <repo>/pki/nrf.key
    ```
 4. Repeat for amf (8001), ausf (8002), etc.
 5. Restart Wireshark

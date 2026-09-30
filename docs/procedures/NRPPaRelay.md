@@ -251,7 +251,7 @@ cell_coordinates:
   "000000011": { lat: 40.4530, lon: -3.6883 }   # neighbour
 ```
 
-Algorithm (`nf/lmf/internal/nrppa/ecid.go`):
+Algorithm (`nf/lmf/internal/server/ecid.go`):
 
 1. For each measured NRCGI `i` in the report, look up `coord_i = (lat_i, lon_i)` from
    `cell_coordinates`; skip cells with no mapping (logged). At least one mapped cell (the
@@ -332,7 +332,7 @@ Algorithm (`nf/lmf/internal/nrppa/ecid.go`):
 ## Implementation notes (for the NF developer)
 
 - **Shared NRPPa codec** (`shared/nrppa/`): define the **E-CID subset** ASN.1 types
-  following the `shared/ngap/` pattern, encoded with the same **free5gc/aper** library used
+  following the `nf/amf/internal/ngap/` pattern, encoded with the same **free5gc/aper** library used
   for NGAP (descriptor: "APER-encoded"). Parse/build only: `PositioningInformationRequest/
   Response/Failure`, `E-CIDMeasurementInitiationRequest/Response/Failure`,
   `E-CIDMeasurementReport`. Keep it dependency-free of the AMF/LMF packages so both import it.

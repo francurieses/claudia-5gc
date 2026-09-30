@@ -17,9 +17,9 @@ import {
   TableEmptyRow,
   TableHead,
   TableHeaderCell,
-  TableRow,
-} from '../components/ui'
+  TableRow, Tabs } from '../components/ui'
 import type { BadgeVariant } from '../components/ui'
+import { useTabParam } from '../lib/useTabParam'
 
 /** 5GMM states persisted by the AMF (TS 24.501 §5.1.3.2). */
 const GMM_STATES: Record<number, string> = {
@@ -56,6 +56,7 @@ function gmmBadge(state: number): { variant: BadgeVariant; icon: ReactNode; labe
 }
 
 export default function Sessions() {
+  const [tab, setTab] = useTabParam(['pdu', 'ue'] as const, 'pdu')
   const {
     data: sessions = [],
     isLoading: loadSess,
@@ -88,6 +89,16 @@ export default function Sessions() {
         subtitle="Live data from PostgreSQL"
       />
 
+      <Tabs
+        label="Sessions view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'pdu',
+            label: 'PDU Sessions',
+            content: (
+              <div className="space-y-6">
       {/* Active PDU sessions (SMF store) */}
       <Section
         bare
@@ -151,6 +162,14 @@ export default function Sessions() {
         )}
       </Section>
 
+              </div>
+            ),
+          },
+          {
+            id: 'ue',
+            label: 'UE Contexts',
+            content: (
+              <div className="space-y-6">
       {/* UE contexts (AMF store) */}
       <Section
         bare
@@ -208,6 +227,11 @@ export default function Sessions() {
           </Table>
         )}
       </Section>
+              </div>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

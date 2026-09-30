@@ -11,8 +11,7 @@ import StatCard from '../components/StatCard'
 import {
   Badge, Button, ChartWrapper, DegradedState, EmptyState, Loading, PageHeader, RangeControl, Section,
   Skeleton, Table, TableBody, TableCell, TableEmptyRow, TableHead, TableHeaderCell, TableRow,
-  useChartTheme,
-} from '../components/ui'
+  useChartTheme, Tabs } from '../components/ui'
 import type { ChartState, ChartTableFallback } from '../components/ui'
 import {
   DEFAULT_RANGE_ID, chartSpanMs, formatRangePoint, formatTick, isEmptySeries,
@@ -20,6 +19,7 @@ import {
 } from '../lib/metricsRange'
 import type { CustomRange, RangeId } from '../lib/metricsRange'
 import { formatBitsPerSec } from '../lib/format'
+import { useTabParam } from '../lib/useTabParam'
 
 /**
  * Poll interval for the preset (relative-window) charts. A custom range is
@@ -36,6 +36,7 @@ const RANGE_QUERY_INTERVAL_MS = 10_000
 const LINE_DASH: Array<string | undefined> = [undefined, '6 3', '2 4']
 
 export default function Dashboard() {
+  const [tab, setTab] = useTabParam(['overview', 'metrics'] as const, 'overview')
   const [rangeId, setRangeId] = useState<RangeId>(DEFAULT_RANGE_ID)
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
 
@@ -96,6 +97,16 @@ export default function Dashboard() {
     <div className="space-y-8 p-6">
       <PageHeader eyebrow="Overview" title="Dashboard" subtitle="Real-time status of ClaudIA 5GC" />
 
+      <Tabs
+        label="Dashboard view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'overview',
+            label: 'Overview',
+            content: (
+              <div className="space-y-6">
       {/* KPI cards (PORTAL-UI-21 adds the two instant 5-minute success rates) */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
         <StatCard
@@ -132,66 +143,6 @@ export default function Dashboard() {
           variant="info"
         />
       </div>
-
-      {/* Metrics — curated range queries (PORTAL-UI-17), six 3GPP-grounded KPIs (PORTAL-UI-20) */}
-      <Section
-        bare
-        headingLevel={2}
-        title="Metrics"
-        description="Six 3GPP-grounded KPIs from the curated metrics backend — control plane (registration, sessions), security (5G-AKA) and user plane (N3 throughput). Presets are relative to now; a custom range is fixed."
-      >
-        <RangeControl value={rangeId} custom={customRange} onChange={handleRangeChange} className="mb-4" />
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-          <MetricChart
-            metric="ue_registered"
-            title="UEs registered"
-            description="UEs in 5GMM-REGISTERED state (TS 28.554 §5.1)"
-            axis="count"
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-          <MetricChart
-            metric="registration_success_rate"
-            title="Registration success rate"
-            description="Initial Registration OK / attempts × 100 (TS 28.554 §5.1)"
-            axis="percent"
-            emptyMessage="No registrations in this range — register a UE (UERANSIM page) to populate it."
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-          <MetricChart
-            metric="procedure_rates_by_result"
-            title="Procedure results"
-            description="Completions per second by result — watch REJECT / FAILURE"
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-          <MetricChart
-            metric="pdu_sessions_active"
-            title="PDU sessions active"
-            description="Active PDU sessions (SMF) (TS 28.554 §5.2)"
-            axis="count"
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-          <MetricChart
-            metric="authentication_rate"
-            title="5G-AKA authentications"
-            description="Authentication completions per second by result (AUSF)"
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-          <MetricChart
-            metric="upf_gtp_throughput"
-            title="User-plane throughput (N3)"
-            description="GTP-U bits/s forwarded, uplink / downlink (TS 28.554 §5.3)"
-            axis="throughput"
-            emptyMessage="No user-plane traffic in this range — send real traffic, e.g. a ping from the UERANSIM page."
-            rangeId={rangeId}
-            customRange={customRange}
-          />
-        </div>
-      </Section>
 
       {/* NF Status grid */}
       <Section bare headingLevel={2} title="Network Functions">
@@ -285,6 +236,79 @@ export default function Dashboard() {
           </Table>
         )}
       </Section>
+              </div>
+            ),
+          },
+          {
+            id: 'metrics',
+            label: 'Metrics',
+            content: (
+              <div className="space-y-6">
+      {/* Metrics — curated range queries (PORTAL-UI-17), six 3GPP-grounded KPIs (PORTAL-UI-20) */}
+      <Section
+        bare
+        headingLevel={2}
+        title="Metrics"
+        description="Six 3GPP-grounded KPIs from the curated metrics backend — control plane (registration, sessions), security (5G-AKA) and user plane (N3 throughput). Presets are relative to now; a custom range is fixed."
+      >
+        <RangeControl value={rangeId} custom={customRange} onChange={handleRangeChange} className="mb-4" />
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          <MetricChart
+            metric="ue_registered"
+            title="UEs registered"
+            description="UEs in 5GMM-REGISTERED state (TS 28.554 §5.1)"
+            axis="count"
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+          <MetricChart
+            metric="registration_success_rate"
+            title="Registration success rate"
+            description="Initial Registration OK / attempts × 100 (TS 28.554 §5.1)"
+            axis="percent"
+            emptyMessage="No registrations in this range — register a UE (UERANSIM page) to populate it."
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+          <MetricChart
+            metric="procedure_rates_by_result"
+            title="Procedure results"
+            description="Completions per second by result — watch REJECT / FAILURE"
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+          <MetricChart
+            metric="pdu_sessions_active"
+            title="PDU sessions active"
+            description="Active PDU sessions (SMF) (TS 28.554 §5.2)"
+            axis="count"
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+          <MetricChart
+            metric="authentication_rate"
+            title="5G-AKA authentications"
+            description="Authentication completions per second by result (AUSF)"
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+          <MetricChart
+            metric="upf_gtp_throughput"
+            title="User-plane throughput (N3)"
+            description="GTP-U bits/s forwarded, uplink / downlink (TS 28.554 §5.3)"
+            axis="throughput"
+            emptyMessage="No user-plane traffic in this range — send real traffic, e.g. a ping from the UERANSIM page."
+            rangeId={rangeId}
+            customRange={customRange}
+          />
+        </div>
+      </Section>
+
+              </div>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

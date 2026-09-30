@@ -1,29 +1,26 @@
 # shared/nas — NAS-5GS codec (TS 24.501)
 
-Phase 1 deliverable. Not yet implemented.
+Hand-written, spec-faithful NAS-5GS codec used by the AMF, SMF and the MCP NAS tools.
+It does **not** wrap `github.com/free5gc/nas`; free5GC is only a reference for IE layouts.
 
-## Plan
+| File | Content |
+|---|---|
+| `nas.go`, `ie.go` | Message header, IE primitives (TV / TLV / LV / LV-E / TLV-E), IEI constants |
+| `registration.go`, `deregistration.go`, `service_request.go` | 5GMM registration, deregistration, service request |
+| `auth_security.go` | Authentication, Security Mode Command/Complete |
+| `transport.go` | UL/DL NAS Transport, payload containers (incl. UE policy container 0x05) |
+| `configuration_update.go`, `network_name.go` | Configuration Update Command, network name IEs |
+| `pdu_session.go` | 5GSM PDU session establishment / modification / release, QoS rules and flow descriptions |
+| `nssaa.go`, `secondary_auth.go` | NSSAA and secondary (DN-AAA) authentication messages |
 
-Two viable paths:
+Rules:
 
-1. **Reuse `github.com/free5gc/nas`** (Apache-2.0). Mature, complete, used in
-   production by free5GC. Wrap with our logging/types conventions in
-   `shared/nas/wrap.go`.
-2. **Hand-roll** a minimal subset (Registration Request, Authentication
-   Request/Response, Security Mode Command/Complete, Service Request, etc.)
-   for educational purposes.
+- Encode every IE in the format TS 24.501 §9.11 mandates for it (check the IEI table in §8
+  for TV vs TLV vs TLV-E before adding one) — see root `CLAUDE.md` § Protocol Encoding Rules.
+- Decoders never panic on malformed input; they return an error.
+- Each message type has round-trip tests; `*_wire_test.go` and `conformance_audit_test.go`
+  hold byte vectors captured from UERANSIM and real UEs — add one when fixing an interop bug.
 
-**Recommendation:** Reuse free5GC. Document the import in this README and add
-the dependency in `shared/go.mod` when Phase 1 starts.
-
-## Requirements
-
-- Encode/decode all 5GMM messages per TS 24.501 §8.2.
-- Encode/decode all 5GSM messages per TS 24.501 §8.3.
-- NAS security: ciphering (NEA0/1/2/3) and integrity (NIA0/1/2/3) per §4.4.
-- SUCI handling: encoding per §9.11.3.4, schemes per TS 33.501 Annex C.
-
-## Tests
-
-Property-based encode→decode→equal tests with `gopter`. Vector-based tests
-using PCAPs from UERANSIM as ground truth.
+```bash
+go test ./shared/nas/
+```

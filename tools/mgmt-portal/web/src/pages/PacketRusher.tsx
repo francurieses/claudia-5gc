@@ -12,6 +12,8 @@ import {
   Badge, Button, Card, ErrorState, Input, Loading, PageHeader, Section, Tabs, useToast,
 } from '../components/ui'
 import type { BadgeVariant, TabItem } from '../components/ui'
+import { useStickToBottom } from '../lib/useStickToBottom'
+import { useTabParam } from '../lib/useTabParam'
 
 // ---- Types ------------------------------------------------------------------
 
@@ -251,7 +253,7 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
   const [lines, setLines]   = useState<LogLine[]>([])
   const [filter, setFilter] = useState('')
   const [paused, setPaused] = useState(false)
-  const endRef              = useRef<HTMLDivElement>(null)
+  const logRef              = useRef<HTMLDivElement>(null)
   const [frozen, setFrozen] = useState<LogLine[]>([])
   const [status, setStatus] = useState<WSStatus>('connecting')
 
@@ -305,7 +307,7 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
   const display  = paused ? frozen : lines
   const filtered = filter ? display.filter(l => l.raw.toLowerCase().includes(filter.toLowerCase())) : display
 
-  useEffect(() => { if (!paused) endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [filtered, paused])
+  useStickToBottom(logRef, filtered, paused)
 
   const connection = connectionStatus(status)
 
@@ -342,7 +344,7 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
         </div>
       </div>
 
-      <div className="log-surface h-64 overflow-y-auto p-3">
+      <div ref={logRef} role="log" aria-label={`Logs for ${container}`} tabIndex={0} className="log-surface scroll-thin h-[max(12rem,calc(100dvh-24rem))] overflow-y-auto p-3">
         {filtered.length === 0
           ? (
             <span className="text-muted-fg">
@@ -359,7 +361,6 @@ function LogPanel({ container, clearKey, onClear }: { container: string; clearKe
             </div>
           ))
         }
-        <div ref={endRef} />
       </div>
     </Card>
   )
@@ -591,7 +592,9 @@ export default function PacketRusher() {
   const qc = useQueryClient()
   const { toast } = useToast()
   const [activeLogTab, setActiveLogTab] = useState<Tab>('packetrusher')
-  const [showLogs, setShowLogs]         = useState(false)
+  const [mainTab, setMainTab] = useTabParam(['scenarios', 'logs', 'validation'] as const, 'scenarios')
+  const showLogs = mainTab === 'logs'
+  const setShowLogs = (fn: (v: boolean) => boolean) => setMainTab(fn(showLogs) ? 'logs' : 'scenarios')
   const [clearKey, setClearKey]         = useState(0)
 
   // Per-scenario reset keys — incrementing clears that scenario's checklist
@@ -709,7 +712,7 @@ export default function PacketRusher() {
   const xnChecks = useCheckpoints(XN_CHECKPOINTS, xnAllLines)
   const n2Checks = useCheckpoints(N2_CHECKPOINTS, n2AllLines)
 
-  const openLog = (tab: Tab) => { setShowLogs(true); setActiveLogTab(tab) }
+  const openLog = (tab: Tab) => { setMainTab('logs'); setActiveLogTab(tab) }
 
   const clearAll = () => {
     setClearKey(k => k + 1)
@@ -769,6 +772,16 @@ export default function PacketRusher() {
         }
       />
 
+      <Tabs
+        label="PacketRusher view"
+        value={mainTab}
+        onChange={id => setMainTab(id as typeof mainTab)}
+        tabs={[
+          {
+            id: 'scenarios',
+            label: 'Scenarios',
+            content: (
+              <div className="space-y-6">
       {/* URSP incompatibility warning */}
       <Card>
         <div className="flex items-start gap-3">
@@ -844,8 +857,24 @@ export default function PacketRusher() {
         </div>
       )}
 
+      {/* Quick reference */}
+      <Section bare headingLevel={2} title="Quick Reference">
+        <div className="grid grid-cols-1 gap-x-8 gap-y-1 text-xs text-muted-fg md:grid-cols-2">
+          <p><span className="font-mono text-fg">make handover-test</span> — build image + start Xn scenario (required once)</p>
+          <p><span className="font-mono text-fg">make handover-n2-test</span> — start N2 scenario (reuses built image)</p>
+          <p><span className="font-mono text-fg">make handover-down</span> — stop Xn profile containers</p>
+          <p><span className="font-mono text-fg">make handover-n2-down</span> — stop N2 profile containers</p>
+        </div>
+      </Section>
+              </div>
+            ),
+          },
+          {
+            id: 'logs',
+            label: 'Logs',
+            content: (
+              <>
       {/* Log viewer */}
-      {showLogs && (
         <Section
           bare
           headingLevel={2}
@@ -859,8 +888,14 @@ export default function PacketRusher() {
             onChange={id => setActiveLogTab(id as Tab)}
           />
         </Section>
-      )}
-
+              </>
+            ),
+          },
+          {
+            id: 'validation',
+            label: 'Mobility Validation',
+            content: (
+              <>
       {/* Mobility validation */}
       <Section
         bare
@@ -882,15 +917,11 @@ export default function PacketRusher() {
         </div>
       </Section>
 
-      {/* Quick reference */}
-      <Section bare headingLevel={2} title="Quick Reference">
-        <div className="grid grid-cols-1 gap-x-8 gap-y-1 text-xs text-muted-fg md:grid-cols-2">
-          <p><span className="font-mono text-fg">make handover-test</span> — build image + start Xn scenario (required once)</p>
-          <p><span className="font-mono text-fg">make handover-n2-test</span> — start N2 scenario (reuses built image)</p>
-          <p><span className="font-mono text-fg">make handover-down</span> — stop Xn profile containers</p>
-          <p><span className="font-mono text-fg">make handover-n2-down</span> — stop N2 profile containers</p>
-        </div>
-      </Section>
+              </>
+            ),
+          },
+        ]}
+      />
     </div>
   )
 }

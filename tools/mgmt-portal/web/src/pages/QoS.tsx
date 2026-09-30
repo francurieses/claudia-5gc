@@ -21,9 +21,9 @@ import {
 import {
   Badge, Button, Card, Dialog, Disclosure, EmptyState, ErrorState, Field, Input, Loading,
   PageHeader, SegmentedControl, Select, Spinner, Table, TableBody, TableCell, TableEmptyRow,
-  TableHead, TableHeaderCell, TableRow, Textarea, useToast,
-} from '../components/ui'
+  TableHead, TableHeaderCell, TableRow, Textarea, useToast, Tabs } from '../components/ui'
 import type { BadgeVariant } from '../components/ui'
+import { useTabParam } from '../lib/useTabParam'
 
 // ---- 5QI helpers (TS 23.501 Table 5.7.4-1) --------------------------------
 
@@ -872,6 +872,7 @@ function ValidationPanel({ onDone }: { onDone: () => void }) {
 // ---- Page ---------------------------------------------------------------------
 
 export default function QoS() {
+  const [tab, setTab] = useTabParam(['sessions', 'nw-session', 'validation'] as const, 'sessions')
   const qc = useQueryClient()
   const [modifyTarget, setModifyTarget] = useState<QoSSession | null>(null)
   const [inspectSupi, setInspectSupi] = useState<string | null>(null)
@@ -909,6 +910,17 @@ export default function QoS() {
         }
       />
 
+      <Tabs
+        keepMounted
+        label="QoS view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'sessions',
+            label: 'Sessions',
+            content: (
+              <div className="space-y-6">
       {/* Session table */}
       {isError ? (
         <ErrorState
@@ -997,12 +1009,33 @@ export default function QoS() {
         category: GBR (1–4), delay-critical GBR (82–85), non-GBR (5–9, 65–70) and operator-defined.
       </p>
 
+              </div>
+            ),
+          },
+          {
+            id: 'nw-session',
+            label: 'NW-Triggered Session',
+            content: (
+              <div className="space-y-6">
       {/* NW-triggered additional PDU session */}
       <NWSessionPanel sessions={sessions} />
 
+              </div>
+            ),
+          },
+          {
+            id: 'validation',
+            label: 'E2E Validation',
+            content: (
+              <div className="space-y-6">
       {/* E2E validation */}
       <ValidationPanel onDone={() => qc.invalidateQueries({ queryKey: ['qos-sessions'] })} />
 
+              </div>
+            ),
+          },
+        ]}
+      />
       {/* Dialogs */}
       {modifyTarget && (
         <ModifyDialog session={modifyTarget} onClose={() => setModifyTarget(null)} />

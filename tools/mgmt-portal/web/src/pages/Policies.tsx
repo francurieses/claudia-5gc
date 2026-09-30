@@ -22,9 +22,9 @@ import {
 import {
   Badge, Button, Card, Checkbox, ConfirmDialog, Dialog, Disclosure, EmptyState, ErrorState, Field,
   IconButton, Input, Loading, PageHeader, Section, Select, Table, TableBody, TableCell,
-  TableEmptyRow, TableHead, TableHeaderCell, TableRow, Textarea, useToast,
-} from '../components/ui'
+  TableEmptyRow, TableHead, TableHeaderCell, TableRow, Textarea, useToast, Tabs } from '../components/ui'
 import type { BadgeVariant, SelectOption } from '../components/ui'
+import { useTabParam } from '../lib/useTabParam'
 
 // ---- Slice identity -------------------------------------------------------
 //
@@ -531,6 +531,7 @@ const EMPTY_TEMPLATE: Omit<PolicyTemplate, 'id' | 'updated_at'> = {
 const EMPTY_POLICY: Omit<Policy, 'id' | 'updated_at'> = { supi: '', precedence: 100, rules: [{ ...EMPTY_RULE }] }
 
 export default function Policies() {
+  const [tab, setTab] = useTabParam(['templates', 'subscribers'] as const, 'templates')
   const qc = useQueryClient()
   const { toast } = useToast()
 
@@ -677,6 +678,16 @@ export default function Policies() {
         subtitle="URSP (UE Route Selection Policy) — TS 24.526 / TS 29.525"
       />
 
+      <Tabs
+        label="Policies view"
+        value={tab}
+        onChange={id => setTab(id as typeof tab)}
+        tabs={[
+          {
+            id: 'templates',
+            label: 'Templates',
+            content: (
+              <div className="space-y-6">
       {/* ── Section 1: Policy Templates ── */}
       <Section
         bare
@@ -776,6 +787,14 @@ export default function Policies() {
         </div>
       </Section>
 
+              </div>
+            ),
+          },
+          {
+            id: 'subscribers',
+            label: 'Per-Subscriber',
+            content: (
+              <div className="space-y-6">
       {/* ── Section 2: Per-Subscriber Policies ── */}
       <Section
         bare
@@ -888,6 +907,11 @@ export default function Policies() {
         )}
       </Section>
 
+              </div>
+            ),
+          },
+        ]}
+      />
       {/* Template editor */}
       {editingTemplate !== null && (
         <TemplateEditor

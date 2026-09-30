@@ -4,7 +4,7 @@
 
 - Go 1.26.2
 - Docker + Docker Compose v2
-- `golangci-lint` (CI-enforced)
+- `golangci-lint` (optional — see lint caveat below)
 - `gofmt` + `goimports` (pre-commit enforced)
 
 ```bash
@@ -33,19 +33,22 @@ Scope is the NF name (`amf`, `smf`, `nrf`, `shared`, `portal`, `mcp`, etc.).
 
 ## Implementing a New Procedure
 
-Follow the 7-step process — do not skip steps:
+Read the referenced 3GPP TS first, then follow these steps — do not skip any:
 
 1. `docs/procedures/<procedure>.md` — sequence diagram (Mermaid) + spec ref + IEs + error cases
 2. `.feature` Cucumber file — happy path + at least one error scenario
 3. Implement handler + state machine + SBI calls (logic in `internal/`, not `cmd/`)
 4. Step definitions for godog
-5. Integration test with UERANSIM or gNBSim
+5. Integration test with UERANSIM or PacketRusher
 6. PCAP validation (see `docs/pcap-diagnostics.md`)
 7. `docs/compliance-matrix.md` — mark procedure as implemented
+8. Docs: update everything the change affects — the procedure doc, `docs/compliance-matrix.md`
+   and the recipe in `docs/validation-commands.md`
 
 ## Code Standards
 
-- `gofmt` + `goimports` are mandatory; `golangci-lint` must pass (CI fails on warnings).
+- `gofmt` + `goimports` are mandatory. `golangci-lint` does not yet support Go 1.26.2, so the
+  CI lint job is disabled; if `make lint` fails, check the failure is pre-existing on a clean tree.
 - No new external dependencies without justification in the PR description.
 - Do not copy code from Open5GS (AGPL). free5GC codecs (Apache-2.0) are acceptable.
 - No `panic` in production code (allowed in `init()` and tests).
@@ -63,11 +66,32 @@ make test-slices                  # E2E multi-slice suite (requires running stac
 
 ## Adding a New Network Function
 
-Copy the template:
+Copy the template (renames the `{{NF_NAME}}` / `{{nf_name}}` placeholders):
 ```bash
-cp -r nf/_template nf/<nfname>
+./scripts/new-nf.sh <nfname>
 ```
-Read `nf/_template/CLAUDE.md` before proceeding.
+Then follow this checklist — misalignment here is what breaks CI:
+
+1. **No per-NF `go.mod`.** The NF is part of the root module; never run `go mod init` inside
+   `nf/<nfname>/` (NRF is the sole legacy exception).
+2. **Import paths** use the root module path from `go.mod`, e.g. `<module>/nf/<nfname>/internal/…`
+   and `<module>/shared/…`.
+3. **Dockerfile** keeps the template shape: `ARG GO_VERSION=1.26.2`, `COPY go.mod go.sum* ./`,
+   `COPY shared/ ./shared/`, `COPY nf/<nfname>/ …`, build `./nf/<nfname>/cmd/<nfname>`. Only change `EXPOSE`.
+4. **New dependency?** Justify it in the PR, then run `GOWORK=off go mod tidy` from the repo root
+   (Docker/CI build with `GOWORK=off`; a missing checksum shows up as the misleading
+   "no required module provides package …").
+5. **Wire the NF into all four surfaces:** the `docker` job matrix in `.github/workflows/ci.yml`;
+   `docker-compose.yml` (service with `profiles: [core]`, unique SBI + metrics ports, NRF in
+   `depends_on`, plus a `<nfname>-pcap` sidecar); the `NFS :=` list in the root `Makefile`.
+6. **Verify before pushing:**
+   ```bash
+   GOWORK=off go build ./nf/... ./shared/...   # mirrors the CI go-build job
+   make -C nf/<nfname> test
+   make -C nf/<nfname> docker                  # mirrors the CI docker job
+   ```
+7. Every NF registers with the NRF on startup, exposes `/metrics`, and logs canonical JSON via
+   `shared/logging`.
 
 ## 3GPP References
 
