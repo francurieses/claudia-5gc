@@ -80,10 +80,35 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Service Request UP re-activation (TS 23.502 §4.2.3) — E2E-gated steps.
 	initServiceRequestSteps(sc)
 
+	// Paged Service Request user-plane re-activation (TS 23.502 §4.2.3.3 step 6) —
+	// real in-process steps driving the NAS handler; shares ICS assertions above.
+	initNTSRSteps(sc)
+
+	// Service Accept IEs (0x50 / 0x26) + local release of PDU sessions the UE
+	// reports inactive (TS 24.501 §5.6.1.4.1) — in-process, reuses ntsrW.
+	initServiceAcceptSteps(sc)
+
 	// Public Warning System (TS 38.413 §8.9) — real in-process steps against
 	// the AMF NGAP PWS registry + codec; gNB response fan-in is E2E-gated
 	// (see public_warning_system_steps_test.go file header for why).
 	initPWSSteps(sc)
+
+	// gNB registry (TS 38.413 §8.7.1 / §8.7.4) — real in-process steps against
+	// the AMF NGAP registry seams and the mgmt gNB-list handler.
+	initGNBRegistrySteps(sc)
+
+	// Initial Context Setup UE-AMBR conditional presence (TS 38.413 §8.3.1,
+	// §9.2.2.1, §8.2.1) — in-process builder + decoder steps.
+	initICSSteps(sc)
+
+	// Xn Handover Path Switch Ack/Failure, NH/NCC chain, PPID 60 (TS 38.413 §8.4.4).
+	// Registered after initICSSteps: shared step texts are bound there and delegate
+	// to the xn* functions when the scenario belongs to xn_handover.feature.
+	initXnHandoverSteps(sc)
+
+	// Synchronous SMF leg of Xn / N2 handover (AMF-012): SMF fake behind the ngap hooks,
+	// builds on the world of the Xn steps above.
+	initHandoverSMFLegSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

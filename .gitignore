@@ -60,3 +60,6 @@ mcp/config/local.yaml
 go*.linux-amd64.tar.gz
 go*.darwin-amd64.tar.gz
 go*.windows-amd64.zip
+
+# PORTAL-001 scripts/services-restart-check.sh default output
+services-restart-results.md

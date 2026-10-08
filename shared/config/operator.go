@@ -52,6 +52,8 @@ type OperatorConfig struct {
 	PLMN    PLMN          `yaml:"plmn"`
 	SNSSAIs []SNSSAIEntry `yaml:"snssais"`
 	DNNs    []DNNEntry    `yaml:"dnns"`
+	// SliceDNNQoS is the optional Session-AMBR seed per (S-NSSAI, DNN).
+	SliceDNNQoS []SliceDNNQoSEntry `yaml:"slice_dnn_qos"`
 }
 
 // LoadOperator reads the operator config from:
@@ -113,4 +115,31 @@ func (op *OperatorConfig) DNNList() []DNNEntry {
 		return nil
 	}
 	return op.DNNs
+}
+
+// SessionAMBREntry is a subscribed Session-AMBR pair as TS 29.571 §5.5.2
+// BitRate strings (e.g. "100 Mbps").
+type SessionAMBREntry struct {
+	Uplink   string `yaml:"uplink"`
+	Downlink string `yaml:"downlink"`
+}
+
+// SliceDNNQoSEntry is one optional operator.yaml `slice_dnn_qos` item: the seed
+// of the subscribed Session-AMBR of an (S-NSSAI, DNN) pair (TS 23.501 §5.7.2.6,
+// TS 29.503 §6.1.6.2.9). SD "" means no SD. It never overwrites a value edited
+// at runtime; the UDR validates the BitRates.
+type SliceDNNQoSEntry struct {
+	SST         int              `yaml:"sst"`
+	SD          string           `yaml:"sd"`
+	DNN         string           `yaml:"dnn"`
+	SessionAMBR SessionAMBREntry `yaml:"session_ambr"`
+}
+
+// SliceDNNQoSList returns the optional per-slice/DNN Session-AMBR seed list,
+// or nil when not configured / not loaded.
+func (op *OperatorConfig) SliceDNNQoSList() []SliceDNNQoSEntry {
+	if op == nil {
+		return nil
+	}
+	return op.SliceDNNQoS
 }

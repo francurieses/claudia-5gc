@@ -28,39 +28,43 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Portable helpers (bash 3.2 + BSD userland, SIGPIPE-safe matching, sbi_curl, run_timeout).
+# shellcheck source=scripts/lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
+
+require_cmds docker curl
+
+# Precondition: these checks drive UERANSIM, which is optional (RAN=ueransim).
+DOCKER_NAMES=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+if ! text_has '^ueransim-' "$DOCKER_NAMES"; then
+    echo "UERANSIM not deployed — run: make ueransim (or make up-obs RAN=ueransim)" >&2
+    exit 2
+fi
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
 BOLD='\033[1m'; NC='\033[0m'
 
 PASS=0; FAIL=0; SKIP=0
 
-pass() { echo -e "  ${GREEN}✓${NC} $1"; ((PASS++)); }
-fail() { echo -e "  ${RED}✗${NC} $1"; ((FAIL++)); }
-skip() { echo -e "  ${YELLOW}○${NC} $1 (skipped)"; ((SKIP++)); }
+pass() { echo -e "  ${GREEN}✓${NC} $1"; PASS=$((PASS + 1)); }
+fail() { echo -e "  ${RED}✗${NC} $1"; FAIL=$((FAIL + 1)); }
+skip() { echo -e "  ${YELLOW}○${NC} $1 (skipped)"; SKIP=$((SKIP + 1)); }
 section() { echo -e "\n${BOLD}${CYAN}━━ $1 ━━${NC}"; }
 
 info() { echo -e "  ${CYAN}ℹ${NC}  $1"; }
 
-SUPI="imsi-001010000000001"
-AMF_MGMT="http://localhost:9002"
+# Target UE. Defaults to the default-scenario UE (ueransim-ue on ueransim-gnb,
+# SUPI imsi-001010000000001), which is also what `make ueransim-all` runs next to
+# the multi-slice and SUCI Profile A UEs. Override for another scenario, e.g.
+#   UE_CONTAINER=ueransim-ue-profile-a SUPI=imsi-001010000000301 make validate-ursp
+UE_CONTAINER="${UE_CONTAINER:-ueransim-ue}"
+SUPI="${SUPI:-imsi-001010000000001}"
+AMF_MGMT="${AMF_MGMT:-http://localhost:9002}"
 
-wait_for_log() {
-    local container=$1 pattern=$2 timeout=${3:-30}
-    local deadline=$((SECONDS + timeout))
-    while [ $SECONDS -lt $deadline ]; do
-        # Use grep -cE (reads ALL input, no SIGPIPE) instead of grep -q.
-        # grep -q exits early on first match; docker logs then gets SIGPIPE and exits 141.
-        # Under set -o pipefail, the pipeline returns 141 (non-zero) even when matched.
-        if docker logs "$container" 2>&1 | grep -cE "$pattern" > /dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-container_running() {
-    docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null | grep -q "running"
-}
+# wait_for_log / container_running / text_has come from scripts/lib/common.sh.
+# Matching never pipes `echo "$BIG"` or `docker logs` into `grep -q`: under pipefail
+# the early grep exit SIGPIPEs the producer and the pipeline reports 141.
 
 echo -e "\n${BOLD}5GC URSP Validation — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo "SUPI: $SUPI · TS 24.526 / TS 29.525 / TS 24.501 §8.2.29"
@@ -69,7 +73,7 @@ echo "SUPI: $SUPI · TS 24.526 / TS 29.525 / TS 24.501 §8.2.29"
 section "U0 · Infrastructure — containers running"
 # ─────────────────────────────────────────────────────────────────────────────
 
-for svc in amf pcf udr ueransim-ue; do
+for svc in amf pcf udr ${UE_CONTAINER}; do
     if container_running "$svc"; then
         pass "container $svc running"
     else
@@ -81,15 +85,16 @@ done
 # After implicit detach the UE context is removed from memory; a restart
 # of the UE container forces a fresh initial registration.
 info "Checking UE registration state in AMF..."
-if curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "$AMF_MGMT/amf/v1/ue-contexts/$SUPI/push-policies" 2>/dev/null | grep -q "^204$\|^409$"; then
-    info "UE is CM-CONNECTED or CM-IDLE — context present in AMF"
+CTX_STATUS=$(curl -s --max-time 5 -o /dev/null -w "%{http_code}" \
+    "$AMF_MGMT/amf/v1/ue-contexts/$SUPI" 2>/dev/null || true)
+if [ "$CTX_STATUS" = "200" ]; then
+    info "UE context present in AMF (GET /amf/v1/ue-contexts/$SUPI → 200)"
 else
     info "UE context not found (implicit detach expired) — triggering fresh registration"
-    docker restart ueransim-ue >/dev/null 2>&1
+    run_timeout 60 docker restart "${UE_CONTAINER}" >/dev/null 2>&1 || true
     if wait_for_log "amf" '"result":"OK".*RegistrationAccept|RegistrationAccept.*"result":"OK"' 30; then
         info "UE re-registered successfully"
-    elif wait_for_log "ueransim-ue" "Initial Registration is successful" 20; then
+    elif wait_for_log "${UE_CONTAINER}" "Initial Registration is successful" 20; then
         info "UE re-registered (from UE logs)"
     else
         info "UE may still be registering — proceeding anyway"
@@ -101,25 +106,25 @@ fi
 section "U1 · PCF N15 — policy association created at registration"
 # ─────────────────────────────────────────────────────────────────────────────
 
-PCF_LOGS=$(docker logs pcf 2>&1)
+PCF_LOGS=$(container_logs pcf)
 
-if echo "$PCF_LOGS" | grep -cE '"procedure":"UEPolicyCreate"' > /dev/null; then
+if text_has '"procedure":"UEPolicyCreate"' "$PCF_LOGS"; then
     pass "PCF logged UEPolicyCreate procedure"
 else
     fail "PCF has no UEPolicyCreate log — N15 may not be called"
     info "Check: docker logs pcf | grep UEPolicyCreate"
 fi
 
-if echo "$PCF_LOGS" | grep -cE '"result":"OK"' > /dev/null && echo "$PCF_LOGS" | grep -cE '"rule_count"' > /dev/null; then
+if text_has '"result":"OK"' "$PCF_LOGS" && text_has '"rule_count"' "$PCF_LOGS"; then
     pass "PCF responded with OK + rule_count"
 else
     fail "PCF did not log OK result with rule_count"
     info "Expected: {\"procedure\":\"UEPolicyCreate\",\"result\":\"OK\",\"rule_count\":...}"
 fi
 
-if echo "$PCF_LOGS" | grep -cE '"container_bytes"' > /dev/null; then
-    CONTAINER_BYTES=$(echo "$PCF_LOGS" | grep '"container_bytes"' | tail -1 | \
-        grep -oP '"container_bytes":\s*\K[0-9]+' || echo "?")
+if text_has '"container_bytes"' "$PCF_LOGS"; then
+    CONTAINER_BYTES=$(json_num_last container_bytes "$(text_lines '"container_bytes"' "$PCF_LOGS")")
+    CONTAINER_BYTES=${CONTAINER_BYTES:-?}
     if [ "$CONTAINER_BYTES" != "?" ] && [ "$CONTAINER_BYTES" -gt 0 ] 2>/dev/null; then
         pass "PCF encoded URSP container: $CONTAINER_BYTES bytes"
     else
@@ -129,11 +134,11 @@ else
     fail "PCF did not log container_bytes"
 fi
 
-if echo "$PCF_LOGS" | grep -cE '"rule_count":0' > /dev/null; then
+if text_has '"rule_count":0' "$PCF_LOGS"; then
     fail "PCF delivered 0 rules — check default_ursp in nf/pcf/config/dev.yaml"
-elif echo "$PCF_LOGS" | grep -cE '"rule_count":[1-9]' > /dev/null; then
-    RULE_COUNT=$(echo "$PCF_LOGS" | grep '"rule_count":[1-9]' | tail -1 | \
-        grep -oP '"rule_count":\K[0-9]+' || echo "?")
+elif text_has '"rule_count":[1-9]' "$PCF_LOGS"; then
+    RULE_COUNT=$(json_num_last rule_count "$(text_lines '"rule_count":[1-9]' "$PCF_LOGS")")
+    RULE_COUNT=${RULE_COUNT:-?}
     pass "PCF delivered $RULE_COUNT URSP rule(s)"
 fi
 
@@ -143,13 +148,13 @@ section "U2 · AMF — UE policy container delivered via DL NAS Transport"
 
 # Wait briefly for any in-flight registration logs to flush, then snapshot.
 sleep 2
-AMF_LOGS=$(docker logs amf 2>&1)
+AMF_LOGS=$(container_logs amf)
 
 # IMPORTANT: use grep -cE (not grep -qE) in all pipes from echo/docker here.
 # Under set -o pipefail, grep -q causes the producer (echo/docker) to get SIGPIPE
 # when grep exits early after finding a match, making the pipeline return 141.
 # grep -c reads ALL input before exiting, so no SIGPIPE. Exit 0 = at least 1 match.
-if echo "$AMF_LOGS" | grep -cE 'PCF N15|policy_container_bytes|pol_asso_id' > /dev/null; then
+if text_has 'PCF N15|policy_container_bytes|pol_asso_id' "$AMF_LOGS"; then
     pass "AMF logged N15 policy association"
 else
     fail "AMF has no N15 policy association log"
@@ -158,9 +163,9 @@ fi
 
 # The AMF delivers the container via the UE policy delivery service over DL NAS
 # TRANSPORT (procedure=UEPolicyDelivery), logging "UE policy container sent".
-if echo "$AMF_LOGS" | grep -cE 'UE policy container sent|UEPolicyDelivery' > /dev/null; then
-    PCONT_BYTES=$(echo "$AMF_LOGS" | grep '"policy_container_bytes"' | tail -1 | \
-        grep -oP '"policy_container_bytes":\K[0-9]+' || echo "?")
+if text_has 'UE policy container sent|UEPolicyDelivery' "$AMF_LOGS"; then
+    PCONT_BYTES=$(json_num_last policy_container_bytes "$AMF_LOGS")
+    PCONT_BYTES=${PCONT_BYTES:-?}
     pass "AMF sent UE policy container ($PCONT_BYTES bytes) via DL NAS Transport (payload container type 0x05)"
 else
     fail "AMF did not log UE policy container delivery"
@@ -169,10 +174,10 @@ else
 fi
 
 # Check registration itself succeeded — match any log line that contains the SUPI.
-if echo "$AMF_LOGS" | grep -cE '"supi":"'"$SUPI"'"' > /dev/null; then
+if text_has '"supi":"'"$SUPI"'"' "$AMF_LOGS"; then
     # Filter to SUPI-containing lines, then check for result:OK within those.
-    _supi_lines=$(echo "$AMF_LOGS" | grep '"supi":"'"$SUPI"'"')
-    if echo "$_supi_lines" | grep -cE '"result":"OK"' > /dev/null; then
+    _supi_lines=$(text_lines '"supi":"'"$SUPI"'"' "$AMF_LOGS")
+    if text_has '"result":"OK"' "$_supi_lines"; then
         pass "AMF registered $SUPI successfully"
     else
         pass "AMF has logs for $SUPI (registration in progress or completed)"
@@ -186,20 +191,22 @@ section "U3 · UERANSIM — registration accepted (URSP not supported by UERANSI
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "  Waiting for UE registration (up to 30s)..."
-if wait_for_log "ueransim-ue" "MM-REGISTERED" 30; then
-    pass "ueransim-ue reached MM-REGISTERED state"
+if wait_for_log "${UE_CONTAINER}" "MM-REGISTERED" 30; then
+    pass "${UE_CONTAINER} reached MM-REGISTERED state"
 else
-    fail "ueransim-ue did NOT reach MM-REGISTERED within timeout"
-    info "Debug: docker logs ueransim-ue 2>&1 | tail -30"
+    fail "${UE_CONTAINER} did NOT reach MM-REGISTERED within timeout"
+    info "Debug: docker logs ${UE_CONTAINER} 2>&1 | tail -30"
 fi
 
-UE_LOGS=$(docker logs ueransim-ue 2>&1)
+UE_LOGS=$(container_logs "${UE_CONTAINER}")
 
 # UERANSIM v3.2.8 does NOT implement the UE policy delivery service. When it
 # receives a DL NAS TRANSPORT with payload container type 0x05 it logs
 # "Unhandled DL NAS Transport payload container type [5]" and does not reply.
 # This is expected — the AMF still emits a spec-correct, Wireshark-decodable PDU.
-if echo "$UE_LOGS" | grep -icE 'Unhandled DL NAS Transport payload container type \[5\]' > /dev/null; then
+if text_has_i 'URSP policy received' "$UE_LOGS"; then
+    pass "UERANSIM received and applied the UE policy container ('URSP policy received' — modded UE, tools/ueransim patches)"
+elif text_has_i 'Unhandled DL NAS Transport payload container type \[5\]' "$UE_LOGS"; then
     pass "UERANSIM received the UE policy container (logged 'Unhandled type [5]' — no URSP support, as expected)"
 else
     skip "UERANSIM did not log receipt of the UE policy container (it may not have been delivered yet)"
@@ -207,10 +214,10 @@ else
 fi
 
 # Registration itself must have succeeded (the policy is delivered after it).
-if echo "$UE_LOGS" | grep -q "MM-REGISTERED"; then
-    pass "ueransim-ue is MM-REGISTERED — Registration Accept was accepted"
+if text_has "MM-REGISTERED" "$UE_LOGS"; then
+    pass "${UE_CONTAINER} is MM-REGISTERED — Registration Accept was accepted"
 else
-    skip "ueransim-ue MM state unclear from logs"
+    skip "${UE_CONTAINER} MM state unclear from logs"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,7 +227,6 @@ section "U4 · Binary check — PCF UE policy container decodes cleanly"
 # Fetch the live UE policy container from the PCF N15 endpoint and decode it with
 # scripts/decode-ursp.py. A clean decode proves the MANAGE UE POLICY COMMAND is
 # byte-correct per TS 24.501 Annex D / TS 24.526 — i.e. Wireshark-decodable.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DECODE_PY="$SCRIPT_DIR/decode-ursp.py"
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -228,18 +234,19 @@ if ! command -v python3 >/dev/null 2>&1; then
 elif [ ! -f "$DECODE_PY" ]; then
     skip "decode-ursp.py not found at $DECODE_PY"
 else
-    N15_JSON=$(docker exec amf curl -sk --http2-prior-knowledge \
-        -X POST https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \
-        -H 'Content-Type: application/json' \
-        -d "{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}" 2>/dev/null || true)
+    # NF images are distroless (no curl inside): sbi_curl uses the published PCF port
+    # with an mTLS client cert from pki/, or a throw-away curl container on the SBI net.
+    N15_JSON=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \
+        -X POST -H 'Content-Type: application/json' \
+        -d "{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}")
 
     if [ -z "$N15_JSON" ]; then
         skip "PCF N15 returned no data (PCF may be unavailable)"
     else
-        DECODED=$(echo "$N15_JSON" | python3 "$DECODE_PY" 2>&1 || true)
-        if echo "$DECODED" | grep -cE 'MANAGE UE POLICY COMMAND' > /dev/null \
-            && echo "$DECODED" | grep -cE 'URSP rule' > /dev/null \
-            && ! echo "$DECODED" | grep -ciE 'ERROR|type=0x' > /dev/null; then
+        DECODED=$(python3 "$DECODE_PY" <<<"$N15_JSON" 2>&1 || true)
+        if text_has 'MANAGE UE POLICY COMMAND' "$DECODED" \
+            && text_has 'URSP rule' "$DECODED" \
+            && ! text_has_i 'ERROR|type=0x' "$DECODED"; then
             pass "PCF UE policy container decodes cleanly (MANAGE UE POLICY COMMAND with URSP rules)"
             echo "$DECODED" | sed 's/^/      /'
         else
@@ -254,140 +261,40 @@ section "U5 · N15 endpoint — direct PCF smoke-test"
 # ─────────────────────────────────────────────────────────────────────────────
 
 info "Calling PCF N15 directly: POST /npcf-ue-policy-control/v1/ue-policies"
-# PCF port 8006 is published to the host; use host curl (no curl in AMF container).
-N15_BODY_FILE=$(mktemp /tmp/n15-resp-XXXXXX.json)
-N15_RESP=$(curl -sk \
-    -X POST "https://localhost:8006/npcf-ue-policy-control/v1/ue-policies" \
-    -H "Content-Type: application/json" \
+# SBI is always mTLS + HTTP/2: go through sbi_curl (published port + client cert, or
+# a throw-away curl container on the SBI network). Body and status come back together;
+# the status is the last line (-w '\n%{http_code}').
+N15_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/n15-resp-XXXXXX")
+N15_RAW=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \
+    -X POST -H "Content-Type: application/json" \
     -d "{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}" \
-    -o "$N15_BODY_FILE" -w "%{http_code}" 2>/dev/null || echo "000")
+    -w '\n%{http_code}')
+N15_RESP=$(tail -n 1 <<<"$N15_RAW")
+case "$N15_RESP" in [0-9][0-9][0-9]) ;; *) N15_RESP="000" ;; esac
+sed '$d' <<<"$N15_RAW" > "$N15_BODY_FILE"
 
 if [ "$N15_RESP" = "201" ]; then
     pass "PCF N15 returned 201 Created"
     N15_BODY=$(cat "$N15_BODY_FILE" 2>/dev/null || echo "{}")
     rm -f "$N15_BODY_FILE"
-    if echo "$N15_BODY" | grep -q '"polAssoId"'; then
-        POL_ID=$(echo "$N15_BODY" | grep -oP '"polAssoId"\s*:\s*"\K[^"]+' || echo "?")
+    if text_has '"polAssoId"' "$N15_BODY"; then
+        POL_ID=$(json_str_last polAssoId "$N15_BODY")
+        POL_ID=${POL_ID:-?}
         pass "PCF returned polAssoId: $POL_ID"
     else
         fail "PCF response missing polAssoId field"
     fi
-    if echo "$N15_BODY" | grep -q '"uePolicySections"'; then
+    if text_has '"uePolicySections"' "$N15_BODY"; then
         pass "PCF response contains uePolicySections with encoded URSP"
-        CONT_B64=$(echo "$N15_BODY" | grep -oP '"uePolicySectionContent"\s*:\s*"\K[^"]+' || echo "")
+        CONT_B64=$(json_str_last uePolicySectionContent "$N15_BODY")
         if [ -n "$CONT_B64" ] && [ ${#CONT_B64} -gt 8 ]; then
             CONT_BYTES=$(( (${#CONT_B64} * 3) / 4 ))
             pass "Base64 container size: ~$CONT_BYTES bytes"
             info "Container (first 64 chars): ${CONT_B64:0:64}..."
 
-            # Decode and display if python3 is available
-            if command -v python3 >/dev/null 2>&1; then
-                python3 - "$CONT_B64" << 'PYEOF' 2>/dev/null || true
-import sys, base64, struct
-
-b64 = sys.argv[1].strip()
-try:
-    raw = base64.b64decode(b64)
-    print(f"  Container decoded: {len(raw)} bytes")
-    # Wire format per TS 24.501 §9.11.4.15:
-    #   [0:2]   total list length
-    #   [2:5]   PLMN ID
-    #   [5:7]   sublist length
-    #   [7:9]   UPSC (bits 15-12 = type, bits 11-0 = index)
-    #   [9]     Instruction
-    #   [10:12] section contents length
-    #   [12:]   URSP rules (no section-type prefix)
-    if len(raw) < 12:
-        print(f"  Container too short to parse ({len(raw)} bytes, need ≥12)")
-        sys.exit(0)
-    total = struct.unpack('>H', raw[0:2])[0]
-    print(f"  Section list total length: {total}")
-    plmn = raw[2:5]
-    mcc = f"{plmn[0]&0xF}{(plmn[0]>>4)&0xF}{plmn[1]&0xF}"
-    mnc_d3 = (plmn[1]>>4)&0xF
-    mnc = f"{plmn[2]&0xF}{(plmn[2]>>4)&0xF}" if mnc_d3==0xF else f"{plmn[2]&0xF}{(plmn[2]>>4)&0xF}{mnc_d3}"
-    print(f"  PLMN: MCC={mcc} MNC={mnc} ({plmn.hex()})")
-    sublist_len = struct.unpack('>H', raw[5:7])[0]
-    upsc = struct.unpack('>H', raw[7:9])[0]
-    instr = raw[9]
-    section_len = struct.unpack('>H', raw[10:12])[0]
-    upsc_type = (upsc >> 12) & 0xF
-    upsc_index = upsc & 0xFFF
-    type_names = {1: 'URSP', 2: 'ANDSP', 3: 'V2XRSP'}
-    print(f"  UPSC: {upsc:#06x} (type={type_names.get(upsc_type, upsc_type)}, index={upsc_index})")
-    print(f"  Instruction: {instr:#04x} ({'create-and-replace' if instr==1 else 'unknown'})")
-    print(f"  Section contents length: {section_len}")
-
-    # URSP payload starts at raw[12] — section contents ARE the URSP rules (no type prefix)
-    ursp = raw[12:12+section_len]
-    rule_num = 0
-    i = 0
-    while i < len(ursp):
-        if i >= len(ursp): break
-        precedence = ursp[i]; i += 1
-        if i + 2 > len(ursp): break
-        td_len = struct.unpack('>H', ursp[i:i+2])[0]; i += 2
-        td = ursp[i:i+td_len]; i += td_len
-        if i + 2 > len(ursp): break
-        rsd_len = struct.unpack('>H', ursp[i:i+2])[0]; i += 2
-        rsd = ursp[i:i+rsd_len]; i += rsd_len
-        rule_num += 1
-
-        # Parse TD
-        td_desc = []
-        j = 0
-        while j < len(td):
-            t = td[j]; j += 1
-            if t == 0x01:
-                td_desc.append("match-all")
-            elif t == 0x08 and j < len(td):
-                l = td[j]; j += 1
-                if j + l <= len(td):
-                    label_len = td[j]; j += 1
-                    dnn = td[j:j+label_len].decode('utf-8','replace'); j += label_len
-                    td_desc.append(f"DNN={dnn}")
-            else:
-                if j < len(td):
-                    l = td[j]; j += 1+l
-                td_desc.append(f"type={t:#04x}")
-
-        # Parse RSD
-        rsd_desc = []
-        j = 0
-        while j < len(rsd):
-            prec = rsd[j]; j += 1
-            if j + 2 > len(rsd): break
-            comp_len = struct.unpack('>H', rsd[j:j+2])[0]; j += 2
-            comps = rsd[j:j+comp_len]; j += comp_len
-            cj = 0
-            comp_desc = [f"prec={prec}"]
-            while cj < len(comps):
-                ct = comps[cj]; cj += 1
-                if cj >= len(comps): break
-                cl = comps[cj]; cj += 1
-                cv = comps[cj:cj+cl]; cj += cl
-                if ct == 0x01:
-                    comp_desc.append(f"SSC={cv[0] if cv else '?'}")
-                elif ct == 0x02:
-                    if len(cv) == 1:
-                        comp_desc.append(f"SNSSAI(SST={cv[0]})")
-                    elif len(cv) >= 4:
-                        comp_desc.append(f"SNSSAI(SST={cv[0]},SD={cv[1:4].hex()})")
-                elif ct == 0x03:
-                    if cv:
-                        label_len = cv[0]
-                        dnn = cv[1:1+label_len].decode('utf-8','replace')
-                        comp_desc.append(f"DNN={dnn}")
-                elif ct == 0x04:
-                    ptype = {1:'IPv4',2:'IPv6',3:'IPv4v6'}.get(cv[0] if cv else 0, f'{cv[0]:#04x}')
-                    comp_desc.append(f"PDUType={ptype}")
-            rsd_desc.append("{" + ",".join(comp_desc) + "}")
-
-        print(f"  Rule {rule_num}: precedence={precedence} TD=[{','.join(td_desc)}] RSD={rsd_desc}")
-except Exception as ex:
-    print(f"  Parse error: {ex}")
-    import traceback; traceback.print_exc()
-PYEOF
+            # Display the decoded container (same decoder as U4; informational only).
+            if have_cmd python3 && [ -f "$DECODE_PY" ]; then
+                python3 "$DECODE_PY" <<<"$N15_BODY" 2>&1 | sed 's/^/    /' || true
             fi
         else
             fail "PCF returned uePolicySections but uePolicySectionContent is empty"
@@ -397,8 +304,8 @@ PYEOF
         info "Body: $N15_BODY"
     fi
 elif [ "$N15_RESP" = "000" ]; then
-    fail "PCF N15 not reachable (port 8006)"
-    info "Check: curl -sk https://localhost:8006/healthz"
+    fail "PCF N15 not reachable (pcf:8006, mTLS)"
+    info "Check: curl -sk --http2 --cert pki/amf.crt --key pki/amf.key https://localhost:8006/healthz"
 else
     fail "PCF N15 returned unexpected HTTP $N15_RESP"
     info "Body: $(cat "$N15_BODY_FILE" 2>/dev/null || echo '?')"
@@ -412,7 +319,7 @@ section "U6 · Policy push — on-demand policy delivery to CM-CONNECTED UE"
 info "Waiting for UE to be CM-CONNECTED (up to 20s)..."
 sleep 5  # allow PDU session to establish if needed
 
-UCU_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+UCU_STATUS=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
     -X POST "$AMF_MGMT/amf/v1/ue-contexts/$SUPI/push-policies" 2>/dev/null || echo "000")
 
 case "$UCU_STATUS" in
@@ -421,7 +328,7 @@ case "$UCU_STATUS" in
         ;;
     "409")
         skip "AMF push-policies returned 409 — UE is CM-IDLE (delivery deferred)"
-        info "The UE may have gone idle. Retry: docker exec ueransim-ue nr-cli $SUPI -e 'ps-establish default internet'"
+        info "The UE may have gone idle. Retry: docker exec ${UE_CONTAINER} nr-cli $SUPI -e 'ps-establish IPv4 --sst 1 --sd 1 --dnn internet'"
         ;;
     "404")
         fail "AMF push-policies returned 404 — UE not registered in AMF"
@@ -449,8 +356,8 @@ section "U7 · Delivery — AMF sent the UE policy container (ursp_version bumpe
 # (a real UE would reply with MANAGE UE POLICY COMPLETE in UL NAS TRANSPORT).
 if [ "$UCU_STATUS" = "204" ]; then
     if wait_for_log "amf" "UE policy container sent|ursp_version" 10; then
-        URSP_VER=$(docker logs amf 2>&1 | grep '"ursp_version"' | tail -1 | \
-            grep -oP '"ursp_version":\K[0-9]+' || echo "?")
+        URSP_VER=$(json_num_last ursp_version "$(container_logs amf)")
+        URSP_VER=${URSP_VER:-?}
         pass "AMF sent UE policy container — ursp_version=$URSP_VER"
         info "No UE ACK expected: UERANSIM does not implement MANAGE UE POLICY COMPLETE"
     else
@@ -468,24 +375,47 @@ section "U8 · Routing — PDU session follows URSP match-all rule"
 # The default URSP config has a match-all rule → internet/SST=1/SD=000001.
 # Establish a PDU session and verify SMF bound it to SST=1/SD=000001.
 
-info "Establishing PDU session via nr-cli..."
-PS_OUTPUT=$(docker exec ueransim-ue \
-    nr-cli "$SUPI" -e "ps-establish default internet" 2>&1 || true)
+# ps_active_internet — "PSI address" of a PS-ACTIVE internet session on SST=1/SD=000001.
+ps_active_internet() {
+    local out
+    out=$(nrcli "${UE_CONTAINER}" "$SUPI" ps-list 10)
+    awk '
+        function emit() { if (st == "PS-ACTIVE" && apn == "internet" && sst == "0x01" && sd == "0x000001") print psi, addr }
+        /^PDU Session/ { emit(); psi = $2; sub(/^Session/, "", psi); sub(/:$/, "", psi); st = apn = sst = sd = addr = "" }
+        /state:/   { st = $2 }
+        /apn:/     { apn = $2 }
+        /sst:/     { sst = $2 }
+        /sd:/      { sd = $2 }
+        /address:/ { addr = $2 }
+        END        { emit() }
+    ' <<<"$out" | head -n 1
+}
 
-if echo "$PS_OUTPUT" | grep -qi "successful\|established\|session"; then
-    pass "PDU Session established (nr-cli)"
-elif docker logs ueransim-ue 2>&1 | grep -q "PDU Session establishment is successful"; then
-    pass "PDU Session establishment is successful (UE log)"
+PS_ACTIVE=$(ps_active_internet)
+if [ -n "$PS_ACTIVE" ]; then
+    pass "PDU Session PSI ${PS_ACTIVE%% *} PS-ACTIVE on internet/SST=1/SD=000001 (${PS_ACTIVE#* }) — URSP match-all route"
 else
-    skip "Could not confirm PDU session establishment — may already be established"
-    info "Manual: docker exec ueransim-ue nr-cli $SUPI -e 'ps-list'"
+    info "No internet session on SST=1/SD=000001 — establishing one via nr-cli..."
+    PS_OUTPUT=$(nrcli "${UE_CONTAINER}" "$SUPI" "ps-establish IPv4 --sst 1 --sd 1 --dnn internet" 15)
+    deadline=$((SECONDS + 20))
+    while [ -z "$PS_ACTIVE" ] && [ "$SECONDS" -lt "$deadline" ]; do
+        sleep 2
+        PS_ACTIVE=$(ps_active_internet)
+    done
+    if [ -n "$PS_ACTIVE" ]; then
+        pass "PDU Session PSI ${PS_ACTIVE%% *} established on internet/SST=1/SD=000001 (${PS_ACTIVE#* })"
+    else
+        fail "No PS-ACTIVE internet session on SST=1/SD=000001 after ps-establish"
+        info "nr-cli: ${PS_OUTPUT:0:200}"
+        info "Manual: docker exec ${UE_CONTAINER} nr-cli $SUPI -e 'ps-list'"
+    fi
 fi
 
 # Verify SMF used the URSP-specified slice (SST=1/SD=000001)
-SMF_LOGS=$(docker logs smf 2>&1)
-if echo "$SMF_LOGS" | grep -q "000001" && echo "$SMF_LOGS" | grep -q '"sst".*1\|snssai_sst.*1'; then
+SMF_LOGS=$(container_logs smf)
+if text_has "000001" "$SMF_LOGS" && text_has '"sst".*1|snssai_sst.*1' "$SMF_LOGS"; then
     pass "SMF session uses SST=1/SD=000001 — matches URSP rule (match-all → internet)"
-elif echo "$SMF_LOGS" | grep -q "000001"; then
+elif text_has "000001" "$SMF_LOGS"; then
     pass "SMF session uses SD=000001 — consistent with URSP rule"
 else
     skip "Could not verify URSP-specified slice in SMF logs"
@@ -493,40 +423,46 @@ else
 fi
 
 # Check TUN interface is up (data plane validates the full chain)
-UE_TUN=$(docker exec ueransim-ue ip link show uesimtun0 2>/dev/null || true)
-if echo "$UE_TUN" | grep -q "UP\|UNKNOWN\|uesimtun0"; then
+UE_TUN=$(run_timeout 10 docker exec "${UE_CONTAINER}" ip link show uesimtun0 2>/dev/null || true)
+if text_has "UP|UNKNOWN|uesimtun0" "$UE_TUN"; then
     pass "UE TUN interface uesimtun0 active — URSP-routed data plane is ready"
     # Optional: ping through the URSP-routed session
-    if docker exec ueransim-ue ping -c 1 -W 3 -I uesimtun0 172.30.3.100 >/dev/null 2>&1; then
+    if run_timeout 10 docker exec "${UE_CONTAINER}" ping -c 1 -W 3 -I uesimtun0 172.30.3.100 >/dev/null 2>&1; then
         pass "Ping via uesimtun0 → UPF OK — end-to-end URSP routing confirmed"
     else
         skip "Ping via uesimtun0 failed (UPF may not respond to ICMP) — data plane route exists"
     fi
 else
     skip "uesimtun0 not found (PDU session may not be established)"
-    info "Manual: docker exec ueransim-ue nr-cli $SUPI -e 'ps-establish default internet'"
+    info "Manual: docker exec ${UE_CONTAINER} nr-cli $SUPI -e 'ps-establish IPv4 --sst 1 --sd 1 --dnn internet'"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 section "U9 · Unit tests — Go codec (URSP binary + DL NAS Transport)"
 # ─────────────────────────────────────────────────────────────────────────────
 
+# go_unit LABEL PKG RUN — run Go unit tests from the repo root; pass only when `go test`
+# itself succeeds (grepping its output alone would also "match" on --- FAIL lines).
+go_unit() {
+    local label="$1" pkg="$2" run="$3" out rc=0
+    if ! have_cmd go; then
+        skip "$label — go toolchain not found on host"
+        return 0
+    fi
+    out=$(cd "$REPO_ROOT" && go test "$pkg" -v -run "$run" -count=1 2>&1) || rc=$?
+    text_lines '^=== RUN|^--- (PASS|FAIL)|^ok|^FAIL' "$out"
+    if [ "$rc" -eq 0 ] && text_has '^ok' "$out"; then
+        pass "$label"
+    else
+        fail "$label (go test exit $rc)"
+    fi
+}
+
 echo "  Running URSP codec unit tests..."
-if go test ./nf/pcf/internal/policy/... -v -run "TestEncodeURSPRules" \
-    -count=1 2>&1 | grep -E "^=== RUN|^--- (PASS|FAIL)|^ok|^FAIL"; then
-    pass "PCF URSP binary codec unit tests"
-else
-    fail "PCF URSP binary codec unit tests"
-fi
+go_unit "PCF URSP binary codec unit tests" ./nf/pcf/internal/policy/... "TestEncodeURSPRules"
 
 echo "  Running NAS transport / ConfigurationUpdate unit tests..."
-if go test ./shared/nas/... -v \
-    -run "TestDLNASTransport|TestConfigurationUpdate" \
-    -count=1 2>&1 | grep -E "^=== RUN|^--- (PASS|FAIL)|^ok|^FAIL"; then
-    pass "NAS DL NAS Transport / ConfigurationUpdate unit tests"
-else
-    fail "NAS DL NAS Transport / ConfigurationUpdate unit tests"
-fi
+go_unit "NAS DL NAS Transport / ConfigurationUpdate unit tests" ./shared/nas/... "TestDLNASTransport|TestConfigurationUpdate"
 
 # ─────────────────────────────────────────────────────────────────────────────
 section "Summary"
@@ -540,12 +476,12 @@ if [ $FAIL -gt 0 ]; then
     echo "    docker logs pcf 2>&1 | jq -c 'select(.procedure==\"UEPolicyCreate\")'"
     echo "    docker logs amf 2>&1 | jq -c 'select(.procedure==\"UEPolicyDelivery\")'"
     echo "    docker logs amf 2>&1 | jq -c 'select(.interface==\"N15\")'"
-    echo "    docker exec ueransim-ue nr-cli $SUPI -e 'ps-list'"
+    echo "    docker exec ${UE_CONTAINER} nr-cli $SUPI -e 'ps-list'"
     echo "    curl -X POST $AMF_MGMT/amf/v1/ue-contexts/$SUPI/push-policies"
     echo ""
-    echo "  URSP decode (requires stack up, PCF reachable from amf container):"
-    echo "    docker exec amf curl -sk --http2-prior-knowledge \\"
-    echo "      -X POST https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \\"
+    echo "  URSP decode (requires stack up; PCF requires an mTLS client cert):"
+    echo "    curl -sk --http2 --cert pki/amf.crt --key pki/amf.key \\"
+    echo "      -X POST https://localhost:8006/npcf-ue-policy-control/v1/ue-policies \\"
     echo "      -H 'Content-Type: application/json' \\"
     echo "      -d '{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}' | \\"
     echo "      python3 scripts/decode-ursp.py"

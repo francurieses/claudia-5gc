@@ -424,6 +424,8 @@ func (s *Server) completeSecondaryAuth(ctx context.Context, pending *pendingSeco
 		ARPPriority:    policyQoS.ARPPriority,
 		AMBRULMbps:     policyQoS.AMBRULMbps,
 		AMBRDLMbps:     policyQoS.AMBRDLMbps,
+		AMBRULKbps:     policyQoS.AMBRULKbps,
+		AMBRDLKbps:     policyQoS.AMBRDLKbps,
 		QoSSource:      policyQoS.Source,
 		State:          "ACTIVE",
 		CreatedAt:      time.Now(),

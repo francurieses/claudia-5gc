@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/config"
+	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/deployment"
 	dockerclient "github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/docker"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/nrf"
 	promclient "github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/prometheus"
@@ -29,8 +30,14 @@ type Deps struct {
 	AMFBaseURL string // for push-policies endpoint
 	UDMBaseURL string // for subscription QoS lookups (Nudm_SDM sm-data)
 	UDRBaseURL string // for re-deriving sm-data after a slice change (internal API)
+	IperfImage string // image for throw-away iperf3 servers/clients (PORTAL_IPERF_IMAGE)
 	PCFBaseURL string // for SM policy QoS overrides (NW-triggered session flow)
 	LMFBaseURL string // for Nlmf_Location DetermineLocation (UE location map)
+	// AMFMgmtURLs lists the AMF management endpoints queried for the gNBs page
+	// (AMF_MGMT_URLS). Empty → [AMFBaseURL].
+	AMFMgmtURLs []string
+	// Deployment detects which RAN simulators are deployed (nil = not wired).
+	Deployment *deployment.Detector
 	// MTLSClient is an HTTP client carrying the portal's mTLS client certificate.
 	// Used for /healthz probes against NFs that enforce mutual TLS (NRF, AMF).
 	MTLSClient *http.Client
@@ -61,6 +68,11 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Get("/slices", deps.handleListSlices)
 		r.Post("/slices", deps.handleAddSlice)
 		r.Delete("/slices/{sst}/{sd}", deps.handleDeleteSlice)
+		// Per-(S-NSSAI, DNN) subscribed Session-AMBR (UDR-003; sd "-" = no SD)
+		r.Get("/slices/qos", deps.handleListSliceQoS)
+		r.Put("/slices/qos/{sst}/{sd}/{dnn}", deps.handlePutSliceQoS)
+		r.Delete("/slices/qos/{sst}/{sd}/{dnn}", deps.handleDeleteSliceQoS)
+		r.Post("/slices/qos/{sst}/{sd}/{dnn}/apply", deps.handleApplySliceQoS)
 
 		// DNNs
 		r.Get("/dnns", deps.handleListDNNs)
@@ -98,20 +110,31 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Get("/pcap/{nf}/files/{filename}", deps.handlePCAPDownload)
 		r.Delete("/pcap/{nf}/files/{filename}", deps.handlePCAPDeleteFile)
 
-		// UERANSIM management
-		r.Get("/ueransim/status", deps.handleUERANSIMStatus)
-		r.Post("/ueransim/nr-cli", deps.handleNRCLI)
-		r.Post("/ueransim/ping", deps.handleUERANSIMPing)
-		r.Get("/ueransim/scenarios", deps.handleUERANSIMScenarios)
-		r.Post("/ueransim/scenarios/{scenario}/start", deps.handleUERANSIMScenarioStart)
-		r.Post("/ueransim/scenarios/{scenario}/stop", deps.handleUERANSIMScenarioStop)
+		// Deployment mode (standalone core vs. RAN simulators) and gNB registry (AMF)
+		r.Get("/deployment", deps.handleDeployment)
+		r.Get("/ran/gnbs", deps.handleRANGnbs)
 
-		// PacketRusher mobility testing (Xn HO / N2 HO)
+		// UERANSIM management — mutating calls need UERANSIM deployed (409 otherwise)
+		r.Get("/ueransim/status", deps.handleUERANSIMStatus)
+		r.Get("/ueransim/scenarios", deps.handleUERANSIMScenarios)
+		r.Group(func(r chi.Router) {
+			r.Use(deps.requireRANTool(deployment.ModeUERANSIM))
+			r.Post("/ueransim/nr-cli", deps.handleNRCLI)
+			r.Post("/ueransim/ping", deps.handleUERANSIMPing)
+			r.Post("/ueransim/iperf", deps.handleUERANSIMIperf)
+			r.Post("/ueransim/scenarios/{scenario}/start", deps.handleUERANSIMScenarioStart)
+			r.Post("/ueransim/scenarios/{scenario}/stop", deps.handleUERANSIMScenarioStop)
+		})
+
+		// PacketRusher mobility testing (Xn HO / N2 HO) — mutating calls need PacketRusher deployed
 		r.Get("/packetrusher/status", deps.handlePacketRusherStatus)
-		r.Post("/packetrusher/{scenario}/start", deps.handlePacketRusherStart)
-		r.Post("/packetrusher/{scenario}/stop", deps.handlePacketRusherStop)
-		r.Post("/packetrusher/{scenario}/pause", deps.handlePacketRusherPause)
-		r.Post("/packetrusher/{scenario}/resume", deps.handlePacketRusherResume)
+		r.Group(func(r chi.Router) {
+			r.Use(deps.requireRANTool(deployment.ModePacketRusher))
+			r.Post("/packetrusher/{scenario}/start", deps.handlePacketRusherStart)
+			r.Post("/packetrusher/{scenario}/stop", deps.handlePacketRusherStop)
+			r.Post("/packetrusher/{scenario}/pause", deps.handlePacketRusherPause)
+			r.Post("/packetrusher/{scenario}/resume", deps.handlePacketRusherResume)
+		})
 
 		// QoS / PDU sessions (SMF management API + UDM SDM proxies)
 		r.Get("/qos/sessions", deps.handleQoSListSessions)
@@ -119,7 +142,7 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Post("/qos/sessions/{psi}/modify", deps.handleQoSModifySession)
 		r.Get("/qos/subscription/{supi}", deps.handleQoSSubscription)
 		// NW-triggered additional PDU session (URSP-based — TS 23.503 §6.6.2)
-		r.Post("/qos/nw-sessions", deps.handleNWSessionTrigger)
+		r.With(deps.requireRANTool(deployment.ModeUERANSIM)).Post("/qos/nw-sessions", deps.handleNWSessionTrigger)
 
 		// Public Warning System (ETWS/CMAS — TS 38.413 §8.9, TS 23.041)
 		r.Post("/pws/broadcast", deps.handlePWSBroadcast)

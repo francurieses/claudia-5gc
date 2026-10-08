@@ -157,3 +157,49 @@ func runIdempotent(name string, args ...string) error {
 	}
 	return nil
 }
+
+// SetLinkParams applies the optional N6 TUN tuning knobs; a zero value leaves the kernel default.
+//   - mtu: ip link set dev <name> mtu <mtu>
+//   - txqueuelen: ip link set dev <name> txqueuelen <n>
+func SetLinkParams(name string, mtu, txqueuelen int) error {
+	if mtu > 0 {
+		if err := run("ip", "link", "set", "dev", name, "mtu", fmt.Sprint(mtu)); err != nil {
+			return err
+		}
+	}
+	if txqueuelen > 0 {
+		if err := run("ip", "link", "set", "dev", name, "txqueuelen", fmt.Sprint(txqueuelen)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MSSClampArgs returns the iptables arguments (after the binary name) that clamp the TCP
+// MSS of SYN segments to the path MTU in the mangle FORWARD chain. dir is "-o" (towards
+// the TUN, downlink) or "-i" (from the TUN, uplink); op is "-A" (append) or "-C" (check).
+func MSSClampArgs(op, dir, name string) []string {
+	return []string{"-t", "mangle", op, "FORWARD", dir, name,
+		"-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"}
+}
+
+// SetupMSSClamp installs the MSS clamp rules in both directions of the TUN (idempotent), for
+// IPv4 and, when ipv6 is true, IPv6. Clamping keeps TCP segments within the TUN MTU so DL
+// segments fit in a single N3 packet without outer fragmentation.
+func SetupMSSClamp(name string, ipv6 bool) error {
+	bins := []string{"iptables"}
+	if ipv6 {
+		bins = append(bins, "ip6tables")
+	}
+	for _, bin := range bins {
+		for _, dir := range []string{"-o", "-i"} {
+			if exec.Command(bin, MSSClampArgs("-C", dir, name)...).Run() == nil {
+				continue
+			}
+			if err := run(bin, MSSClampArgs("-A", dir, name)...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

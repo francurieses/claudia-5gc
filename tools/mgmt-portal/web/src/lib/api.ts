@@ -8,7 +8,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error((err as { error: string }).error || res.statusText)
+    const e = err as { error?: string; detail?: string }
+    throw new Error(e.error || e.detail || res.statusText)
   }
   const text = await res.text()
   if (!text) return undefined as T
@@ -133,6 +134,50 @@ export const addSlice = (slice: SNSSAI, restart = false) =>
 export const deleteSlice = (sst: number, sd: string, restart = false) =>
   request<DeleteSliceResult>('DELETE', `/slices/${sst}/${sd}?restart=${restart}`)
 
+// ---- Slice/DNN Session-AMBR (UDR-003, TS 23.501 §5.7.2.6) -----------------
+
+export interface SessionAmbr { uplink: string; downlink: string }
+export type SliceQoSSource = 'default' | 'operator' | 'edited'
+
+/** UDR SliceDnnQos object (non-3GPP internal API, relayed by the portal). */
+export interface SliceDnnQoS {
+  snssai: { sst: number; sd?: string }
+  dnn: string
+  sessionAmbr: SessionAmbr
+  source: SliceQoSSource
+  defaultSessionAmbr: SessionAmbr
+  defaultSource: 'default' | 'operator'
+  updatedAt: string
+}
+
+export interface SliceQoSResync {
+  affectedSubscribers: number
+  synced: number
+  failed?: { supi: string; error: string }[]
+}
+export interface SliceQoSWriteResult { item: SliceDnnQoS; changed: boolean; resync?: SliceQoSResync }
+
+export interface SliceQoSApplyResult {
+  sessionAmbr: SessionAmbr
+  applied_mbps: { ul: number; dl: number }
+  matched: number
+  applied: { supi: string; pduSessionId: number }[]
+  skipped: { supi: string; pduSessionId: number; qosSource?: string; reason: string }[]
+  failed: { supi: string; pduSessionId: number; status: number; cause?: string; detail?: string }[]
+}
+
+/** Path segment for an S-NSSAI: SD lower-case hex, "-" when there is no SD. */
+const qosPath = (sst: number, sd: string | undefined, dnn: string) =>
+  `/slices/qos/${sst}/${sd ? sd : '-'}/${encodeURIComponent(dnn)}`
+
+export const getSliceQoS = () => request<{ items: SliceDnnQoS[] }>('GET', '/slices/qos')
+export const putSliceQoS = (sst: number, sd: string | undefined, dnn: string, ambr: SessionAmbr) =>
+  request<SliceQoSWriteResult>('PUT', qosPath(sst, sd, dnn), { sessionAmbr: ambr })
+export const deleteSliceQoS = (sst: number, sd: string | undefined, dnn: string) =>
+  request<SliceQoSWriteResult>('DELETE', qosPath(sst, sd, dnn))
+export const applySliceQoS = (sst: number, sd: string | undefined, dnn: string, includeOverridden = false) =>
+  request<SliceQoSApplyResult>('POST', `${qosPath(sst, sd, dnn)}/apply`, { include_overridden: includeOverridden })
+
 // ---- Services ------------------------------------------------------------
 
 export const getServices = () => request<Service[]>('GET', '/services')
@@ -168,6 +213,71 @@ export interface UELocation {
 export const getLocationSummary = () => request<UELocation[]>('GET', '/location/summary')
 export const getUELocation = (supi: string) =>
   request<UELocation>('GET', `/location/ue/${encodeURIComponent(supi)}`)
+
+// ---- Deployment mode + gNBs (RAN) ----------------------------------------
+
+export type DeploymentMode = 'standalone' | 'ueransim' | 'packetrusher' | 'both'
+export type RanTool = 'ueransim' | 'packetrusher'
+
+export interface RanToolState {
+  deployed: boolean
+  running: boolean
+  containers: { name: string; state: string; running: boolean }[]
+}
+
+export interface Deployment {
+  mode: DeploymentMode
+  ueransim: RanToolState
+  packetrusher: RanToolState
+  source: 'docker' | 'override' | 'unavailable'
+  detected_at: string
+}
+
+export type GnbState = 'NG_READY' | 'SCTP_UP' | 'DISCONNECTED'
+
+export interface RanGnb {
+  id: string
+  amf_name: string
+  ran_node: {
+    type: string
+    plmn: { mcc: string; mnc: string }
+    gnb_id: number
+    gnb_id_hex: string
+    gnb_id_bit_length: number
+  }
+  ran_node_name: string
+  sctp: { remote_addrs: string[]; remote_port: number }
+  state: GnbState
+  connected_at: string
+  ng_setup_at?: string
+  disconnected_at?: string
+  disconnect_reason?: string
+  supported_tas: {
+    tac: number
+    broadcast_plmns: { mcc: string; mnc: string; slices: { sst: number; sd: string }[] }[]
+  }[]
+  ues: { connected: number; idle: number }
+  last_ng_reset_at?: string
+  ng_reset_count: number
+  amf?: { url: string; name: string }
+}
+
+export interface RanSource {
+  amf_url: string
+  amf_name?: string
+  n2_addr?: string
+  ok: boolean
+  error?: string
+}
+
+export interface RanGnbsResponse {
+  gnbs: RanGnb[]
+  sources: RanSource[]
+  generated_at: string
+}
+
+export const getDeployment = () => request<Deployment>('GET', '/deployment')
+export const getRanGnbs = () => request<RanGnbsResponse>('GET', '/ran/gnbs')
 
 // ---- Metrics -------------------------------------------------------------
 
@@ -241,7 +351,8 @@ export const pcapBulkDownload = async (nf: string, files: string[]): Promise<voi
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error((err as { error: string }).error || res.statusText)
+    const e = err as { error?: string; detail?: string }
+    throw new Error(e.error || e.detail || res.statusText)
   }
   const blob = await res.blob()
   const url = URL.createObjectURL(blob)
@@ -288,6 +399,54 @@ export const nrCLI = (container: string, supi: string, command: string) =>
   request<NRCLIResult>('POST', '/ueransim/nr-cli', { container, supi, command })
 export const pingUE = (container: string, ue_ip: string, target: string, count: number) =>
   request<NRCLIResult>('POST', '/ueransim/ping', { container, ue_ip, target, count })
+
+export interface IperfParams {
+  container: string
+  ue_ip: string
+  network: string // N6 Docker network: 5gc-n6 | 5gc-n6-ims
+  protocol: 'tcp' | 'udp'
+  direction: 'ul' | 'dl'
+  duration: number
+  streams: number
+  bandwidth?: string // target bitrate (-b), e.g. "10M"; empty on TCP = unlimited
+  server_ip?: string // external iperf3 server (IPv4); empty = auto throw-away container
+  server_port?: number // default 5201
+}
+
+export interface IperfSummary {
+  mbps: number // delivered rate
+  offered_mbps?: number // UDP uplink: rate the client sent
+  retransmits?: number
+  jitter_ms?: number
+  loss_percent?: number
+  packets?: number
+  seconds: number
+}
+
+export interface IperfResult {
+  ok: boolean
+  error?: string
+  container: string
+  ue_ip: string
+  network: string
+  server_ip: string
+  server_port?: number
+  server_mode?: 'auto' | 'external'
+  protocol: string
+  direction: string
+  duration: number
+  streams: number
+  bandwidth?: string
+  summary?: IperfSummary
+  upf_n6_ip?: string
+  server_peer?: string
+  path_checked: boolean
+  path_ok: boolean
+  client_mode?: string
+  raw_output?: string
+}
+
+export const iperfUE = (p: IperfParams) => request<IperfResult>('POST', '/ueransim/iperf', p)
 
 export interface ScenarioContainerState {
   name: string

@@ -23,6 +23,7 @@ import {
   PageHeader, SegmentedControl, Select, Spinner, Table, TableBody, TableCell, TableEmptyRow,
   TableHead, TableHeaderCell, TableRow, Textarea, useToast, Tabs } from '../components/ui'
 import type { BadgeVariant } from '../components/ui'
+import { isToolAvailable, useDeployment } from '../lib/deployment'
 import { useTabParam } from '../lib/useTabParam'
 
 // ---- 5QI helpers (TS 23.501 Table 5.7.4-1) --------------------------------
@@ -872,6 +873,7 @@ function ValidationPanel({ onDone }: { onDone: () => void }) {
 // ---- Page ---------------------------------------------------------------------
 
 export default function QoS() {
+  const hasUeransim = isToolAvailable(useDeployment(), 'ueransim')
   const [tab, setTab] = useTabParam(['sessions', 'nw-session', 'validation'] as const, 'sessions')
   const qc = useQueryClient()
   const [modifyTarget, setModifyTarget] = useState<QoSSession | null>(null)
@@ -954,7 +956,7 @@ export default function QoS() {
               </TableEmptyRow>
             ) : sessions.length === 0 ? (
               <TableEmptyRow colSpan={9}>
-                No active PDU sessions. Use UERANSIM to register a UE and establish a session.
+                No active PDU sessions. {hasUeransim ? 'Use UERANSIM to register a UE and establish a session.' : 'Register a UE through a connected gNB (see the gNBs page).'}
               </TableEmptyRow>
             ) : (
               sessions.map(s => (
@@ -1018,7 +1020,14 @@ export default function QoS() {
             content: (
               <div className="space-y-6">
       {/* NW-triggered additional PDU session */}
-      <NWSessionPanel sessions={sessions} />
+      {hasUeransim ? (
+        <NWSessionPanel sessions={sessions} />
+      ) : (
+        <EmptyState
+          title="UERANSIM is not deployed in this mode"
+          description="The NW-triggered session flow drives the UE through UERANSIM nr-cli. Add it with: make up RAN=ueransim"
+        />
+      )}
 
               </div>
             ),

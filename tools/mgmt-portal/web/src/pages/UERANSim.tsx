@@ -2,13 +2,13 @@ import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Play, Square, RefreshCw, Terminal, ChevronDown, ChevronRight, X,
-  Signal, SignalZero, Wifi, WifiOff, LogOut, Plus, Globe, Layers,
+  Signal, SignalZero, Wifi, WifiOff, LogOut, Plus, Globe, Layers, Gauge,
   CheckCircle2, XCircle, Circle, Clock, AlertTriangle,
 } from 'lucide-react'
 import {
-  getUERANSIMStatus, nrCLI, pingUE, startService, stopService,
+  getUERANSIMStatus, nrCLI, pingUE, iperfUE, startService, stopService,
   getUERANSIMScenarios, startUERANSIMScenario, stopUERANSIMScenario,
-  type UEEntry, type UEContainer, type UERANSIMScenarioState,
+  type UEEntry, type UEContainer, type UERANSIMScenarioState, type IperfResult,
 } from '../lib/api'
 import { formatHex32 } from '../lib/format'
 import {
@@ -620,6 +620,264 @@ function PingDialog({ ue, onClose }: { ue: UEEntry; onClose: () => void }) {
   )
 }
 
+// ---- iperf3 dialog ----------------------------------------------------------
+
+/** N6 Docker network that fronts a DNN: ims has its own bridge, the rest share 5gc-n6. */
+const iperfNetworkForDNN = (dnn: string) => (dnn === 'ims' ? '5gc-n6-ims' : '5gc-n6')
+
+function IperfDialog({ ue, onClose }: { ue: UEEntry; onClose: () => void }) {
+  const [sourceIP, setSourceIP] = useState(ue.sessions[0]?.ue_ip ?? '')
+  const [protocol, setProtocol] = useState<'tcp' | 'udp'>('tcp')
+  const [direction, setDirection] = useState<'ul' | 'dl'>('ul')
+  const [duration, setDuration] = useState(5)
+  const [streams, setStreams] = useState(1)
+  const [bandwidth, setBandwidth] = useState('')
+  const [serverMode, setServerMode] = useState<'auto' | 'external'>('auto')
+  const [serverIP, setServerIP] = useState('')
+  const [serverPort, setServerPort] = useState('5201')
+  const [result, setResult] = useState<IperfResult | null>(null)
+  const [error, setError] = useState('')
+
+  const session = ue.sessions.find(s => s.ue_ip === sourceIP)
+  const network = iperfNetworkForDNN(session?.dnn ?? '')
+  // Empty is valid: UDP falls back to 10M, TCP runs unlimited.
+  const bandwidthValid = bandwidth === '' || /^[1-9][0-9]{0,4}[KMG]?$/i.test(bandwidth)
+  const serverIPValid = serverMode === 'auto'
+    || /^((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)$/.test(serverIP.trim())
+  const portNum = Number(serverPort)
+  const serverPortValid = Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535
+
+  const iperfMut = useMutation({
+    mutationFn: () => iperfUE({
+      container: ue.container, ue_ip: sourceIP, network, protocol, direction,
+      duration, streams, bandwidth: bandwidth || undefined,
+      server_ip: serverMode === 'external' ? serverIP.trim() : undefined,
+      server_port: portNum,
+    }),
+    onMutate: () => { setResult(null); setError('') },
+    onSuccess: r => { setResult(r); if (!r.ok && r.error) setError(r.error) },
+    onError: (e: Error) => setError(e.message),
+  })
+
+  const sourceOptions: SelectOption[] = ue.sessions.map(s => ({
+    value: s.ue_ip,
+    label: `${s.ue_ip} (${s.dnn} SST:${s.sst}${s.sd ? `/SD:${s.sd}` : ''})`,
+  }))
+
+  const sum = result?.summary
+  const stat = (label: string, value: string) => (
+    <div className="rounded-control border border-border bg-muted/40 px-3 py-2">
+      <p className="text-xs text-muted-fg">{label}</p>
+      <p className="font-mono text-sm text-fg">{value}</p>
+    </div>
+  )
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      size="md"
+      title={`iperf3 Test — ${ue.supi}`}
+      description={`container: ${ue.container || 'unknown'} · bound to the session's tunnel address`}
+    >
+      <div className="space-y-3">
+        <Field label="Source (UE IP)">
+          {({ id }) => (
+            ue.sessions.length > 1 ? (
+              <Select
+                id={id}
+                value={sourceIP}
+                options={sourceOptions}
+                onChange={e => setSourceIP(e.target.value)}
+                className="font-mono text-xs"
+              />
+            ) : (
+              <div className="flex h-10 items-center rounded-control border border-border bg-muted/40 px-3 font-mono text-xs text-fg">
+                {sourceIP || <span className="font-sans text-muted-fg">no PDU session active</span>}
+              </div>
+            )
+          )}
+        </Field>
+        <div className="flex flex-wrap items-start gap-3">
+          <Field label="iperf3 server" className="min-w-[11rem] flex-1">
+            {({ id }) => (
+              <Select
+                id={id}
+                value={serverMode}
+                options={[
+                  { value: 'auto', label: `Auto — throw-away container on ${network}` },
+                  { value: 'external', label: 'Custom server IP' },
+                ]}
+                onChange={e => setServerMode(e.target.value as 'auto' | 'external')}
+              />
+            )}
+          </Field>
+          <Field label="Port" className="w-24" error={serverPortValid ? undefined : '1-65535'}>
+            {({ id }) => (
+              <Input
+                id={id}
+                value={serverPort}
+                inputMode="numeric"
+                onChange={e => setServerPort(e.target.value.replace(/\D/g, ''))}
+                className="font-mono text-xs"
+              />
+            )}
+          </Field>
+        </div>
+        {serverMode === 'external' ? (
+          <Field
+            label="Server IP"
+            hint={`Run iperf3 -s -p ${serverPort || '5201'} on that host; it must be reachable through the UPF.`}
+            error={serverIPValid || serverIP === '' ? undefined : 'Enter a valid IPv4 address'}
+          >
+            {({ id }) => (
+              <Input
+                id={id}
+                value={serverIP}
+                onChange={e => setServerIP(e.target.value)}
+                placeholder="192.168.1.50"
+                className="font-mono text-xs"
+              />
+            )}
+          </Field>
+        ) : (
+          <p className="text-xs text-muted-fg">
+            The server IP is assigned when the test starts (shown in the result). The container is removed afterwards.
+          </p>
+        )}
+
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Protocol" className="w-32">
+            {({ id }) => (
+              <Select
+                id={id}
+                value={protocol}
+                options={[{ value: 'tcp', label: 'TCP' }, { value: 'udp', label: 'UDP' }]}
+                onChange={e => setProtocol(e.target.value as 'tcp' | 'udp')}
+              />
+            )}
+          </Field>
+          <Field label="Direction" className="min-w-[10rem] flex-1">
+            {({ id }) => (
+              <Select
+                id={id}
+                value={direction}
+                options={[
+                  { value: 'ul', label: 'Uplink (UE → server)' },
+                  { value: 'dl', label: 'Downlink (server → UE)' },
+                ]}
+                onChange={e => setDirection(e.target.value as 'ul' | 'dl')}
+              />
+            )}
+          </Field>
+        </div>
+
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Duration" className="w-28">
+            {({ id }) => (
+              <Select
+                id={id}
+                value={String(duration)}
+                options={[5, 10, 20, 30].map(n => ({ value: String(n), label: `${n} s` }))}
+                onChange={e => setDuration(Number(e.target.value))}
+              />
+            )}
+          </Field>
+          <Field label="Streams" className="w-24">
+            {({ id }) => (
+              <Select
+                id={id}
+                value={String(streams)}
+                options={[1, 2, 4, 8].map(n => ({ value: String(n), label: String(n) }))}
+                onChange={e => setStreams(Number(e.target.value))}
+              />
+            )}
+          </Field>
+          <Field
+            label="Bandwidth"
+            className="w-36"
+            hint={`${protocol === 'udp' ? 'Empty = 10M' : 'Empty = unlimited'}; per stream`}
+            error={bandwidthValid ? undefined : 'e.g. 500K, 10M, 1G'}
+          >
+            {({ id }) => (
+              <Input
+                id={id}
+                value={bandwidth}
+                onChange={e => setBandwidth(e.target.value.toUpperCase())}
+                placeholder={protocol === 'udp' ? '10M' : 'unlimited'}
+                className="font-mono text-xs"
+              />
+            )}
+          </Field>
+        </div>
+
+        <Button
+          icon={<Gauge size={13} />}
+          loading={iperfMut.isPending}
+          disabled={iperfMut.isPending || !sourceIP || !ue.container || !bandwidthValid || !serverIPValid || !serverPortValid || (serverMode === 'external' && !serverIP.trim())}
+          onClick={() => iperfMut.mutate()}
+          className="w-full"
+        >
+          {iperfMut.isPending ? `Running (${duration} s)…` : 'Run iperf3'}
+        </Button>
+
+        {error && (
+          <div role="alert" className="flex items-start gap-2 rounded-control border border-danger-border bg-danger-surface p-3 text-xs text-danger-fg">
+            <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden />
+            <span className="break-words">{error}</span>
+          </div>
+        )}
+
+        {sum && (
+          <div>
+            <SectionLabel>Result</SectionLabel>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {stat('Throughput', `${sum.mbps.toFixed(1)} Mbps`)}
+              {sum.offered_mbps !== undefined && stat('Offered', `${sum.offered_mbps.toFixed(1)} Mbps`)}
+              {sum.retransmits !== undefined && stat('Retransmits', String(sum.retransmits))}
+              {sum.loss_percent !== undefined && stat('Loss', `${sum.loss_percent.toFixed(2)} %`)}
+              {sum.jitter_ms !== undefined && stat('Jitter', `${sum.jitter_ms.toFixed(3)} ms`)}
+              {stat('Duration', `${sum.seconds.toFixed(1)} s`)}
+              {stat('Server', result?.server_ip ? `${result.server_ip}:${result.server_port ?? 5201}` : '—')}
+            </div>
+            <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-fg">
+              {result?.path_checked ? (
+                result.path_ok ? (
+                  <>
+                    <CheckCircle2 size={12} className="text-success-fg" aria-hidden />
+                    Path verified: the server saw the UPF N6 address ({result.upf_n6_ip}) — traffic crossed the UPF.
+                  </>
+                ) : (
+                  <>
+                    <XCircle size={12} className="text-danger-fg" aria-hidden />
+                    Path check failed: server saw {result.server_peer}, expected {result.upf_n6_ip}.
+                  </>
+                )
+              ) : (
+                <>
+                  <AlertTriangle size={12} className="text-warning-fg" aria-hidden />
+                  {result?.server_mode === 'external'
+                    ? 'Path not verified: custom server — the portal cannot see which address it saw.'
+                    : 'Path not verified (UPF N6 address or server peer unavailable).'}
+                </>
+              )}
+            </p>
+          </div>
+        )}
+
+        {result?.raw_output && (
+          <div>
+            <SectionLabel>iperf3 output</SectionLabel>
+            <pre className="log-surface max-h-40 overflow-y-auto whitespace-pre-wrap rounded-control border border-border p-3 text-log-fg">
+              {result.raw_output}
+            </pre>
+          </div>
+        )}
+      </div>
+    </Dialog>
+  )
+}
+
 // ---- Scenario card ----------------------------------------------------------
 
 function ScenarioCard({
@@ -750,7 +1008,12 @@ function ContainerCard({
 
 // ---- UE row -----------------------------------------------------------------
 
-function UERow({ ue, onAction, onPing }: { ue: UEEntry; onAction: (ue: UEEntry) => void; onPing: (ue: UEEntry) => void }) {
+function UERow({ ue, onAction, onPing, onIperf }: {
+  ue: UEEntry
+  onAction: (ue: UEEntry) => void
+  onPing: (ue: UEEntry) => void
+  onIperf: (ue: UEEntry) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const gmm = gmmStatus(ue.gmm_state)
   const detailId = `ue-sessions-${ue.supi}`
@@ -803,6 +1066,19 @@ function UERow({ ue, onAction, onPing }: { ue: UEEntry; onAction: (ue: UEEntry) 
               title="Ping test from UE"
             >
               Ping
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Gauge size={11} />}
+              disabled={!ue.container || ue.sessions.length === 0}
+              onClick={e => {
+                e.stopPropagation()
+                onIperf(ue)
+              }}
+              title="iperf3 throughput test from UE"
+            >
+              iperf3
             </Button>
             <Button
               size="sm"
@@ -882,6 +1158,7 @@ export default function UERANSim() {
   const [logContainer, setLogContainer] = useState<string | null>(null)
   const [activeUE, setActiveUE] = useState<UEEntry | null>(null)
   const [pingTarget, setPingTarget] = useState<UEEntry | null>(null)
+  const [iperfTarget, setIperfTarget] = useState<UEEntry | null>(null)
 
   const actionFailed = (verb: string) => (err: unknown) =>
     toast({ variant: 'error', title: `${verb} failed`, description: errMessage(err), duration: 0 })
@@ -953,6 +1230,7 @@ export default function UERANSim() {
     <div className="space-y-8 p-6">
       {activeUE && <NRCLIDialog ue={activeUE} onClose={() => setActiveUE(null)} />}
       {pingTarget && <PingDialog ue={pingTarget} onClose={() => setPingTarget(null)} />}
+      {iperfTarget && <IperfDialog ue={iperfTarget} onClose={() => setIperfTarget(null)} />}
 
       <PageHeader
         eyebrow="Test UEs"
@@ -1152,7 +1430,7 @@ export default function UERANSim() {
                 </TableEmptyRow>
               ) : (
                 ues.map(ue => (
-                  <UERow key={ue.supi} ue={ue} onAction={setActiveUE} onPing={setPingTarget} />
+                  <UERow key={ue.supi} ue={ue} onAction={setActiveUE} onPing={setPingTarget} onIperf={setIperfTarget} />
                 ))
               )}
             </TableBody>

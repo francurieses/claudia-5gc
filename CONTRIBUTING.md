@@ -1,3 +1,4 @@
+<!-- tier: public -->
 # Contributing
 
 ## Prerequisites
@@ -35,15 +36,14 @@ Scope is the NF name (`amf`, `smf`, `nrf`, `shared`, `portal`, `mcp`, etc.).
 
 Read the referenced 3GPP TS first, then follow these steps — do not skip any:
 
-1. `docs/procedures/<procedure>.md` — sequence diagram (Mermaid) + spec ref + IEs + error cases
+1. Procedure design document — sequence diagram (Mermaid) + spec ref + IEs + error cases (maintainers keep these in the members documentation; in a PR, put the same content in the description)
 2. `.feature` Cucumber file — happy path + at least one error scenario
 3. Implement handler + state machine + SBI calls (logic in `internal/`, not `cmd/`)
 4. Step definitions for godog
 5. Integration test with UERANSIM or PacketRusher
-6. PCAP validation (see `docs/pcap-diagnostics.md`)
-7. `docs/compliance-matrix.md` — mark procedure as implemented
-8. Docs: update everything the change affects — the procedure doc, `docs/compliance-matrix.md`
-   and the recipe in `docs/validation-commands.md`
+6. PCAP validation (`./scripts/pcap-control.sh`, see `docs/observability.md`)
+7. Conformance update — state which TS clauses the change implements and any deviation
+8. Docs: update everything the change affects (`docs/features.md`, `docs/configuration.md`, `docs/implementation-status.md`, …)
 
 ## Code Standards
 
@@ -98,3 +98,19 @@ Then follow this checklist — misalignment here is what breaks CI:
 Include spec section references in commit messages and doc comments.
 Key specs: TS 23.501 (architecture), TS 23.502 (procedures), TS 24.501 (NAS-5GS),
 TS 38.413 (NGAP), TS 29.244 (PFCP), TS 29.500/29.501 (SBA framework).
+
+## Unit and BDD tests
+
+```bash
+go test ./...
+go test ./shared/nas/...              # NAS codec
+go test ./nf/amf/internal/ngap/...   # NGAP codec AMF
+go test ./nf/smf/internal/server/... # SMF handlers + N2SM APER
+go test ./shared/crypto/...           # SUCI deconcealment, NIA2, NEA2
+
+# BDD (godog)
+cd nf/nrf && make test-functional                        # 3 in-process scenarios, no stack needed
+make ueransim && cd nf/amf && E2E_TEST=1 make test-functional   # E2E; without E2E_TEST=1 → pending (exit 0)
+```
+
+The multi-slice suite is `make test-slices` (see `docs/getting-started.md`).

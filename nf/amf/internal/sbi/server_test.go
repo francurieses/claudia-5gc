@@ -182,6 +182,9 @@ func TestN1N2MessageTransfer_IdleUEPaged(t *testing.T) {
 	if !pending {
 		t.Error("PendingN1N2 not set")
 	}
+	if got := ue.PagedPDUSessions(); len(got) != 1 || got[0] != psi {
+		t.Errorf("paged PDU sessions = %v, want [%d]", got, psi)
+	}
 }
 
 func TestN1N2MessageTransfer_ConnectedUENoPaging(t *testing.T) {

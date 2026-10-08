@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -107,7 +108,29 @@ const ngapPPID uint32 = 60
 // PPID=60 is mandatory per TS 38.412 §7.
 // Ref: TS 38.412 §7; IANA "Stream Control Transmission Protocol (SCTP) Parameters".
 func writeNGAP(conn *sctp.SCTPConn, pdu []byte) (int, error) {
-	return conn.SCTPWrite(pdu, &sctp.SndRcvInfo{PPID: ngapPPID})
+	return conn.SCTPWrite(pdu, ngapSndRcvInfo())
+}
+
+// ngapSndRcvInfo is the per-write SCTP send info for an NGAP PDU (PPID 60).
+func ngapSndRcvInfo() *sctp.SndRcvInfo { return &sctp.SndRcvInfo{PPID: ngapPPID} }
+
+// writeNGAP sends an NGAP PDU to this gNB with PPID 60 (TS 38.412 §7). It goes
+// through the sctpWrite test seam when one is installed (gnb_registry_seams.go),
+// else over Conn.
+func (g *GNBContext) writeNGAP(pdu []byte) (int, error) {
+	if g.sctpWrite != nil {
+		return g.sctpWrite(pdu, ngapSndRcvInfo())
+	}
+	return writeNGAP(g.Conn, pdu)
+}
+
+// remoteAddrString is the remote address key of the gNB association (what
+// UEContext.GNBAddr stores). Falls back to the seam-provided address when Conn is nil.
+func (g *GNBContext) remoteAddrString() string {
+	if g.Conn == nil {
+		return g.testAddr
+	}
+	return g.Conn.RemoteAddr().String()
 }
 
 // NRPPaResult is the result of an NGAP Downlink/Uplink UE-Associated NRPPa
@@ -246,6 +269,22 @@ type GNBContext struct {
 	Name         string
 	SupportedTAs []SupportedTA
 	Conn         *sctp.SCTPConn
+
+	// sctpWrite / testAddr are test seams (SetTransportForTest); nil/empty in production.
+	sctpWrite func(pdu []byte, info *sctp.SndRcvInfo) (int, error)
+	testAddr  string
+
+	// Registry fields exposed through GNBSnapshots (see gnb_registry.go).
+	// RemoteAddrs/RemotePort are stored as strings at connect time so snapshots
+	// never touch Conn (nil in unit tests).
+	RANNode       GlobalRANNode
+	RemoteAddrs   []string
+	RemotePort    int
+	ConnectedAt   time.Time
+	NGSetupAt     time.Time
+	State         GNBState
+	LastNGResetAt time.Time
+	NGResetCount  int
 	// CM-CONNECTED UEs indexed by RAN UE NGAP ID.
 	UEs map[int64]*amfctx.UEContext
 	// CM-IDLE UEs still logically associated with this gNB (went idle via
@@ -293,7 +332,7 @@ type AMFConfig struct {
 // TimerConfig holds the durations for UE lifecycle timers managed by the NGAP server.
 // Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach),
 //
-//	TS 38.413 §8.3.5 (PendingRemoval watchdog).
+//	TS 38.413 §8.3.3 (PendingRemoval watchdog).
 //
 // To change values: edit nf/amf/config/dev.yaml section "timers:" and restart the AMF.
 type TimerConfig struct {
@@ -320,6 +359,11 @@ type Server struct {
 	logger     *slog.Logger
 	mu         sync.RWMutex
 	gnbs       map[string]*GNBContext // key: remote SCTP addr
+
+	// gnbHistory holds recently disconnected gNBs (newest last); guarded by mu.
+	gnbHistory []gnbHistoryEntry
+	// now is the clock seam for the gNB registry (defaults to time.Now).
+	now func() time.Time
 
 	// onPDUSessionSetup is called when gNB confirms PDU session resources.
 	// Carries the smContextRef and raw N2SM response transfer bytes.
@@ -352,23 +396,57 @@ type Server struct {
 	// Ref: TS 23.501 §5.3.2
 	onImplicitDetach func(ctx context.Context, ue *amfctx.UEContext)
 
-	// onPathSwitchPDUSession is called for each PDU session during Xn handover.
-	// It receives the SMF smContextRef and the raw PathSwitchRequestTransfer bytes
-	// so the SMF can update the PFCP session with the target gNB's DL GTP-U endpoint.
-	// If nil, PFCP update is skipped (data plane may briefly be suboptimal).
-	// Ref: TS 23.502 §4.9.1.2 step 6
-	onPathSwitchPDUSession func(ctx context.Context, smContextRef string, pathSwitchTransfer []byte)
+	// onPathSwitchPDUSession performs Nsmf_PDUSession_UpdateSMContext (n2SmInfoType
+	// PATH_SWITCH_REQ, toBeSwitched=true) for each PDU session of a Path Switch Request and
+	// returns the decoded SMF response, which the AMF waits for before it answers the
+	// target gNB. If nil ("no SMF configured"), every known PDU session counts as
+	// switched with an empty PathSwitchRequestAcknowledgeTransfer and a WARN is logged.
+	// Ref: TS 23.502 §4.9.1.2.2 steps 2-7
+	onPathSwitchPDUSession SMFTransferHook
 
-	// onN2HandoverComplete is called after HandoverNotify when the UE context has
-	// been migrated to the target gNB. The callback should notify SMF to update
-	// PFCP with the new DL endpoint (similar to Xn path switch).
-	// If nil, the PFCP update is skipped.
-	// Ref: TS 23.502 §4.9.1.3 step 12
-	onN2HandoverComplete func(ctx context.Context, smContextRef string, hoAckTransfer []byte)
+	// onPathSwitchSetupFail forwards a Failed-to-Setup PDU session of the Path Switch
+	// Request to the SMF (n2SmInfoType PATH_SWITCH_SETUP_FAIL, failedToBeSwitched=true).
+	// Only logged; nil skips the call. Ref: TS 23.502 §4.9.1.2.2 step 2
+	onPathSwitchSetupFail SMFTransferHook
+
+	// onUPDeactivate sets upCnxState=DEACTIVATED at the SMF for UE PDU sessions that are in
+	// neither list of an acknowledged Path Switch Request. nil skips the call.
+	onUPDeactivate UPDeactivateHook
+
+	// onHandoverReqAck performs Nsmf_PDUSession_UpdateSMContext (hoState=PREPARED,
+	// n2SmInfoType HANDOVER_REQ_ACK) per admitted PDU session of a Handover Request
+	// Acknowledge; the SMF returns the HandoverCommandTransfer (HANDOVER_CMD). If nil,
+	// every admitted PDU session is placed in the HANDOVER COMMAND with an empty
+	// HandoverCommandTransfer (no SMF consultation) and a WARN is logged.
+	// Ref: TS 23.502 §4.9.1.3.2 steps 10-12
+	onHandoverReqAck SMFTransferHook
+
+	// smfHOTimeout overrides smfHOUpdateTimeout when > 0 (tests only).
+	smfHOTimeout time.Duration
+
+	// onHandoverRequired performs the PREPARING Nsmf_PDUSession_UpdateSMContext (hoState
+	// PREPARING, n2SmInfoType HANDOVER_REQUIRED) per candidate PDU session of a HANDOVER
+	// REQUIRED; the SMF returns the PDUSessionResourceSetupRequestTransfer for the HANDOVER
+	// REQUEST (PDU_RES_SETUP_REQ). If nil, the cached N2SmTransfer is used and no SMF call is
+	// made. Ref: TS 23.502 §4.9.1.3.2 steps 3-6; TS 29.502 §5.2.2.3.4
+	onHandoverRequired HandoverRequiredHook
+
+	// onHandoverResAllocFail forwards a PDU session of the Failed to Setup List HOAck of a
+	// HANDOVER REQUEST ACKNOWLEDGE to the SMF (hoState PREPARED, n2SmInfoType
+	// HANDOVER_RES_ALLOC_FAIL). Outcome only logged; nil skips the call.
+	// Ref: TS 23.502 §4.9.1.3.2 steps 10-12; TS 29.502 §5.2.2.3.4
+	onHandoverResAllocFail SMFTransferHook
+
+	// onHandoverComplete performs the Handover Complete Nsmf_PDUSession_UpdateSMContext
+	// (hoState COMPLETED) per SMF-accepted PDU session after HANDOVER NOTIFY. Outcome only
+	// logged; nil skips the call. Ref: TS 23.502 §4.9.1.3.3; TS 29.502 §5.2.2.3.4
+	onHandoverComplete HandoverCompleteHook
 
 	// pendingN2HO tracks in-progress N2 handovers indexed by AMF UE NGAP ID.
 	// Created on HandoverRequired (step 1), consumed on HandoverNotify (step 5).
-	pendingN2HO   map[int64]*n2HandoverState
+	pendingN2HO map[int64]*n2HandoverState
+	// hoCompleteWG tracks the in-flight Handover Complete SMF calls (graceful tests/shutdown).
+	hoCompleteWG  sync.WaitGroup
 	pendingN2HOMu sync.Mutex
 
 	// pendingLoc holds one pending LocationResult channel per AMF-UE-NGAP-ID.
@@ -407,6 +485,7 @@ func NewServer(addr string, mgr *amfctx.Manager, nas NASHandler, cfg AMFConfig, 
 		cfg:         cfg,
 		logger:      logger.With("component", "ngap"),
 		gnbs:        make(map[string]*GNBContext),
+		now:         time.Now,
 		pendingN2HO: make(map[int64]*n2HandoverState),
 		pws:         make(map[PWSKey]*PWSBroadcast),
 	}
@@ -465,20 +544,60 @@ func (s *Server) SetImplicitDetachHandler(fn func(ctx context.Context, ue *amfct
 	s.onImplicitDetach = fn
 }
 
-// SetPathSwitchHandler registers a callback invoked for each PDU session during
-// Xn handover. It receives the SMF smContextRef and the raw PathSwitchRequestTransfer
-// so the SMF can update the PFCP session with the target gNB's DL GTP-U endpoint.
-// Ref: TS 23.502 §4.9.1.2 step 6
-func (s *Server) SetPathSwitchHandler(fn func(ctx context.Context, smContextRef string, pathSwitchTransfer []byte)) {
+// SetPathSwitchHandler registers the SMF hook invoked for each PDU session of an Xn
+// Path Switch Request (Nsmf_PDUSession_UpdateSMContext, PATH_SWITCH_REQ). It receives
+// the SM context reference and the raw PathSwitchRequestTransfer and returns the decoded
+// SMF response; the AMF waits for it (bounded) before answering the target gNB.
+// Ref: TS 23.502 §4.9.1.2.2 steps 2-7
+func (s *Server) SetPathSwitchHandler(fn func(ctx context.Context, smContextRef string, pathSwitchTransfer []byte) SMFUpdateResult) {
 	s.onPathSwitchPDUSession = fn
 }
 
-// SetN2HandoverCompleteHandler registers a callback invoked after HandoverNotify
-// for each admitted PDU session. The callback should notify SMF to update PFCP
-// with the target gNB's new DL GTP-U endpoint (via the HO Ack transfer bytes).
-// Ref: TS 23.502 §4.9.1.3 step 12
-func (s *Server) SetN2HandoverCompleteHandler(fn func(ctx context.Context, smContextRef string, hoAckTransfer []byte)) {
-	s.onN2HandoverComplete = fn
+// SetPathSwitchSetupFailHandler registers the SMF hook for each known PDU session of the
+// Path Switch Request's Failed to Setup List (PATH_SWITCH_SETUP_FAIL); the transfer is the
+// raw PathSwitchRequestSetupFailedTransfer. The outcome is only logged.
+// Ref: TS 23.502 §4.9.1.2.2 step 2
+func (s *Server) SetPathSwitchSetupFailHandler(fn func(ctx context.Context, smContextRef string, setupFailedTransfer []byte) SMFUpdateResult) {
+	s.onPathSwitchSetupFail = fn
+}
+
+// SetUPDeactivateHandler registers the hook that sets upCnxState=DEACTIVATED at the SMF
+// for UE PDU sessions absent from both lists of an acknowledged Path Switch Request.
+// Ref: docs/procedures/XnHandover.md §7.4.4
+func (s *Server) SetUPDeactivateHandler(fn func(ctx context.Context, smContextRef string) error) {
+	s.onUPDeactivate = fn
+}
+
+// SetHandoverRequestAckHandler registers the SMF hook invoked per admitted PDU session
+// of an N2 Handover Request Acknowledge (hoState=PREPARED, HANDOVER_REQ_ACK); the
+// transfer is the raw HandoverRequestAcknowledgeTransfer and the SMF's HANDOVER_CMD
+// n2SmInfo becomes the HandoverCommandTransfer. Ref: TS 23.502 §4.9.1.3.2 steps 10-12
+func (s *Server) SetHandoverRequestAckHandler(fn func(ctx context.Context, smContextRef string, hoAckTransfer []byte) SMFUpdateResult) {
+	s.onHandoverReqAck = fn
+}
+
+// SetHandoverRequiredHandler registers the SMF hook invoked per candidate PDU session of an
+// N2 HANDOVER REQUIRED (hoState PREPARING, HANDOVER_REQUIRED); it receives the SM context
+// reference, the raw HandoverRequiredTransfer (nil when the source sent none) and the
+// decoded Target ID, and returns the SMF response whose PDU_RES_SETUP_REQ n2SmInfo goes
+// into the HANDOVER REQUEST. Ref: TS 23.502 §4.9.1.3.2 steps 3-6
+func (s *Server) SetHandoverRequiredHandler(fn func(ctx context.Context, smContextRef string, hoRequiredTransfer []byte, target HOTargetID) SMFUpdateResult) {
+	s.onHandoverRequired = fn
+}
+
+// SetHandoverResAllocFailHandler registers the SMF hook for each known PDU session of the
+// Failed to Setup List HOAck of an N2 HANDOVER REQUEST ACKNOWLEDGE; the transfer is the raw
+// HandoverResourceAllocationUnsuccessfulTransfer. The outcome is only logged.
+// Ref: TS 23.502 §4.9.1.3.2 steps 10-12
+func (s *Server) SetHandoverResAllocFailHandler(fn func(ctx context.Context, smContextRef string, unsuccessfulTransfer []byte) SMFUpdateResult) {
+	s.onHandoverResAllocFail = fn
+}
+
+// SetHandoverCompleteHandler registers the SMF hook invoked per SMF-accepted PDU session
+// after HANDOVER NOTIFY (hoState COMPLETED). The outcome is only logged.
+// Ref: TS 23.502 §4.9.1.3.3
+func (s *Server) SetHandoverCompleteHandler(fn func(ctx context.Context, smContextRef string) SMFUpdateResult) {
+	s.onHandoverComplete = fn
 }
 
 // WithTimerConfig sets the UE lifecycle timer durations.
@@ -580,7 +699,7 @@ func (s *Server) startImplicitDetachTimer(ue *amfctx.UEContext) {
 // startPendingRemovalTimer arms the PendingRemoval watchdog for ue after a
 // UEContextReleaseCommand has been sent. If UEContextReleaseComplete does not
 // arrive within the configured timeout the context is force-removed.
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 func (s *Server) startPendingRemovalTimer(ue *amfctx.UEContext) {
 	if s.timerCfg.PendingRemoval == 0 {
 		return
@@ -594,7 +713,7 @@ func (s *Server) startPendingRemovalTimer(ue *amfctx.UEContext) {
 			"procedure", "Deregistration",
 			"supi", ue.SUPI,
 			"watchdog_dur", s.timerCfg.PendingRemoval,
-			"spec_ref", "TS 38.413 §8.3.5",
+			"spec_ref", "TS 38.413 §8.3.3",
 		)
 		s.removeUEFromIdleUEs(ue)
 		s.mgr.Remove(context.Background(), ue)
@@ -675,14 +794,23 @@ func (s *Server) handleGNBConn(ctx context.Context, conn *sctp.SCTPConn) {
 	log := s.logger.With("gnb_addr", remoteAddr)
 	log.Info("gNB connected", "direction", "IN", "interface", "N2")
 
+	addrs, port := remoteAddrParts(ra)
 	gnb := &GNBContext{
-		Conn:    conn,
-		UEs:     make(map[int64]*amfctx.UEContext),
-		IdleUEs: make(map[int64]*amfctx.UEContext),
+		Conn:        conn,
+		UEs:         make(map[int64]*amfctx.UEContext),
+		IdleUEs:     make(map[int64]*amfctx.UEContext),
+		RemoteAddrs: addrs,
+		RemotePort:  port,
+		ConnectedAt: s.clock(),
+		State:       GNBStateSCTPUp,
 	}
 	s.mu.Lock()
 	s.gnbs[remoteAddr] = gnb
 	s.mu.Unlock()
+
+	// closeReason classifies why the association ended, for the gNB registry
+	// history and the TNLAssociationRelease log.
+	closeReason := GNBDisconnectReadError
 
 	defer func() {
 		// Collect all UEs still associated with this gNB:
@@ -716,14 +844,27 @@ func (s *Server) handleGNBConn(ctx context.Context, conn *sctp.SCTPConn) {
 		conn.Close()
 		s.mu.Lock()
 		delete(s.gnbs, remoteAddr)
+		s.recordGNBDisconnectLocked(gnb, remoteAddr, closeReason)
 		s.mu.Unlock()
-		log.Info("gNB disconnected", "ues_cleaned_up", len(ues))
+		log.Info("gNB disconnected",
+			"procedure", "TNLAssociationRelease",
+			"interface", "N2",
+			"spec_ref", "TS 38.412 §7",
+			"cause", closeReason,
+			"ues_cleaned_up", len(ues),
+		)
 	}()
 
 	for {
 		buf := make([]byte, 65536)
 		n, err := conn.Read(buf)
 		if err != nil {
+			switch {
+			case ctx.Err() != nil:
+				closeReason = GNBDisconnectAMFShutdown
+			case errors.Is(err, io.EOF):
+				closeReason = GNBDisconnectSCTPClosed
+			}
 			if !errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
 				log.Error("NGAP read error", "error", err)
 			}
@@ -753,6 +894,10 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 	switch msg.ProcedureCode {
 	case ProcNGSetup:
 		s.handleNGSetup(ctx, gnb, msg)
+	case ProcNGReset:
+		if msg.Type == 0 {
+			s.observeNGReset(gnb)
+		}
 	case ProcInitialUEMessage:
 		s.handleInitialUEMessage(ctx, gnb, msg)
 	case ProcUplinkNASTransport:
@@ -1077,7 +1222,7 @@ const ngapCauseReleaseDueTo5gcGeneratedReason int64 = 4
 // #71 "ngKSI already in use" because nothing ever released the failed
 // attempt). This handler undoes the premature transition and releases the
 // N2 connection so the retry starts clean.
-// Ref: TS 38.413 §8.3.1, §8.3.5
+// Ref: TS 38.413 §8.3.1, §8.3.3
 func (s *Server) handleInitialContextSetupFailure(ctx context.Context, gnb *GNBContext, msg *Message) {
 	fail, ok := msg.Value.(*InitialContextSetupFailureMsg)
 	if !ok {
@@ -1173,12 +1318,14 @@ func (s *Server) handleNGSetup(ctx context.Context, gnb *GNBContext, msg *Messag
 	}
 	gnb.mu.Lock()
 	gnb.GlobalGNBID = req.GlobalRANNodeID
+	gnb.RANNode = req.RANNode
 	gnb.Name = req.RANNodeName
 	gnb.SupportedTAs = req.SupportedTAList
 	gnb.mu.Unlock()
 
 	log.Info("NG Setup Request received",
 		"gnb_name", req.RANNodeName,
+		"gnb_id", req.RANNode.IDString(),
 		"result", "OK",
 	)
 	log.Info("sending NG Setup Response",
@@ -1190,7 +1337,9 @@ func (s *Server) handleNGSetup(ctx context.Context, gnb *GNBContext, msg *Messag
 		s.cfg.RegionID, s.cfg.SetID, s.cfg.AMFID, s.cfg.SNSSAIs)
 	if _, err := writeNGAP(gnb.Conn, resp); err != nil {
 		log.Error("send NG Setup Response failed", "error", err)
+		return
 	}
+	s.markGNBReady(gnb)
 }
 
 // ---- Initial UE Message (TS 38.413 §8.6.1) ------------------------------
@@ -1227,6 +1376,8 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 			ue.Lock()
 			ue.RANUENGAPId = req.RANUENGAPId
 			ue.GNBAddr = gnb.Conn.RemoteAddr().String()
+			// New UE-associated logical NG connection: the gNB holds no UE-AMBR yet.
+			ue.UEAMBRSentToRAN = false
 			if req.TAI != nil {
 				ue.TAI = amfctx.TAI{MCC: req.TAI.MCC, MNC: req.TAI.MNC, TAC: req.TAI.TAC}
 			}
@@ -1384,7 +1535,7 @@ func (s *Server) handleUplinkNASTransport(ctx context.Context, gnb *GNBContext, 
 	// Processing it here would start a new auth flow on the old NGAP ID, which
 	// the gNB will reject with ErrorIndication once it releases the UE context.
 	// The UE will re-register cleanly after the RRC Release.
-	// Ref: TS 23.502 §4.2.2.3.2, TS 38.413 §8.3.5
+	// Ref: TS 23.502 §4.2.2.3.2, TS 38.413 §8.3.3
 	ue.Lock()
 	pending := ue.PendingRemoval
 	ue.Unlock()
@@ -1508,14 +1659,24 @@ func (s *Server) SendInitialContextSetupRequest(
 		"supi", ue.SUPI,
 		"rfsp", ue.RFSP,
 		"pdu_sessions_cxt_req", len(pduSessions),
-		"spec_ref", "TS 38.413 §8.3.1",
+		"ue_ambr_included", len(pduSessions) > 0,
+		"spec_ref", "TS 38.413 §8.3.1, §9.2.2.1",
 	)
 	_, err := writeNGAP(gnb.Conn, pdu)
+	if err == nil {
+		// An ICS Request establishes a fresh UE context at the gNB: it holds a
+		// UE-AMBR only if this request carried one (i.e. with PDU sessions).
+		ue.Lock()
+		ue.UEAMBRSentToRAN = len(pduSessions) > 0
+		ue.Unlock()
+	}
 	return err
 }
 
-// SendPDUSessionResourceSetupRequest sends a PDU Session Resource Setup Request to gNB
-// Ref: TS 38.413 §8.4.1
+// SendPDUSessionResourceSetupRequest sends a PDU Session Resource Setup Request to gNB.
+// UE-AMBR (optional IE) is included only when the gNB has not yet received one in
+// the current N2 context (ue.UEAMBRSentToRAN false), since the registration ICS
+// Request carries none. Ref: TS 38.413 §8.2.1
 func (s *Server) SendPDUSessionResourceSetupRequest(
 	ue *amfctx.UEContext,
 	pduSessionID uint8,
@@ -1537,10 +1698,19 @@ func (s *Server) SendPDUSessionResourceSetupRequest(
 	}
 	ue.Unlock()
 
+	// UE-AMBR: deliver it here if the gNB does not hold one yet for this N2 context.
+	var ueAMBR *UEAMBR
+	ue.Lock()
+	if !ue.UEAMBRSentToRAN {
+		ueAMBR = NewUEAMBRFromKbps(ue.SubscribedAMBR.UL, ue.SubscribedAMBR.DL)
+	}
+	ue.Unlock()
+
 	pdu := BuildPDUSessionResourceSetupRequest(
 		ue.AMFUENGAPId, ue.RANUENGAPId,
 		pduSessionID, nasPDU, n2SmInfo,
 		sst, sdBytes,
+		ueAMBR,
 	)
 
 	s.logger.Info("PDU Session Resource Setup Request",
@@ -1551,10 +1721,16 @@ func (s *Server) SendPDUSessionResourceSetupRequest(
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"pdu_session_id", pduSessionID,
 		"supi", ue.SUPI,
-		"spec_ref", "TS 38.413 §8.4.1",
+		"ue_ambr_included", ueAMBR != nil,
+		"spec_ref", "TS 38.413 §8.2.1",
 	)
 
 	_, err := writeNGAP(gnb.Conn, pdu)
+	if err == nil && ueAMBR != nil {
+		ue.Lock()
+		ue.UEAMBRSentToRAN = true
+		ue.Unlock()
+	}
 	return err
 }
 
@@ -1647,7 +1823,7 @@ func (s *Server) SendPDUSessionResourceReleaseCommand(ue *amfctx.UEContext, pduS
 // that is currently serving the given UE. Used for AMF-initiated releases such as
 // network-side deregistration and UE deregistration while CM-CONNECTED.
 // If the UE is already CM-IDLE (no gNB entry), this is a no-op.
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePresent int, causeValue int64) error {
 	gnb := s.findGNBForUE(ue)
 	if gnb == nil {
@@ -1660,7 +1836,7 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 			"direction", "OUT",
 			"amf_ue_ngap_id", ue.AMFUENGAPId,
 			"supi", ue.SUPI,
-			"spec_ref", "TS 38.413 §8.3.5",
+			"spec_ref", "TS 38.413 §8.3.3",
 		)
 		return nil
 	}
@@ -1670,7 +1846,7 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 	// Arm the PendingRemoval watchdog if the UE context is being torn down (deregistration,
 	// NW-initiated release). The caller must set ue.PendingRemoval = true BEFORE calling
 	// this function so that the watchdog is always armed when needed.
-	// Ref: TS 38.413 §8.3.5
+	// Ref: TS 38.413 §8.3.3
 	ue.Lock()
 	pending := ue.PendingRemoval
 	ue.Unlock()
@@ -1684,7 +1860,7 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 // supported Tracking Areas cover the UE's registration TAI. If no connected gNB
 // advertises that TAC, the Paging is broadcast to all connected gNBs as a best
 // effort (the UE may have moved within the registration area).
-// Ref: TS 38.413 §9.2.8, TS 23.502 §4.2.3.3 step 4a.
+// Ref: TS 38.413 §8.5.1 / §9.2.4.1, TS 23.502 §4.2.3.3 step 4b.
 func (s *Server) SendPaging(ue *amfctx.UEContext) error {
 	ue.Lock()
 	guti := ue.GUTI
@@ -1754,12 +1930,12 @@ func (s *Server) SendPaging(ue *amfctx.UEContext) error {
 		"tmsi", fmt.Sprintf("%08x", guti.TMSI),
 		"tac", tai.TAC,
 		"gnbs_paged", sent,
-		"spec_ref", "TS 38.413 §9.2.8",
+		"spec_ref", "TS 38.413 §8.5.1",
 	)
 	return nil
 }
 
-// ---- UE Context Release (TS 38.413 §8.3.4 and §8.3.5) -------------------
+// ---- UE Context Release (TS 38.413 §8.3.4 and §8.3.3) -------------------
 
 // handleUEContextReleaseRequest processes the gNB's unsolicited UE Context Release
 // Request and responds immediately with a UE Context Release Command.
@@ -1800,11 +1976,34 @@ func (s *Server) handleUEContextReleaseRequest(ctx context.Context, gnb *GNBCont
 
 // handleUEContextReleaseComplete processes the gNB's confirmation that the UE context
 // has been released. Transitions the UE to CM-IDLE and notifies the SMF.
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBContext, msg *Message) {
 	cpl, ok := msg.Value.(*UEContextReleaseCompleteMsg)
 	if !ok {
 		s.logger.Error("UEContextReleaseComplete body decode failed")
+		return
+	}
+
+	// Source-side release after a completed N2 handover: the UE context was migrated to
+	// the target gNB by handleHandoverNotify, so this Release Complete confirms only the
+	// release of the old UE-associated logical NG connection. No CM-state change and no
+	// AN release towards the SMF. Ref: TS 23.502 §4.9.1.3.3; TS 38.413 §8.3.3.
+	if ue, found := s.mgr.GetByNGAPId(cpl.AMFUENGAPId); found && isStaleSourceRelease(ue, gnb, cpl.RANUENGAPId) {
+		gnb.mu.Lock()
+		delete(gnb.UEs, cpl.RANUENGAPId)
+		delete(gnb.IdleUEs, cpl.RANUENGAPId)
+		gnb.mu.Unlock()
+		s.logger.Info("UE Context Release Complete from source gNB after handover — UE stays CM-CONNECTED",
+			"nf", "AMF",
+			"procedure", procN2Handover,
+			"interface", "N2",
+			"direction", "IN",
+			"message_type", "UEContextReleaseComplete",
+			"amf_ue_ngap_id", cpl.AMFUENGAPId,
+			"ran_ue_ngap_id", cpl.RANUENGAPId,
+			"supi", ue.SUPI,
+			"spec_ref", "TS 23.502 §4.9.1.3.3 (UE Context Release in the source NG-RAN); TS 38.413 §8.3.3",
+		)
 		return
 	}
 
@@ -1834,6 +2033,7 @@ func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBCon
 	// Transition UE to CM-IDLE.
 	ue.Lock()
 	ue.CMState = amfctx.CMIdle
+	ue.UEAMBRSentToRAN = false // UE-associated NG connection released
 	pending := ue.PendingRemoval
 	ue.Unlock()
 
@@ -1847,7 +2047,7 @@ func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBCon
 		"supi", ue.SUPI,
 		"cm_state", "CM-IDLE",
 		"pending_removal", pending,
-		"spec_ref", "TS 38.413 §8.3.5",
+		"spec_ref", "TS 38.413 §8.3.3",
 	)
 
 	if pending {
@@ -1893,9 +2093,23 @@ func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBCon
 	s.StartMobileReachableTimer(ue)
 }
 
+// isStaleSourceRelease reports whether a UEContextReleaseComplete received from gnb with
+// ranID refers to a UE-associated NG connection the UE context no longer uses, i.e. the
+// source-side connection released after a completed N2 handover. handleHandoverNotify
+// migrates ue.GNBAddr and ue.RANUENGAPId to the target, so a mismatch on either (the
+// gNB address, or the RAN UE NGAP ID when source and target are the same gNB) identifies it.
+func isStaleSourceRelease(ue *amfctx.UEContext, gnb *GNBContext, ranID int64) bool {
+	ue.Lock()
+	defer ue.Unlock()
+	if ue.GNBAddr != "" && ue.GNBAddr != gnb.remoteAddrString() {
+		return true
+	}
+	return ue.RANUENGAPId != 0 && ue.RANUENGAPId != ranID
+}
+
 // SendUEContextReleaseCommand sends an NGAP UE Context Release Command to the gNB.
 // Used both for AMF-initiated release and as the response to a gNB Release Request.
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 func (s *Server) SendUEContextReleaseCommand(gnb *GNBContext, amfUEID, ranUEID int64, causePresent int, causeValue int64) error {
 	pdu := BuildUEContextReleaseCommand(amfUEID, ranUEID, causePresent, causeValue)
 	if pdu == nil {
@@ -1908,9 +2122,9 @@ func (s *Server) SendUEContextReleaseCommand(gnb *GNBContext, amfUEID, ranUEID i
 		"message_type", "UEContextReleaseCommand",
 		"amf_ue_ngap_id", amfUEID,
 		"ran_ue_ngap_id", ranUEID,
-		"spec_ref", "TS 38.413 §8.3.5",
+		"spec_ref", "TS 38.413 §8.3.3",
 	)
-	_, err := writeNGAP(gnb.Conn, pdu)
+	_, err := gnb.writeNGAP(pdu)
 	return err
 }
 
@@ -2139,6 +2353,7 @@ func (s *Server) handleUplinkNonUEAssociatedNRPPa(ctx context.Context, gnb *GNBC
 // NGSetupRequest holds decoded fields from an NG Setup Request.
 type NGSetupRequest struct {
 	GlobalRANNodeID []byte
+	RANNode         GlobalRANNode
 	RANNodeName     string
 	SupportedTAList []SupportedTA
 }

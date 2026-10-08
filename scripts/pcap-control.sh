@@ -238,7 +238,7 @@ NOTES:
 COMMON ISSUES:
 
   ❌ I don't see NGAP messages
-    → UERANSIM must be running: make ueransim
+    → A gNB must be connected: check the portal gNBs page; UERANSIM: make ueransim (or make up-obs RAN=ueransim)
     → N2 must be connected: docker network inspect 5gc-n2
 
   ❌ I don't see HTTP/2 in Wireshark

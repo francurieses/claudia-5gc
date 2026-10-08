@@ -1,3 +1,4 @@
+<!-- tier: public -->
 # ClaudIA 5GC
 
 [![CI](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml/badge.svg)](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml)
@@ -65,16 +66,40 @@ Every NF registers with and discovers its peers through the NRF (Nnrf edges omit
 
 Prerequisites: Docker ≥ 24 usable without `sudo`, Docker Compose v2, GNU Make (Node 18+ only for the portal). Details and troubleshooting: [`docs/getting-started.md`](docs/getting-started.md#prerequisites).
 
+The core deploys **standalone** by default: the 13 NFs plus PostgreSQL and Redis, with no RAN simulator built or started. Point any gNB at the AMF (`N2`, `38412/sctp`) and it shows up on the portal's **gNBs (RAN)** page.
+
 ```bash
 git clone https://github.com/francurieses/claudia-5gc && cd claudia-5gc
 make pki        # dev CA + one certificate per NF (first time only)
-make ueransim   # 13 NFs + observability + UERANSIM gNB + 1 UE (UE_COUNT=N for more)
-docker exec ueransim-ue nr-cli --dump                       # the UE reaches MM-REGISTERED
-docker exec ueransim-ue ping -I uesimtun0 -c3 8.8.8.8       # user-plane through the UPF
+make 5gcsa     # standalone core + observability + management portal
+curl -s localhost:9002/amf/v1/ran/gnbs | jq '.gnbs'   # gNBs attached to the AMF (empty until one connects)
 make down       # stop and remove volumes
 ```
 
-Want everything (portal + 4 slices with one UE each)? `make full`, then open the portal.
+Add `MCP=on` to also deploy the MCP server container (SSE on `:9300`, e.g. `make 5gcsa MCP=on`); it combines with `RAN=`, for example `make 5gcsa RAN=both MCP=on`.
+
+`make up` starts the core only; `make up-obs` adds observability.
+
+### Add a RAN simulator (optional)
+
+Pick the deployment mode with `RAN=` on `make up`, `make up-obs` or `make 5gcsa`:
+
+| Mode | Command | Starts |
+|------|---------|--------|
+| Standalone (default) | `make 5gcsa` | Core only |
+| + UERANSIM | `make 5gcsa RAN=ueransim` | Core + UERANSIM gNB + `UE_COUNT` UEs |
+| + PacketRusher | `make 5gcsa RAN=packetrusher` | Core + PacketRusher (`PR_SCENARIO=xn\|n2\|none`, default `xn`) |
+| + both | `make 5gcsa RAN=both` | Core + UERANSIM + PacketRusher |
+| + MCP server | `make 5gcsa MCP=on` (any mode) | Adds the MCP server container, SSE at http://localhost:9300 |
+
+```bash
+make ueransim                                               # shortcut for: make up-obs RAN=ueransim
+docker exec ueransim-ue nr-cli --dump                       # the UE reaches MM-REGISTERED
+docker exec ueransim-ue ping -I uesimtun0 -c3 8.8.8.8       # user-plane through the UPF
+make handover-test                                          # PacketRusher Xn handover (handover-n2-test for N2)
+```
+
+The portal detects the mode at runtime: in standalone mode the UERANSIM and PacketRusher pages are hidden, and the **gNBs (RAN)** page (gNB, IP address, status, slices, UEs) is available in every mode. Want everything (portal + 4 slices with one UE each)? `make full`.
 
 | Service | URL |
 |---------|-----|
@@ -82,6 +107,7 @@ Want everything (portal + 4 slices with one UE each)? `make full`, then open the
 | Grafana (admin/admin, dev only) | http://localhost:3000 |
 | Jaeger | http://localhost:16686 |
 | Prometheus | http://localhost:9090 |
+| MCP server (with `MCP=on`) | http://localhost:9300 (`/mcp/health`) |
 
 ## Screenshots
 
@@ -111,7 +137,7 @@ Screenshots are coming soon. Run `make full` to see the portal, Grafana and Jaeg
 
 ## Features
 
-Clause-level status for every procedure: [`docs/compliance-matrix.md`](docs/compliance-matrix.md). Each row below has a procedure doc under [`docs/procedures/`](docs/procedures/).
+Feature descriptions with how to try each one: [`docs/features.md`](docs/features.md). Clause-level conformance and per-procedure designs (sequence diagrams, IEs, error cases) are part of the [members documentation](https://www.claudia5gc.dev/docs/members/).
 
 ### Registration & security
 
@@ -211,7 +237,7 @@ Clause-level status for every procedure: [`docs/compliance-matrix.md`](docs/comp
 
 ## Management portal
 
-`make portal` (or `make full`) serves the portal at http://localhost:8080 — light/dark themes, 13 pages in 6 groups: dashboard with 3GPP KPI charts (TS 28.554), subscribers, slices, services, sessions, QoS, policies, UE location, UERANSIM, PacketRusher, logs, PCAP and Public Warning. Details: [`tools/mgmt-portal/`](tools/mgmt-portal/).
+`make 5gcsa` (or `make full`) serves the portal at http://localhost:8080 — light/dark themes, 14 pages in 6 groups: dashboard with 3GPP KPI charts (TS 28.554), subscribers, slices, services, gNBs (RAN), sessions, QoS, policies, UE location, logs, PCAP and Public Warning, plus UERANSIM and PacketRusher when those simulators are deployed. Details: [`tools/mgmt-portal/`](tools/mgmt-portal/).
 
 ## AI-native development
 
@@ -228,7 +254,7 @@ tools/mgmt-portal/   Management portal (Go + React)
 tools/ueransim/      UERANSIM build + patch set
 observability/       Loki, Prometheus, Grafana, Promtail
 config/              Operator, UERANSIM and PacketRusher configs
-docs/                Getting started, architecture, procedures, status, compliance matrix
+docs/                Getting started, architecture, features, configuration, status
 specs/3gpp-openapi/  3GPP Rel-17 OpenAPI YAMLs
 scripts/             PKI, test suites, PCAP control
 ```
@@ -238,18 +264,19 @@ scripts/             PKI, test suites, PCAP control
 | Doc | What it is for |
 |-----|----------------|
 | [`docs/getting-started.md`](docs/getting-started.md) | Prerequisites, Make reference, scenarios, UERANSIM usage |
-| [`docs/implementation-status.md`](docs/implementation-status.md) | What is implemented per NF |
-| [`docs/compliance-matrix.md`](docs/compliance-matrix.md) | Clause-level 3GPP traceability |
-| [`docs/procedures/`](docs/procedures/) | One document per procedure: sequence diagram, IEs, error cases |
-| [`docs/validation-commands.md`](docs/validation-commands.md) | Validation recipes and T0–T9 suite |
-| [`docs/pcap-diagnostics.md`](docs/pcap-diagnostics.md) | NGAP / NAS / HTTP2 troubleshooting with PCAPs |
+| [`docs/architecture.md`](docs/architecture.md) | Architecture, deployment modes, networks, ports |
+| [`docs/configuration.md`](docs/configuration.md) | Operator config, environment variables, PKI |
+| [`docs/features.md`](docs/features.md) | What the core does and how to try each feature |
+| [`docs/implementation-status.md`](docs/implementation-status.md) | What is implemented per NF, portal pages |
+| [`docs/portal.md`](docs/portal.md) · [`docs/mcp-tools.md`](docs/mcp-tools.md) · [`docs/observability.md`](docs/observability.md) | Management portal, MCP server, metrics / traces / logs |
 | [`docs/ran-integration-guide.md`](docs/ran-integration-guide.md) | Connecting a real gNB and UEs |
-| [`docs/architecture.md`](docs/architecture.md) | Architecture overview |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) · [`docs/performance/summary.md`](docs/performance/summary.md) | Common problems; headline throughput |
+| [Members documentation](https://www.claudia5gc.dev/docs/members/) | Procedure designs, clause-level conformance, validation recipes, PCAP diagnostics (login required) |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`SECURITY.md`](SECURITY.md) | Contribution rules, security policy |
 
 ## Contributing
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Commits look like `feat(amf): implement X [TS 23.502 §4.2.2.2.2]`. Each new procedure follows the same flow: procedure doc → Cucumber feature → implementation → step definitions → integration test → PCAP validation → compliance matrix.
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Commits look like `feat(amf): implement X [TS 23.502 §4.2.2.2.2]`. Each new procedure follows the same flow: procedure doc → Cucumber feature → implementation → step definitions → integration test → PCAP validation → conformance update.
 
 ## License
 

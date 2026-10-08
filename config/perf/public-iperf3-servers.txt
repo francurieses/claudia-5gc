@@ -1,0 +1,17 @@
+# Candidate public iperf3 servers — NOTHING here is trusted until
+# scripts/perf/iperf-public-probe.sh validates it (reachable, port open, not busy).
+# Format: host  port-or-range(s, comma separated)  note
+iperf.he.net                5201                 Hurricane Electric (US)
+ping.online.net             5200-5209            Scaleway/Online (FR)
+ping6.online.net            5200-5209            Scaleway/Online IPv6-only host (FR)
+bouygues.iperf.fr           5200-5209,9200-9222  Bouygues (FR)
+speedtest.serverius.net     5002                 Serverius (NL)
+iperf.worldstream.nl        5201                 Worldstream (NL)
+speedtest.wtnet.de          5200-5209            WTnet (DE)
+iperf3.moji.fr              5200-5240            Moji (FR)
+paris.bbr.iperf.bytel.fr    9200-9240            Bouygues Telecom (FR)
+nl.iperf.014.fr             10415-10420          014 (NL)
+iperf.par2.as49434.net      9200-9240            Harmony Hosting (FR)
+speedtest.fra1.de.leaseweb.net 5201-5210         Leaseweb Frankfurt (DE)
+speedtest.lon12.uk.leaseweb.net 5201-5210        Leaseweb London (UK)
+speedtest.sin1.sg.leaseweb.net 5201-5210         Leaseweb Singapore (far, RTT contrast)

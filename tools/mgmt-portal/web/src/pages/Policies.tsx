@@ -25,6 +25,7 @@ import {
   TableEmptyRow, TableHead, TableHeaderCell, TableRow, Textarea, useToast, Tabs } from '../components/ui'
 import type { BadgeVariant, SelectOption } from '../components/ui'
 import { useTabParam } from '../lib/useTabParam'
+import { isToolAvailable, useDeployment } from '../lib/deployment'
 
 // ---- Slice identity -------------------------------------------------------
 //
@@ -192,6 +193,7 @@ interface ApplyDialogProps {
 function ApplyDialog({ template, onClose, onSuccess }: ApplyDialogProps) {
   const { toast } = useToast()
   const { data: ueContexts = [] } = useQuery({ queryKey: ['ue-contexts'], queryFn: getUEContexts })
+  const hasUeransim = isToolAvailable(useDeployment(), 'ueransim')
   const [supi, setSupi] = useState('')
   const [customize, setCustomize] = useState(false)
   const [rulesText, setRulesText] = useState(() => JSON.stringify(template.rules, null, 2))
@@ -260,7 +262,7 @@ function ApplyDialog({ template, onClose, onSuccess }: ApplyDialogProps) {
         {ueContexts.length === 0 ? (
           <EmptyState
             title="No registered UEs"
-            description="Start UERANSIM first (make ueransim), then reopen this dialog."
+            description={hasUeransim ? 'Start UERANSIM first (make ueransim), then reopen this dialog.' : 'Register a UE through a connected gNB (see the gNBs page), then reopen this dialog.'}
           />
         ) : (
           <Field label="Target UE (registered)">

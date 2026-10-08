@@ -35,6 +35,19 @@ func (c *AMF) ListContexts(ctx context.Context) (json.RawMessage, error) {
 	return body, nil
 }
 
+// ListGNBs retrieves the AMF gNB registry (connected + recently disconnected
+// gNBs). Calls GET /amf/v1/ran/gnbs. Ref: TS 38.413 §8.7.1 (NG Setup).
+func (c *AMF) ListGNBs(ctx context.Context) (json.RawMessage, error) {
+	body, status, err := c.do(ctx, c.baseURL+"/amf/v1/ran/gnbs")
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("amf: list ran gnbs: status %d", status)
+	}
+	return body, nil
+}
+
 // GetContext retrieves a single UE context snapshot by SUPI. Returns (nil, nil)
 // when the UE is not found.
 func (c *AMF) GetContext(ctx context.Context, supi string) (json.RawMessage, error) {

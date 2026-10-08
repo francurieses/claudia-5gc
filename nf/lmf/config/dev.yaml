@@ -24,11 +24,11 @@ metrics:
 # gNB's 36-bit NR Cell Identity) to a WGS84 anchor. The synthesized UE position walks around
 # this anchor (see mobility below). Absent entries fall back to default_coordinate.
 #   UERANSIM gnb.yaml    nci 0x000000010 → "000000010"
-#   UERANSIM gnb-ms.yaml nci 0x000000011 → "000000011"
+#   UERANSIM gnb-ms.yaml nci 0x000000100 → "000000100"
 # Ref: TS 29.572 §6.1.6.2.2 (locationEstimate, GeographicArea shape=POINT).
 cell_coordinates:
   "000000010": { lat: 40.4168, lon: -3.7038 }   # Madrid — Puerta del Sol
-  "000000011": { lat: 40.4530, lon: -3.6883 }   # Madrid — Chamartín (multi-slice gNB)
+  "000000100": { lat: 40.4530, lon: -3.6883 }   # Madrid — Chamartín (multi-slice gNB)
 
 # default_coordinate anchors UEs served by a cell with no explicit entry above.
 default_coordinate: { lat: 40.4168, lon: -3.7038 }

@@ -291,6 +291,9 @@ services:
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       UE_COUNT: ${UE_COUNT:-1}
+      # Extra dev subscribers outside the UE_COUNT range: 101 PacketRusher,
+      # 201-204 multi-slice UEs, 301 SUCI Profile A UE, 401 ue-unauth (test-slices T8).
+      SEED_EXTRA_SUPIS: "${SEED_EXTRA_SUPIS:-imsi-001010000000101,imsi-001010000000201,imsi-001010000000202,imsi-001010000000203,imsi-001010000000204,imsi-001010000000301,imsi-001010000000401}"
       DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
     labels:
       logging.5gc/nf: "UDR"
@@ -446,6 +449,68 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
       logging.5gc/nf: "UPF"
+
+  # ---------------------------------------------------------------------------
+  # perf profile — user-plane throughput benchmarking (docs/performance/user-plane-throughput.md).
+  # Opt-in: never started by `make up`. `make perf-up` starts it.
+  # ---------------------------------------------------------------------------
+  # In-core iperf3 server on the N6 data network ("dummy internet"): UE traffic
+  # reaches it via UPF -> N6 (MASQUERADE). One daemon per port because an iperf3
+  # server serves a single test at a time (one port per concurrent UE).
+  iperf3-dn:
+    image: nicolaka/netshoot
+    profiles: [perf]
+    container_name: iperf3-dn
+    init: true
+    command: ["sh", "-c", "for p in $$(seq 5201 5216); do iperf3 -s -D -p $$p; done; sleep infinity"]
+    networks:
+      n6-net:
+        ipv4_address: 172.30.6.50
+    labels:
+      logging.5gc/nf: "PERF"
+
+  # iperf3 server inside the UPF network namespace: reachable from a UE at the
+  # N6 TUN address (10.60.0.254), no N6 bridge hop. Shares the UPF's CPU budget.
+  iperf3-upf-local:
+    image: nicolaka/netshoot
+    profiles: [perf]
+    container_name: iperf3-upf-local
+    init: true
+    network_mode: "service:upf"
+    command: ["sh", "-c", "for p in $$(seq 5301 5316); do iperf3 -s -D -p $$p; done; sleep infinity"]
+    labels:
+      logging.5gc/nf: "PERF"
+
+  # UERANSIM-bypass load generator, RAN side: fake SMF (N4) + fake gNB (N3). Driven by
+  # scripts/perf/gtpu-bench.sh. Tool, not an NF: no NRF registration, not in the CI matrix.
+  gtpu-bench:
+    image: 5gc/gtpu-bench:dev
+    profiles: [perf]
+    build:
+      context: .
+      dockerfile: tools/gtpu-bench/Dockerfile
+    container_name: gtpu-bench
+    init: true
+    networks:
+      n3-net:
+        ipv4_address: 172.30.3.20
+      n4-net: {}
+    labels:
+      logging.5gc/nf: "PERF"
+
+  # Same image, data-network side: UDP sink + downlink sender on N6 (172.30.6.51).
+  # NET_ADMIN for the static route to the synthetic UE addresses via the UPF.
+  gtpu-bench-dn:
+    image: 5gc/gtpu-bench:dev
+    profiles: [perf]
+    container_name: gtpu-bench-dn
+    init: true
+    cap_add: [NET_ADMIN]
+    networks:
+      n6-net:
+        ipv4_address: 172.30.6.51
+    labels:
+      logging.5gc/nf: "PERF"
 
   upf-pcap:
     image: nicolaka/netshoot
@@ -864,6 +929,8 @@ services:
       PROMETHEUS_URL: "http://prometheus:9090"
       SMF_URL: "https://smf:8004"
       AMF_URL: "http://amf:9002"
+      # RAN simulator detection: auto (probe Docker) | none | ueransim | packetrusher | both
+      PORTAL_RAN_TOOLS: "${PORTAL_RAN_TOOLS:-auto}"
       UDM_URL: "https://udm:8003"
       UDR_URL: "https://udr:8005"
       PCF_URL: "https://pcf:8006"
@@ -982,8 +1049,10 @@ services:
   # Start with: make ueransim-slices
   # ============================================================
 
-  # gNB for multi-slice UEs — uses 172.30.3.4 on n3-net (avoids conflict with
-  # ueransim-gnb which holds 172.30.3.3). gtpIp in gnb-ms.yaml matches.
+  # gNB for multi-slice UEs — uses 172.30.3.4 on n3-net (ueransim-gnb holds
+  # 172.30.3.3; gtpIp in gnb-ms.yaml matches), its own n2/n3 aliases and its own
+  # NCI (0x000000100 → gNB-ID 0x10), so it runs side by side with ueransim-gnb
+  # (make ueransim-all). Multi-slice UEs point gnbSearchList at ueransim-gnb-ms.
   ueransim-gnb-ms:
     image: 5gc/ueransim:dev
     profiles: [multi-slice]
@@ -992,10 +1061,10 @@ services:
     networks:
       sbi-net: {}
       n2-net:
-        aliases: [ueransim-gnb]
+        aliases: [ueransim-gnb-ms]
       n3-net:
         ipv4_address: 172.30.3.4
-        aliases: [ueransim-gnb-n3]
+        aliases: [ueransim-gnb-ms-n3]
     volumes:
       - ./config/ueransim/gnb-ms.yaml:/ueransim/config/gnb-ms.yaml:ro
     cap_add: [NET_ADMIN]
@@ -1004,11 +1073,11 @@ services:
     image: 5gc/ueransim:dev
     profiles: [multi-slice]
     container_name: ueransim-ue-internet
-    command: nr-ue -c /ueransim/config/ue.yaml
+    command: nr-ue -c /ueransim/config/ue-internet.yaml
     networks:
       n2-net: {}
     volumes:
-      - ./config/ueransim/ue.yaml:/ueransim/config/ue.yaml:ro
+      - ./config/ueransim/ue-internet.yaml:/ueransim/config/ue-internet.yaml:ro
     depends_on: [ueransim-gnb-ms]
     privileged: true
     cap_add: [NET_ADMIN]
@@ -1071,7 +1140,7 @@ services:
 
   # ============================================================
   # XN HANDOVER TEST: PacketRusher dual-gNB scenario
-  # Start with: make handover-test
+  # Start with: make handover-test   (or: make up-obs RAN=packetrusher PR_SCENARIO=xn)
   # PacketRusher: https://github.com/HewlettPackard/PacketRusher
   # Runs UE registration + PDU session + Xn handover simulation.
   # ============================================================
@@ -1099,7 +1168,7 @@ services:
     privileged: true
 
   # N2 HANDOVER TEST: same dual-gNB setup, AMF-mediated preparation phase.
-  # Start with: make handover-n2-test
+  # Start with: make handover-n2-test   (or: make up-obs RAN=packetrusher PR_SCENARIO=n2)
   # ============================================================
   packetrusher-n2:
     build:

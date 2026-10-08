@@ -19,19 +19,36 @@
 #   gnss        A-GNSS positioning: LMF DetermineLocation (hAccuracy=30) -> AMF LPP relay (DL/UL
 #               NAS Transport, payload container type 3) -> modded UE LPP responder (patch 0042);
 #               checks positioningDataList=["gnss"] + uncertainty <=50 m + UE/AMF/LMF LPP log lines.
-#   all         run every check in sequence.
+#   all         run every check in sequence; exits 1 if any check failed (✗).
+#
+# Portable to macOS bash 3.2 + BSD userland (helpers in scripts/lib/common.sh). Log checks
+# only look at lines emitted after the check's trigger (`docker logs --since`), and every
+# docker exec / nr-cli call is time-bounded.
 #
 set -euo pipefail
 
-# Pick the first actually-running candidate container. Different `make ueransim*`
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/common.sh
+. "$SCRIPT_DIR/lib/common.sh"
+
+require_cmds docker curl python3
+
+# Precondition: these checks drive UERANSIM, which is optional (RAN=ueransim).
+DOCKER_NAMES=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
+if ! text_has '^ueransim-' "$DOCKER_NAMES"; then
+    echo "UERANSIM not deployed — run: make ueransim (or make up-obs RAN=ueransim)" >&2
+    exit 2
+fi
+
+# Pick the first actually-running candidate container. The `make ueransim*`
 # scenarios (standard / multi-slice / suci-profile-a) name the UE/gNB containers
-# differently, and only one scenario is normally up at a time, so autodetecting
-# avoids stale "container not found / stopped" false negatives when the caller
-# doesn't override UE_CONTAINER/GNB_CONTAINER for the scenario currently running.
+# differently, and `make ueransim-all` runs all of them at once, so candidates are
+# listed in preference order: the default-scenario UE (ueransim-ue on ueransim-gnb)
+# wins whenever it is up. Override with UE_CONTAINER / GNB_CONTAINER / SUPI.
 detect_container() {
     local c
     for c in "$@"; do
-        if [ "$(docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null)" = "true" ]; then
+        if container_running "$c"; then
             printf '%s' "$c"; return 0
         fi
     done
@@ -39,8 +56,25 @@ detect_container() {
 }
 
 UE_CONTAINER="${UE_CONTAINER:-$(detect_container ueransim-ue ueransim-ue-profile-a ueransim-ue-internet)}"
-GNB_CONTAINER="${GNB_CONTAINER:-$(detect_container ueransim-gnb ueransim-gnb-ms)}"
-SUPI="${SUPI:-imsi-001010000000001}"
+# The gNB follows the UE: multi-slice UEs attach to ueransim-gnb-ms, the rest to ueransim-gnb.
+case "$UE_CONTAINER" in
+    ueransim-ue-internet|ueransim-ue-gold|ueransim-ue-silver|ueransim-ue-bronze)
+        GNB_CONTAINER="${GNB_CONTAINER:-ueransim-gnb-ms}" ;;
+    *)  GNB_CONTAINER="${GNB_CONTAINER:-$(detect_container ueransim-gnb ueransim-gnb-ms)}" ;;
+esac
+# Default SUPI follows the selected UE container (SUPI plan: ueransim-ue
+# 001..UE_COUNT, multi-slice 201..204, SUCI Profile A 301).
+default_supi_for() {
+    case "$1" in
+        ueransim-ue-internet)  printf 'imsi-001010000000201' ;;
+        ueransim-ue-gold)      printf 'imsi-001010000000202' ;;
+        ueransim-ue-silver)    printf 'imsi-001010000000203' ;;
+        ueransim-ue-bronze)    printf 'imsi-001010000000204' ;;
+        ueransim-ue-profile-a) printf 'imsi-001010000000301' ;;
+        *)                     printf 'imsi-001010000000001' ;;
+    esac
+}
+SUPI="${SUPI:-$(default_supi_for "$UE_CONTAINER")}"
 AMF_MGMT="${AMF_MGMT:-http://localhost:9002}"
 SMF_MGMT="${SMF_MGMT:-https://localhost:8004}"
 
@@ -48,38 +82,61 @@ green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 hr() { printf -- '----------------------------------------------------------------\n'; }
 
-# Wait until `docker logs <c>` contains <pattern> (up to <secs>). Returns 0/1.
-# Uses `grep -c` (consumes all input) rather than `grep -q` (closes the pipe early),
-# because under `set -o pipefail` the early close sends SIGPIPE to `docker logs` and
-# the pipeline would report failure even on a match.
-wait_for_log() {
-    local c="$1" pat="$2" secs="${3:-30}" n
-    for _ in $(seq 1 "$secs"); do
-        n=$(docker logs "$c" 2>&1 | grep -cE "$pat" || true)
-        if [ "${n:-0}" -gt 0 ]; then return 0; fi
-        sleep 1
-    done
-    return 1
+# wait_for_log / logs_have / nrcli / run_timeout / now_ts: scripts/lib/common.sh.
+
+# internet_psi — PSI of the UE's PS-ACTIVE internet PDU session (empty if none).
+internet_psi() {
+    local out
+    out=$(nrcli "$UE_CONTAINER" "$SUPI" ps-list 10)
+    awk '
+        function emit() { if (st == "PS-ACTIVE" && apn == "internet" && psi != "") print psi }
+        /^PDU Session/ { emit(); psi = $2; sub(/^Session/, "", psi); sub(/:$/, "", psi); st = apn = "" }
+        /state:/ { st = $2 }
+        /apn:/   { apn = $2 }
+        END      { emit() }
+    ' <<<"$out" | head -n 1
+}
+
+# ensure_internet_session — make sure the UE has a PS-ACTIVE internet session (keeps it
+# CM-CONNECTED for the network-triggered procedures) without stacking duplicates.
+# Prints the PSI (empty if none could be established).
+ensure_internet_session() {
+    local psi
+    psi=$(internet_psi)
+    if [ -z "$psi" ]; then
+        nrcli "$UE_CONTAINER" "$SUPI" "ps-establish IPv4 --dnn internet" 15 >/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            psi=$(internet_psi)
+            [ -n "$psi" ] && break
+        done
+    fi
+    printf '%s' "$psi"
 }
 
 check_ursp() {
     hr; green "[ursp] URSP delivery round-trip (TS 24.501 Annex D)"
-    # The policy is pushed at registration; force a fresh push to be deterministic.
-    curl -fsS -X POST "$AMF_MGMT/amf/v1/ue-contexts/$SUPI/push-policies" >/dev/null 2>&1 || true
+    # The policy is pushed at registration; force a fresh push to be deterministic and
+    # only accept log lines emitted after it.
+    local since code
+    since=$(now_ts)
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -X POST "$AMF_MGMT/amf/v1/ue-contexts/$SUPI/push-policies" 2>/dev/null || true)
+    echo "    push-policies $SUPI → HTTP ${code:-000}"
 
-    if wait_for_log amf "UE policy container sent|ursp_version" 20; then
+    if wait_for_log amf "UE policy container sent|ursp_version" 20 "$since"; then
         green "  ✓ AMF sent the UE policy container (MANAGE UE POLICY COMMAND)"
     else
-        red "  ✗ AMF did not send a UE policy container"; return 1
+        red "  ✗ AMF did not send a UE policy container (push-policies HTTP ${code:-000})"; return 1
     fi
 
-    if wait_for_log amf "MANAGE UE POLICY COMPLETE received" 20; then
+    if wait_for_log amf "MANAGE UE POLICY COMPLETE received" 20 "$since"; then
         green "  ✓ AMF received MANAGE UE POLICY COMPLETE — modded UE acknowledged URSP"
     else
         red "  ✗ no MANAGE UE POLICY COMPLETE (is the modified UERANSIM image running?)"; return 1
     fi
 
-    if docker logs "$UE_CONTAINER" 2>&1 | grep -qi "URSP policy received"; then
+    if wait_for_log "$UE_CONTAINER" "URSP policy received" 10 "$since"; then
         green "  ✓ UE applied the URSP rules (no 'Unhandled payload container type [5]')"
     else
         red "  ! UE log did not show 'URSP policy received' (check $UE_CONTAINER)"
@@ -88,17 +145,27 @@ check_ursp() {
 
 check_ursp_cli() {
     hr; green "[ursp-cli] nr-cli URSP introspection"
-    echo "  ursp-show:"
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ursp-show" | sed 's/^/    /'
-    echo "  ursp-match ims:"
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ursp-match ims" | sed 's/^/    /'
+    local out rc=0 cmd
+    for cmd in "ursp-show" "ursp-match ims"; do
+        echo "  $cmd:"
+        out=$(nrcli "$UE_CONTAINER" "$SUPI" "$cmd" 10)
+        sed 's/^/    /' <<<"$out"
+        if [ -z "$out" ] || text_has_i '^ERROR|unknown command|Command not found' "$out"; then
+            red "  ✗ nr-cli $cmd failed (is the URSP-patched UERANSIM image running?)"; rc=1
+        else
+            green "  ✓ nr-cli $cmd answered"
+        fi
+    done
+    return "$rc"
 }
 
 check_ursp_steer() {
     hr; green "[ursp-steer] URSP-steered additional PDU session (TS 23.503 §6.6.2)"
-    local target="${1:-ims}"
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ursp-establish $target" | sed 's/^/    /'
-    if wait_for_log "$UE_CONTAINER" "PDU Session establishment is successful" 30; then
+    local target="${1:-ims}" since out
+    since=$(now_ts)
+    out=$(nrcli "$UE_CONTAINER" "$SUPI" "ursp-establish $target" 15)
+    sed 's/^/    /' <<<"$out"
+    if wait_for_log "$UE_CONTAINER" "PDU Session establishment is successful" 30 "$since"; then
         green "  ✓ UE established the URSP-steered session for '$target'"
     else
         red "  ✗ no successful establishment for '$target'"; return 1
@@ -107,19 +174,32 @@ check_ursp_steer() {
 
 check_qos_mod() {
     hr; green "[qos-mod] NW-initiated QoS modification round-trip (TS 23.502 §4.3.3.2)"
-    # Ensure a session exists.
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ps-establish IPv4 --dnn internet" >/dev/null 2>&1 || true
-    sleep 3
-    curl -fsSk -X POST "$SMF_MGMT/nsmf-management/v1/sessions/1/qos" \
+    # Target the UE's real internet session: several UEs share PSI 1 under
+    # `make ueransim-all`, so the SMF needs the SUPI to disambiguate (else 409).
+    local psi since resp code body
+    psi=$(ensure_internet_session)
+    if [ -z "$psi" ]; then
+        red "  ✗ $UE_CONTAINER ($SUPI) has no PS-ACTIVE internet PDU session"; return 1
+    fi
+    since=$(now_ts)
+    resp=$(curl -sSk --max-time 10 -X POST "$SMF_MGMT/nsmf-management/v1/sessions/$psi/qos" \
         -H 'Content-Type: application/json' \
-        -d '{"5qi":7,"reason":"validate-ueransim-mod"}' >/dev/null 2>&1 || true
+        -d "{\"5qi\":7,\"reason\":\"validate-ueransim-mod\",\"supi\":\"$SUPI\"}" \
+        -w '\n%{http_code}' 2>/dev/null || true)
+    code=$(tail -n 1 <<<"$resp")
+    body=$(sed '$d' <<<"$resp")
+    echo "    POST sessions/$psi/qos (supi=$SUPI, 5qi=7) → HTTP ${code:-000} ${body:0:200}"
+    case "$code" in
+        2??) ;;
+        *) red "  ✗ SMF rejected the QoS modification request (HTTP ${code:-000})"; return 1 ;;
+    esac
 
-    if wait_for_log "$UE_CONTAINER" "QoS modified by the network|Modification Complete" 25; then
+    if wait_for_log "$UE_CONTAINER" "QoS modified by the network|Modification Complete" 25 "$since"; then
         green "  ✓ UE handled PDU SESSION MODIFICATION COMMAND (0xCB) and replied COMPLETE (0xCC)"
     else
         red "  ✗ UE did not handle the modification command"; return 1
     fi
-    if wait_for_log amf "Modification Complete received" 15; then
+    if wait_for_log amf "Modification Complete received" 15 "$since"; then
         green "  ✓ AMF received the modification complete — loop closed"
     else
         red "  ! AMF did not log the modification complete"
@@ -128,16 +208,16 @@ check_qos_mod() {
 
 check_location() {
     hr; green "[location] Cell-ID positioning round-trip (TS 29.572 §5.2.2.2 / TS 38.413 §8.17)"
-    local ROOT lmf_url r1 r2 cell lat1 lat2
-    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local ROOT lmf_url r1 r2 cell lat1 lat2 since
+    ROOT="$REPO_ROOT"
     lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
 
     # The UE must be CM-CONNECTED for the AMF to trigger NGAP Location Reporting; ensure a session.
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ps-establish IPv4 --dnn internet" >/dev/null 2>&1 || true
-    sleep 3
+    ensure_internet_session >/dev/null
+    since=$(now_ts)
 
     locate() {
-        curl -sk --http2 \
+        curl -sk --http2 --max-time 30 \
             --cert "$ROOT/pki/smf.crt" --key "$ROOT/pki/smf.key" --cacert "$ROOT/pki/ca.crt" \
             -X POST "$lmf_url" -H 'Content-Type: application/json' -d "{\"supi\":\"$SUPI\"}"
     }
@@ -151,7 +231,7 @@ check_location() {
         red "  ✗ LMF returned no valid NRCGI (is the location-patched UERANSIM running and the UE connected?)"; return 1
     fi
 
-    if wait_for_log "$GNB_CONTAINER" "Location Report sent" 20; then
+    if wait_for_log "$GNB_CONTAINER" "Location Report sent" 20 "$since"; then
         green "  ✓ gNB answered LocationReportingControl with a LocationReport"
     else
         red "  ! gNB log did not show 'Location Report sent'"
@@ -170,23 +250,23 @@ check_location() {
 
 check_nrppa() {
     hr; green "[nrppa] E-CID positioning round-trip (TS 38.455 §8 / TS 38.413 §8.17.3)"
-    local ROOT lmf_url r uncert pdl
-    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local ROOT lmf_url r uncert pdl since
+    ROOT="$REPO_ROOT"
     lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
 
     # The UE must be CM-CONNECTED for the AMF to relay NRPPa to the gNB; ensure a session.
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ps-establish IPv4 --dnn internet" >/dev/null 2>&1 || true
-    sleep 3
+    ensure_internet_session >/dev/null
+    since=$(now_ts)
 
     # hAccuracy=100 m selects E-CID (50 < hAccuracy <= 200 -> E-CID; TS 23.273 §6.2.9).
-    r=$(curl -sk --http2 \
+    r=$(curl -sk --http2 --max-time 30 \
         --cert "$ROOT/pki/smf.crt" --key "$ROOT/pki/smf.key" --cacert "$ROOT/pki/ca.crt" \
         -X POST "$lmf_url" -H 'Content-Type: application/json' \
         -d "{\"supi\":\"$SUPI\",\"locationQoS\":{\"hAccuracy\":100}}")
     echo "    $r"
 
     pdl=$(printf '%s' "$r" | python3 -c 'import sys,json; print(",".join(json.load(sys.stdin).get("positioningDataList",[])))' 2>/dev/null || true)
-    if printf '%s' "$pdl" | grep -q "eCID"; then
+    if text_has "eCID" "$pdl"; then
         green "  ✓ LMF returned an E-CID fix (positioningDataList=[$pdl])"
     else
         red "  ✗ LMF did not return an E-CID fix (positioningDataList=[$pdl]) — fell back to Cell-ID?"; return 1
@@ -199,13 +279,13 @@ check_nrppa() {
         red "  ! E-CID uncertainty '${uncert}' m not within the <=150 m band"
     fi
 
-    if wait_for_log "$GNB_CONTAINER" "Uplink UE-associated NRPPa Transport sent|E-CIDMeasurementReport" 20; then
+    if wait_for_log "$GNB_CONTAINER" "Uplink UE-associated NRPPa Transport sent|E-CIDMeasurementReport" 20 "$since"; then
         green "  ✓ gNB answered the NRPPa exchange (E-CIDMeasurementReport over ProcCode=50)"
     else
         red "  ! gNB log did not show the NRPPa reply"
     fi
 
-    if wait_for_log amf "NRPPa|UplinkNRPPa|dl-nrppa" 20; then
+    if wait_for_log amf "NRPPa|UplinkNRPPa|dl-nrppa" 20 "$since"; then
         green "  ✓ AMF relayed the NRPPa transport (DL ProcCode=8 / UL ProcCode=50)"
     else
         red "  ! AMF log did not show the NRPPa relay"
@@ -216,23 +296,23 @@ check_nrppa() {
 
 check_gnss() {
     hr; green "[gnss] A-GNSS positioning round-trip (TS 37.355 §6 / TS 24.501 §8.7.4 / TS 23.273 §6.2.10)"
-    local ROOT lmf_url r uncert pdl
-    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    local ROOT lmf_url r uncert pdl since
+    ROOT="$REPO_ROOT"
     lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
 
     # The UE must be CM-CONNECTED for the AMF to relay LPP over N1; ensure a session.
-    docker exec "$UE_CONTAINER" nr-cli "$SUPI" -e "ps-establish IPv4 --dnn internet" >/dev/null 2>&1 || true
-    sleep 3
+    ensure_internet_session >/dev/null
+    since=$(now_ts)
 
     # hAccuracy=30 m selects GNSS/LPP (hAccuracy < 50 -> GNSS; TS 23.273 §6.2.10).
-    r=$(curl -sk --http2 \
+    r=$(curl -sk --http2 --max-time 30 \
         --cert "$ROOT/pki/smf.crt" --key "$ROOT/pki/smf.key" --cacert "$ROOT/pki/ca.crt" \
         -X POST "$lmf_url" -H 'Content-Type: application/json' \
         -d "{\"supi\":\"$SUPI\",\"locationQoS\":{\"hAccuracy\":30}}")
     echo "    $r"
 
     pdl=$(printf '%s' "$r" | python3 -c 'import sys,json; print(",".join(json.load(sys.stdin).get("positioningDataList",[])))' 2>/dev/null || true)
-    if printf '%s' "$pdl" | grep -q "gnss"; then
+    if text_has "gnss" "$pdl"; then
         green "  ✓ LMF returned a GNSS fix (positioningDataList=[$pdl])"
     else
         red "  ✗ LMF did not return a GNSS fix (positioningDataList=[$pdl]) — fell back to E-CID/Cell-ID?"; return 1
@@ -248,19 +328,19 @@ check_gnss() {
     # 20s budget: UERANSIM's logger sets flush_on(warn) (src/utils/logger.cpp), so
     # these info-level lines can sit buffered for a few seconds before `docker logs`
     # sees them even though the LPP round trip itself already completed synchronously.
-    if wait_for_log "$UE_CONTAINER" "LPP RequestCapabilities received|ProvideLocationInformation" 20; then
+    if wait_for_log "$UE_CONTAINER" "LPP RequestCapabilities received|ProvideLocationInformation" 20 "$since"; then
         green "  ✓ UE ran the LPP capability + measurement exchange (patch 0042)"
     else
         red "  ! UE log did not show the LPP exchange (is the LPP-patched UERANSIM running?)"
     fi
 
-    if wait_for_log amf "LPP|dl-lpp|UplinkLPP" 20; then
+    if wait_for_log amf "LPP|dl-lpp|UplinkLPP" 20 "$since"; then
         green "  ✓ AMF relayed the LPP transport (DL/UL NAS Transport, payload container type 3)"
     else
         red "  ! AMF log did not show the LPP relay"
     fi
 
-    if wait_for_log lmf "GNSS position calculated|GNSS fix" 20; then
+    if wait_for_log lmf "GNSS position calculated|GNSS fix" 20 "$since"; then
         green "  ✓ LMF computed the GNSS fix from the UE measurements (WLS solve)"
     else
         red "  ! LMF log did not show the GNSS fix"
@@ -280,10 +360,10 @@ check_gnss_no_malformed_packets() {
         return 0
     fi
     local ROOT pcap_dir latest malformed
-    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    ROOT="$REPO_ROOT"
     pcap_dir="$ROOT/pcaps/amf"
 
-    ./scripts/pcap-control.sh rotate amf >/dev/null 2>&1 || true
+    run_timeout 30 "$ROOT/scripts/pcap-control.sh" rotate amf >/dev/null 2>&1 || true
     sleep 2
     latest=$(ls -1t "$pcap_dir"/*.pcap 2>/dev/null | head -1 || true)
     if [ -z "$latest" ]; then
@@ -312,10 +392,10 @@ check_nrppa_no_malformed_packets() {
         return 0
     fi
     local ROOT pcap_dir latest
-    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    ROOT="$REPO_ROOT"
     pcap_dir="$ROOT/pcaps/amf"
 
-    ./scripts/pcap-control.sh rotate amf >/dev/null 2>&1 || true
+    run_timeout 30 "$ROOT/scripts/pcap-control.sh" rotate amf >/dev/null 2>&1 || true
     sleep 2
 
     latest=$(ls -1t "$pcap_dir"/*.pcap 2>/dev/null | head -1 || true)
@@ -344,13 +424,19 @@ case "${1:-all}" in
     nrppa) check_nrppa ;;
     gnss) check_gnss ;;
     all)
-        check_ursp || true
-        check_ursp_cli || true
-        check_ursp_steer ims || true
-        check_qos_mod || true
-        check_location || true
-        check_nrppa || true
-        check_gnss || true
+        echo "UE: $UE_CONTAINER ($SUPI) · gNB: $GNB_CONTAINER"
+        FAILED=""
+        check_ursp || FAILED="$FAILED ursp"
+        check_ursp_cli || FAILED="$FAILED ursp-cli"
+        check_ursp_steer ims || FAILED="$FAILED ursp-steer"
+        check_qos_mod || FAILED="$FAILED qos-mod"
+        check_location || FAILED="$FAILED location"
+        check_nrppa || FAILED="$FAILED nrppa"
+        check_gnss || FAILED="$FAILED gnss"
+        if [ -n "$FAILED" ]; then
+            hr; red "validate-ueransim-mod: FAILED checks:$FAILED"
+            exit 1
+        fi
         ;;
     *) echo "usage: $0 {ursp|ursp-cli|ursp-steer [target]|qos-mod|location|nrppa|gnss|all}" >&2; exit 2 ;;
 esac

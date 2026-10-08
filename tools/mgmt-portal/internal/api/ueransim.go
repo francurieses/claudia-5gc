@@ -16,11 +16,11 @@ import (
 
 // ueContainer carries container state plus its UERANSIM role.
 type ueContainer struct {
-	Name    string `json:"name"`
-	State   string `json:"state"`
-	Status  string `json:"status"`
-	Uptime  string `json:"uptime"`
-	Role    string `json:"role"` // "gnb" | "ue"
+	Name   string `json:"name"`
+	State  string `json:"state"`
+	Status string `json:"status"`
+	Uptime string `json:"uptime"`
+	Role   string `json:"role"` // "gnb" | "ue"
 }
 
 // ueEntry combines an AMF UE context with its PDU sessions and a hint about
@@ -207,16 +207,20 @@ type scenarioDef struct {
 	hint          string   // CLI make target to create the containers if not_found
 	containers    []string // start order; first should be the gNB
 	keyContainers []string // UE-specific containers that determine active state (excludes shared gNB)
-	conflicts     []string // containers from other scenarios that must stop first
+	conflicts     []string // containers from other scenarios that must stop first (none today)
 }
 
-// ueransimScenarios lists the three supported scenarios.
-// "standard" and "profile-a" share ueransim-gnb (172.30.3.3).
-// "slices" uses ueransim-gnb-ms (172.30.3.4) but BOTH gnbs share the
-// ueransim-gnb alias on n2-net, so only one can run at a time.
+// ueransimScenarios lists the three supported scenarios. They no longer conflict
+// and may all run at once (make ueransim-all):
+//   - "standard" and "profile-a" share ueransim-gnb (NCI 0x000000010, 172.30.3.3);
+//     their UEs use distinct SUPIs (001..UE_COUNT vs 301).
+//   - "slices" uses ueransim-gnb-ms (NCI 0x000000100, 172.30.3.4) with its own
+//     n2/n3 aliases (ueransim-gnb-ms / ueransim-gnb-ms-n3) and SUPIs 201..204.
 //
 // keyContainers excludes ueransim-gnb for standard/profile-a because the
 // shared gNB being up must not make both scenarios appear active simultaneously.
+// Stopping one of them keeps the shared gNB up while the other one's UE runs
+// (scenarioContainersToStop).
 var ueransimScenarios = []scenarioDef{
 	{
 		name:          "standard",
@@ -224,7 +228,6 @@ var ueransimScenarios = []scenarioDef{
 		hint:          "make ueransim-only",
 		containers:    []string{"ueransim-gnb", "ueransim-ue"},
 		keyContainers: []string{"ueransim-ue"},
-		conflicts:     []string{"ueransim-ue-profile-a", "ueransim-gnb-ms", "ueransim-ue-internet", "ueransim-ue-gold", "ueransim-ue-silver", "ueransim-ue-bronze"},
 	},
 	{
 		name:          "slices",
@@ -232,7 +235,6 @@ var ueransimScenarios = []scenarioDef{
 		hint:          "make ueransim-slices",
 		containers:    []string{"ueransim-gnb-ms", "ueransim-ue-internet", "ueransim-ue-gold", "ueransim-ue-silver", "ueransim-ue-bronze"},
 		keyContainers: []string{"ueransim-gnb-ms", "ueransim-ue-internet", "ueransim-ue-gold", "ueransim-ue-silver", "ueransim-ue-bronze"},
-		conflicts:     []string{"ueransim-gnb", "ueransim-ue", "ueransim-ue-profile-a"},
 	},
 	{
 		name:          "profile-a",
@@ -240,7 +242,6 @@ var ueransimScenarios = []scenarioDef{
 		hint:          "make ueransim-profile-a",
 		containers:    []string{"ueransim-gnb", "ueransim-ue-profile-a"},
 		keyContainers: []string{"ueransim-ue-profile-a"},
-		conflicts:     []string{"ueransim-ue", "ueransim-gnb-ms", "ueransim-ue-internet", "ueransim-ue-gold", "ueransim-ue-silver", "ueransim-ue-bronze"},
 	},
 }
 
@@ -377,11 +378,52 @@ func (d Deps) handleUERANSIMScenarioStop(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	for i := len(sc.containers) - 1; i >= 0; i-- {
-		_ = d.Docker.Stop(r.Context(), sc.containers[i])
+	running := map[string]bool{}
+	if svcs, err := d.Docker.List(r.Context()); err == nil {
+		for _, s := range svcs {
+			if s.State == "running" {
+				running[s.Name] = true
+			}
+		}
+	}
+	for _, ctr := range scenarioContainersToStop(sc, running) {
+		_ = d.Docker.Stop(r.Context(), ctr)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped", "scenario": sc.name})
+}
+
+// scenarioContainersToStop returns sc's containers in reverse start order,
+// skipping any container shared with another scenario whose UE (key) containers
+// are still running — e.g. stopping "profile-a" keeps ueransim-gnb up while the
+// "standard" ueransim-ue uses it.
+func scenarioContainersToStop(sc *scenarioDef, running map[string]bool) []string {
+	inUse := map[string]bool{}
+	for i := range ueransimScenarios {
+		other := &ueransimScenarios[i]
+		if other.name == sc.name {
+			continue
+		}
+		active := false
+		for _, k := range other.keyContainers {
+			if running[k] {
+				active = true
+				break
+			}
+		}
+		if active {
+			for _, c := range other.containers {
+				inUse[c] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(sc.containers))
+	for i := len(sc.containers) - 1; i >= 0; i-- {
+		if !inUse[sc.containers[i]] {
+			out = append(out, sc.containers[i])
+		}
+	}
+	return out
 }
 
 func resolveScenario(name string) *scenarioDef {
@@ -397,8 +439,9 @@ func resolveScenario(name string) *scenarioDef {
 // based on known UERANSIM compose naming conventions.
 //
 // Priority:
-//  1. Named multi-slice containers (ueransim-ue-internet/gold/silver/bronze)
-//  2. Generic ueransim-ue (standard single-UE / multi-UE mode)
+//  1. Fixed-SUPI containers: multi-slice ueransim-ue-internet/gold/silver/bronze
+//     (imsi-...201..204) and ueransim-ue-profile-a (imsi-...301)
+//  2. Generic ueransim-ue (standard single-UE / multi-UE mode, imsi-...001..UE_COUNT)
 //  3. ueransim-ue-profile-a (SUCI Profile A / X25519 scenario)
 //  4. First running UE container (catch-all for future scenarios)
 func guessUEContainer(supi string, running []string) string {
@@ -410,12 +453,14 @@ func guessUEContainer(supi string, running []string) string {
 		runningSet[r] = true
 	}
 
-	// Multi-slice fixed mapping (docker-compose.yml multi-slice profile)
+	// Fixed-SUPI mapping (config/ueransim/ue-*.yaml; multi-slice and
+	// suci-profile-a compose profiles).
 	named := map[string]string{
-		"001010000000001": "ueransim-ue-internet",
-		"001010000000002": "ueransim-ue-gold",
-		"001010000000003": "ueransim-ue-silver",
-		"001010000000004": "ueransim-ue-bronze",
+		"001010000000201": "ueransim-ue-internet",
+		"001010000000202": "ueransim-ue-gold",
+		"001010000000203": "ueransim-ue-silver",
+		"001010000000204": "ueransim-ue-bronze",
+		"001010000000301": "ueransim-ue-profile-a",
 	}
 	if ctr, ok := named[imsi]; ok && runningSet[ctr] {
 		return ctr
@@ -427,7 +472,7 @@ func guessUEContainer(supi string, running []string) string {
 	}
 
 	// SUCI Profile A (X25519) scenario — explicit check before catch-all so
-	// IMSI 001 is not routed to a wrong container when only profile-a is running.
+	// an unmapped IMSI prefers profile-a over an arbitrary container.
 	if runningSet["ueransim-ue-profile-a"] {
 		return "ueransim-ue-profile-a"
 	}

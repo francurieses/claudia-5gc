@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -27,7 +29,7 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: config.LogLevelFromEnv(),
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))
@@ -57,8 +59,33 @@ func main() {
 		"dnns", dnnNames,
 	)
 
+	logger.Info("UPF runtime",
+		"procedure", "Startup",
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"num_cpu", runtime.NumCPU(),
+		"gogc", os.Getenv("GOGC"),
+		"log_level", config.LogLevelFromEnv().String(),
+		"qos_mbr_enforcement", cfg.QoSMBREnforcement(),
+		"qos_burst_ms", cfg.QoSBurstMs())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Optional CPU/heap profiling (UPF_PPROF_ADDR), off by default. Not published
+	// to the host: fetch it from inside the UPF network namespace.
+	if addr := config.PprofAddrFromEnv(); addr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		go func() {
+			logger.Info("pprof listening", "addr", addr)
+			if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("pprof server error", "error", err)
+			}
+		}()
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -109,9 +136,18 @@ func main() {
 					"dnn", dnn.Name, "dev", dnn.TunName, "ue_ipv6_prefix", dnn.UEIPv6Prefix)
 			}
 		}
+		if err := tun.SetLinkParams(dnn.TunName, cfg.N6.TunMTU, cfg.N6.TunTxQueueLen); err != nil {
+			logger.Error("TUN link tuning failed", "dnn", dnn.Name, "tun", dnn.TunName, "error", err)
+		}
+		if cfg.N6.TCPMSSClamp {
+			if err := tun.SetupMSSClamp(dnn.TunName, dnn.UEIPv6Prefix != ""); err != nil {
+				logger.Error("TCP MSS clamp setup failed", "dnn", dnn.Name, "tun", dnn.TunName, "error", err)
+			}
+		}
 		logger.Info("N6 TUN ready",
 			"dnn", dnn.Name, "dev", dnn.TunName,
-			"addr", dnn.TunAddr, "ue_pool", dnn.UEIPPool)
+			"addr", dnn.TunAddr, "ue_pool", dnn.UEIPPool,
+			"mtu", cfg.N6.TunMTU, "txqueuelen", cfg.N6.TunTxQueueLen, "tcp_mss_clamp", cfg.N6.TCPMSSClamp)
 		tunEntries = append(tunEntries, gtpu.TUNEntry{
 			DNN:     dnn.Name,
 			Subnet:  dnn.UEIPPool,
@@ -135,6 +171,8 @@ func main() {
 		Address:         cfg.N4.Address,
 		NodeIP:          cfg.N3.IP,
 		DNNIPv6Prefixes: dnnIPv6Prefixes,
+		// MBR / Session-AMBR enforcement (UPF-005): TS 23.501 §5.7.1.8.
+		QoS: pfcp.QoSConfig{MBRDisabled: !cfg.QoSMBREnforcement(), BurstMs: cfg.QoSBurstMs()},
 	}
 	pfcpSrv, err := pfcp.New(pfcpCfg, logger, sessionTable)
 	if err != nil {
@@ -146,12 +184,38 @@ func main() {
 	gtpuCfg := gtpu.Config{
 		Address: cfg.N3.Address,
 		N3IP:    cfg.N3.IP,
+
+		SocketBufferBytes: cfg.N3.SocketBufferBytes,
+
+		L4ChecksumRepair: cfg.N6L4ChecksumRepair(),
 	}
+	logger.Info("N6 downlink L4 checksum repair",
+		"procedure", "DownlinkChecksum",
+		"interface", "N6",
+		"enabled", gtpuCfg.L4ChecksumRepair,
+		"spec_ref", "RFC 1071; TS 29.281 §5")
 	gtpuSrv, err := gtpu.New(gtpuCfg, logger, sessionTable, tunEntries)
 	if err != nil {
 		logger.Error("GTP-U server creation failed", "error", err)
 		os.Exit(1)
 	}
+	// Pre-resolve the counter children once (no label lookup per repair).
+	tcp4 := metrics.UPFL4ChecksumRepairedTotal.WithLabelValues("tcp", "v4")
+	tcp6 := metrics.UPFL4ChecksumRepairedTotal.WithLabelValues("tcp", "v6")
+	udp4 := metrics.UPFL4ChecksumRepairedTotal.WithLabelValues("udp", "v4")
+	udp6 := metrics.UPFL4ChecksumRepairedTotal.WithLabelValues("udp", "v6")
+	gtpuSrv.SetL4RepairHook(func(proto, ipver string) {
+		switch {
+		case proto == "tcp" && ipver == "v4":
+			tcp4.Inc()
+		case proto == "tcp" && ipver == "v6":
+			tcp6.Inc()
+		case proto == "udp" && ipver == "v4":
+			udp4.Inc()
+		case proto == "udp" && ipver == "v6":
+			udp6.Inc()
+		}
+	})
 
 	// Wire the N4 (PFCP) / N3 (GTP-U) seam for IPv6 prefix delegation Router
 	// Advertisements (TS 23.501 §5.8.2.2.2) before either server starts

@@ -1,6 +1,6 @@
 mcc: '001'
 mnc: '01'
-nci: '0x000000011'
+nci: '0x000000100'   # gNB-ID = NCI>>4 = 0x10 (idLength 32); gnb.yaml is 0x1 — must differ to coexist
 idLength: 32
 tac: 1
 linkIp: 0.0.0.0

@@ -31,12 +31,12 @@ func TestBuildPDUSessionResourceReleaseCommand(t *testing.T) {
 	// here we use a plausible placeholder to verify NAS-PDU passthrough.
 	nasPDU := []byte{
 		0x7e, 0x02, 0x11, 0x22, 0x33, 0x44, // 5GMM outer security header
-		0x00,                               // SQN
-		0x7e, 0x00, 0x62,                   // DL NAS Transport plain header (MT=0x62)
-		0x12, 0x01,                         // PDU Session ID IE (TV: IEI=0x12, value=1)
-		0x59,                               // Payload container type (N1 SM = 1)
-		0x00, 0x05,                         // Payload container length (LV-E)
-		0x2e, 0x01, 0x01, 0xd3, 0x24,      // 5GSM: EPD|PSI|PTI|MT(0xD3)|Cause(0x24)
+		0x00,             // SQN
+		0x7e, 0x00, 0x62, // DL NAS Transport plain header (MT=0x62)
+		0x12, 0x01, // PDU Session ID IE (TV: IEI=0x12, value=1)
+		0x59,       // Payload container type (N1 SM = 1)
+		0x00, 0x05, // Payload container length (LV-E)
+		0x2e, 0x01, 0x01, 0xd3, 0x24, // 5GSM: EPD|PSI|PTI|MT(0xD3)|Cause(0x24)
 	}
 
 	pdu := BuildPDUSessionResourceReleaseCommand(amfID, ranID, pduSessionID, nasPDU)

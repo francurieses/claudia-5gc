@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,7 +15,9 @@ import (
 	"sync"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 )
 
 // ---- AUSF Client (Nausf_UEAuthentication) --------------------------------
@@ -415,34 +418,192 @@ func (c *HTTPSMFClient) UpdateSMContext(ctx context.Context, smContextRef string
 	return nil
 }
 
-// UpdatePathSwitch calls Nsmf_PDUSession_UpdateSMContext with the PathSwitchRequestTransfer.
-// The SMF decodes the transfer to learn the target gNB's new DL GTP-U endpoint and
-// updates the PFCP session accordingly.
-// Ref: TS 29.502 §5.2.2.3.2, TS 23.502 §4.9.1.2 step 6
-func (c *HTTPSMFClient) UpdatePathSwitch(ctx context.Context, smContextRef string, pathSwitchTransfer []byte) error {
-	body, _ := json.Marshal(map[string]any{
-		"n2SmInfo":     base64.StdEncoding.EncodeToString(pathSwitchTransfer),
-		"n2SmInfoType": "PATH_SWITCH_REQ",
-	})
+// maxSMFUpdateBody bounds the SMF UpdateSMContext response body read by the AMF.
+const maxSMFUpdateBody = 1 << 20
+
+// postUpdateSMContext POSTs an Nsmf_PDUSession_UpdateSMContext request (JSON, n2SmInfo as
+// base64 — this repo's AMF-SMF binding) and decodes the response into an SMFUpdateResult.
+// Transport errors are returned in Err, never as a Go error, so the handover logic can
+// classify them. Ref: TS 29.502 §5.2.2.3, §6.1.6.2 (SmContextUpdatedData / SmContextUpdateError).
+func (c *HTTPSMFClient) postUpdateSMContext(ctx context.Context, smContextRef string, fields map[string]any) ngap.SMFUpdateResult {
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return ngap.SMFUpdateResult{Err: fmt.Errorf("smf: encode update sm context: %w", err)}
+	}
 	url := "https://" + c.address + "/nsmf-pdusession/v1/sm-contexts/" + smContextRef + "/modify"
-	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return ngap.SMFUpdateResult{Err: fmt.Errorf("smf: build update sm context request: %w", err)}
+	}
 	req.Header.Set("Content-Type", "application/json")
+	if id := logging.CorrelationID(ctx); id != "" {
+		req.Header.Set("X-Correlation-Id", id)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("smf: update path switch: %w", err)
+		return ngap.SMFUpdateResult{Err: fmt.Errorf("smf: update sm context: %w", err)}
 	}
-	resp.Body.Close()
-	return nil
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSMFUpdateBody))
+	if err != nil {
+		return ngap.SMFUpdateResult{HTTPStatus: resp.StatusCode, Err: fmt.Errorf("smf: read update sm context response: %w", err)}
+	}
+	return decodeSMFUpdateResponse(resp.StatusCode, raw)
+}
+
+// decodeSMFUpdateResponse decodes SmContextUpdatedData (2xx) or SmContextUpdateError
+// (other statuses; a plain ProblemDetails body is tolerated) into an SMFUpdateResult.
+// An empty or non-JSON body leaves the N2/problem fields empty. An n2SmInfo that is not
+// valid base64 is returned as its raw bytes so the AMF's APER decode check rejects it
+// (it is never forwarded). Ref: TS 29.502 §6.1.6.2 (SmContextUpdatedData / SmContextUpdateError).
+func decodeSMFUpdateResponse(status int, body []byte) ngap.SMFUpdateResult {
+	res := ngap.SMFUpdateResult{HTTPStatus: status}
+	var parsed struct {
+		N2SmInfo     string `json:"n2SmInfo"`
+		N2SmInfoType string `json:"n2SmInfoType"`
+		HoState      string `json:"hoState"`
+		Cause        string `json:"cause"` // plain ProblemDetails
+		Error        *struct {
+			Cause string `json:"cause"`
+		} `json:"error"` // SmContextUpdateError.error
+	}
+	if len(bytes.TrimSpace(body)) == 0 || json.Unmarshal(body, &parsed) != nil {
+		return res
+	}
+	res.N2SmInfoType = parsed.N2SmInfoType
+	res.HoState = parsed.HoState
+	if parsed.N2SmInfo != "" {
+		if dec, err := base64.StdEncoding.DecodeString(parsed.N2SmInfo); err == nil {
+			res.N2SmInfo = dec
+		} else {
+			res.N2SmInfo = []byte(parsed.N2SmInfo)
+		}
+	}
+	res.Cause = parsed.Cause
+	if parsed.Error != nil && parsed.Error.Cause != "" {
+		res.Cause = parsed.Error.Cause
+	}
+	return res
+}
+
+// UpdatePathSwitch calls Nsmf_PDUSession_UpdateSMContext with the PathSwitchRequestTransfer
+// (n2SmInfoType PATH_SWITCH_REQ, toBeSwitched=true) and returns the decoded SMF response:
+// the PathSwitchRequestAcknowledgeTransfer (PATH_SWITCH_REQ_ACK) on success or the
+// SmContextUpdateError on failure. The SMF updates the PFCP session with the target gNB's
+// DL GTP-U endpoint.
+// Ref: TS 29.502 §5.2.2.3.3, TS 23.502 §4.9.1.2.2 steps 2-6
+func (c *HTTPSMFClient) UpdatePathSwitch(ctx context.Context, smContextRef string, pathSwitchTransfer []byte) ngap.SMFUpdateResult {
+	return c.postUpdateSMContext(ctx, smContextRef, map[string]any{
+		"n2SmInfo":     base64.StdEncoding.EncodeToString(pathSwitchTransfer),
+		"n2SmInfoType": "PATH_SWITCH_REQ",
+		"toBeSwitched": true,
+	})
+}
+
+// UpdatePathSwitchSetupFail forwards a PDU session of the Path Switch Request's Failed to
+// Setup List PSReq (PathSwitchRequestSetupFailedTransfer, PATH_SWITCH_SETUP_FAIL,
+// failedToBeSwitched=true). Ref: TS 29.502 §5.2.2.3.3, TS 23.502 §4.9.1.2.2 step 2
+func (c *HTTPSMFClient) UpdatePathSwitchSetupFail(ctx context.Context, smContextRef string, setupFailedTransfer []byte) ngap.SMFUpdateResult {
+	return c.postUpdateSMContext(ctx, smContextRef, map[string]any{
+		"n2SmInfo":           base64.StdEncoding.EncodeToString(setupFailedTransfer),
+		"n2SmInfoType":       "PATH_SWITCH_SETUP_FAIL",
+		"failedToBeSwitched": true,
+	})
+}
+
+// PrepareHandover calls Nsmf_PDUSession_UpdateSMContext for one admitted PDU session of an
+// N2 handover (hoState=PREPARED, n2SmInfoType HANDOVER_REQ_ACK, n2SmInfo =
+// HandoverRequestAcknowledgeTransfer). The SMF answers with the HandoverCommandTransfer
+// (HANDOVER_CMD). Ref: TS 29.502 §5.2.2.3.4, TS 23.502 §4.9.1.3.2 steps 10-12
+func (c *HTTPSMFClient) PrepareHandover(ctx context.Context, smContextRef string, hoAckTransfer []byte) ngap.SMFUpdateResult {
+	return c.postUpdateSMContext(ctx, smContextRef, map[string]any{
+		"n2SmInfo":     base64.StdEncoding.EncodeToString(hoAckTransfer),
+		"n2SmInfoType": "HANDOVER_REQ_ACK",
+		"hoState":      "PREPARED",
+	})
+}
+
+// PrepareHandoverRequired calls Nsmf_PDUSession_UpdateSMContext for one candidate PDU session
+// of a HANDOVER REQUIRED (hoState=PREPARING, n2SmInfoType HANDOVER_REQUIRED, n2SmInfo =
+// HandoverRequiredTransfer, omitted when the source sent none, targetId = NgRanTargetId).
+// The SMF answers with the PDUSessionResourceSetupRequestTransfer (PDU_RES_SETUP_REQ).
+// Ref: TS 29.502 §5.2.2.3.4, TS 23.502 §4.9.1.3.2 steps 3-6
+func (c *HTTPSMFClient) PrepareHandoverRequired(ctx context.Context, smContextRef string, hoRequiredTransfer []byte, target ngap.HOTargetID) ngap.SMFUpdateResult {
+	fields := map[string]any{
+		"hoState":      "PREPARING",
+		"n2SmInfoType": "HANDOVER_REQUIRED",
+	}
+	if len(hoRequiredTransfer) > 0 {
+		fields["n2SmInfo"] = base64.StdEncoding.EncodeToString(hoRequiredTransfer)
+	}
+	if t := ngRanTargetID(target); len(t) > 0 {
+		fields["targetId"] = t
+	}
+	return c.postUpdateSMContext(ctx, smContextRef, fields)
+}
+
+// HandoverResourceAllocationFailed forwards one PDU session of the Failed to Setup List HOAck
+// of a HANDOVER REQUEST ACKNOWLEDGE (hoState=PREPARED, n2SmInfoType HANDOVER_RES_ALLOC_FAIL,
+// n2SmInfo = HandoverResourceAllocationUnsuccessfulTransfer). The SMF answers 403
+// HANDOVER_RESOURCE_ALLOCATION_FAILURE with a HANDOVER_PREP_FAIL transfer (TS 29.502
+// §5.2.2.3.4.2), counted OK by the AMF (C2). Ref: TS 29.502 §5.2.2.3.4, TS 23.502 §4.9.1.3.2 steps 10-12
+func (c *HTTPSMFClient) HandoverResourceAllocationFailed(ctx context.Context, smContextRef string, unsuccessfulTransfer []byte) ngap.SMFUpdateResult {
+	return c.postUpdateSMContext(ctx, smContextRef, map[string]any{
+		"n2SmInfo":     base64.StdEncoding.EncodeToString(unsuccessfulTransfer),
+		"n2SmInfoType": "HANDOVER_RES_ALLOC_FAIL",
+		"hoState":      "PREPARED",
+	})
+}
+
+// CompleteHandover sends the Handover Complete UpdateSMContext (hoState=COMPLETED, no
+// n2SmInfo) after a HANDOVER NOTIFY. Ref: TS 29.502 §5.2.2.3.4, TS 23.502 §4.9.1.3.3
+func (c *HTTPSMFClient) CompleteHandover(ctx context.Context, smContextRef string) ngap.SMFUpdateResult {
+	return c.postUpdateSMContext(ctx, smContextRef, map[string]any{"hoState": "COMPLETED"})
+}
+
+// gNBValueMinDigits is the minimum number of hex digits of NgRanTargetId gNbId.gNBValue
+// (pattern ^[A-Fa-f0-9]{6,8}$, TS 29.571 GNbId).
+const gNBValueMinDigits = 6
+
+// ngRanTargetID renders the Target ID of a HANDOVER REQUIRED as the TS 29.571 NgRanTargetId
+// JSON object ({ranNodeId:{plmnId,gNbId:{bitLength,gNBValue}}, tai:{plmnId,tac}}); parts that
+// are absent are omitted and an empty map is returned when nothing is known. gNBValue is the
+// right-aligned gNB ID value as hex (ceil(bitLength/4) digits, at least 6).
+func ngRanTargetID(t ngap.HOTargetID) map[string]any {
+	out := map[string]any{}
+	if n := t.Node; n.Type == ngap.RANNodeTypeGNB && n.GNBIDBitLen > 0 {
+		digits := (int(n.GNBIDBitLen) + 3) / 4
+		if digits < gNBValueMinDigits {
+			digits = gNBValueMinDigits
+		}
+		out["ranNodeId"] = map[string]any{
+			"plmnId": map[string]string{"mcc": n.MCC, "mnc": n.MNC},
+			"gNbId": map[string]any{
+				"bitLength": n.GNBIDBitLen,
+				"gNBValue":  fmt.Sprintf("%0*x", digits, n.GNBID),
+			},
+		}
+	}
+	if t.TAI != nil {
+		out["tai"] = map[string]any{
+			"plmnId": map[string]string{"mcc": t.TAI.MCC, "mnc": t.TAI.MNC},
+			"tac":    t.TAI.TAC,
+		}
+	}
+	return out
 }
 
 // NotifyANRelease calls Nsmf_PDUSession_UpdateSMContext with upCnxState=DEACTIVATED.
 // This signals the SMF that the UE has gone CM-IDLE so DL traffic should be buffered/dropped.
-// Ref: TS 29.502 §5.2.2.3.2
+// Ref: TS 29.502 §5.2.2.3.2 (UP activation/deactivation)
 func (c *HTTPSMFClient) NotifyANRelease(ctx context.Context, smContextRef string) error {
 	body, _ := json.Marshal(map[string]string{"upCnxState": "DEACTIVATED"})
 	url := "https://" + c.address + "/nsmf-pdusession/v1/sm-contexts/" + smContextRef + "/modify"
 	req, _ := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if id := logging.CorrelationID(ctx); id != "" {
+		req.Header.Set("X-Correlation-Id", id)
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {

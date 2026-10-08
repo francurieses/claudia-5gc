@@ -119,6 +119,10 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 		switch m := msg.(type) {
 		case *pfcpmsg.SessionReportRequest:
 			s.handleSessionReport(ctx, conn, raddr, m)
+		case *pfcpmsg.HeartbeatRequest:
+			// Node-level Heartbeat from the UPF (TS 29.244 §6.2.2): answer with
+			// the SMF Recovery Time Stamp and run restart detection.
+			s.handlePFCPHeartbeatRequest(ctx, conn, raddr, m)
 		default:
 			s.logger.Info("SMF: PFCP receiver: unhandled message type",
 				"nf", "SMF", "interface", "N4", "direction", "IN",

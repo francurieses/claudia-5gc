@@ -72,7 +72,7 @@ func (w *sbiWorld) ueHasSession(psi int, dnn string) error {
 		return fmt.Errorf("no UE seeded")
 	}
 	w.ue.PDUSessions[uint8(psi)] = &amfctx.PDUSession{
-		PDUSessionID: uint8(psi), DNN: dnn, SMFInstanceID: "smf-ctx-ref-1",
+		PDUSessionID: uint8(psi), DNN: dnn, SMFInstanceID: fmt.Sprintf("smf-ctx-ref-%d", psi),
 		SNSSAI: amfctx.SNSSAISubscribed{SST: 1, SD: "000001"},
 	}
 	return nil

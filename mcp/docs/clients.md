@@ -1,6 +1,7 @@
+<!-- tier: public -->
 # 5GC MCP Server — Client Integration Guide
 
-The MCP server exposes 35 tools (NAS codec, NF lifecycle, UE context,
+The MCP server exposes 36 tools (NAS codec, NF lifecycle, UE context,
 traces/metrics, UERANSIM orchestration) over two transports that run concurrently:
 
 | Transport | When to use |
@@ -29,7 +30,7 @@ make pki                    # produces pki/ca.crt + pki/mcp.{crt,key}
 Quick liveness check:
 
 ```bash
-curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":35}
+curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":36}
 ```
 
 ---
@@ -44,9 +45,9 @@ The repo ships a pre-wired `.mcp.json` at the repo root — nothing to configure
 {
   "mcpServers": {
     "5gc": {
-      "command": "/home/<user>/proyectos/5gc-rel17/mcp/bin/mcp",
+      "command": "/path/to/claudia-5gc/mcp/bin/mcp",
       "env": {
-        "CONFIG_PATH": "/home/<user>/proyectos/5gc-rel17/mcp/config/local.yaml",
+        "CONFIG_PATH": "/path/to/claudia-5gc/mcp/config/local.yaml",
         "MCP_TRANSPORT": "stdio"
       }
     }
@@ -90,8 +91,8 @@ Edit `claude_desktop_config.json`:
 {
   "mcpServers": {
     "5gc": {
-      "command": "/absolute/path/to/5gc-rel17/mcp/bin/mcp",
-      "args": ["-config", "/absolute/path/to/5gc-rel17/mcp/config/local.yaml"]
+      "command": "/absolute/path/to/claudia-5gc/mcp/bin/mcp",
+      "args": ["-config", "/absolute/path/to/claudia-5gc/mcp/config/local.yaml"]
     }
   }
 }
@@ -142,13 +143,13 @@ Desktop — no manual port-forwarding needed.
 make -C mcp build
 ```
 
-**Step 3 — Verify the bridge script** at `mcp/bin/mcp-desktop.sh`:
+**Step 3 — Create the bridge script** at mcp/bin/mcp-desktop.sh (untracked: `mcp/bin/` is gitignored, so you create it locally):
 
 ```bash
 #!/bin/bash
 # Claude Desktop on Windows spawns this via wsl.exe -e.
-exec /home/<user>/proyectos/5gc-rel17/mcp/bin/mcp \
-    -config /home/<user>/proyectos/5gc-rel17/mcp/config/local.yaml
+exec /path/to/claudia-5gc/mcp/bin/mcp \
+    -config /path/to/claudia-5gc/mcp/config/local.yaml
 ```
 
 Update the absolute paths to match your WSL home directory if needed, then
@@ -168,7 +169,7 @@ File: `%APPDATA%\Claude\claude_desktop_config.json`
   "mcpServers": {
     "5gc": {
       "command": "C:\\Windows\\System32\\wsl.exe",
-      "args": ["-e", "/home/<user>/proyectos/5gc-rel17/mcp/bin/mcp-desktop.sh"]
+      "args": ["-e", "/path/to/claudia-5gc/mcp/bin/mcp-desktop.sh"]
     }
   }
 }
@@ -207,8 +208,8 @@ In LM Studio → Settings → Developers → MCP Servers → Add Server:
 ```json
 {
   "name": "5gc",
-  "command": "/absolute/path/to/5gc-rel17/mcp/bin/mcp",
-  "args": ["-config", "/absolute/path/to/5gc-rel17/mcp/config/local.yaml"],
+  "command": "/absolute/path/to/claudia-5gc/mcp/bin/mcp",
+  "args": ["-config", "/absolute/path/to/claudia-5gc/mcp/config/local.yaml"],
   "env": {
     "MCP_TRANSPORT": "stdio"
   }
@@ -221,7 +222,7 @@ On **Windows with WSL**, use the same `wsl.exe` wrapper as Claude Desktop:
 {
   "name": "5gc",
   "command": "C:\\Windows\\System32\\wsl.exe",
-  "args": ["-e", "/home/<user>/proyectos/5gc-rel17/mcp/bin/mcp-desktop.sh"]
+  "args": ["-e", "/path/to/claudia-5gc/mcp/bin/mcp-desktop.sh"]
 }
 ```
 
@@ -248,8 +249,8 @@ from `~/.cursor/mcp.json` globally.
 {
   "mcpServers": {
     "5gc": {
-      "command": "/absolute/path/to/5gc-rel17/mcp/bin/mcp",
-      "args": ["-config", "/absolute/path/to/5gc-rel17/mcp/config/local.yaml"]
+      "command": "/absolute/path/to/claudia-5gc/mcp/bin/mcp",
+      "args": ["-config", "/absolute/path/to/claudia-5gc/mcp/config/local.yaml"]
     }
   }
 }
@@ -262,7 +263,7 @@ from `~/.cursor/mcp.json` globally.
   "mcpServers": {
     "5gc": {
       "command": "C:\\Windows\\System32\\wsl.exe",
-      "args": ["-e", "/home/<user>/proyectos/5gc-rel17/mcp/bin/mcp-desktop.sh"]
+      "args": ["-e", "/path/to/claudia-5gc/mcp/bin/mcp-desktop.sh"]
     }
   }
 }
@@ -283,8 +284,8 @@ Add to the `mcpServers` array:
   "mcpServers": [
     {
       "name": "5gc",
-      "command": "/absolute/path/to/5gc-rel17/mcp/bin/mcp",
-      "args": ["-config", "/absolute/path/to/5gc-rel17/mcp/config/local.yaml"],
+      "command": "/absolute/path/to/claudia-5gc/mcp/bin/mcp",
+      "args": ["-config", "/absolute/path/to/claudia-5gc/mcp/config/local.yaml"],
       "env": {
         "MCP_TRANSPORT": "stdio"
       }
@@ -301,7 +302,7 @@ Windows (WSL) — use the same `wsl.exe` wrapper:
     {
       "name": "5gc",
       "command": "C:\\Windows\\System32\\wsl.exe",
-      "args": ["-e", "/home/<user>/proyectos/5gc-rel17/mcp/bin/mcp-desktop.sh"]
+      "args": ["-e", "/path/to/claudia-5gc/mcp/bin/mcp-desktop.sh"]
     }
   ]
 }
@@ -326,7 +327,7 @@ make up                    # 5GC stack (needed for NF/UE tools)
 # Health check
 curl -s http://localhost:9300/mcp/health
 
-# List all 35 tools
+# List all 36 tools
 curl -s http://localhost:9300/mcp -X POST \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | jq '.result.tools[].name'

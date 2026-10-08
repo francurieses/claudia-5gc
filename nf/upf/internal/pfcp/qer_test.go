@@ -18,9 +18,16 @@ import (
 
 func startTestUPF(t *testing.T) (*Server, *SessionTable, *net.UDPAddr, context.CancelFunc) {
 	t.Helper()
+	return startTestUPFWith(t, Config{})
+}
+
+// startTestUPFWith starts a test UPF PFCP server on a loopback port with cfg
+// (Address and NodeIP are filled in).
+func startTestUPFWith(t *testing.T, cfg Config) (*Server, *SessionTable, *net.UDPAddr, context.CancelFunc) {
+	t.Helper()
 	table := NewSessionTable()
-	srv, err := New(Config{Address: "127.0.0.1:0", NodeIP: "127.0.0.1"},
-		slog.New(slog.NewTextHandler(os.Stderr, nil)), table)
+	cfg.Address, cfg.NodeIP = "127.0.0.1:0", "127.0.0.1"
+	srv, err := New(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), table)
 	if err != nil {
 		t.Fatalf("New UPF PFCP server: %v", err)
 	}
@@ -32,18 +39,20 @@ func startTestUPF(t *testing.T) (*Server, *SessionTable, *net.UDPAddr, context.C
 	}
 }
 
-// qerSnapshot returns a copy of the session's QER read under the table lock.
-// The UPF server mutates sess.QER from its own dispatch goroutine under
+// qerSnapshot returns a copy of the session's QER 1 read under the table lock.
+// The UPF server mutates sess.QERs from its own dispatch goroutine under
 // table.mu; the test must take the same lock to avoid a data race (the UDP
 // response does not establish a happens-before edge the race detector honours).
 func qerSnapshot(table *SessionTable, teid uint32) QERState {
 	table.mu.RLock()
 	defer table.mu.RUnlock()
 	s := table.byULTEID[teid]
-	if s == nil {
+	if s == nil || s.QERs[1] == nil {
 		return QERState{}
 	}
-	return s.QER
+	c := *s.QERs[1]
+	c.ulBucket, c.dlBucket = nil, nil
+	return c
 }
 
 func sendAndRecv(t *testing.T, addr *net.UDPAddr, msg pfcpmsg.Message) pfcpmsg.Message {

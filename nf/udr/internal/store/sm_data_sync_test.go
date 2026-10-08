@@ -10,7 +10,7 @@ import "testing"
 func TestBuildSMSubscriptions_UsesPortalDNN(t *testing.T) {
 	got := BuildSMSubscriptions([]SNSSAISubscribed{
 		{SST: 1, SD: "001234", DNN: "gaming"},
-	})
+	}, nil)
 	if len(got) != 1 {
 		t.Fatalf("expected 1 SM entry, got %d", len(got))
 	}
@@ -26,7 +26,7 @@ func TestBuildSMSubscriptions_UsesPortalDNN(t *testing.T) {
 // TestBuildSMSubscriptions_DefaultsToInternet: a slice with no DNN assigned
 // keeps the previous behaviour, so the dev seed is unchanged.
 func TestBuildSMSubscriptions_DefaultsToInternet(t *testing.T) {
-	got := BuildSMSubscriptions([]SNSSAISubscribed{{SST: 1, SD: "000001"}})
+	got := BuildSMSubscriptions([]SNSSAISubscribed{{SST: 1, SD: "000001"}}, nil)
 	if _, ok := got[0].DNNConfigurations["internet"]; !ok {
 		t.Errorf("slice without a DNN must default to internet; got keys %v",
 			keysOf(got[0].DNNConfigurations))
@@ -49,7 +49,7 @@ func TestBuildSMSubscriptions_QoSPerSlice(t *testing.T) {
 		{"bronze", SNSSAISubscribed{SST: 3, SD: "000001"}, 9, "50 Mbps"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := BuildSMSubscriptions([]SNSSAISubscribed{tc.slice})
+			got := BuildSMSubscriptions([]SNSSAISubscribed{tc.slice}, nil)
 			cfg := got[0].DNNConfigurations["internet"]
 			if cfg.DefaultQos.FiveQI != tc.wantFiveQI {
 				t.Errorf("5QI: got %d, want %d", cfg.DefaultQos.FiveQI, tc.wantFiveQI)
@@ -65,7 +65,7 @@ func TestBuildSMSubscriptions_QoSPerSlice(t *testing.T) {
 }
 
 func TestBuildSMSubscriptions_Empty(t *testing.T) {
-	if got := BuildSMSubscriptions(nil); len(got) != 0 {
+	if got := BuildSMSubscriptions(nil, nil); len(got) != 0 {
 		t.Errorf("no slices must yield no SM entries, got %d", len(got))
 	}
 }

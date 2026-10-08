@@ -271,13 +271,13 @@
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 15},
       "id": 11,
       "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}},
-      "title": "Handover Rate by Type (Xn / N2)",
+      "title": "Handover Rate by Type and Result (Xn / N2)",
       "type": "timeseries",
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-          "expr": "sum by (ho_type)(rate(fivegc_handover_total{result=\"OK\"}[5m]))",
-          "legendFormat": "{{ho_type}}",
+          "expr": "sum by (ho_type, result)(rate(fivegc_handover_total[5m]))",
+          "legendFormat": "{{ho_type}} {{result}}",
           "refId": "A"
         }
       ]

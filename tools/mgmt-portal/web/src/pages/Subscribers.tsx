@@ -318,7 +318,7 @@ export default function Subscribers() {
               )}
             </Field>
 
-            <Field label="AMBR UL (kbps)">
+            <Field label="UE-AMBR UL (kbps) — all sessions, enforced by gNB" hint="Per-session limits: Slices → Session-AMBR">
               {({ id, describedBy, invalid }) => (
                 <Input
                   id={id}
@@ -331,7 +331,7 @@ export default function Subscribers() {
               )}
             </Field>
 
-            <Field label="AMBR DL (kbps)">
+            <Field label="UE-AMBR DL (kbps) — all sessions, enforced by gNB" hint="Per-session limits: Slices → Session-AMBR">
               {({ id, describedBy, invalid }) => (
                 <Input
                   id={id}
@@ -426,7 +426,7 @@ export default function Subscribers() {
               <TableHeaderCell>SUPI</TableHeaderCell>
               <TableHeaderCell>K (partial)</TableHeaderCell>
               <TableHeaderCell>Slices / DNN</TableHeaderCell>
-              <TableHeaderCell>AMBR UL/DL</TableHeaderCell>
+              <TableHeaderCell>UE-AMBR UL/DL</TableHeaderCell>
               <TableHeaderCell>RFSP</TableHeaderCell>
               <TableHeaderCell className="text-right">Actions</TableHeaderCell>
             </TableRow>

@@ -102,7 +102,10 @@ var (
 	})
 
 	// UPFPacketDropsTotal counts GTP-U packets dropped by the UPF.
-	// Labels: reason (no_session|no_route).
+	// Labels: reason (no_session|no_route|tun_write_error|gtpu_send_error|
+	// dl_no_session|dl_tunnel_not_ready|qer_mbr_exceeded|qer_gate_closed).
+	// qer_mbr_exceeded = above a QER MBR / the Session-AMBR (TS 29.244 §5.4.4,
+	// TS 23.501 §5.7.1.8); qer_gate_closed = QER Gate Status CLOSED (§5.4.3).
 	UPFPacketDropsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fivegc_upf_packet_drops_total",
 		Help: "Total GTP-U packets dropped.",
@@ -124,6 +127,15 @@ var (
 		Help: "Total IPv6 Router Advertisements sent by the UPF, labeled by trigger (periodic|solicited).",
 	}, []string{"trigger"})
 
+	// UPFL4ChecksumRepairedTotal counts downlink packets read from the N6 TUN
+	// whose TCP/UDP checksum was wrong and rewritten by the UPF before GTP-U
+	// encapsulation. Labels: proto (tcp|udp), ip (v4|v6).
+	// Ref: RFC 1071, RFC 793 §3.1, RFC 768, RFC 8200 §8.1; UPF-003.
+	UPFL4ChecksumRepairedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_upf_l4_checksum_repaired_total",
+		Help: "Total downlink TCP/UDP packets whose L4 checksum was repaired by the UPF, labeled by proto (tcp|udp) and ip (v4|v6).",
+	}, []string{"proto", "ip"})
+
 	// --- NRF Registry ---
 
 	// NFInstancesRegistered tracks NF instances currently registered in the NRF.
@@ -142,8 +154,8 @@ var (
 
 	// --- Mobility (AMF) ---
 
-	// HandoverTotal counts handover procedures completed.
-	// Labels: nf, ho_type (xn|n2), result (OK).
+	// HandoverTotal counts handover procedures by outcome.
+	// Labels: nf, ho_type (xn|n2), result (OK|REJECT|FAILURE).
 	HandoverTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fivegc_handover_total",
 		Help: "Total handover procedures completed.",

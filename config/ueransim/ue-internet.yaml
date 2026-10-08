@@ -1,0 +1,59 @@
+# Multi-slice scenario — "internet" UE (SST=1 / SD=000001, eMBB best-effort).
+# Service: ueransim-ue-internet (profiles: multi-slice). Started by
+# `make ueransim-slices` or `make ueransim-all`; validated by `make test-slices`.
+#
+# SUPI 201 is outside the default ueransim-ue range (001..UE_COUNT) so this UE can
+# run next to the default scenario. UDR seeds it via SEED_EXTRA_SUPIS with the
+# cyclic multi-slice profile ((msin-1)%4 == 0 → internet only).
+# Same semantics as ue.yaml (SUCI Profile A, internet session) minus the
+# test-slice (SD=001234) session, which ueransim-gnb-ms does not broadcast.
+supi: 'imsi-001010000000201'
+mcc: '001'
+mnc: '01'
+# Profile A: X25519 ECIES concealment (as ue.yaml)
+protectionScheme: 1
+# Home Network public key (X25519, derived from UDM's hn_private_key_x25519)
+homeNetworkPublicKey: '61cdb319f72eddfbac55c06c3ec38d15828880a259cbc11cc03ca92abb60fb5e'
+homeNetworkPublicKeyId: 1
+routingIndicator: '0000'
+key: '465b5ce8b199b49faa5f0a2ee238a6bc'
+op: 'cd63cb71954a9f4e48a5994e37a02baf'
+opType: 'OPC'
+amf: 'b9b9'
+imei: '356938035643807'
+imeiSv: '4370816125816155'
+gnbSearchList:
+  - ueransim-gnb-ms
+uacAic:
+  mps: false
+  mcs: false
+uacAcc:
+  normalClass: 0
+  class11: false
+  class12: false
+  class13: false
+  class14: false
+  class15: false
+sessions:
+  - type: 'IPv4'
+    apn: 'internet'
+    slice:
+      sst: 1
+      sd: 0x000001
+configured-nssai:
+  - sst: 1
+    sd: 0x000001
+default-nssai:
+  - sst: 1
+    sd: 0x000001
+integrity:
+  IA1: false
+  IA2: true
+  IA3: false
+ciphering:
+  EA1: false
+  EA2: true
+  EA3: false
+integrityMaxRate:
+  uplink: 'full'
+  downlink: 'full'

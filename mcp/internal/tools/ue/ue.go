@@ -15,7 +15,7 @@ import (
 // All returns the Group C tools bound to an AMF client.
 func All(amf *clients.AMF) []registry.Tool {
 	return []registry.Tool{
-		listTool{amf}, getTool{amf}, gmmTool{amf},
+		listTool{amf}, getTool{amf}, gmmTool{amf}, ranGNBListTool{amf},
 	}
 }
 

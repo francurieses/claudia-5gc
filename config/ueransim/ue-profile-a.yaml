@@ -2,10 +2,13 @@
 # Requires UDM to have hn_private_key_x25519 configured in dev.yaml.
 # Ref: TS 33.501 §6.12, Annex C.3
 #
-# Validation: make ueransim → UERANSIM uses Profile A SUCI for registration.
+# SUPI 301 is distinct from ueransim-ue (001..UE_COUNT) so both can run on
+# ueransim-gnb at once (make ueransim-all); UDR seeds it via SEED_EXTRA_SUPIS.
+#
+# Validation: make ueransim-profile-a → UE uses Profile A SUCI for registration.
 # Expected: AMF log shows "SUCI deconcealed (Profile A / X25519)"
 
-supi: 'imsi-001010000000001'
+supi: 'imsi-001010000000301'
 mcc: '001'
 mnc: '01'
 #protectionScheme: 0

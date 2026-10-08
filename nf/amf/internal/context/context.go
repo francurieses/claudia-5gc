@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 )
 
 // ---- CM State Machine (TS 23.501 §5.3.2) --------------------------------
@@ -137,6 +138,13 @@ type UEContext struct {
 	// the N2 handover handler can derive NH for the target gNB.
 	// Ref: TS 33.501 §A.9, §A.11
 	KgNB [32]byte
+	// NH / NCC / NHValid hold the AMF's locally kept Next Hop chain
+	// (TS 33.501 §6.9.2.1.1, §6.9.2.3.2, Annex A.10). Always go through
+	// SetKgNB / NextNH — they keep the three fields consistent. N2-connection
+	// scoped like UEAMBRSentToRAN: deliberately NOT persisted.
+	NH      [32]byte
+	NCC     uint8
+	NHValid bool
 
 	// CM state (TS 23.501 §5.3.2)
 	CMState CMState
@@ -193,6 +201,14 @@ type UEContext struct {
 		UL, DL uint64 // kbps
 	}
 
+	// UEAMBRSentToRAN is true once the serving gNB has been given the UE-AMBR in
+	// the current UE-associated logical NG connection (via an ICS Request carrying
+	// PDU sessions, a PDU Session Resource Setup Request, or a Handover Request).
+	// It is reset whenever that connection is released or replaced. N2-context
+	// scoped: deliberately NOT persisted (Redis/Postgres ignore it).
+	// Ref: TS 38.413 §8.2.1.2, §9.2.2.1; TS 23.501 §5.7.2.6
+	UEAMBRSentToRAN bool
+
 	// PDU Sessions
 	PDUSessions map[uint8]*PDUSession
 
@@ -212,6 +228,15 @@ type UEContext struct {
 	// once the UE returns to CM-CONNECTED via Service Request and the user plane is
 	// re-activated. Ref: TS 23.502 §4.2.3.3
 	PendingN1N2 bool
+
+	// pagedPDUSessions holds the PSIs for which an Namf_Communication_N1N2MessageTransfer
+	// arrived while the UE was CM-IDLE (the session whose downlink data triggered
+	// paging). The paging-triggered Service Request (service type "mobile
+	// terminated services", no Uplink Data Status) re-activates exactly these
+	// sessions; the set is consumed (cleared) by TakePagedPDUSessions.
+	// In-memory only; guarded by mu.
+	// Ref: TS 23.502 §4.2.3.3 step 6 → §4.2.3.2 steps 4/12, TS 24.501 §5.6.1.4.1
+	pagedPDUSessions map[uint8]struct{}
 
 	// Timestamps
 	RegistrationTime time.Time
@@ -346,8 +371,140 @@ type PDUSession struct {
 	// N2SmTransfer is the APER-encoded PDUSessionResourceSetupRequestTransfer from
 	// the SMF at session establishment. Cached here so the AMF can populate the
 	// HandoverRequestTransfer during N2 handover without re-querying the SMF.
-	// Ref: TS 38.413 §9.3.4.1, §9.3.4.2
+	// Ref: TS 38.413 §9.3.4.1 (PDU Session Resource Setup Request Transfer, also used as the Handover Request Transfer)
 	N2SmTransfer []byte
+}
+
+// nccModulus is the Next Hop Chaining Count range: NCC is a 3-bit counter
+// (INTEGER 0..7). Ref: TS 38.413 §9.3.1.18, TS 33.501 §6.9.2.1.1.
+const nccModulus = 8
+
+// InitialNCC is the NCC associated with the first NH derived after a new KgNB:
+// the KgNB itself is tied to a virtual NH with NCC 0, "the derived NH value is
+// associated with the NCC value one". Ref: TS 33.501 §6.9.2.1.1.
+const InitialNCC uint8 = 1
+
+// AddPagedPDUSession records psi as the target of a network-triggered Service
+// Request so the paging response re-activates its user plane. Safe for
+// concurrent use; takes ue.mu — do not call with the lock held.
+// Ref: TS 23.502 §4.2.3.3 step 3a
+func (u *UEContext) AddPagedPDUSession(psi uint8) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.pagedPDUSessions == nil {
+		u.pagedPDUSessions = make(map[uint8]struct{})
+	}
+	u.pagedPDUSessions[psi] = struct{}{}
+}
+
+// PagedPDUSessions returns the recorded paged PSIs in ascending order without
+// clearing them (read accessor). Takes ue.mu.
+func (u *UEContext) PagedPDUSessions() []uint8 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.sortedPagedLocked()
+}
+
+// TakePagedPDUSessions returns the recorded paged PSIs in ascending order and
+// clears the set, so it never leaks into a later Service Request. Takes ue.mu.
+// Ref: TS 23.502 §4.2.3.3 step 6
+func (u *UEContext) TakePagedPDUSessions() []uint8 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	out := u.sortedPagedLocked()
+	u.pagedPDUSessions = nil
+	return out
+}
+
+// sortedPagedLocked returns the paged PSIs sorted ascending; caller holds u.mu.
+func (u *UEContext) sortedPagedLocked() []uint8 {
+	if len(u.pagedPDUSessions) == 0 {
+		return nil
+	}
+	out := make([]uint8, 0, len(u.pagedPDUSessions))
+	for psi := range u.pagedPDUSessions {
+		out = append(out, psi)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// SetKgNB stores a newly established KgNB and (re)starts the NH chain:
+// NH1 = KNH(KAMF, KgNB), NCC = 1. Call it from every site that sets a new KgNB
+// (Registration, Service Request, Registration Update). It takes ue.mu — do not
+// call with the lock held (use SetKgNBLocked). If KAMF is not set the chain stays
+// invalid. Ref: TS 33.501 §6.9.2.1.1, Annex A.10.
+func (u *UEContext) SetKgNB(kgnb [32]byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.SetKgNBLocked(kgnb)
+}
+
+// SetKgNBLocked is SetKgNB for callers that already hold ue.mu.
+func (u *UEContext) SetKgNBLocked(kgnb [32]byte) {
+	u.KgNB = kgnb
+	u.NHValid = false
+	u.NH = [32]byte{}
+	u.NCC = 0
+	if !kamfUsable(u.SecurityCtx.KAMF) {
+		return
+	}
+	copy(u.NH[:], kdf.KNH(u.SecurityCtx.KAMF, kgnb[:]))
+	u.NCC = InitialNCC
+	u.NHValid = true
+}
+
+// NextNH advances the NH chain and returns the new pair: NCC := (NCC+1) mod 8,
+// NH := KNH(KAMF, NH_prev). Used for each Path Switch Request Acknowledge and
+// each HANDOVER REQUEST; atomic under ue.mu. ok is false (chain untouched) when
+// no usable chain exists (no KgNB established yet or KAMF unusable).
+// Ref: TS 33.501 §6.9.2.3.2, §6.9.2.3.3, Annex A.10.
+func (u *UEContext) NextNH() (nh [32]byte, ncc uint8, ok bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.NextNHLocked()
+}
+
+// NextNHLocked is NextNH for callers that already hold ue.mu.
+func (u *UEContext) NextNHLocked() (nh [32]byte, ncc uint8, ok bool) {
+	if !u.NHValid || !kamfUsable(u.SecurityCtx.KAMF) {
+		return [32]byte{}, 0, false
+	}
+	u.NCC = (u.NCC + 1) % nccModulus
+	copy(u.NH[:], kdf.KNH(u.SecurityCtx.KAMF, u.NH[:]))
+	return u.NH, u.NCC, true
+}
+
+// NHChainUsableLocked reports whether NextNHLocked would succeed (chain initialised and
+// KAMF usable) without advancing it. Caller holds ue.mu. Used to pre-check a Path Switch
+// Request before the SMF leg so a request that would be rejected never switches the UPF.
+func (u *UEContext) NHChainUsableLocked() bool {
+	return u.NHValid && kamfUsable(u.SecurityCtx.KAMF)
+}
+
+// NHState returns the current chain state without advancing it (diagnostics,
+// tests). valid is false until a KgNB has been set.
+func (u *UEContext) NHState() (nh [32]byte, ncc uint8, valid bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.NH, u.NCC, u.NHValid
+}
+
+// SetNHState overwrites the chain state (restoring a chain, test setup).
+func (u *UEContext) SetNHState(nh [32]byte, ncc uint8) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.NH, u.NCC, u.NHValid = nh, ncc%nccModulus, true
+}
+
+// kamfUsable reports whether KAMF is a non-empty, non-zero key.
+func kamfUsable(kamf []byte) bool {
+	for _, b := range kamf {
+		if b != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Lock/Unlock expose the mutex for procedures that need to hold state across steps.

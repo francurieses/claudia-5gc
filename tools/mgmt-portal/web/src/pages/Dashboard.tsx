@@ -20,6 +20,7 @@ import {
 import type { CustomRange, RangeId } from '../lib/metricsRange'
 import { formatBitsPerSec } from '../lib/format'
 import { useTabParam } from '../lib/useTabParam'
+import { isToolAvailable, useDeployment } from '../lib/deployment'
 
 /**
  * Poll interval for the preset (relative-window) charts. A custom range is
@@ -36,6 +37,7 @@ const RANGE_QUERY_INTERVAL_MS = 10_000
 const LINE_DASH: Array<string | undefined> = [undefined, '6 3', '2 4']
 
 export default function Dashboard() {
+  const hasUeransim = isToolAvailable(useDeployment(), 'ueransim')
   const [tab, setTab] = useTabParam(['overview', 'metrics'] as const, 'overview')
   const [rangeId, setRangeId] = useState<RangeId>(DEFAULT_RANGE_ID)
   const [customRange, setCustomRange] = useState<CustomRange | null>(null)
@@ -266,7 +268,7 @@ export default function Dashboard() {
             title="Registration success rate"
             description="Initial Registration OK / attempts × 100 (TS 28.554 §5.1)"
             axis="percent"
-            emptyMessage="No registrations in this range — register a UE (UERANSIM page) to populate it."
+            emptyMessage={`No registrations in this range — ${hasUeransim ? 'register a UE (UERANSIM page)' : 'connect a gNB and register a UE (see the gNBs page)'} to populate it.`}
             rangeId={rangeId}
             customRange={customRange}
           />
@@ -297,7 +299,7 @@ export default function Dashboard() {
             title="User-plane throughput (N3)"
             description="GTP-U bits/s forwarded, uplink / downlink (TS 28.554 §5.3)"
             axis="throughput"
-            emptyMessage="No user-plane traffic in this range — send real traffic, e.g. a ping from the UERANSIM page."
+            emptyMessage={`No user-plane traffic in this range — send real traffic${hasUeransim ? ', e.g. a ping from the UERANSIM page' : ' from a registered UE'}.`}
             rangeId={rangeId}
             customRange={customRange}
           />

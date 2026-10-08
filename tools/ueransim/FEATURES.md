@@ -1,3 +1,4 @@
+<!-- tier: public -->
 # UERANSIM — Modified Features & Command Reference
 
 Stock UERANSIM v3.2.8 lacks UE-side support for several 5GC Rel-17 procedures.
@@ -88,14 +89,13 @@ so the 5G-S-TMSI never matched and CN Paging was silently ignored. Now decoded a
 ### Patch 0060 — IPv6 / IPv4v6 PDU sessions
 Removes the five artificial "IPv4 only" guards in stock UERANSIM (PDU type selection,
 address decode, TUN configuration, RA handling and the GTP-U uplink IP-version filter)
-and adds an IPv6 TUN path. Needed for SMF-002 prefix delegation E2E. Details in
-`docs/procedures/ipv6-prefix-delegation.md`.
+and adds an IPv6 TUN path. Needed for IPv6 prefix delegation end to end.
 
 ### Patch 0070 — PWS: Write-Replace Warning / PWS Cancel (gNB)
 gNB handles NGAP Write-Replace Warning Request (ProcCode 51) and PWS Cancel Request
 (ProcCode 32), decodes the CBS page structure per the DataCodingScheme (GSM7 / 8-bit /
 UCS2 + language prefix) and answers with BroadcastCompletedAreaList / BroadcastCancelledAreaList
-(TS 38.413 §8.9). Enables live PWS E2E (`docs/procedures/PublicWarningSystem.md`).
+(TS 38.413 §8.9). Enables live PWS end to end.
 
 ---
 

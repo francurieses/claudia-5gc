@@ -1,6 +1,7 @@
+<!-- tier: public -->
 # Architecture Overview
 
-This doc captures the high-level design decisions. For what is implemented, see [`implementation-status.md`](implementation-status.md) and [`compliance-matrix.md`](compliance-matrix.md). For per-NF detail, see the NF folder under `nf/<nf>/` and the design docs in [`procedures/`](procedures/).
+This doc captures the high-level design decisions. For what is implemented, see [`implementation-status.md`](implementation-status.md) and [`features.md`](features.md). For per-NF detail, see the NF folder under `nf/<nf>/`; per-procedure designs and conformance are in the [members documentation](https://www.claudia5gc.dev/docs/members/).
 
 ## Reference architecture
 
@@ -126,6 +127,24 @@ Not implemented: N37 (NEF – UDR), N40 (CHF), N9 (I-UPF), SCP, UDSF.
 | Kubernetes vs Compose | Compose | Fewer moving parts during development |
 | Service mesh | None | SBA already has NRF; mesh breaks SBI tracing |
 
+## Deployment modes
+
+The default deployment is a **standalone deployment (core-only)**: the NFs, observability and the
+portal run with no RAN simulator built or started. RAN simulators are opt-in through the root
+Makefile variable `RAN` (compose profiles in parentheses):
+
+| `RAN=` | Running next to the core | Compose profiles added |
+|---|---|---|
+| `none` (default) | nothing | — (`core`, `observability`, `tools` as requested) |
+| `ueransim` | UERANSIM gNB + UEs | `integration-ueransim` |
+| `packetrusher` | PacketRusher dual-gNB (`PR_SCENARIO=xn\|n2\|none`) | `handover` / `handover-n2` |
+| `both` | both | all of the above |
+
+The mgmt-portal detects the mode at runtime from the running containers (`GET /api/v1/deployment`, override
+`PORTAL_RAN_TOOLS`) and hides the UERANSIM / PacketRusher pages when absent. The **gNBs (RAN)** page works in
+every mode because its data comes from the AMF, not from Docker: the AMF gNB registry is served on the
+management port `GET :9002/amf/v1/ran/gnbs` (plain HTTP, read-only). Commands: [`getting-started.md`](getting-started.md).
+
 ## Network topology (Docker)
 
 | Network | Subnet | Purpose | Members |
@@ -137,6 +156,8 @@ Not implemented: N37 (NEF – UDR), N40 (CHF), N9 (I-UPF), SCP, UDSF.
 | n6-net | 172.30.6.0/24 + `fd00:6::/64` | UPF egress for the `internet` DNN | UPF |
 | n6-ims-net | 172.30.7.0/24 + `fd00:7::/64` | UPF egress for the `ims` DNN | UPF |
 | obs-net | (Docker-assigned) | Observability | Loki, Prometheus, Grafana, Jaeger, NFs |
+
+`perf` profile (opt-in benchmarking, headline figures in [`performance/summary.md`](performance/summary.md)): `iperf3-dn` 172.30.6.50 and `gtpu-bench-dn` 172.30.6.51 on n6-net; `gtpu-bench` 172.30.3.20 on n3-net + n4-net; `iperf3-upf-local` shares the UPF network namespace (10.60.0.254). iperf3 ports: 5201-5216 (`iperf3-dn`), 5301-5316 (`iperf3-upf-local`); none are published to the host.
 
 UE IP pools are per DNN (`10.60.0.0/24` internet, `10.61.0.0/24` ims, …); the single source of truth is `config/operator.yaml`. There is no N9 network yet (no I-UPF).
 
@@ -159,6 +180,21 @@ UE IP pools are per DNN (`10.60.0.0/24` internet, `10.61.0.0/24` ims, …); the 
 | LMF | 8012 | 9113 |
 | MCP server | 9300 (SSE) | — |
 | Management portal | 8080 | — |
+
+### RAN simulator addressing
+
+No port collision exists between UERANSIM and PacketRusher: each simulator runs in its own network namespace and every gNB has its own IP. NGAP uses SCTP PPID 60 (TS 38.412 §7); GTP-U stays on 2152 (TS 29.281 §4.4.2.3).
+
+| Endpoint | N2 (5gc-n2 / n2-net) | N3 (n3-net) | gNB ID / NCI |
+|---|---|---|---|
+| Core: AMF N2 listener | 172.30.1.2:38412/sctp | — | — |
+| Core: UPF N3 listener | — | 172.30.3.100:2152/udp | — |
+| UERANSIM `ueransim-gnb` | dynamic IP, ephemeral SCTP local port | 172.30.3.3 | gNB-ID `0x00000001` (32-bit), nci `0x000000010` |
+| UERANSIM `ueransim-gnb-ms` | dynamic IP | 172.30.3.4 | gNB-ID `0x10`, nci `0x000000100`; own aliases `ueransim-gnb-ms` / `ueransim-gnb-ms-n3`, so it runs next to `ueransim-gnb` (`make ueransim-all`) |
+| PacketRusher gNB1 | 172.30.1.20:9487 | 172.30.3.10:2152 | gNB-ID `000002` (24-bit) |
+| PacketRusher gNB2 (handover) | 172.30.1.21:9488 | 172.30.3.11:2152 | gNB-ID `000003` |
+
+`docker/packetrusher/entrypoint.sh` runs ARP duplicate-address detection before adding the secondary `.21`/`.11` addresses (exits 1 with a clear message if taken) and then a gratuitous ARP. Verify with `curl -s localhost:9002/amf/v1/ran/gnbs` (all gNBs `NG_READY`).
 
 ## Observability
 

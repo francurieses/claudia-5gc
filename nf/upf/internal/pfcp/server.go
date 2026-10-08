@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,8 +70,13 @@ type Session struct {
 	// Requests (node-initiated) are sent here. Ref: TS 29.244 §7.5.5.
 	SMFAddr *net.UDPAddr
 
-	// QoS enforcement state from the QER (TS 29.244 §7.5.2.5 / §8.2).
-	QER QERState
+	// QoS enforcement state (TS 29.244 §5.2.5, §7.5.2.5): QERs keyed by QER ID
+	// and the QER ID list of each PDR. Mutated only by the PFCP goroutine under
+	// SessionTable.mu; the datapath never reads them — it reads the immutable
+	// snapshot published in qos by RebuildQoS.
+	QERs map[uint32]*QERState
+	PDRs map[uint16]*PDRState
+	qos  atomic.Pointer[qosView]
 
 	// Usage Reporting Rule state (TS 29.244 §5.2.2.4 / §7.5.2.4).
 	URRState URRState
@@ -80,17 +86,6 @@ type Session struct {
 	// §5.8.2.2.2). Guarded by SessionTable.mu (same lock used elsewhere for
 	// mutable Session fields). Nil when no advertiser is running.
 	raCancel context.CancelFunc
-}
-
-// QERState mirrors the QoS Enforcement Rule installed by the SMF.
-// MBR values are in kbps per TS 29.244 §8.2.8.
-type QERState struct {
-	QERID     uint32
-	QFI       uint8
-	GateUL    uint8 // 0 = OPEN, 1 = CLOSED (TS 29.244 §8.2.7)
-	GateDL    uint8
-	MBRULKbps uint64
-	MBRDLKbps uint64
 }
 
 // URRState mirrors the Usage Reporting Rule installed by the SMF for active
@@ -147,9 +142,9 @@ func (s *Session) AddDLVolume(n int) {
 // SessionTable is a concurrency-safe store shared by PFCP and GTP-U servers.
 type SessionTable struct {
 	mu       sync.RWMutex
-	bySEID   map[uint64]*Session // keyed by UP SEID
-	byULTEID map[uint32]*Session // keyed by UL TEID (GTP-U uplink fast path)
-	byUEIP   map[string]*Session // keyed by UE IPv4 string (TUN downlink fast path)
+	bySEID   map[uint64]*Session     // keyed by UP SEID
+	byULTEID map[uint32]*Session     // keyed by UL TEID (GTP-U uplink fast path)
+	byUEIP   map[netip.Addr]*Session // keyed by UE IPv4 (TUN downlink fast path; no per-packet String())
 	// byUEIPv6Net is keyed by the delegated /64 network string (e.g.
 	// "2001:db8:60::/64"), not the full UE address: the UE forms its own IID
 	// via SLAAC (and may use temporary/privacy addresses), so IPv6 downlink is
@@ -163,7 +158,7 @@ func NewSessionTable() *SessionTable {
 	return &SessionTable{
 		bySEID:      make(map[uint64]*Session),
 		byULTEID:    make(map[uint32]*Session),
-		byUEIP:      make(map[string]*Session),
+		byUEIP:      make(map[netip.Addr]*Session),
 		byUEIPv6Net: make(map[string]*Session),
 	}
 }
@@ -177,9 +172,13 @@ func (t *SessionTable) GetByULTEID(teid uint32) *Session {
 
 // GetByUEIP returns the session for the given UE IPv4 (called on every IPv4 TUN read).
 func (t *SessionTable) GetByUEIP(ip net.IP) *Session {
+	a, ok := ueAddr(ip)
+	if !ok {
+		return nil
+	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.byUEIP[ip.String()]
+	return t.byUEIP[a]
 }
 
 // GetByUEIPv6Prefix returns the session whose delegated /64 contains ip (called
@@ -195,6 +194,16 @@ func (t *SessionTable) GetByUEIPv6Prefix(ip net.IP) *Session {
 	return t.byUEIPv6Net[prefix.String()]
 }
 
+// ueAddr converts a UE IP to the map key used by byUEIP (4-in-6 unmapped).
+func ueAddr(ip net.IP) (netip.Addr, bool) {
+	a, ok := netip.AddrFromSlice(ip)
+	return a.Unmap(), ok
+}
+
+// Add inserts sess into every lookup index. The PFCP handlers use the same
+// path; it is exported for benchmarks and tests that need a populated table.
+func (t *SessionTable) Add(sess *Session) { t.store(sess) }
+
 func (t *SessionTable) store(sess *Session) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -203,7 +212,9 @@ func (t *SessionTable) store(sess *Session) {
 		t.byULTEID[sess.ULTEID] = sess
 	}
 	if len(sess.UEIP) > 0 {
-		t.byUEIP[sess.UEIP.String()] = sess
+		if a, ok := ueAddr(sess.UEIP); ok {
+			t.byUEIP[a] = sess
+		}
 	}
 	if prefix := ueV6Prefix(sess.UEIPv6); prefix != nil {
 		t.byUEIPv6Net[prefix.String()] = sess
@@ -216,7 +227,9 @@ func (t *SessionTable) delete(upSEID uint64) {
 	if sess, ok := t.bySEID[upSEID]; ok {
 		delete(t.byULTEID, sess.ULTEID)
 		if len(sess.UEIP) > 0 {
-			delete(t.byUEIP, sess.UEIP.String())
+			if a, ok := ueAddr(sess.UEIP); ok {
+				delete(t.byUEIP, a)
+			}
 		}
 		if prefix := ueV6Prefix(sess.UEIPv6); prefix != nil {
 			delete(t.byUEIPv6Net, prefix.String())
@@ -254,6 +267,10 @@ type Config struct {
 	// establishment — the /64 actually advertised always comes from the PFCP
 	// UE IP Address IE, never from this map. Ref: TS 23.501 §5.8.2.2.
 	DNNIPv6Prefixes map[string]string
+
+	// QoS configures MBR / Session-AMBR enforcement (AmbrEnforcement, UPF-005).
+	// The zero value enforces with qos.DefaultBurstMs and the real clock.
+	QoS QoSConfig
 }
 
 // RASender delivers a downlink IP packet (a Router Advertisement) to the UE
@@ -273,6 +290,11 @@ type Server struct {
 	reportSeq  atomic.Uint32 // Session Report Request sequence number generator
 	raSender   RASender
 	raInterval time.Duration
+	// recoveryTS is the UPF start time, advertised as Recovery Time Stamp in
+	// Association Setup and Heartbeat responses. Ref: TS 29.244 §8.2.65, TS 23.007 §19A.
+	recoveryTS time.Time
+	// qosCfg is the normalised QoS enforcement configuration.
+	qosCfg QoSConfig
 }
 
 // New creates a PFCP server.
@@ -295,6 +317,8 @@ func New(cfg Config, logger *slog.Logger, sessions *SessionTable) (*Server, erro
 		conn:       conn,
 		sessions:   sessions,
 		raInterval: raInterval,
+		recoveryTS: time.Now().UTC().Truncate(time.Second),
+		qosCfg:     cfg.QoS.normalized(),
 	}, nil
 }
 
@@ -343,7 +367,7 @@ func (s *Server) dispatch(ctx context.Context, raddr *net.UDPAddr, msg pfcpmsg.M
 	case *pfcpmsg.SessionEstablishmentRequest:
 		s.handleSessionEstablishment(ctx, raddr, m)
 	case *pfcpmsg.SessionModificationRequest:
-		s.handleSessionModification(raddr, m)
+		s.handleSessionModification(ctx, raddr, m)
 	case *pfcpmsg.SessionDeletionRequest:
 		s.handleSessionDeletion(ctx, raddr, m)
 	case *pfcpmsg.HeartbeatRequest:
@@ -358,17 +382,24 @@ func (s *Server) dispatch(ctx context.Context, raddr *net.UDPAddr, msg pfcpmsg.M
 func (s *Server) handleAssociationSetup(raddr *net.UDPAddr, req *pfcpmsg.AssociationSetupRequest) {
 	resp := pfcpmsg.NewAssociationSetupResponse(
 		req.Sequence(),
-		pfcpie.NewNodeID("", "", "upf"),
+		pfcpie.NewNodeID("", "", upfNodeFQDN),
 		pfcpie.NewCause(pfcpie.CauseRequestAccepted),
+		pfcpie.NewRecoveryTimeStamp(s.recoveryTS),
 	)
 	s.sendResponse(raddr, resp)
-	s.logger.Info("PFCP AssociationSetup accepted", "remote", raddr)
+	s.logger.Info("PFCP AssociationSetup accepted", "remote", raddr,
+		"spec_ref", "TS 29.244 §7.4.4.2")
 }
 
 func (s *Server) handleHeartbeat(raddr *net.UDPAddr, req *pfcpmsg.HeartbeatRequest) {
-	resp := pfcpmsg.NewHeartbeatResponse(req.Sequence(), nil)
+	resp := pfcpmsg.NewHeartbeatResponse(req.Sequence(), pfcpie.NewRecoveryTimeStamp(s.recoveryTS))
 	s.sendResponse(raddr, resp)
 }
+
+// upfNodeFQDN is the Node ID (FQDN type) the UPF announces in Association
+// Setup and Session Establishment responses. Ref: TS 29.244 §8.2.38,
+// §7.4.4.2, §7.5.3.1 (Node ID is mandatory in the Establishment Response).
+const upfNodeFQDN = "upf"
 
 // handleSessionEstablishment processes Create PDR/FAR IEs, stores session keyed by UL TEID.
 func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPAddr, req *pfcpmsg.SessionEstablishmentRequest) {
@@ -388,11 +419,20 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 	var ulTEID uint32
 	var ueIP, ueIPv6 net.IP
 	var dnn string
+	var pdrStates []*PDRState
 	for _, pdr := range req.CreatePDR {
 		pdrIEs, err := pdr.CreatePDR()
 		if err != nil {
 			continue
 		}
+		// QoS view of the PDR: ID, precedence, Source Interface, QER ID list
+		// (TS 29.244 §7.5.2.2).
+		ps, rej := parsePDRQoS(pdrIEs, s.warnFn(ctx, cpSEID))
+		if rej != nil {
+			s.rejectEstablishment(ctx, raddr, seq, cpSEID, rej)
+			return
+		}
+		pdrStates = append(pdrStates, ps)
 		for _, child := range pdrIEs {
 			if child.Type != pfcpie.PDI {
 				continue
@@ -449,39 +489,21 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 		SMFAddr: &net.UDPAddr{IP: raddr.IP, Port: smfPFCPPort},
 	}
 
-	// Create QER — QoS enforcement state for the session's default flow.
-	// Ref: TS 29.244 §7.5.2.5 (Create QER), §8.2.7/§8.2.8 (Gate Status / MBR)
-	for _, qer := range req.CreateQER {
-		qerIEs, err := qer.CreateQER()
-		if err != nil {
-			continue
-		}
-		for _, child := range qerIEs {
-			switch child.Type {
-			case pfcpie.QERID:
-				if v, err := child.QERID(); err == nil {
-					sess.QER.QERID = v
-				}
-			case pfcpie.QFI:
-				if v, err := child.QFI(); err == nil {
-					sess.QER.QFI = v
-				}
-			case pfcpie.GateStatus:
-				if v, err := child.GateStatusUL(); err == nil {
-					sess.QER.GateUL = v
-				}
-				if v, err := child.GateStatusDL(); err == nil {
-					sess.QER.GateDL = v
-				}
-			case pfcpie.MBR:
-				if v, err := child.MBRUL(); err == nil {
-					sess.QER.MBRULKbps = v
-				}
-				if v, err := child.MBRDL(); err == nil {
-					sess.QER.MBRDLKbps = v
-				}
-			}
-		}
+	// Create QER — QoS enforcement rules, several per session keyed by QER ID,
+	// referenced by the PDRs' QER ID lists. Validated in full before the session
+	// is stored. Ref: TS 29.244 §7.5.2.2, §7.5.2.5, §5.2.5.
+	qers, pdrs, rej := establishmentQoS(req.CreateQER, pdrStates, s.warnFn(ctx, upSEID))
+	if rej != nil {
+		s.rejectEstablishment(ctx, raddr, seq, cpSEID, rej)
+		return
+	}
+	sess.QERs, sess.PDRs = qers, pdrs
+	sess.RebuildQoS(s.qosCfg)
+	for _, id := range sortedQERIDs(sess.QERs) {
+		s.logQER(ctx, "create", specCreateQER, upSEID, id, sess.QERs[id])
+	}
+	if v := sess.qos.Load(); len(sess.QERs) > 0 && (v == nil || !v.hasQFI) {
+		s.warnNoQFI(ctx, upSEID)
 	}
 
 	// Create URR — Usage Reporting Rule for active volume/periodic reporting.
@@ -537,8 +559,7 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 
 	s.logger.Info("PFCP Session established",
 		"cpSEID", cpSEID, "ulTEID", ulTEID, "ueIP", ueIP, "ueIPv6", ueIPv6, "dnn", dnn,
-		"qer_id", sess.QER.QERID, "qfi", sess.QER.QFI,
-		"mbr_ul_kbps", sess.QER.MBRULKbps, "mbr_dl_kbps", sess.QER.MBRDLKbps,
+		"qer_count", len(sess.QERs), "dl_qfi", sess.DLQFI(),
 		"urr_installed", sess.URRState.Installed, "urr_id", sess.URRState.URRID,
 		"volume_threshold", sess.URRState.VolumeThreshold,
 		"measurement_period", sess.URRState.MeasurementPeriod,
@@ -561,20 +582,48 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 
 	resp := pfcpmsg.NewSessionEstablishmentResponse(
 		0, 0, cpSEID, seq, 0,
+		pfcpie.NewNodeID("", "", upfNodeFQDN),
 		pfcpie.NewCause(pfcpie.CauseRequestAccepted),
 		pfcpie.NewFSEID(upSEID, net.ParseIP(s.cfg.NodeIP), nil),
 	)
 	s.sendResponse(raddr, resp)
 }
 
-// handleSessionModification updates the FAR with DL TEID + gNB IP from UpdateFAR.
-func (s *Server) handleSessionModification(raddr *net.UDPAddr, req *pfcpmsg.SessionModificationRequest) {
+// rejectEstablishment answers a Session Establishment Request with a rejection
+// Cause plus the Offending IE / Failed Rule ID, storing no session. Ref:
+// TS 29.244 §7.5.3, §8.2.1, §8.2.80.
+func (s *Server) rejectEstablishment(ctx context.Context, raddr *net.UDPAddr, seq uint32, cpSEID uint64, rej *pfcpReject) {
+	s.logReject(ctx, cpSEID, rej)
+	s.sendResponse(raddr, pfcpmsg.NewSessionEstablishmentResponse(
+		0, 0, cpSEID, seq, 0,
+		append([]*pfcpie.IE{pfcpie.NewNodeID("", "", upfNodeFQDN), pfcpie.NewCause(rej.cause)}, rej.ies...)...))
+}
+
+// warnNoQFI logs (once, at PFCP time) that no QER of the session carries a
+// QFI, so DL packets get QFI 0 in the PDU Session Container.
+func (s *Server) warnNoQFI(ctx context.Context, seid uint64) {
+	logging.NewProcedureLogger(ctx, s.logger, procAmbrEnforcement).Warn("no QER carries a QFI, DL QFI defaults to 0",
+		"interface", "N4", "direction", "IN",
+		"spec_ref", "TS 29.244 §8.2.89", "seid", seid)
+}
+
+// applyActionFORW is the FORW bit (bit 2) of the Apply Action IE.
+// Ref: TS 29.244 §8.2.26.
+const applyActionFORW uint8 = 0x02
+
+// procPduSessionModification is the canonical procedure name for N4 session
+// modification logs.
+const procPduSessionModification = "PduSessionModification"
+
+// handleSessionModification updates the FAR with DL TEID + gNB IP from UpdateFAR,
+// or clears the DL tunnel when Update FAR carries an Apply Action without FORW.
+func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAddr, req *pfcpmsg.SessionModificationRequest) {
 	seq := req.Sequence()
 	upSEID := req.SEID()
 
-	s.sessions.mu.Lock()
+	s.sessions.mu.RLock()
 	sess := s.sessions.bySEID[upSEID]
-	s.sessions.mu.Unlock()
+	s.sessions.mu.RUnlock()
 
 	if sess == nil {
 		s.logger.Warn("PFCP SessionModification: session not found", "upSEID", upSEID)
@@ -586,54 +635,71 @@ func (s *Server) handleSessionModification(raddr *net.UDPAddr, req *pfcpmsg.Sess
 		return
 	}
 
-	// Update QER — apply the new QoS enforcement parameters (NW-initiated QoS
-	// modification pushes a new MBR/QFI here before the UE is signalled).
-	// Ref: TS 29.244 §7.5.4 (Session Modification), §7.5.2.5 (Update QER)
-	for _, uqer := range req.UpdateQER {
-		qerIEs, err := uqer.UpdateQER()
-		if err != nil {
-			continue
-		}
+	// Create/Update/Remove QER and the PDR QER ID lists: validate everything
+	// first, then apply atomically (no partial application on rejection).
+	// A NW-initiated QoS modification pushes the new Session-AMBR here before
+	// the UE is signalled. Ref: TS 29.244 §7.5.4, §7.5.4.5, §7.5.4.9.
+	s.sessions.mu.RLock()
+	plan, rej := planModificationQoS(sess, req, s.warnFn(ctx, upSEID))
+	s.sessions.mu.RUnlock()
+	if rej != nil {
+		s.logReject(ctx, upSEID, rej)
+		s.sendResponse(raddr, pfcpmsg.NewSessionModificationResponse(
+			0, 0, sess.CPSEID, seq, 0,
+			append([]*pfcpie.IE{pfcpie.NewCause(rej.cause)}, rej.ies...)...))
+		return
+	}
+	if !plan.empty() {
 		s.sessions.mu.Lock()
-		for _, child := range qerIEs {
-			switch child.Type {
-			case pfcpie.QERID:
-				if v, err := child.QERID(); err == nil {
-					sess.QER.QERID = v
-				}
-			case pfcpie.QFI:
-				if v, err := child.QFI(); err == nil {
-					sess.QER.QFI = v
-				}
-			case pfcpie.GateStatus:
-				if v, err := child.GateStatusUL(); err == nil {
-					sess.QER.GateUL = v
-				}
-				if v, err := child.GateStatusDL(); err == nil {
-					sess.QER.GateDL = v
-				}
-			case pfcpie.MBR:
-				if v, err := child.MBRUL(); err == nil {
-					sess.QER.MBRULKbps = v
-				}
-				if v, err := child.MBRDL(); err == nil {
-					sess.QER.MBRDLKbps = v
-				}
+		changed := s.applyQoS(sess, plan)
+		infos := make([]QERState, len(changed))
+		for i, c := range changed {
+			infos[i] = c.q
+		}
+		s.sessions.mu.Unlock()
+		for i, c := range changed {
+			if c.op == "remove" {
+				s.logQER(ctx, c.op, c.spec, upSEID, c.id, nil)
+			} else {
+				s.logQER(ctx, c.op, c.spec, upSEID, c.id, &infos[i])
 			}
 		}
-		qer := sess.QER
-		s.sessions.mu.Unlock()
-		s.logger.Info("PFCP QER updated — QoS enforcement applied",
-			"upSEID", upSEID, "qer_id", qer.QERID, "qfi", qer.QFI,
-			"mbr_ul_kbps", qer.MBRULKbps, "mbr_dl_kbps", qer.MBRDLKbps,
-			"gate_ul", qer.GateUL, "gate_dl", qer.GateDL,
-			"spec_ref", "TS 29.244 §7.5.2.5")
+		for _, u := range plan.pdrs {
+			s.logUpdatePDR(ctx, upSEID, u)
+		}
 	}
 
-	// Extract DL TEID + gNB IP from UpdateFAR → UpdateForwardingParameters → OuterHeaderCreation
+	// Update FAR: Apply Action + Update Forwarding Parameters.
+	// - Apply Action with FORW + Outer Header Creation: set the DL tunnel.
+	// - Apply Action without FORW (DROP, BUFF, NOCP): clear the DL tunnel so
+	//   the datapath drops DL traffic ("dl_tunnel_not_ready"). Used by the SMF
+	//   for UP deactivation, e.g. N2 handover. Ref: TS 29.244 §7.5.4.3, §8.2.26.
+	// - Apply Action absent: only the Outer Header Creation is honoured.
 	for _, ufar := range req.UpdateFAR {
 		ufarIEs, err := ufar.UpdateFAR()
 		if err != nil {
+			continue
+		}
+		var (
+			haveAA bool
+			aa     uint8
+		)
+		for _, child := range ufarIEs {
+			if child.Type == pfcpie.ApplyAction {
+				if v, err := child.ApplyAction(); err == nil {
+					haveAA, aa = true, v
+				}
+			}
+		}
+		if haveAA && aa&applyActionFORW == 0 {
+			s.sessions.mu.Lock()
+			sess.DLTEID = 0
+			sess.GNBIP = nil
+			s.sessions.mu.Unlock()
+			logging.NewProcedureLogger(ctx, s.logger, procPduSessionModification).Info("PFCP Session DL tunnel cleared",
+				"nf", "UPF", "interface", "N4", "direction", "IN",
+				"seid", upSEID, "apply_action", aa,
+				"spec_ref", "TS 29.244 §7.5.4.3")
 			continue
 		}
 		for _, child := range ufarIEs {
@@ -665,11 +731,26 @@ func (s *Server) handleSessionDeletion(ctx context.Context, raddr *net.UDPAddr, 
 	// Stop this session's Router Advertisement advertiser, if any, before
 	// removing it from the table. Ref: TS 23.501 §5.8.2.2.2.
 	s.sessions.mu.Lock()
-	if sess, ok := s.sessions.bySEID[upSEID]; ok && sess.raCancel != nil {
+	sess, found := s.sessions.bySEID[upSEID]
+	if found && sess.raCancel != nil {
 		sess.raCancel()
 	}
 	s.sessions.mu.Unlock()
 
+	if !found {
+		// Unknown SEID: Cause 65. Ref: TS 29.244 §7.5.7, §8.2.1.
+		s.logger.Warn("PFCP Session deletion for unknown SEID", "upSEID", upSEID,
+			"spec_ref", "TS 29.244 §7.5.7", "result", "REJECT")
+		s.sendResponse(raddr, pfcpmsg.NewSessionDeletionResponse(
+			0, 0, 0, req.Sequence(), 0,
+			pfcpie.NewCause(pfcpie.CauseSessionContextNotFound),
+		))
+		return
+	}
+
+	// Drop the QoS snapshot first so a datapath goroutine still holding the
+	// session pointer enforces and forwards nothing stale.
+	sess.qos.Store(nil)
 	s.sessions.delete(upSEID)
 	metrics.UPFPFCPSessionsActive.Dec()
 	s.logger.Info("PFCP Session deleted", "upSEID", upSEID)

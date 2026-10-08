@@ -7,15 +7,20 @@ package gtpu
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/nf/upf/internal/l4csum"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/pfcp"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/ra"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // GTP-U header constants (TS 29.281 §5.1)
@@ -54,12 +59,23 @@ type tunRoute struct {
 	subnet  *net.IPNet
 	subnet6 *net.IPNet // nil for IPv4-only DNNs
 	file    *os.File
+
+	// Pre-resolved Prometheus children: resolving WithLabelValues per packet
+	// hashes the label set on the hot path.
+	ulPkts, ulBytes, dlPkts, dlBytes prometheus.Counter
 }
 
 // Config holds GTP-U server configuration.
 type Config struct {
 	Address string // "0.0.0.0:2152"
 	N3IP    string // UPF N3 interface IP (e.g. "172.30.3.100")
+
+	// SocketBufferBytes sizes the GTP-U UDP socket buffers (0 = kernel default).
+	SocketBufferBytes int
+
+	// L4ChecksumRepair enables recomputing a wrong TCP/UDP checksum on
+	// downlink packets read from the TUN (UPF-003; config n6.l4_checksum_repair).
+	L4ChecksumRepair bool
 }
 
 // Server is the UPF GTP-U server (N3 interface).
@@ -71,6 +87,19 @@ type Server struct {
 	n3IP     net.IP
 	tuns     []tunRoute // per-DNN TUN entries; empty = N6 disabled
 
+	// debug is true when the logger emits DEBUG records. Per-packet logging
+	// is guarded by it so the disabled case costs neither a record nor the
+	// boxing of the log arguments.
+	debug bool
+	// drop* are the pre-resolved fivegc_upf_packet_drops_total children.
+	dropNoSession, dropNoRoute, dropTunWrite, dropSend, dropDLNoSession, dropDLNotReady prometheus.Counter
+	// dropQER holds the QoS enforcement drop counters, indexed by
+	// pfcp.DropReason (qer_gate_closed, qer_mbr_exceeded).
+	dropQER [pfcp.NumDropReasons]prometheus.Counter
+	// limiter rate-limits event-driven INFO/WARN logs that a packet flood
+	// would otherwise repeat per packet (one record per key per interval).
+	limiter logLimiter
+
 	// pfcpSrv is used only to trigger an immediate solicited Router
 	// Advertisement (TS 23.501 §5.8.2.2.2, RFC 4861 §6.2.6) when a Router
 	// Solicitation is decapsulated from the uplink. Nil disables that path
@@ -78,6 +107,42 @@ type Server struct {
 	// SetPFCPServer — the seam between the N3 (GTP-U) and N4 (PFCP)
 	// packages so pfcp need not import gtpu.
 	pfcpSrv *pfcp.Server
+
+	// onL4Repair, when non-nil, is invoked once per repaired downlink packet
+	// (proto "tcp"|"udp", ipver "v4"|"v6"); lets observability attach a counter.
+	onL4Repair func(proto, ipver string)
+}
+
+// SetL4RepairHook registers a callback invoked for every downlink packet whose
+// L4 checksum was repaired. Call before Start; nil disables it.
+func (s *Server) SetL4RepairHook(f func(proto, ipver string)) {
+	s.onL4Repair = f
+}
+
+// repairDownlinkChecksum verifies/repairs the TCP/UDP checksum of a downlink
+// IP packet in place when enabled. A T-PDU must reach the UE with a valid L4
+// checksum, but a userspace-proxied TUN host (Docker Desktop for macOS) may hand
+// over segments with a complete but incorrect checksum. Only the TUN reader path calls this; UPF-built
+// packets (ICMP replies, Router Advertisements) already carry correct sums.
+// Ref: RFC 1071, RFC 793 §3.1, RFC 768, RFC 8200 §8.1, TS 29.281 §5.
+func (s *Server) repairDownlinkChecksum(pkt []byte, dst net.IP, dnn string) {
+	if !s.cfg.L4ChecksumRepair {
+		return
+	}
+	res, ok := l4csum.Repair(pkt)
+	if !ok {
+		return
+	}
+	s.logger.Debug("downlink L4 checksum repaired",
+		"procedure", "DownlinkChecksum",
+		"interface", "N6",
+		"direction", "IN",
+		"spec_ref", "RFC 1071; RFC 793 §3.1; RFC 768; RFC 8200 §8.1",
+		"proto", res.Proto, "ip", res.IP, "dst", dst, "dnn", dnn,
+		"src", srcIP(pkt), "old_cksum", int(res.Old), "new_cksum", int(res.New))
+	if s.onL4Repair != nil {
+		s.onL4Repair(res.Proto, res.IP)
+	}
 }
 
 // New creates a GTP-U server with per-DNN TUN entries for N6 forwarding.
@@ -92,6 +157,13 @@ func New(cfg Config, logger *slog.Logger, sessions *pfcp.SessionTable, tunEntrie
 		return nil, fmt.Errorf("gtpu: listen: %w", err)
 	}
 
+	rcvBuf, sndBuf, err := setSocketBuffers(conn, cfg.SocketBufferBytes)
+	if err != nil {
+		logger.Warn("GTP-U socket buffer sizing failed", "error", err)
+	} else if cfg.SocketBufferBytes > 0 {
+		logger.Info("GTP-U socket buffers", "requested", cfg.SocketBufferBytes, "rcvbuf", rcvBuf, "sndbuf", sndBuf)
+	}
+
 	var tuns []tunRoute
 	for _, e := range tunEntries {
 		_, subnet, err := net.ParseCIDR(e.Subnet)
@@ -99,6 +171,7 @@ func New(cfg Config, logger *slog.Logger, sessions *pfcp.SessionTable, tunEntrie
 			return nil, fmt.Errorf("gtpu: DNN %q subnet %q: %w", e.DNN, e.Subnet, err)
 		}
 		rt := tunRoute{dnn: e.DNN, subnet: subnet, file: e.TunFile}
+		rt.resolveCounters()
 		if e.Subnet6 != "" {
 			_, subnet6, err := net.ParseCIDR(e.Subnet6)
 			if err != nil {
@@ -109,14 +182,117 @@ func New(cfg Config, logger *slog.Logger, sessions *pfcp.SessionTable, tunEntrie
 		tuns = append(tuns, rt)
 	}
 
-	return &Server{
+	srv := &Server{
 		cfg:      cfg,
 		logger:   logger.With("nf", "UPF", "component", "gtpu"),
 		conn:     conn,
 		sessions: sessions,
 		n3IP:     net.ParseIP(cfg.N3IP).To4(),
 		tuns:     tuns,
-	}, nil
+	}
+	srv.initCounters()
+	return srv, nil
+}
+
+// resolveCounters pre-resolves the per-DNN Prometheus children.
+func (r *tunRoute) resolveCounters() {
+	r.ulPkts = metrics.UPFGTPPacketsTotal.WithLabelValues("uplink")
+	r.dlPkts = metrics.UPFGTPPacketsTotal.WithLabelValues("downlink")
+	r.ulBytes = metrics.UPFGTPBytesTotal.WithLabelValues("uplink", r.dnn)
+	r.dlBytes = metrics.UPFGTPBytesTotal.WithLabelValues("downlink", r.dnn)
+}
+
+// initCounters pre-resolves the drop-reason children and caches whether the
+// logger emits DEBUG, so the datapath does no label lookup or log work per packet.
+func (s *Server) initCounters() {
+	s.debug = s.logger.Enabled(context.Background(), slog.LevelDebug)
+	s.dropNoSession = metrics.UPFPacketDropsTotal.WithLabelValues("no_session")
+	s.dropNoRoute = metrics.UPFPacketDropsTotal.WithLabelValues("no_route")
+	s.dropTunWrite = metrics.UPFPacketDropsTotal.WithLabelValues("tun_write_error")
+	s.dropSend = metrics.UPFPacketDropsTotal.WithLabelValues("gtpu_send_error")
+	s.dropDLNoSession = metrics.UPFPacketDropsTotal.WithLabelValues("dl_no_session")
+	s.dropDLNotReady = metrics.UPFPacketDropsTotal.WithLabelValues("dl_tunnel_not_ready")
+	for r := pfcp.DropGateClosed; r < pfcp.NumDropReasons; r++ {
+		s.dropQER[r] = metrics.UPFPacketDropsTotal.WithLabelValues(r.String())
+	}
+}
+
+// logLimitInterval bounds how often an event-driven datapath log repeats for
+// the same key (e.g. a TEID with no session under a packet flood).
+const logLimitInterval = 10 * time.Second
+
+// logLimiter allows one log record per key per logLimitInterval.
+type logLimiter struct{ last sync.Map } // key -> time.Time
+
+func (l *logLimiter) allow(key any) bool {
+	now := time.Now()
+	if v, ok := l.last.Load(key); ok && now.Sub(v.(time.Time)) < logLimitInterval {
+		return false
+	}
+	l.last.Store(key, now)
+	return true
+}
+
+// qosDrop counts a packet refused by QoS enforcement and emits the
+// rate-limited (1 per 10 s per SEID and direction) DEBUG event log. It never
+// logs at INFO and never per packet unguarded.
+// Ref: TS 29.244 §5.4.3 (gating), §5.4.4 (MBR), TS 23.501 §5.7.1.8.
+func (s *Server) qosDrop(sess *pfcp.Session, reason pfcp.DropReason, uplink bool) {
+	s.dropQER[reason].Inc()
+	if !s.debug {
+		return
+	}
+	dir := "DL"
+	if uplink {
+		dir = "UL"
+	}
+	if s.limiter.allow(qosLogKey{seid: sess.UPSEID, uplink: uplink}) {
+		specRef := specQERMBR
+		if reason == pfcp.DropGateClosed {
+			specRef = specQERGate
+		}
+		s.logger.Debug("QER policing drop (repeats suppressed 10s)",
+			"procedure", "AmbrEnforcement", "interface", "N3", "direction", dir,
+			"spec_ref", specRef, "seid", sess.UPSEID, "reason", reason.String(),
+			"result", "REJECT")
+	}
+}
+
+// Spec references of the policing-drop log, chosen by drop reason without
+// allocating. Ref: TS 29.244 §5.4.3 (gating), §5.4.4 (MBR).
+const (
+	specQERGate = "TS 29.244 §5.4.3"
+	specQERMBR  = "TS 29.244 §5.4.4"
+)
+
+// qosLogKey keys the policing-drop log limiter.
+type qosLogKey struct {
+	seid   uint64
+	uplink bool
+}
+
+// AdmitUL polices an uplink inner IP packet of n octets against the session's
+// QERs (gate + MBR + Session-AMBR) and counts the drop. It is the hook
+// handlePacket uses before the URR volume count, the TUN write and the
+// ICMP-to-self reply. Zero allocations.
+// Ref: TS 23.501 §5.7.1.8, TS 29.244 §5.4.3, §5.4.4.
+func (s *Server) AdmitUL(sess *pfcp.Session, n int) bool {
+	ok, reason := sess.AdmitUL(n)
+	if !ok {
+		s.qosDrop(sess, reason, true)
+	}
+	return ok
+}
+
+// AdmitDL polices a downlink inner IP packet of n octets read from the N6 TUN,
+// counting the drop. UPF-originated downlink traffic (Router Advertisements,
+// ICMP echo replies via sendGTPU) does not pass through it and is exempt.
+func (s *Server) AdmitDL(sess *pfcp.Session, n int) bool {
+	ok, reason := sess.AdmitDL(n)
+	if !ok {
+		s.qosDrop(sess, reason, false)
+	}
+	return ok
 }
 
 // SetPFCPServer wires the PFCP server so a decapsulated Router Solicitation
@@ -164,34 +340,31 @@ func (s *Server) Start(ctx context.Context) error {
 		go s.startTUNReader(ctx, t)
 	}
 
+	// A watcher closes the socket on shutdown, which unblocks the read below;
+	// a per-packet SetReadDeadline would cost a syscall-sized timer reset per datagram.
+	go func() {
+		<-ctx.Done()
+		s.conn.Close()
+	}()
+
 	buf := make([]byte, 4096)
 	for {
-		select {
-		case <-ctx.Done():
-			return s.conn.Close()
-		default:
-		}
-
-		s.conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, raddr, err := s.conn.ReadFromUDP(buf)
+		n, _, err := s.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			s.logger.Error("GTP-U read error", "error", err)
 			continue
 		}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		s.handlePacket(raddr, pkt)
+		// handlePacket is synchronous and nothing it calls retains pkt (the RS
+		// path copies the source address), so the receive buffer is reused.
+		s.handlePacket(buf[:n])
 	}
 }
 
-func (s *Server) handlePacket(raddr *net.UDPAddr, pkt []byte) {
+func (s *Server) handlePacket(pkt []byte) {
 	if len(pkt) < gtpuMinHdr {
 		return
 	}
@@ -201,7 +374,9 @@ func (s *Server) handlePacket(raddr *net.UDPAddr, pkt []byte) {
 	teid := binary.BigEndian.Uint32(pkt[4:8])
 
 	if msgType != msgTypeTPDU {
-		s.logger.Debug("GTP-U non-TPDU message", "type", msgType)
+		if s.debug {
+			s.logger.Debug("GTP-U non-TPDU message", "type", msgType)
+		}
 		return
 	}
 
@@ -235,17 +410,31 @@ func (s *Server) handlePacket(raddr *net.UDPAddr, pkt []byte) {
 
 	sess := s.sessions.GetByULTEID(teid)
 	if sess == nil {
-		s.logger.Info("GTP-U no session for TEID", "teid", teid)
-		metrics.UPFPacketDropsTotal.WithLabelValues("no_session").Inc()
+		if s.limiter.allow(teid) {
+			s.logger.Info("GTP-U no session for TEID (repeats suppressed 10s)", "teid", teid,
+				"procedure", "GtpuForwarding", "interface", "N3", "direction", "IN",
+				"spec_ref", "TS 29.281 §5.1", "result", "REJECT")
+		}
+		s.dropNoSession.Inc()
 		return
 	}
 
-	s.logger.Info("GTP-U T-PDU received",
-		"ulTEID", teid, "ueIP", sess.UEIP, "innerLen", len(inner))
+	if s.debug {
+		s.logger.Debug("GTP-U T-PDU received",
+			"procedure", "GtpuForwarding", "interface", "N3", "direction", "IN",
+			"spec_ref", "TS 29.281 §5.1",
+			"ulTEID", teid, "ueIP", sess.UEIP, "innerLen", len(inner))
+	}
+
+	// QoS enforcement (gating + MBR + Session-AMBR) comes first: a policed
+	// packet is neither forwarded nor measured. Ref: TS 29.244 §5.4.3, §5.4.4.
+	if !s.AdmitUL(sess, len(inner)) {
+		return
+	}
 
 	// Uplink usage measurement (TS 29.244 §5.2.2.4, VOLUM method). Counts
-	// every uplink T-PDU regardless of downstream path (TUN-forwarded or
-	// ICMP-to-self both originate on N3 as uplink traffic).
+	// every admitted uplink T-PDU regardless of downstream path (TUN-forwarded
+	// or ICMP-to-self both originate on N3 as uplink traffic).
 	sess.AddULVolume(len(inner))
 
 	// Branch by IP version. IPv6 (TS 23.501 §5.8.2.2): RS → Router
@@ -313,17 +502,24 @@ func (s *Server) handleInnerIPv6(sess *pfcp.Session, inner []byte) {
 	// N6 bridge and ip6tables MASQUERADEs the source. Ref: TS 23.501 §5.8.2.2.
 	rt := s.tunRouteForIPv6(srcIP)
 	if rt == nil {
-		s.logger.Debug("GTP-U no IPv6 TUN for UE prefix, dropping", "src", srcIP, "dst", dstIP,
-			"ueIPv6", sess.UEIPv6)
-		metrics.UPFPacketDropsTotal.WithLabelValues("no_route").Inc()
+		if s.debug {
+			s.logger.Debug("GTP-U no IPv6 TUN for UE prefix, dropping", "src", srcIP, "dst", dstIP,
+				"ueIPv6", sess.UEIPv6)
+		}
+		s.dropNoRoute.Inc()
 		return
 	}
 	if _, err := rt.file.Write(inner); err != nil {
-		s.logger.Error("GTP-U IPv6 TUN write", "error", err, "src", srcIP, "dst", dstIP)
+		if s.limiter.allow("tunwrite6") {
+			s.logger.Error("GTP-U IPv6 TUN write (repeats suppressed 10s)", "error", err, "src", srcIP, "dst", dstIP)
+		}
+		s.dropTunWrite.Inc()
 	} else {
-		s.logger.Debug("GTP-U → TUN (IPv6)", "src", srcIP, "dst", dstIP, "len", len(inner))
-		metrics.UPFGTPPacketsTotal.WithLabelValues("uplink").Inc()
-		metrics.UPFGTPBytesTotal.WithLabelValues("uplink", rt.dnn).Add(float64(len(inner)))
+		if s.debug {
+			s.logger.Debug("GTP-U → TUN (IPv6)", "src", srcIP, "dst", dstIP, "len", len(inner))
+		}
+		rt.ulPkts.Inc()
+		rt.ulBytes.Add(float64(len(inner)))
 	}
 }
 
@@ -361,18 +557,30 @@ func (s *Server) processInnerIP(sess *pfcp.Session, inner []byte) {
 	srcIP := net.IP(inner[12:16])
 	rt := s.tunRouteForIP(srcIP)
 	if rt == nil {
-		s.logger.Debug("GTP-U no TUN for UE subnet, dropping", "src", srcIP, "dst", dstIP)
-		metrics.UPFPacketDropsTotal.WithLabelValues("no_route").Inc()
+		if s.debug {
+			s.logger.Debug("GTP-U no TUN for UE subnet, dropping", "src", srcIP, "dst", dstIP)
+		}
+		s.dropNoRoute.Inc()
 		return
 	}
 	if _, err := rt.file.Write(inner); err != nil {
-		s.logger.Error("GTP-U TUN write", "error", err, "src", srcIP, "dst", dstIP)
+		if s.limiter.allow("tunwrite4") {
+			s.logger.Error("GTP-U TUN write (repeats suppressed 10s)", "error", err, "src", srcIP, "dst", dstIP)
+		}
+		s.dropTunWrite.Inc()
 	} else {
-		s.logger.Debug("GTP-U → TUN", "src", srcIP, "dst", dstIP, "len", len(inner))
-		metrics.UPFGTPPacketsTotal.WithLabelValues("uplink").Inc()
-		metrics.UPFGTPBytesTotal.WithLabelValues("uplink", rt.dnn).Add(float64(len(inner)))
+		if s.debug {
+			s.logger.Debug("GTP-U → TUN", "src", srcIP, "dst", dstIP, "len", len(inner))
+		}
+		rt.ulPkts.Inc()
+		rt.ulBytes.Add(float64(len(inner)))
 	}
 }
+
+// dlHeadroom is the room left in front of each TUN read for the DL GTP-U
+// header (8 octets) and the NG-U extension block (8 octets), so the packet is
+// encapsulated in place without a copy. Ref: TS 29.281 §5.1, §5.2.1.
+const dlHeadroom = gtpuMinHdr + 8
 
 // startTUNReader reads IP packets from a DNN TUN (N6 downlink) and encapsulates
 // them in GTP-U. Each DNN runs its own goroutine.
@@ -382,10 +590,10 @@ func (s *Server) startTUNReader(ctx context.Context, t tunRoute) {
 		t.file.Close()
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, dlHeadroom+4096)
 	s.logger.Info("GTP-U TUN reader started (N6 downlink)", "dnn", t.dnn)
 	for {
-		n, err := t.file.Read(buf)
+		n, err := t.file.Read(buf[dlHeadroom:])
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -396,45 +604,89 @@ func (s *Server) startTUNReader(ctx context.Context, t tunRoute) {
 		if n < 1 {
 			continue
 		}
+		s.handleTUNPacket(&t, buf, n)
+	}
+}
 
-		// Look up the session by the packet's destination UE address (after
-		// conntrack un-DNAT): IPv4 dst at [16:20] matched exactly; IPv6 dst at
-		// [24:40] matched by delegated /64 (the UE's SLAAC IID is its own).
-		var sess *pfcp.Session
-		var dstIP net.IP
-		switch buf[0] >> 4 {
-		case 4:
-			if n < 20 {
-				continue
-			}
-			dstIP = net.IP(buf[16:20])
-			sess = s.sessions.GetByUEIP(dstIP)
-		case 6:
-			if n < 40 {
-				continue
-			}
-			dstIP = net.IP(buf[24:40])
-			sess = s.sessions.GetByUEIPv6Prefix(dstIP)
-		default:
+// InjectDownlink feeds one downlink IP packet through exactly the path a packet
+// read from the DNN's N6 TUN takes (session lookup, QoS admission, checksum
+// repair, GTP-U encapsulation, send) and reports whether a datagram went to the
+// gNB. It allocates and exists for tests and tools; the TUN reader calls
+// handleTUNPacket directly. An unknown dnn returns false.
+func (s *Server) InjectDownlink(dnn string, ipPkt []byte) bool {
+	for i := range s.tuns {
+		if s.tuns[i].dnn != dnn {
 			continue
 		}
-		if sess == nil {
+		buf := make([]byte, dlHeadroom+len(ipPkt))
+		copy(buf[dlHeadroom:], ipPkt)
+		return s.handleTUNPacket(&s.tuns[i], buf, len(ipPkt))
+	}
+	return false
+}
+
+// handleTUNPacket processes one downlink IP packet of n octets that the TUN
+// reader left at buf[dlHeadroom:dlHeadroom+n]: session lookup, QoS admission,
+// checksum repair and in-place GTP-U encapsulation. It reports whether the
+// packet was sent to the gNB.
+func (s *Server) handleTUNPacket(t *tunRoute, buf []byte, n int) bool {
+	pkt := buf[dlHeadroom : dlHeadroom+n]
+
+	// Look up the session by the packet's destination UE address (after
+	// conntrack un-DNAT): IPv4 dst at [16:20] matched exactly; IPv6 dst at
+	// [24:40] matched by delegated /64 (the UE's SLAAC IID is its own).
+	var sess *pfcp.Session
+	var dstIP net.IP
+	switch pkt[0] >> 4 {
+	case 4:
+		if n < 20 {
+			return false
+		}
+		dstIP = net.IP(pkt[16:20])
+		sess = s.sessions.GetByUEIP(dstIP)
+	case 6:
+		if n < 40 {
+			return false
+		}
+		dstIP = net.IP(pkt[24:40])
+		sess = s.sessions.GetByUEIPv6Prefix(dstIP)
+	default:
+		return false
+	}
+	if sess == nil {
+		if s.debug {
 			s.logger.Debug("TUN: no session for dst", "dnn", t.dnn, "dst", dstIP)
-			continue
 		}
-		if sess.DLTEID == 0 || sess.GNBIP == nil {
-			s.logger.Warn("TUN: DL tunnel not ready", "dnn", t.dnn, "ueIP", dstIP)
-			continue
+		s.dropDLNoSession.Inc()
+		return false
+	}
+	if sess.DLTEID == 0 || sess.GNBIP == nil {
+		if s.limiter.allow(sess.DLTEID) {
+			s.logger.Warn("TUN: DL tunnel not ready (repeats suppressed 10s)", "dnn", t.dnn, "ueIP", dstIP.String())
 		}
+		s.dropDLNotReady.Inc()
+		return false
+	}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		s.sendGTPU(sess, pkt)
-		metrics.UPFGTPPacketsTotal.WithLabelValues("downlink").Inc()
-		metrics.UPFGTPBytesTotal.WithLabelValues("downlink", t.dnn).Add(float64(n))
+	// QoS enforcement (gating + MBR + Session-AMBR) before any rewriting or
+	// sending, so a policed packet costs nothing and is not measured by the URR
+	// (AddDLVolume lives in sendFrame). Ref: TS 29.244 §5.4.3, §5.4.4.
+	if !s.AdmitDL(sess, n) {
+		return false
+	}
+
+	s.repairDownlinkChecksum(pkt, dstIP, t.dnn)
+	putDLHeader(buf[:dlHeadroom], sess.DLTEID, sess.DLQFI(), n)
+	if !s.sendFrame(sess, buf[:dlHeadroom+n], n) {
+		return false
+	}
+	t.dlPkts.Inc()
+	t.dlBytes.Add(float64(n))
+	if s.debug {
 		s.logger.Debug("TUN → GTP-U", "dnn", t.dnn, "dst", dstIP,
 			"dlTEID", sess.DLTEID, "gnb", sess.GNBIP)
 	}
+	return true
 }
 
 // handleICMPToSelf replies to ICMP echo requests addressed to the UPF's N3 IP.
@@ -515,33 +767,60 @@ func buildDLPDUSessionContainer(qfi uint8) []byte {
 	}
 }
 
-// sendGTPU encapsulates innerIP in a GTP-U T-PDU and sends it to the gNB.
+// putDLHeader writes the 16-octet DL encapsulation into h: the mandatory GTP-U
+// header (flags 0x34 = v1, PT=1, E=1; T-PDU; length; DL TEID) followed by the
+// NG-U PDU Session Container block of buildDLPDUSessionContainer, byte for byte.
+// Ref: TS 29.281 §5.1, §5.2.1; TS 38.415 §5.5.2.1.
+func putDLHeader(h []byte, dlTEID uint32, qfi uint8, innerLen int) {
+	h[0] = 0x34
+	h[1] = msgTypeTPDU
+	binary.BigEndian.PutUint16(h[2:4], uint16(8+innerLen)) // ext block (8) + inner
+	binary.BigEndian.PutUint32(h[4:8], dlTEID)
+	h[8], h[9], h[10] = 0x00, 0x00, 0x00 // seq (unused), N-PDU (unused)
+	h[11] = extHdrTypePDUSessionContainer
+	h[12] = 0x01 // ext length: 1 * 4 octets
+	h[13] = pduSessionContainerDL
+	h[14] = qfi & 0x3F
+	h[15] = 0x00 // no further extension
+}
+
+// sendGTPU encapsulates innerIP in a GTP-U T-PDU and sends it to the gNB. It
+// copies innerIP once; the TUN reader avoids that copy via sendFrame.
 func (s *Server) sendGTPU(sess *pfcp.Session, innerIP []byte) {
-	gnbAddr := &net.UDPAddr{IP: sess.GNBIP, Port: gtpuPort}
+	frame := make([]byte, dlHeadroom+len(innerIP))
+	copy(frame[dlHeadroom:], innerIP)
+	putDLHeader(frame, sess.DLTEID, sess.DLQFI(), len(innerIP))
+	s.sendFrame(sess, frame, len(innerIP))
+}
 
-	ext := buildDLPDUSessionContainer(sess.QER.QFI)
-
-	hdr := make([]byte, gtpuMinHdr)
-	hdr[0] = 0x34 // version=1, PT=1, E=1 (extension headers present), S=0, PN=0
-	hdr[1] = msgTypeTPDU
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(len(ext)+len(innerIP)))
-	binary.BigEndian.PutUint32(hdr[4:8], sess.DLTEID)
-
-	pkt := make([]byte, 0, len(hdr)+len(ext)+len(innerIP))
-	pkt = append(pkt, hdr...)
-	pkt = append(pkt, ext...)
-	pkt = append(pkt, innerIP...)
-	if _, err := s.conn.WriteToUDP(pkt, gnbAddr); err != nil {
-		s.logger.Error("GTP-U send", "error", err, "gnb", gnbAddr)
-		return
+// sendFrame sends an already encapsulated DL frame (innerLen inner octets) to
+// the session's gNB and accounts the DL usage volume. It reports success.
+func (s *Server) sendFrame(sess *pfcp.Session, frame []byte, innerLen int) bool {
+	gnb, ok := netip.AddrFromSlice(sess.GNBIP)
+	if !ok {
+		s.dropSend.Inc()
+		return false
+	}
+	if _, err := s.conn.WriteToUDPAddrPort(frame, netip.AddrPortFrom(gnb.Unmap(), gtpuPort)); err != nil {
+		if s.limiter.allow("send") {
+			s.logger.Error("GTP-U send (repeats suppressed 10s)", "error", err, "gnb", sess.GNBIP.String())
+		}
+		s.dropSend.Inc()
+		return false
 	}
 
 	// Downlink usage measurement (TS 29.244 §5.2.2.4, VOLUM method). This is
 	// the single choke point for all DL sends (TUN reader + ICMP responder),
 	// so counting here avoids double-counting session volume.
-	sess.AddDLVolume(len(innerIP))
+	sess.AddDLVolume(innerLen)
 
-	s.logger.Info("GTP-U DL sent", "dlTEID", sess.DLTEID, "gnbIP", sess.GNBIP, "qfi", sess.QER.QFI, "len", len(innerIP))
+	if s.debug {
+		s.logger.Debug("GTP-U DL sent",
+			"procedure", "GtpuForwarding", "interface", "N3", "direction", "OUT",
+			"spec_ref", "TS 29.281 §5.1",
+			"dlTEID", sess.DLTEID, "gnbIP", sess.GNBIP, "qfi", sess.DLQFI(), "len", innerLen)
+	}
+	return true
 }
 
 // ipChecksum computes the one's complement checksum over data.
@@ -558,4 +837,13 @@ func ipChecksum(data []byte) [2]byte {
 	}
 	s := uint16(^sum)
 	return [2]byte{byte(s >> 8), byte(s)}
+}
+
+// srcIP returns the source address of an IPv4/IPv6 packet (aliasing pkt);
+// only called on the rare repair path. Callers guarantee a validated header.
+func srcIP(pkt []byte) net.IP {
+	if pkt[0]>>4 == 6 {
+		return net.IP(pkt[8:24])
+	}
+	return net.IP(pkt[12:16])
 }

@@ -41,6 +41,8 @@ type subscribedQoS struct {
 	ARPPreemptVuln string
 	AMBRULMbps     int
 	AMBRDLMbps     int
+	AMBRULKbps     uint64 // exact kbps (0 = derive from Mbps)
+	AMBRDLKbps     uint64
 }
 
 // fetchSubscribedQoS calls Nudm_SDM Get sm-data (N10) and extracts the
@@ -106,9 +108,9 @@ func (s *Server) fetchSubscribedQoS(ctx context.Context, supi, dnn string, slice
 			ARPPriority:    cfg.QoSProfile.ARP.PriorityLevel,
 			ARPPreemptCap:  cfg.QoSProfile.ARP.PreemptCap,
 			ARPPreemptVuln: cfg.QoSProfile.ARP.PreemptVuln,
-			AMBRULMbps:     parseMbps(cfg.SessionAMBR.Uplink, 100),
-			AMBRDLMbps:     parseMbps(cfg.SessionAMBR.Downlink, 100),
 		}
+		q.AMBRULKbps, q.AMBRULMbps = parseAMBR(cfg.SessionAMBR.Uplink, 100_000, 100)
+		q.AMBRDLKbps, q.AMBRDLMbps = parseAMBR(cfg.SessionAMBR.Downlink, 100_000, 100)
 		s.logger.Info("UDM: subscribed default QoS fetched",
 			"supi", supi, "dnn", dnn,
 			"5qi", q.FiveQI, "ambr_ul_mbps", q.AMBRULMbps, "ambr_dl_mbps", q.AMBRDLMbps,
@@ -250,6 +252,7 @@ func (s *Server) handleMgmtGetSession(w http.ResponseWriter, r *http.Request) {
 
 	sess := sessions[0]
 	view := s.sessionToView(refs[0], sess)
+	mbrUlKbps, mbrDlKbps := sessionAMBRKbps(sess)
 	resp := map[string]any{
 		"session": view,
 		"qosFlows": []map[string]any{{
@@ -259,13 +262,29 @@ func (s *Server) handleMgmtGetSession(w http.ResponseWriter, r *http.Request) {
 		}},
 		// SMF-side view of the QER installed in the UPF (TS 29.244 §7.5.2.5).
 		"pfcpQer": map[string]any{
-			"qerId":     1,
-			"qfi":       1,
+			"qerId": 1,
+			// Legacy field kept for portal/MCP backward compatibility: QER 1 no
+			// longer carries a QFI on N4; qfi here is the default flow it governs.
+			"qfi":       defaultQFI,
 			"gateUl":    "OPEN",
 			"gateDl":    "OPEN",
-			"mbrUlKbps": sess.AMBRULMbps * 1000,
-			"mbrDlKbps": sess.AMBRDLMbps * 1000,
+			"mbrUlKbps": mbrUlKbps,
+			"mbrDlKbps": mbrDlKbps,
 			"seid":      sess.SEID,
+		},
+		// Both QERs installed in the UPF (TS 29.244 §7.5.2.5): the Session-AMBR
+		// QER (MBR, no QFI) and the default QoS-flow QER (QFI, no MBR).
+		"pfcpQers": []map[string]any{
+			{
+				"qerId": sessionAMBRQERID, "role": "session-ambr",
+				"gateUl": "OPEN", "gateDl": "OPEN",
+				"mbrUlKbps": mbrUlKbps, "mbrDlKbps": mbrDlKbps,
+				"seid": sess.SEID,
+			},
+			{
+				"qerId": defaultFlowQERID, "role": "qos-flow", "qfi": defaultQFI,
+				"gateUl": "OPEN", "gateDl": "OPEN", "seid": sess.SEID,
+			},
 		},
 	}
 	w.Header().Set("Content-Type", "application/json")

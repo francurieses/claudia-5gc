@@ -100,6 +100,12 @@ func main() {
 		}
 	}()
 
+	// ---- PFCP node-level supervision (SMF-004) ---------------------------
+	// SMF-initiated Association Setup + Heartbeat towards the UPF; restart /
+	// failure detection releases the affected PDU sessions.
+	// Ref: TS 29.244 §6.2.2, §6.2.6.2; TS 23.527 §4.2, §4.3.
+	go sbiSrv.RunPFCPNodeSupervisor(ctx)
+
 	// ---- NRF registration + heartbeat ------------------------------------
 	if cfg.Peers.NRF != "" {
 		var httpClient *http.Client

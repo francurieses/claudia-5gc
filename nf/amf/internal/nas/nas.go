@@ -53,7 +53,7 @@ type Sender interface {
 	SendPDUSessionResourceModifyRequest(ue *amfctx.UEContext, pduSessionID uint8, nasPDU []byte, n2SmInfo []byte) error
 	// SendUEContextReleaseCommandForUE releases the N2 context at the gNB (AMF-initiated).
 	// causePresent/causeValue use NGAP Cause group/value constants (TS 38.413 §9.3.1.2).
-	// No-op if the UE is already CM-IDLE. Ref: TS 38.413 §8.3.5
+	// No-op if the UE is already CM-IDLE. Ref: TS 38.413 §8.3.3
 	SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePresent int, causeValue int64) error
 }
 
@@ -158,6 +158,18 @@ func NewHandler(sender Sender, reg *procedures.RegistrationHandler, logger *slog
 		sender: sender,
 		reg:    reg,
 		logger: logger.With("component", "nas-handler"),
+	}
+}
+
+// notifyUEReachable drops the paged PDU session set (a UE reaching CM-CONNECTED
+// by any path ends the network-triggered paging, mirroring PendingN1N2) and
+// then fires the registered reachability callback. Service Request consumes
+// the set in activatePDUSessions before calling this.
+// Ref: TS 23.502 §4.2.3.3, TS 23.501 §5.3.2
+func (h *Handler) notifyUEReachable(ue *amfctx.UEContext) {
+	ue.TakePagedPDUSessions()
+	if h.onUEReachable != nil {
+		h.onUEReachable(ue)
 	}
 }
 
@@ -555,7 +567,7 @@ func (h *Handler) handleSecurityModeComplete(
 	kgnbBytes := kdf.KgNB(ue.SecurityCtx.KAMF, ue.SecurityCtx.UplinkCount-1, 0x01)
 	var secKey [32]byte
 	copy(secKey[:], kgnbBytes)
-	ue.KgNB = secKey
+	ue.SetKgNB(secKey) // also restarts the NH chain, TS 33.501 §6.9.2.1.1
 
 	// Build UE security capability bitmasks for NGAP from what the UE reported
 	// in the RegistrationRequest (UESecurityCapability IE).
@@ -651,9 +663,7 @@ func (h *Handler) handleRegistrationComplete(
 
 	// UE is registered and CM-CONNECTED — cancel the CM-IDLE reachability
 	// watchdogs (re-armed on AN Release). Ref: TS 23.501 §5.3.2
-	if h.onUEReachable != nil {
-		h.onUEReachable(ue)
-	}
+	h.notifyUEReachable(ue)
 
 	// Step 17b delivery: if the PCF provided a UE policy container during Phase3,
 	// deliver it now via the UE policy delivery service (DL NAS TRANSPORT, payload
@@ -1075,7 +1085,7 @@ func (h *Handler) handleServiceRequest(
 	kgnbBytes := kdf.KgNB(ue.SecurityCtx.KAMF, srCount, 0x01)
 	var kgnb [32]byte
 	copy(kgnb[:], kgnbBytes)
-	ue.KgNB = kgnb
+	ue.SetKgNB(kgnb) // also restarts the NH chain, TS 33.501 §6.9.2.1.1
 
 	// Rebuild UE security capability bitmaps from the stored capabilities.
 	var encAlgs, intAlgs uint16
@@ -1104,12 +1114,26 @@ func (h *Handler) handleServiceRequest(
 	// upCnxState=ACTIVATING) so the ICS Request below carries the N2SM info
 	// that directly re-establishes user-plane resources at the gNB.
 	// Ref: TS 23.502 §4.2.3.2 steps 4/12, TS 29.502 §5.2.2.3.2.2
-	pduSessions := h.activatePDUSessions(ctx, ue, svcReq.UplinkDataStatus, log)
+	//
+	// First, PDU sessions the UE reports as PDU SESSION INACTIVE in the PDU
+	// session status IE are released locally in the AMF and at the SMF, so
+	// they are never re-activated. Ref: TS 24.501 §5.6.1.4.1
+	released := h.releaseInactivePDUSessions(ctx, ue, svcReq.PDUSessionStatus)
+	pduSessions := h.activatePDUSessions(ctx, ue, svcReq.UplinkDataStatus, released, log)
 
-	// Encode Service Accept (empty body, ciphered SHT=0x02).
-	// Ref: TS 24.501 §8.2.16
+	// Build the Service Accept: PDU session status (IEI 0x50) when the SR had
+	// one, PDU session reactivation result (IEI 0x26) when the SR had Uplink
+	// data status. Ref: TS 24.501 §5.6.1.4.1, §8.2.17
+	accept := buildServiceAccept(ue, svcReq, released, pduSessions)
+	log.Info("Service Accept built",
+		"message_type", "ServiceAccept",
+		"pdu_session_status_ie", accept.PDUSessionStatus != nil,
+		"reactivation_result_ie", accept.PDUSessionReactivationResult != nil,
+		"released_locally", len(released),
+		"spec_ref", "TS 24.501 §5.6.1.4.1",
+	)
 	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement,
-		nas.MsgTypeServiceAccept, &nas.ServiceAccept{})
+		nas.MsgTypeServiceAccept, accept)
 	if err != nil {
 		return fmt.Errorf("service request: encode Service Accept: %w", err)
 	}
@@ -1137,9 +1161,7 @@ func (h *Handler) handleServiceRequest(
 
 	// UE is back to CM-CONNECTED — cancel the CM-IDLE reachability watchdogs
 	// (re-armed on AN Release). Ref: TS 23.501 §5.3.2
-	if h.onUEReachable != nil {
-		h.onUEReachable(ue)
-	}
+	h.notifyUEReachable(ue)
 
 	log.Info("Service Request accepted — UE back to CM-CONNECTED",
 		"result", "OK",
@@ -1148,18 +1170,181 @@ func (h *Handler) handleServiceRequest(
 	return nil
 }
 
+// releaseInactivePDUSessionReason tags the local releases triggered by the
+// UE's PDU session status IE in logs and in the NW-release completion path.
+const releaseInactivePDUSessionReason = "UE_PDU_SESSION_STATUS_INACTIVE"
+
+// releaseInactivePDUSessions performs the local release required when a
+// Service Request carries a PDU session status IE: every PDU session that is
+// established on the AMF side (has an SM context) but that the UE reports as
+// PDU SESSION INACTIVE is removed from the UE context, and the SMF is asked
+// to release the SM context (Nsmf_PDUSession_ReleaseSMContext, sent
+// asynchronously on a detached context so the Service Request is not
+// delayed). A session already in a NW-initiated release is completed through
+// that path instead. Returns the set of released PSIs (nil when the IE was
+// absent or nothing was released).
+// Ref: TS 24.501 §5.6.1.4.1, TS 23.502 §4.2.3.2, TS 29.502 §5.2.2.4
+func (h *Handler) releaseInactivePDUSessions(
+	ctx context.Context, ue *amfctx.UEContext, pduSessionStatus *uint16) map[uint8]struct{} {
+
+	if pduSessionStatus == nil {
+		return nil
+	}
+	type victim struct {
+		psi uint8
+		ref string
+	}
+	var victims []victim
+	ue.Lock()
+	for psi, sess := range ue.PDUSessions {
+		if sess.SMFInstanceID == "" || nas.PSIInStatus(*pduSessionStatus, psi) {
+			continue // not established on the AMF side, or active at the UE
+		}
+		victims = append(victims, victim{psi: psi, ref: sess.SMFInstanceID})
+	}
+	ue.Unlock()
+	if len(victims) == 0 {
+		return nil
+	}
+	sort.Slice(victims, func(i, j int) bool { return victims[i].psi < victims[j].psi })
+
+	base := h.logger
+	if base == nil {
+		base = slog.Default()
+	}
+	log := base.With("nf", "AMF", "procedure", "ServiceRequestLocalPDUSessionRelease",
+		"supi", ue.SUPI, "amf_ue_ngap_id", ue.AMFUENGAPId)
+
+	smfDel, canDel := h.sender.(interface {
+		DeleteSMContext(ctx context.Context, smContextRef string) error
+	})
+	detached := context.WithoutCancel(ctx)
+	released := make(map[uint8]struct{}, len(victims))
+	for _, v := range victims {
+		released[v.psi] = struct{}{}
+		log.Info("PDU session reported inactive by UE — releasing locally",
+			"interface", "N1", "direction", "IN",
+			"pdu_session_id", v.psi,
+			"smContextRef", v.ref,
+			"result", "OK",
+			"spec_ref", "TS 24.501 §5.6.1.4.1",
+		)
+		metrics.ProcedureTotal.WithLabelValues("AMF", "ServiceRequestLocalPDUSessionRelease", "OK").Inc()
+
+		// A NW-initiated release already in flight owns the SM context
+		// deletion and the UE-context cleanup — finish it now.
+		if _, pending := h.pendingRelease.Load(pendingReleaseKey(ue.AMFUENGAPId, v.psi)); pending {
+			go h.completeNetworkPDUSessionRelease(detached, ue, v.psi, releaseInactivePDUSessionReason)
+			continue
+		}
+
+		ue.Lock()
+		delete(ue.PDUSessions, v.psi)
+		ue.Unlock()
+
+		if !canDel {
+			log.Warn("no SMF client wired — SM context of UE-inactive PDU session not released at the SMF",
+				"interface", "Nsmf", "direction", "OUT",
+				"pdu_session_id", v.psi, "smContextRef", v.ref,
+				"result", "FAILURE",
+				"spec_ref", "TS 29.502 §5.2.2.4",
+			)
+			continue
+		}
+		ref, psi := v.ref, v.psi
+		delCtx, cancel := context.WithTimeout(detached, releaseSMContextTimeout)
+		go func() {
+			defer cancel()
+			if err := smfDel.DeleteSMContext(delCtx, ref); err != nil {
+				log.Warn("SMF SM context release failed for UE-inactive PDU session",
+					"interface", "Nsmf", "direction", "OUT",
+					"pdu_session_id", psi, "smContextRef", ref,
+					"result", "FAILURE", "error", err,
+					"spec_ref", "TS 29.502 §5.2.2.4",
+				)
+				return
+			}
+			log.Info("SMF SM context released for UE-inactive PDU session",
+				"interface", "Nsmf", "direction", "OUT",
+				"pdu_session_id", psi, "smContextRef", ref,
+				"result", "OK",
+				"spec_ref", "TS 29.502 §5.2.2.4",
+			)
+		}()
+	}
+	if h.reg != nil {
+		h.reg.PersistUE(ctx, ue)
+	}
+	return released
+}
+
+// buildServiceAccept fills the Service Accept optional IEs from the Service
+// Request and the activation outcome:
+//   - PDU session status (0x50) iff the SR carried one: the PDU sessions
+//     still established in the AMF after the local release.
+//   - PDU session reactivation result (0x26) iff the SR carried Uplink data
+//     status: for each PSI the UE flagged, bit = 1 when its user-plane
+//     resources are not being re-established (not in the ICS
+//     PDUSessionResourceSetupListCxtReq), 0 otherwise.
+//
+// Ref: TS 24.501 §5.6.1.4.1, §8.2.17.1.1, §9.11.3.44, §9.11.3.42
+func buildServiceAccept(ue *amfctx.UEContext, svcReq *nas.ServiceRequest,
+	released map[uint8]struct{}, activated []ngap.PDUSessionSetupItemCxtReq) *nas.ServiceAccept {
+
+	accept := &nas.ServiceAccept{}
+	if svcReq.PDUSessionStatus != nil {
+		var active []uint8
+		ue.Lock()
+		for psi, sess := range ue.PDUSessions {
+			if sess.SMFInstanceID == "" {
+				continue
+			}
+			if _, gone := released[psi]; gone {
+				continue
+			}
+			active = append(active, psi)
+		}
+		ue.Unlock()
+		m := nas.PSIMask(active...)
+		accept.PDUSessionStatus = &m
+	}
+	if svcReq.UplinkDataStatus != nil {
+		ok := make(map[uint8]struct{}, len(activated))
+		for _, it := range activated {
+			ok[it.PDUSessionID] = struct{}{}
+		}
+		var failed []uint8
+		for psi := uint8(1); psi <= 15; psi++ {
+			if !nas.PSIInStatus(*svcReq.UplinkDataStatus, psi) {
+				continue
+			}
+			if _, done := ok[psi]; !done {
+				failed = append(failed, psi)
+			}
+		}
+		m := nas.PSIMask(failed...)
+		accept.PDUSessionReactivationResult = &m
+	}
+	return accept
+}
+
 // activatePDUSessions resolves the PDU sessions flagged in the Service
-// Request's Uplink Data Status and fetches each session's
+// Request's Uplink Data Status, plus the PDU sessions whose downlink data
+// triggered paging (UE context paged set, TS 23.502 §4.2.3.3 step 6), and fetches each session's
 // PDUSessionResourceSetupRequestTransfer from the SMF (upCnxState=ACTIVATING).
+// PSIs in released were just released locally because the UE reported them
+// inactive (releaseInactivePDUSessions) and are never activated.
 // Returns the PDUSessionResourceSetupListCxtReq items for the ICS Request, in
 // ascending PSI order. Failures are non-fatal per session: the Service Request
 // still completes and the UE can fall back to UE-requested re-establishment.
 // Ref: TS 23.502 §4.2.3.2 steps 4/12, TS 29.502 §5.2.2.3.2.2
 func (h *Handler) activatePDUSessions(
 	ctx context.Context, ue *amfctx.UEContext,
-	uplinkDataStatus *uint16, log *slog.Logger) []ngap.PDUSessionSetupItemCxtReq {
+	uplinkDataStatus *uint16, released map[uint8]struct{}, log *slog.Logger) []ngap.PDUSessionSetupItemCxtReq {
 
-	if uplinkDataStatus == nil {
+	// Always consume the paged set so it never leaks into a later Service Request.
+	paged := ue.TakePagedPDUSessions()
+	if uplinkDataStatus == nil && len(paged) == 0 {
 		return nil // signalling-only Service Request — nothing to re-activate
 	}
 	activator, ok := h.sender.(interface {
@@ -1175,12 +1360,65 @@ func (h *Handler) activatePDUSessions(
 		sst uint8
 		sd  string
 	}
+	// plog carries the paged-session step reference; derived from the base
+	// logger because log already holds procedure and spec_ref.
+	base := h.logger
+	if base == nil {
+		base = slog.Default()
+	}
+	plog := base.With("nf", "AMF", "procedure", "NetworkTriggeredServiceRequest",
+		"interface", "N1", "supi", ue.SUPI, "amf_ue_ngap_id", ue.AMFUENGAPId)
+	// Distinct procedure label: "NetworkTriggeredServiceRequest" is already
+	// counted at paging time in the SBI handler; this series counts the
+	// UP re-activation outcome per paged PDU session without double counting.
+	const upActProc = "NetworkTriggeredServiceRequestUPActivation"
+	pagedSet := make(map[uint8]struct{}, len(paged))
+	for _, psi := range paged {
+		pagedSet[psi] = struct{}{}
+	}
 	ue.Lock()
 	var targets []target
 	for psi, sess := range ue.PDUSessions {
-		if nas.PSIInStatus(*uplinkDataStatus, psi) && sess.SMFInstanceID != "" {
-			targets = append(targets, target{psi: psi, ref: sess.SMFInstanceID,
-				sst: sess.SNSSAI.SST, sd: sess.SNSSAI.SD})
+		if sess.SMFInstanceID == "" {
+			continue
+		}
+		_, isPaged := pagedSet[psi]
+		ulds := uplinkDataStatus != nil && nas.PSIInStatus(*uplinkDataStatus, psi)
+		if !ulds && !isPaged {
+			continue
+		}
+		if _, gone := released[psi]; gone {
+			// Only reachable for a session whose NW-initiated release is
+			// being completed asynchronously (still in the map); the
+			// others were already removed. Never re-activate it.
+			continue
+		}
+		if isPaged {
+			plog.Info("UP activation: paged PDU session added to activation set",
+				"pdu_session_id", psi,
+				"result", "OK",
+				"spec_ref", "TS 23.502 §4.2.3.3 step 6")
+		}
+		targets = append(targets, target{psi: psi, ref: sess.SMFInstanceID,
+			sst: sess.SNSSAI.SST, sd: sess.SNSSAI.SD})
+	}
+	for _, psi := range paged {
+		if _, gone := released[psi]; gone {
+			// The UE reports the paged PSI inactive: it was released
+			// locally instead of re-activated. Ref: TS 24.501 §5.6.1.4.1
+			plog.Warn("UP activation: paged PDU session not active in UE PDU session status — released locally, not activated",
+				"pdu_session_id", psi,
+				"result", "REJECT",
+				"spec_ref", "TS 24.501 §5.6.1.4.1")
+			metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "REJECT").Inc()
+			continue
+		}
+		if sess, ok := ue.PDUSessions[psi]; !ok || sess.SMFInstanceID == "" {
+			plog.Warn("UP activation: paged PDU session unknown or without SMF context — skipped",
+				"pdu_session_id", psi,
+				"result", "FAILURE",
+				"spec_ref", "TS 23.502 §4.2.3.3 step 6")
+			metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "FAILURE").Inc()
 		}
 	}
 	ue.Unlock()
@@ -1189,7 +1427,11 @@ func (h *Handler) activatePDUSessions(
 	var items []ngap.PDUSessionSetupItemCxtReq
 	for _, t := range targets {
 		transfer, err := activator.ActivateSMContext(ctx, t.ref)
+		_, wasPaged := pagedSet[t.psi]
 		if err != nil {
+			if wasPaged {
+				metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "FAILURE").Inc()
+			}
 			log.Warn("UP activation: SMF ActivateSMContext failed — session skipped",
 				"pdu_session_id", t.psi,
 				"smContextRef", t.ref,
@@ -1208,6 +1450,9 @@ func (h *Handler) activatePDUSessions(
 			SD:           sdBytes,
 			Transfer:     transfer,
 		})
+		if wasPaged {
+			metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "OK").Inc()
+		}
 		log.Info("UP activation: N2SM Setup Request Transfer fetched from SMF",
 			"pdu_session_id", t.psi,
 			"smContextRef", t.ref,
@@ -1267,7 +1512,7 @@ func (h *Handler) handleRegistrationUpdate(
 	kgnbBytes := kdf.KgNB(ue.SecurityCtx.KAMF, regCount, 0x01)
 	var kgnb [32]byte
 	copy(kgnb[:], kgnbBytes)
-	ue.KgNB = kgnb
+	ue.SetKgNB(kgnb) // also restarts the NH chain, TS 33.501 §6.9.2.1.1
 
 	var encAlgs, intAlgs uint16
 	if ue.UESecCapEA[1] {
@@ -1310,9 +1555,7 @@ func (h *Handler) handleRegistrationUpdate(
 	// UE has checked in via Periodic/Mobility Registration Update and is
 	// CM-CONNECTED — cancel the CM-IDLE reachability watchdogs (re-armed on
 	// AN Release). Ref: TS 23.501 §5.3.2
-	if h.onUEReachable != nil {
-		h.onUEReachable(ue)
-	}
+	h.notifyUEReachable(ue)
 	return nil
 }
 
@@ -1418,13 +1661,13 @@ func (h *Handler) handleDeregistration(
 
 	// Step 4: mark context for deferred removal and release the N2 UE context at the gNB.
 	// PendingRemoval must be set BEFORE SendUEContextReleaseCommandForUE so that:
-	//   (a) the PendingRemoval watchdog timer is armed immediately (TS 38.413 §8.3.5), and
+	//   (a) the PendingRemoval watchdog timer is armed immediately (TS 38.413 §8.3.3), and
 	//   (b) handleUEContextReleaseComplete finds pending=true and removes the context.
 	// The actual Remove happens in handleUEContextReleaseComplete so that gnb.UEs
 	// is cleaned up before the AMF index entries are deleted. If the gNB never
 	// responds (UE was already CM-IDLE), the context will be cleaned by the next
 	// registration attempt (new AllocateUEContext replaces by SUPI/TMSI).
-	// Ref: TS 23.502 §4.2.2.3.2 step 4, TS 38.413 §8.3.5
+	// Ref: TS 23.502 §4.2.2.3.2 step 4, TS 38.413 §8.3.3
 	ue.TransitionTo(amfctx.GMMDeregistered)
 	ue.PendingRemoval = true
 
@@ -1556,7 +1799,7 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 	}
 
 	// Mark context for deferred removal BEFORE releasing N2, so the watchdog timer
-	// in SendUEContextReleaseCommandForUE is armed correctly. Ref: TS 38.413 §8.3.5
+	// in SendUEContextReleaseCommandForUE is armed correctly. Ref: TS 38.413 §8.3.3
 	ue.TransitionTo(amfctx.GMMDeregistered)
 	ue.PendingRemoval = true
 

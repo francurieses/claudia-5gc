@@ -1,7 +1,7 @@
 package ngap
 
 // paging_test.go — unit tests for the NGAP Paging codec.
-// Ref: 3GPP TS 38.413 §9.2.8, TS 23.502 §4.2.3.3
+// Ref: 3GPP TS 38.413 §9.2.4.1 / §8.5.1, TS 23.502 §4.2.3.3
 
 import (
 	"testing"

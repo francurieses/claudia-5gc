@@ -292,7 +292,11 @@ func decodeBody(msg *Message, b []byte) (*Message, error) {
 		}
 		msg.Body = body
 	case MsgTypeServiceAccept:
-		msg.Body = &ServiceAccept{}
+		body, err := DecodeServiceAccept(b)
+		if err != nil {
+			return nil, err
+		}
+		msg.Body = body
 	case MsgTypeConfigurationUpdateCommand:
 		body, err := DecodeConfigurationUpdateCommand(b)
 		if err != nil {

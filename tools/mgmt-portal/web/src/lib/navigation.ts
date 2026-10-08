@@ -1,4 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
+import type { Deployment } from './api'
 import {
   Activity,
   AlertTriangle,
@@ -9,6 +10,7 @@ import {
   LayoutDashboard,
   MapPin,
   Radio,
+  RadioTower,
   Server,
   ShieldCheck,
   Users,
@@ -33,6 +35,8 @@ export interface NavItem {
   icon: LucideIcon
   /** Match the path exactly (used for the index route). */
   end?: boolean
+  /** RAN simulator that must be deployed for this item to be offered. */
+  requires?: 'ueransim' | 'packetrusher'
 }
 
 export interface NavGroup {
@@ -61,16 +65,17 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Runtime',
     items: [
       { to: '/services', label: 'Services', icon: Server },
+      { to: '/ran', label: 'gNBs (RAN)', icon: RadioTower },
       { to: '/sessions', label: 'Sessions', icon: Activity },
       { to: '/qos', label: 'QoS / PDU Sessions', icon: Gauge },
     ],
   },
   {
     id: 'test-ues',
-    label: 'Test UEs',
+    label: 'Test Tools',
     items: [
-      { to: '/ueransim', label: 'UERANSIM', icon: Antenna },
-      { to: '/packetrusher', label: 'PacketRusher', icon: Zap },
+      { to: '/ueransim', label: 'UERANSIM', icon: Antenna, requires: 'ueransim' },
+      { to: '/packetrusher', label: 'PacketRusher', icon: Zap, requires: 'packetrusher' },
       { to: '/location', label: 'UE Location', icon: MapPin },
     ],
   },
@@ -88,6 +93,28 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [{ to: '/pws', label: 'Public Warning', icon: AlertTriangle }],
   },
 ]
+
+/**
+ * The nav groups to render for the current deployment mode: items whose
+ * `requires` simulator is not deployed are dropped, and groups left empty are
+ * hidden. While the deployment probe is loading, gated items stay hidden
+ * (standalone is the default); if it failed, everything is shown (fail-open).
+ */
+export function visibleNavGroups(
+  groups: NavGroup[],
+  caps: Pick<Deployment, 'ueransim' | 'packetrusher'> | undefined,
+  failed: boolean,
+): NavGroup[] {
+  return groups
+    .map(group => ({
+      ...group,
+      items: group.items.filter(item => {
+        if (!item.requires || failed) return true
+        return caps?.[item.requires].deployed ?? false
+      }),
+    }))
+    .filter(group => group.items.length > 0)
+}
 
 /** The route table rendered by `App.tsx`, in navigation order. */
 export const NAV_ROUTES: { path: string; label: string }[] = NAV_GROUPS.flatMap(group =>

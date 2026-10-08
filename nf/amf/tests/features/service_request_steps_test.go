@@ -29,12 +29,22 @@ func ueForcedCMIdleByANRelease() error                 { return pendingIfNoE2E()
 func ueSendsUplinkDataOnSession(_ string) error        { return pendingIfNoE2E() }
 func ueSendsServiceRequestWithULStatus(_ string) error { return pendingIfNoE2E() }
 func amfFetchesN2SMWithActivating() error              { return pendingIfNoE2E() }
-func icsCarriesSessionInCxtReq(_ string) error         { return pendingIfNoE2E() }
-func gnbReturnsDLTunnelInCxtRes() error                { return pendingIfNoE2E() }
-func amfForwardsDLTunnelToSMF() error                  { return pendingIfNoE2E() }
-func pingViaUETunnelSucceeds() error                   { return pendingIfNoE2E() }
-func ueSendsSignallingOnlyServiceRequest() error       { return pendingIfNoE2E() }
-func icsCarriesNoCxtReqList() error                    { return pendingIfNoE2E() }
+func icsCarriesSessionInCxtReq(psi string) error {
+	if ntsrW.active {
+		return ntsrW.icsCarries(psi)
+	}
+	return pendingIfNoE2E()
+}
+func gnbReturnsDLTunnelInCxtRes() error          { return pendingIfNoE2E() }
+func amfForwardsDLTunnelToSMF() error            { return pendingIfNoE2E() }
+func pingViaUETunnelSucceeds() error             { return pendingIfNoE2E() }
+func ueSendsSignallingOnlyServiceRequest() error { return pendingIfNoE2E() }
+func icsCarriesNoCxtReqList() error {
+	if ntsrW.active {
+		return ntsrW.icsCarries("")
+	}
+	return pendingIfNoE2E()
+}
 
 func initServiceRequestSteps(sc *godog.ScenarioContext) {
 	sc.Step(`^the Registration Accept sent to the UE includes a TAI list covering the serving TAC$`, regAcceptIncludesTAIList)

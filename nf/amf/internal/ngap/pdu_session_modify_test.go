@@ -8,8 +8,8 @@ package ngap
 import (
 	"testing"
 
-	libngap "github.com/free5gc/ngap"
 	"github.com/free5gc/aper"
+	libngap "github.com/free5gc/ngap"
 	"github.com/free5gc/ngap/ngapType"
 )
 
@@ -21,7 +21,7 @@ func TestBuildPDUSessionResourceModifyRequest(t *testing.T) {
 	const ranID int64 = 20
 	const pduSessionID uint8 = 1
 	nasPDU := []byte{0x7E, 0x02, 0xAA, 0xBB, 0xCC} // stub secured DL NAS Transport
-	n2SmInfo := []byte{0x00}                          // stub APER-encoded modify transfer
+	n2SmInfo := []byte{0x00}                       // stub APER-encoded modify transfer
 
 	pdu := BuildPDUSessionResourceModifyRequest(amfID, ranID, pduSessionID, nasPDU, n2SmInfo)
 	if len(pdu) == 0 {

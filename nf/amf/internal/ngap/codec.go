@@ -7,6 +7,7 @@ package ngap
 import (
 	"encoding/hex"
 	"fmt"
+	"sort"
 
 	"github.com/free5gc/aper"
 	libngap "github.com/free5gc/ngap"
@@ -152,6 +153,7 @@ func extractNGSetupRequest(req *ngapType.NGSetupRequest) *NGSetupRequest {
 		case ngapType.ProtocolIEIDGlobalRANNodeID: // 27
 			if ie.Value.GlobalRANNodeID != nil {
 				out.GlobalRANNodeID = extractGlobalRANNodeIDBytes(ie.Value.GlobalRANNodeID)
+				out.RANNode = extractGlobalRANNode(ie.Value.GlobalRANNodeID)
 				out.RANNodeName = "" // populated below if present
 			}
 		case ngapType.ProtocolIEIDRANNodeName: // 82
@@ -182,6 +184,55 @@ func extractGlobalRANNodeIDBytes(id *ngapType.GlobalRANNodeID) []byte {
 	return nil
 }
 
+// extractGlobalRANNode decodes the Global RAN Node ID into its structured form,
+// keeping the gNB ID bit length (22..32) that the flat byte form loses.
+// Ref: TS 38.413 §9.3.1.5, §9.3.1.6.
+func extractGlobalRANNode(id *ngapType.GlobalRANNodeID) GlobalRANNode {
+	switch id.Present {
+	case ngapType.GlobalRANNodeIDPresentGlobalGNBID:
+		n := GlobalRANNode{Type: RANNodeTypeGNB}
+		if g := id.GlobalGNBID; g != nil {
+			n.MCC = plmnToMCC(g.PLMNIdentity.Value)
+			n.MNC = plmnToMNC(g.PLMNIdentity.Value)
+			if bs := g.GNBID.GNBID; bs != nil {
+				n.GNBIDBitLen = uint8(bs.BitLength)
+				var v uint64
+				for _, b := range bs.Bytes {
+					v = v<<8 | uint64(b)
+				}
+				// The BIT STRING is left-aligned in its octets; drop the padding bits.
+				if pad := uint(len(bs.Bytes))*8 - uint(bs.BitLength); pad < 64 {
+					v >>= pad
+				}
+				n.GNBID = uint32(v)
+			}
+		}
+		return n
+	case ngapType.GlobalRANNodeIDPresentGlobalNgENBID:
+		return GlobalRANNode{Type: RANNodeTypeNgENB}
+	case ngapType.GlobalRANNodeIDPresentGlobalN3IWFID:
+		return GlobalRANNode{Type: RANNodeTypeN3IWF}
+	}
+	return GlobalRANNode{}
+}
+
+// extractTAISliceSupport decodes a TAI Slice Support List into S-NSSAIs.
+// Ref: TS 38.413 §9.3.1.x (Slice Support List).
+func extractTAISliceSupport(list ngapType.SliceSupportList) []amfctx.SNSSAISubscribed {
+	var out []amfctx.SNSSAISubscribed
+	for _, item := range list.List {
+		var sn amfctx.SNSSAISubscribed
+		if len(item.SNSSAI.SST.Value) > 0 {
+			sn.SST = item.SNSSAI.SST.Value[0]
+		}
+		if item.SNSSAI.SD != nil && len(item.SNSSAI.SD.Value) > 0 {
+			sn.SD = hex.EncodeToString(item.SNSSAI.SD.Value)
+		}
+		out = append(out, sn)
+	}
+	return out
+}
+
 func extractSupportedTAList(list *ngapType.SupportedTAList) []SupportedTA {
 	var result []SupportedTA
 	for _, item := range list.List {
@@ -190,8 +241,9 @@ func extractSupportedTAList(list *ngapType.SupportedTAList) []SupportedTA {
 		}
 		for _, bplmn := range item.BroadcastPLMNList.List {
 			ps := PLMNSlice{
-				MCC: plmnToMCC(bplmn.PLMNIdentity.Value),
-				MNC: plmnToMNC(bplmn.PLMNIdentity.Value),
+				MCC:          plmnToMCC(bplmn.PLMNIdentity.Value),
+				MNC:          plmnToMNC(bplmn.PLMNIdentity.Value),
+				SliceSupport: extractTAISliceSupport(bplmn.TAISliceSupportList),
 			}
 			ta.BroadcastPLMNs = append(ta.BroadcastPLMNs, ps)
 		}
@@ -507,11 +559,46 @@ type PDUSessionSetupItemCxtReq struct {
 	Transfer     []byte
 }
 
+// DefaultUEAMBRBps is the operator-default UE Aggregate Maximum Bit Rate (1 Gbps,
+// bit/s) used per direction when the subscription (UDM am-data) carries no
+// subscribedUeAmbr. Ref: TS 38.413 §9.3.1.58 (Bit Rate, bit/s), TS 23.501 §5.7.2.6.
+const DefaultUEAMBRBps int64 = 1_000_000_000
+
+// UEAMBR is a UE Aggregate Maximum Bit Rate to encode, in bit/s. A value <= 0 in
+// either direction falls back to DefaultUEAMBRBps. Ref: TS 38.413 §9.3.1.58.
+type UEAMBR struct {
+	ULBps, DLBps int64
+}
+
+// NewUEAMBRFromKbps converts the subscribed UE-AMBR stored on the UE context
+// (kbit/s, from UDM am-data) to a UEAMBR in bit/s. Zero keeps the default.
+// Ref: TS 38.413 §9.3.1.58, TS 29.571 BitRate
+func NewUEAMBRFromKbps(ulKbps, dlKbps uint64) *UEAMBR {
+	return &UEAMBR{ULBps: int64(ulKbps) * 1000, DLBps: int64(dlKbps) * 1000}
+}
+
+// buildUEAMBR builds the NGAP UE Aggregate Maximum Bit Rate IE value, applying
+// the operator default for non-positive inputs. Ref: TS 38.413 §9.3.1.58.
+func buildUEAMBR(ulBps, dlBps int64) *ngapType.UEAggregateMaximumBitRate {
+	if ulBps <= 0 {
+		ulBps = DefaultUEAMBRBps
+	}
+	if dlBps <= 0 {
+		dlBps = DefaultUEAMBRBps
+	}
+	return &ngapType.UEAggregateMaximumBitRate{
+		UEAggregateMaximumBitRateUL: ngapType.BitRate{Value: ulBps},
+		UEAggregateMaximumBitRateDL: ngapType.BitRate{Value: dlBps},
+	}
+}
+
 // BuildInitialContextSetupRequest builds an Initial Context Setup Request PDU.
 // encAlgsBitmap and intAlgsBitmap are the UE's advertised capability bitmasks
 // (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3) per TS 38.413 §9.3.1.86.
 // ambrULBps/ambrDLBps is the subscribed UE Aggregate Maximum Bit Rate in bit/s
-// (TS 38.413 §9.3.1.58); pass 0 to fall back to the 1 Gbps operator default.
+// (TS 38.413 §9.3.1.58); pass 0 to fall back to the 1 Gbps operator default. It
+// is only encoded when pduSessions is non-empty (C-ifPDUsessionResourceSetup,
+// Table 9.2.2.1-1); with no PDU session list the IE is omitted and the values ignored.
 // rfsp is the Radio Frequency Selection Priority index (1-256) from PCF; 0 means omit.
 // pduSessions, when non-empty, is encoded as PDUSessionResourceSetupListCxtReq
 // (IE id=71) so the gNB re-establishes user-plane resources during Service
@@ -530,15 +617,6 @@ func BuildInitialContextSetupRequest(
 	pduSessions []PDUSessionSetupItemCxtReq,
 ) []byte {
 	plmn := plmnFromMCCMNC(mcc, mnc)
-
-	// UE-AMBR: subscribed value from UDM am-data; 1 Gbps operator default when
-	// the subscription carries none. Ref: TS 38.413 §9.3.1.58, TS 23.501 §5.7.2.6
-	if ambrULBps <= 0 {
-		ambrULBps = 1_000_000_000
-	}
-	if ambrDLBps <= 0 {
-		ambrDLBps = 1_000_000_000
-	}
 
 	// IEs in the exact order specified by TS 38.413 Table 9.2.2.1-1.
 	// TS 38.413 §8.1: "Protocol IEs shall be contained in the order specified in the
@@ -562,28 +640,34 @@ func BuildInitialContextSetupRequest(
 				RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUEID},
 			},
 		},
-		// (4) UEAggregateMaximumBitRate (id=110) — Conditional (mandatory without PDU session list)
-		{
+	}
+
+	// (4) UEAggregateMaximumBitRate (id=110) — C-ifPDUsessionResourceSetup: "shall be
+	// present if the PDU Session Resource Setup Request List IE is present", and MUST
+	// NOT be included otherwise (strict gNBs reject it with an Abstract Syntax Error,
+	// TS 38.413 §10.3). Position 4: after RAN UE NGAP ID, before GUAMI. Value: the
+	// subscribed UE-AMBR or the 1 Gbps operator default.
+	// Ref: TS 38.413 Table 9.2.2.1-1, §9.3.1.58, TS 23.502 §4.2.3.2 step 12
+	if len(pduSessions) > 0 {
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUEAggregateMaximumBitRate},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present: ngapType.InitialContextSetupRequestIEsPresentUEAggregateMaximumBitRate,
-				UEAggregateMaximumBitRate: &ngapType.UEAggregateMaximumBitRate{
-					UEAggregateMaximumBitRateUL: ngapType.BitRate{Value: ambrULBps},
-					UEAggregateMaximumBitRateDL: ngapType.BitRate{Value: ambrDLBps},
-				},
+				Present:                   ngapType.InitialContextSetupRequestIEsPresentUEAggregateMaximumBitRate,
+				UEAggregateMaximumBitRate: buildUEAMBR(ambrULBps, ambrDLBps),
 			},
-		},
-		// (6) GUAMI (id=28) — Mandatory
-		{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDGUAMI},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
-			Value: ngapType.InitialContextSetupRequestIEsValue{
-				Present: ngapType.InitialContextSetupRequestIEsPresentGUAMI,
-				GUAMI:   buildGUAMI(plmn, regionID, setID, amfIDByte),
-			},
-		},
+		})
 	}
+
+	// (6) GUAMI (id=28) — Mandatory
+	ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDGUAMI},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.InitialContextSetupRequestIEsValue{
+			Present: ngapType.InitialContextSetupRequestIEsPresentGUAMI,
+			GUAMI:   buildGUAMI(plmn, regionID, setID, amfIDByte),
+		},
+	})
 
 	// (7) PDUSessionResourceSetupListCxtReq (id=71) — position 7 in the spec
 	// table, between GUAMI and AllowedNSSAI. Carries the SMF-built
@@ -886,10 +970,15 @@ func zeroPad(s string, n int) string {
 
 // BuildPDUSessionResourceSetupRequest builds a PDU Session Resource Setup Request.
 // sst is the Slice/Service Type (1 byte); sdBytes is the 3-byte SD (nil if not set).
-// Ref: TS 38.413 §8.4.1
+// ueAMBR, when non-nil, appends the optional UE Aggregate Maximum Bit Rate IE
+// (id=110, criticality ignore) AFTER the PDU Session Resource Setup Request List,
+// as in the Rel-17 PDUSessionResourceSetupRequestIEs order; nil omits it. The AMF
+// passes it when the gNB has not yet received a UE-AMBR for the current N2 context.
+// Ref: TS 38.413 §8.2.1, §9.2.1.1, §9.3.1.58
 func BuildPDUSessionResourceSetupRequest(
 	amfUEID, ranUEID int64, pduSessionID uint8, nasPDU []byte, n2SmInfo []byte,
 	sst uint8, sdBytes []byte,
+	ueAMBR *UEAMBR,
 ) []byte {
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentInitiatingMessage,
@@ -943,6 +1032,18 @@ func BuildPDUSessionResourceSetupRequest(
 		},
 	}
 
+	if ueAMBR != nil {
+		ies := &pdu.InitiatingMessage.Value.PDUSessionResourceSetupRequest.ProtocolIEs
+		ies.List = append(ies.List, ngapType.PDUSessionResourceSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUEAggregateMaximumBitRate},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.PDUSessionResourceSetupRequestIEsValue{
+				Present:                   ngapType.PDUSessionResourceSetupRequestIEsPresentUEAggregateMaximumBitRate,
+				UEAggregateMaximumBitRate: buildUEAMBR(ueAMBR.ULBps, ueAMBR.DLBps),
+			},
+		})
+	}
+
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
 		return nil
@@ -962,7 +1063,7 @@ type PDUSessionSetupResult struct {
 // Carries the gNB GTP-U tunnel info for each PDU session. FailedPSIs lists the
 // sessions the gNB could not set up (PDUSessionResourceFailedToSetupListSURes) —
 // the AMF must inform the SMF so the session is released and its resources
-// (UE IP, PFCP) are freed. Ref: TS 38.413 §8.4.1, TS 23.502 §4.3.2.2.1 step 16.
+// (UE IP, PFCP) are freed. Ref: TS 38.413 §8.2.1, TS 23.502 §4.3.2.2.1 step 16.
 type PDUSessionResourceSetupResponseMsg struct {
 	AMFUENGAPId int64
 	RANUENGAPId int64
@@ -1233,7 +1334,7 @@ func extractUERadioCapabilityInfoIndication(m *ngapType.UERadioCapabilityInfoInd
 }
 
 // ---- UE Context Release Complete (gNB→AMF, SuccessfulOutcome, ProcCode=41) ---
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 
 // UEContextReleaseCompleteMsg holds decoded fields from a UE Context Release Complete.
 type UEContextReleaseCompleteMsg struct {
@@ -1259,11 +1360,11 @@ func extractUEContextReleaseComplete(msg *ngapType.UEContextReleaseComplete) *UE
 }
 
 // ---- UE Context Release Command (AMF→gNB, InitiatingMessage, ProcCode=41) ----
-// Ref: TS 38.413 §8.3.5
+// Ref: TS 38.413 §8.3.3
 
 // BuildUEContextReleaseCommand builds a UE Context Release Command NGAP PDU.
 // cause: 1=RadioNetwork, 3=NAS; causeValue: the enumerated value within that group.
-// Ref: TS 38.413 §8.3.5, Table 9.1.3.5-1
+// Ref: TS 38.413 §8.3.3, Table 9.1.3.5-1
 func BuildUEContextReleaseCommand(amfUEID, ranUEID int64, causePresent int, causeValue int64) []byte {
 	cause := buildCause(causePresent, causeValue)
 
@@ -1316,7 +1417,7 @@ func BuildUEContextReleaseCommand(amfUEID, ranUEID int64, causePresent int, caus
 }
 
 // ---- Paging (AMF→gNB, InitiatingMessage, ProcedureCode=24) ------------------
-// Ref: TS 38.413 §9.2.8 (Paging), TS 23.502 §4.2.3.3 (Network Triggered Service Request)
+// Ref: TS 38.413 §9.2.4.1 (PAGING message), §8.5.1 (Paging procedure), TS 23.502 §4.2.3.3 step 4b (Network Triggered Service Request)
 
 // TAIForPaging is one Tracking Area Identity in the paging area.
 type TAIForPaging struct {
@@ -1405,8 +1506,12 @@ func buildCause(causePresent int, causeValue int64) ngapType.Cause {
 	switch causePresent {
 	case ngapType.CausePresentRadioNetwork:
 		c.RadioNetwork = &ngapType.CauseRadioNetwork{Value: aper.Enumerated(causeValue)}
+	case ngapType.CausePresentTransport:
+		c.Transport = &ngapType.CauseTransport{Value: aper.Enumerated(causeValue)}
 	case ngapType.CausePresentNas:
 		c.Nas = &ngapType.CauseNas{Value: aper.Enumerated(causeValue)}
+	case ngapType.CausePresentProtocol:
+		c.Protocol = &ngapType.CauseProtocol{Value: aper.Enumerated(causeValue)}
 	case ngapType.CausePresentMisc:
 		c.Misc = &ngapType.CauseMisc{Value: aper.Enumerated(causeValue)}
 	default:
@@ -1415,6 +1520,34 @@ func buildCause(causePresent int, causeValue int64) ngapType.Cause {
 		c.Nas = &ngapType.CauseNas{Value: ngapType.CauseNasPresentNormalRelease}
 	}
 	return c
+}
+
+// causeFromNGAP flattens a decoded NGAP Cause into the (present, value) pair buildCause
+// takes; ok is false when the selected group is absent.
+func causeFromNGAP(c ngapType.Cause) (present int, value int64, ok bool) {
+	switch c.Present {
+	case ngapType.CausePresentRadioNetwork:
+		if c.RadioNetwork != nil {
+			return c.Present, int64(c.RadioNetwork.Value), true
+		}
+	case ngapType.CausePresentTransport:
+		if c.Transport != nil {
+			return c.Present, int64(c.Transport.Value), true
+		}
+	case ngapType.CausePresentNas:
+		if c.Nas != nil {
+			return c.Present, int64(c.Nas.Value), true
+		}
+	case ngapType.CausePresentProtocol:
+		if c.Protocol != nil {
+			return c.Present, int64(c.Protocol.Value), true
+		}
+	case ngapType.CausePresentMisc:
+		if c.Misc != nil {
+			return c.Present, int64(c.Misc.Value), true
+		}
+	}
+	return 0, 0, false
 }
 
 // ensure hex import is used
@@ -1570,12 +1703,49 @@ func nrCellIdentityToHex(b []byte, bitLen uint64) string {
 }
 
 // ---- N2 Handover — HandoverRequired (source gNB → AMF, ProcCode=12) --------
-// Ref: TS 38.413 §8.4.1 (Handover Preparation), TS 23.502 §4.9.1.3
+// Ref: TS 38.413 §8.4.1 (Handover Preparation), §9.2.3.1; TS 23.502 §4.9.1.3.2
 
 // PDUSessionHORqdItem carries one PDU session that must be set up at the target gNB.
 type PDUSessionHORqdItem struct {
 	PDUSessionID             uint8
-	HandoverRequiredTransfer []byte // opaque transfer per TS 38.413 §9.3.4.4
+	HandoverRequiredTransfer []byte // opaque transfer per TS 38.413 §9.3.4.14
+}
+
+// HOTargetTAI is the Selected TAI of the Target ID of a HANDOVER REQUIRED, in the string
+// form of TS 29.571 (Tai): PLMN digits and the 3-octet TAC as 6 hex digits.
+type HOTargetTAI struct {
+	MCC, MNC string
+	TAC      string // 6 hex digits
+}
+
+// HOTargetID is the decoded Target ID (TargetRANNodeID: Global gNB ID + Selected TAI) of a
+// HANDOVER REQUIRED, used to build the TS 29.571 NgRanTargetId of the PREPARING
+// UpdateSMContext. Absent parts are left zero / nil and omitted from the SBI JSON.
+// Ref: TS 38.413 §9.2.3.1 (Target ID IE); TS 29.571 (NgRanTargetId, GlobalRanNodeId, Tai).
+type HOTargetID struct {
+	// Node is the Global gNB ID (Type == RANNodeTypeGNB) of the target; zero when the
+	// target is not a gNB or absent.
+	Node GlobalRANNode
+	// TAI is the Selected TAI, nil when absent.
+	TAI *HOTargetTAI
+}
+
+// extractHOTargetID decodes the TargetRANNodeID of a Target ID IE.
+func extractHOTargetID(t *ngapType.TargetID) HOTargetID {
+	var out HOTargetID
+	if t == nil || t.Present != ngapType.TargetIDPresentTargetRANNodeID || t.TargetRANNodeID == nil {
+		return out
+	}
+	out.Node = extractGlobalRANNode(&t.TargetRANNodeID.GlobalRANNodeID)
+	sel := t.TargetRANNodeID.SelectedTAI
+	if len(sel.PLMNIdentity.Value) >= 3 && len(sel.TAC.Value) > 0 {
+		out.TAI = &HOTargetTAI{
+			MCC: plmnToMCC(sel.PLMNIdentity.Value),
+			MNC: plmnToMNC(sel.PLMNIdentity.Value),
+			TAC: hex.EncodeToString(sel.TAC.Value),
+		}
+	}
+	return out
 }
 
 // HandoverRequiredMsg holds decoded fields from an NGAP HandoverRequired.
@@ -1586,6 +1756,7 @@ type HandoverRequiredMsg struct {
 	CausePresent                       int
 	CauseValue                         int64
 	TargetGlobalRANNodeID              []byte // GlobalRANNodeID bytes for gNB lookup
+	Target                             HOTargetID
 	PDUSessions                        []PDUSessionHORqdItem
 	SourceToTargetTransparentContainer []byte // opaque RRC container
 }
@@ -1647,12 +1818,21 @@ func extractHandoverRequired(req *ngapType.HandoverRequired) *HandoverRequiredMs
 }
 
 // ---- N2 Handover — HandoverRequestAcknowledge (target gNB → AMF, ProcCode=13) ---
-// Ref: TS 38.413 §8.4.2 (Handover Resource Allocation)
+// Ref: TS 38.413 §8.4.2 (Handover Resource Allocation), §9.2.3.5
 
 // PDUSessionHOAdmittedItem carries one successfully admitted PDU session.
 type PDUSessionHOAdmittedItem struct {
 	PDUSessionID                       uint8
-	HandoverRequestAcknowledgeTransfer []byte // opaque transfer per TS 38.413 §9.3.4.18
+	HandoverRequestAcknowledgeTransfer []byte // opaque HandoverRequestAcknowledgeTransfer, TS 38.413 §9.3.4.11 (ngapType.HandoverRequestAcknowledgeTransfer)
+}
+
+// PDUSessionHOFailedItem is one item of the PDU Session Resource Failed to Setup List
+// HOAck of a HANDOVER REQUEST ACKNOWLEDGE: a PDU session the target could not admit.
+type PDUSessionHOFailedItem struct {
+	PDUSessionID uint8
+	// HandoverResourceAllocationUnsuccessfulTransfer is the opaque transfer, TS 38.413
+	// §9.3.4 (Handover Resource Allocation Unsuccessful Transfer).
+	HandoverResourceAllocationUnsuccessfulTransfer []byte
 }
 
 // HandoverRequestAckMsg holds decoded fields from an NGAP HandoverRequestAcknowledge.
@@ -1660,6 +1840,7 @@ type HandoverRequestAckMsg struct {
 	AMFUENGAPId                        int64
 	RANUENGAPId                        int64
 	AdmittedSessions                   []PDUSessionHOAdmittedItem
+	FailedSessions                     []PDUSessionHOFailedItem
 	TargetToSourceTransparentContainer []byte
 }
 
@@ -1681,6 +1862,15 @@ func extractHandoverRequestAcknowledge(ack *ngapType.HandoverRequestAcknowledge)
 					out.AdmittedSessions = append(out.AdmittedSessions, PDUSessionHOAdmittedItem{
 						PDUSessionID:                       uint8(item.PDUSessionID.Value),
 						HandoverRequestAcknowledgeTransfer: []byte(item.HandoverRequestAcknowledgeTransfer),
+					})
+				}
+			}
+		case ngapType.HandoverRequestAcknowledgeIEsPresentPDUSessionResourceFailedToSetupListHOAck:
+			if ie.Value.PDUSessionResourceFailedToSetupListHOAck != nil {
+				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListHOAck.List {
+					out.FailedSessions = append(out.FailedSessions, PDUSessionHOFailedItem{
+						PDUSessionID: uint8(item.PDUSessionID.Value),
+						HandoverResourceAllocationUnsuccessfulTransfer: []byte(item.HandoverResourceAllocationUnsuccessfulTransfer),
 					})
 				}
 			}
@@ -1724,7 +1914,7 @@ func extractHandoverNotify(msg *ngapType.HandoverNotify) *HandoverNotifyMsg {
 }
 
 // ---- N2 Handover — BuildHandoverRequest (AMF → target gNB) -----------------
-// Ref: TS 38.413 §8.4.2, §9.2.2.2 (Handover Resource Allocation)
+// Ref: TS 38.413 §8.4.2, §9.2.3.4 (Handover Resource Allocation)
 
 // PDUSessionHOReqItem carries one PDU session setup request for the target gNB.
 type PDUSessionHOReqItem struct {
@@ -1733,14 +1923,31 @@ type PDUSessionHOReqItem struct {
 	HandoverRequestTransfer []byte // from source gNB's HandoverRequiredTransfer
 }
 
+// HandoverRequestMissingIE returns the name of the first mandatory HANDOVER
+// REQUEST IE (TS 38.413 Table 9.2.3.4-1) that cannot be populated, or "".
+func HandoverRequestMissingIE(nSessions, nAllowedNSSAI, containerLen int) string {
+	switch {
+	case nSessions == 0:
+		return "PDUSessionResourceSetupListHOReq"
+	case nAllowedNSSAI == 0:
+		return "AllowedNSSAI"
+	case containerLen == 0:
+		return "SourceToTarget-TransparentContainer"
+	}
+	return ""
+}
+
 // BuildHandoverRequest builds an NGAP HandoverRequest (AMF → target gNB).
-// nhNCC is the Next Hop Chaining Count (1 for first handover).
-// nh is the 32-byte Next Hop key derived via KDF(KAMF, KgNB_source).
+// Returns nil if a mandatory IE (session list, Allowed NSSAI, container) is empty.
+// ueAMBR is the subscribed UE-AMBR (nil, or a non-positive direction, falls back
+// to DefaultUEAMBRBps). nhNCC/nh are the next pair of the per-UE NH chain
+// (UEContext.NextNH: NCC+1 mod 8, NH = KNH(KAMF, NH_prev), TS 33.501 §6.9.2.3.3).
 // srcToTgtContainer is forwarded opaquely from the HandoverRequired.
 func BuildHandoverRequest(
 	amfUEID int64,
 	handoverType int,
 	causePresent int, causeValue int64,
+	ueAMBR *UEAMBR,
 	nhNCC uint8, nh [32]byte,
 	encAlgsBitmap, intAlgsBitmap uint16,
 	sessions []PDUSessionHOReqItem,
@@ -1749,6 +1956,9 @@ func BuildHandoverRequest(
 	mcc, mnc string,
 	regionID byte, setID uint16, amfIDByte byte,
 ) []byte {
+	if len(sessions) == 0 || len(allowedNSSAI) == 0 || len(srcToTgtContainer) == 0 {
+		return nil
+	}
 	plmn := plmnFromMCCMNC(mcc, mnc)
 
 	var sessionList []ngapType.PDUSessionResourceSetupItemHOReq
@@ -1760,11 +1970,11 @@ func BuildHandoverRequest(
 		})
 	}
 
-	var nssaiItems []ngapType.AllowedNSSAIItem
-	for _, s := range allowedNSSAI {
-		nssaiItems = append(nssaiItems, ngapType.AllowedNSSAIItem{
-			SNSSAI: buildNGAPSNSSAI(s.SST, snssaiSDBytes(s.SD)),
-		})
+	nssaiItems := allowedNSSAIItems(allowedNSSAI)
+
+	var ambrUL, ambrDL int64
+	if ueAMBR != nil {
+		ambrUL, ambrDL = ueAMBR.ULBps, ueAMBR.DLBps
 	}
 
 	cause := buildCause(causePresent, causeValue)
@@ -1802,11 +2012,8 @@ func BuildHandoverRequest(
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUEAggregateMaximumBitRate},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverRequestIEsValue{
-				Present: ngapType.HandoverRequestIEsPresentUEAggregateMaximumBitRate,
-				UEAggregateMaximumBitRate: &ngapType.UEAggregateMaximumBitRate{
-					UEAggregateMaximumBitRateUL: ngapType.BitRate{Value: 1000000000},
-					UEAggregateMaximumBitRateDL: ngapType.BitRate{Value: 1000000000},
-				},
+				Present:                   ngapType.HandoverRequestIEsPresentUEAggregateMaximumBitRate,
+				UEAggregateMaximumBitRate: buildUEAMBR(ambrUL, ambrDL),
 			},
 		},
 		// UESecurityCapabilities
@@ -1854,9 +2061,11 @@ func BuildHandoverRequest(
 		},
 	}
 
-	// PDUSessionResourceSetupListHOReq — optional, include when sessions exist
-	if len(sessionList) > 0 {
-		ieList = append(ieList, ngapType.HandoverRequestIEs{
+	// PDUSessionResourceSetupListHOReq (73) and AllowedNSSAI (0) — mandatory
+	// (TS 38.413 Table 9.2.3.4-1); an empty SEQUENCE (SIZE(1..max)) cannot be
+	// encoded, so the caller must have checked HandoverRequestMissingIE first.
+	ieList = append(ieList,
+		ngapType.HandoverRequestIEs{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceSetupListHOReq},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverRequestIEsValue{
@@ -1865,20 +2074,21 @@ func BuildHandoverRequest(
 					List: sessionList,
 				},
 			},
-		})
-	}
-
-	// AllowedNSSAI — optional
-	if len(nssaiItems) > 0 {
-		ieList = append(ieList, ngapType.HandoverRequestIEs{
+		},
+		ngapType.HandoverRequestIEs{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAllowedNSSAI},
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverRequestIEsValue{
 				Present:      ngapType.HandoverRequestIEsPresentAllowedNSSAI,
 				AllowedNSSAI: &ngapType.AllowedNSSAI{List: nssaiItems},
 			},
-		})
-	}
+		},
+	)
+	// aper encodes IEs in append order: sort into the ASN.1 HandoverRequestIEs
+	// order (TS 38.413 Table 9.2.3.4-1) so real RANs do not reject the message.
+	sort.SliceStable(ieList, func(i, j int) bool {
+		return ieList[i].Value.Present < ieList[j].Value.Present
+	})
 
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentInitiatingMessage,
@@ -1901,33 +2111,119 @@ func BuildHandoverRequest(
 	return b
 }
 
+// BuildHandoverPreparationFailure builds an NGAP HandoverPreparationFailure
+// (UnsuccessfulOutcome of HandoverPreparation, AMF → source gNB): AMF UE NGAP ID,
+// RAN UE NGAP ID, Cause. Ref: TS 38.413 §8.4.1.3, §9.2.3.3.
+func BuildHandoverPreparationFailure(amfUEID, ranUEID int64, causePresent int, causeValue int64) []byte {
+	cause := buildCause(causePresent, causeValue)
+	fail := &ngapType.HandoverPreparationFailure{}
+	add := func(id int64, crit aper.Enumerated, v ngapType.HandoverPreparationFailureIEsValue) {
+		fail.ProtocolIEs.List = append(fail.ProtocolIEs.List, ngapType.HandoverPreparationFailureIEs{
+			Id:          ngapType.ProtocolIEID{Value: id},
+			Criticality: ngapType.Criticality{Value: crit},
+			Value:       v,
+		})
+	}
+	add(ngapType.ProtocolIEIDAMFUENGAPID, ngapType.CriticalityPresentIgnore, ngapType.HandoverPreparationFailureIEsValue{
+		Present:     ngapType.HandoverPreparationFailureIEsPresentAMFUENGAPID,
+		AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUEID},
+	})
+	add(ngapType.ProtocolIEIDRANUENGAPID, ngapType.CriticalityPresentIgnore, ngapType.HandoverPreparationFailureIEsValue{
+		Present:     ngapType.HandoverPreparationFailureIEsPresentRANUENGAPID,
+		RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUEID},
+	})
+	add(ngapType.ProtocolIEIDCause, ngapType.CriticalityPresentIgnore, ngapType.HandoverPreparationFailureIEsValue{
+		Present: ngapType.HandoverPreparationFailureIEsPresentCause,
+		Cause:   &cause,
+	})
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentUnsuccessfulOutcome,
+		UnsuccessfulOutcome: &ngapType.UnsuccessfulOutcome{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeHandoverPreparation},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.UnsuccessfulOutcomeValue{
+				Present:                    ngapType.UnsuccessfulOutcomePresentHandoverPreparationFailure,
+				HandoverPreparationFailure: fail,
+			},
+		},
+	}
+	b, err := libngap.Encoder(pdu)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
 // ---- N2 Handover — BuildHandoverCommand (AMF → source gNB) -----------------
 // Ref: TS 38.413 §8.4.1 (SuccessfulOutcome of HandoverPreparation)
 
-// BuildHandoverCommand builds an NGAP HandoverCommand (successful outcome of HandoverPreparation).
-// tgtToSrcContainer is the TargetToSourceTransparentContainer from HandoverRequestAcknowledge.
-// admittedSessions holds the admitted sessions with their HandoverCommandTransfer bytes.
+// PDUSessionHOCmdItem is one item of the PDU Session Resource Handover List (IE 59)
+// of a HANDOVER COMMAND.
+type PDUSessionHOCmdItem struct {
+	PDUSessionID uint8
+	// HandoverCommandTransfer is the APER HandoverCommandTransfer (TS 38.413 §9.3.4.10)
+	// returned by the SMF (n2SmInfoType HANDOVER_CMD). Empty: the builder encodes an
+	// empty transfer (all IEs optional — no data forwarding tunnels).
+	HandoverCommandTransfer []byte
+}
+
+// PDUSessionHOReleaseItem is one item of the PDU Session Resource To Release List
+// HOCmd (IE 78) of a HANDOVER COMMAND: an admitted PDU session that will not be handed
+// over, with its HandoverPreparationUnsuccessfulTransfer.
+type PDUSessionHOReleaseItem struct {
+	PDUSessionID uint8
+	// HandoverPreparationUnsuccessfulTransfer, when non-empty, is the SMF-supplied
+	// transfer (n2SmInfoType HANDOVER_PREP_FAIL) and is used verbatim; otherwise the
+	// builder encodes {Cause} from CausePresent/CauseValue.
+	HandoverPreparationUnsuccessfulTransfer []byte
+	CausePresent                            int
+	CauseValue                              int64
+}
+
+// BuildHandoverCommand builds an NGAP HandoverCommand (successful outcome of
+// HandoverPreparation). IEs are appended in TS 38.413 Table 9.2.3.2-1 order:
+// AMF UE NGAP ID (10), RAN UE NGAP ID (85), Handover Type (29), [PDU Session Resource
+// Handover List (59)], [PDU Session Resource To Release List HOCmd (78)], Target to
+// Source Transparent Container (106). tgtToSrcContainer is the container from
+// HandoverRequestAcknowledge. Returns nil when an item cannot be encoded.
+// Ref: TS 38.413 §8.4.1.2, §9.2.3.2; TS 23.502 §4.9.1.3.2 steps 9-12.
 func BuildHandoverCommand(
 	amfUEID, ranUEID int64,
 	handoverType int,
-	admittedSessions []PDUSessionHOAdmittedItem,
+	handled []PDUSessionHOCmdItem,
+	toRelease []PDUSessionHOReleaseItem,
 	tgtToSrcContainer []byte,
 ) []byte {
 	var sessionList []ngapType.PDUSessionResourceHandoverItem
-	for _, s := range admittedSessions {
-		// The HandoverCommandTransfer is empty for simple cases — target gNB
-		// fills in UL forwarding if applicable.
-		var cmdTransfer []byte
-		if len(s.HandoverRequestAcknowledgeTransfer) > 0 {
-			t := ngapType.HandoverCommandTransfer{}
-			tb, err := aper.MarshalWithParams(t, "valueExt")
-			if err == nil {
-				cmdTransfer = tb
+	for _, s := range handled {
+		cmdTransfer := s.HandoverCommandTransfer
+		if len(cmdTransfer) == 0 {
+			tb, err := aper.MarshalWithParams(ngapType.HandoverCommandTransfer{}, "valueExt")
+			if err != nil {
+				return nil
 			}
+			cmdTransfer = tb
 		}
 		sessionList = append(sessionList, ngapType.PDUSessionResourceHandoverItem{
 			PDUSessionID:            ngapType.PDUSessionID{Value: int64(s.PDUSessionID)},
 			HandoverCommandTransfer: aper.OctetString(cmdTransfer),
+		})
+	}
+	var releaseList []ngapType.PDUSessionResourceToReleaseItemHOCmd
+	for _, r := range toRelease {
+		tr := r.HandoverPreparationUnsuccessfulTransfer
+		if len(tr) == 0 {
+			tb, err := aper.MarshalWithParams(ngapType.HandoverPreparationUnsuccessfulTransfer{
+				Cause: buildCause(r.CausePresent, r.CauseValue),
+			}, "valueExt")
+			if err != nil {
+				return nil
+			}
+			tr = tb
+		}
+		releaseList = append(releaseList, ngapType.PDUSessionResourceToReleaseItemHOCmd{
+			PDUSessionID:                            ngapType.PDUSessionID{Value: int64(r.PDUSessionID)},
+			HandoverPreparationUnsuccessfulTransfer: aper.OctetString(tr),
 		})
 	}
 
@@ -1959,20 +2255,8 @@ func BuildHandoverCommand(
 				HandoverType: &ngapType.HandoverType{Value: aper.Enumerated(handoverType)},
 			},
 		},
-		// TargetToSourceTransparentContainer (mandatory)
-		{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDTargetToSourceTransparentContainer},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
-			Value: ngapType.HandoverCommandIEsValue{
-				Present: ngapType.HandoverCommandIEsPresentTargetToSourceTransparentContainer,
-				TargetToSourceTransparentContainer: &ngapType.TargetToSourceTransparentContainer{
-					Value: aper.OctetString(tgtToSrcContainer),
-				},
-			},
-		},
 	}
-
-	// PDU session handover list — include when sessions were admitted
+	// PDUSessionResourceHandoverList (59) — aper keeps append order.
 	if len(sessionList) > 0 {
 		ieList = append(ieList, ngapType.HandoverCommandIEs{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceHandoverList},
@@ -1985,6 +2269,30 @@ func BuildHandoverCommand(
 			},
 		})
 	}
+	// PDUSessionResourceToReleaseListHOCmd (78) — between 59 and 106.
+	if len(releaseList) > 0 {
+		ieList = append(ieList, ngapType.HandoverCommandIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceToReleaseListHOCmd},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.HandoverCommandIEsValue{
+				Present: ngapType.HandoverCommandIEsPresentPDUSessionResourceToReleaseListHOCmd,
+				PDUSessionResourceToReleaseListHOCmd: &ngapType.PDUSessionResourceToReleaseListHOCmd{
+					List: releaseList,
+				},
+			},
+		})
+	}
+	// TargetToSourceTransparentContainer (106, mandatory)
+	ieList = append(ieList, ngapType.HandoverCommandIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDTargetToSourceTransparentContainer},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+		Value: ngapType.HandoverCommandIEsValue{
+			Present: ngapType.HandoverCommandIEsPresentTargetToSourceTransparentContainer,
+			TargetToSourceTransparentContainer: &ngapType.TargetToSourceTransparentContainer{
+				Value: aper.OctetString(tgtToSrcContainer),
+			},
+		},
+	})
 
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentSuccessfulOutcome,
@@ -2109,19 +2417,44 @@ func extractPDUSessionResourceModifyResponse(resp *ngapType.PDUSessionResourceMo
 	return out
 }
 
-// ---- Path Switch Request (Xn Handover, TS 38.413 §8.9.4) -----------------
+// ---- Path Switch Request (Xn Handover, TS 38.413 §8.4.4) -----------------
 
 // PDUSessionSwitchItem carries one PDU session's new DL GTP-U endpoint for Xn handover.
 type PDUSessionSwitchItem struct {
 	PDUSessionID              uint8
 	PathSwitchRequestTransfer []byte // raw APER bytes of PathSwitchRequestTransfer
+	// AckTransfer is used only when the item is placed in the PATH SWITCH REQUEST
+	// ACKNOWLEDGE Switched List: the SMF-returned PathSwitchRequestAcknowledgeTransfer
+	// (TS 38.413 §9.3.4.9), used verbatim. Empty: the builder encodes an empty transfer.
+	AckTransfer []byte
 }
 
-// PathSwitchRequestMsg is the decoded form of an NGAP PathSwitchRequest.
+// PDUSessionFailedSetupItem is one entry of the PDU Session Resource Failed to
+// Setup List PSReq (TS 38.413 §9.2.3.8).
+type PDUSessionFailedSetupItem struct {
+	PDUSessionID                         uint8
+	PathSwitchRequestSetupFailedTransfer []byte
+}
+
+// UESecCapBitmaps are the NR encryption / integrity algorithm bitmaps of a UE
+// Security Capabilities IE (bit 15 = NEA1/NIA1 ... bit 13 = NEA3/NIA3).
+// Ref: TS 38.413 §9.3.1.86.
+type UESecCapBitmaps struct {
+	Enc, Int uint16
+}
+
+// PathSwitchRequestMsg is the decoded form of an NGAP PathSwitchRequest
+// (TS 38.413 Table 9.2.3.8-1).
 type PathSwitchRequestMsg struct {
 	SourceAMFUENGAPId int64 // AMF UE NGAP ID assigned by source AMF
 	RANUENGAPId       int64 // new RAN UE NGAP ID assigned by target gNB
 	PDUSessions       []PDUSessionSwitchItem
+	// TAI is the TAI of the User Location Information (nil when absent / not NR).
+	TAI *TAI
+	// UESecCap is the UE Security Capabilities received from the target (nil if absent).
+	UESecCap *UESecCapBitmaps
+	// FailedToSetup lists PDU Session Resource Failed to Setup List PSReq items.
+	FailedToSetup []PDUSessionFailedSetupItem
 }
 
 func extractPathSwitchRequest(req *ngapType.PathSwitchRequest) *PathSwitchRequestMsg {
@@ -2136,6 +2469,17 @@ func extractPathSwitchRequest(req *ngapType.PathSwitchRequest) *PathSwitchReques
 			if ie.Value.RANUENGAPID != nil {
 				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
 			}
+		case ngapType.PathSwitchRequestIEsPresentUserLocationInformation:
+			if ie.Value.UserLocationInformation != nil {
+				out.TAI = extractTAIFromULI(ie.Value.UserLocationInformation)
+			}
+		case ngapType.PathSwitchRequestIEsPresentUESecurityCapabilities:
+			if c := ie.Value.UESecurityCapabilities; c != nil {
+				out.UESecCap = &UESecCapBitmaps{
+					Enc: bitmap16(c.NRencryptionAlgorithms.Value.Bytes),
+					Int: bitmap16(c.NRintegrityProtectionAlgorithms.Value.Bytes),
+				}
+			}
 		case ngapType.PathSwitchRequestIEsPresentPDUSessionResourceToBeSwitchedDLList:
 			if ie.Value.PDUSessionResourceToBeSwitchedDLList != nil {
 				for _, item := range ie.Value.PDUSessionResourceToBeSwitchedDLList.List {
@@ -2145,14 +2489,117 @@ func extractPathSwitchRequest(req *ngapType.PathSwitchRequest) *PathSwitchReques
 					})
 				}
 			}
+		case ngapType.PathSwitchRequestIEsPresentPDUSessionResourceFailedToSetupListPSReq:
+			if ie.Value.PDUSessionResourceFailedToSetupListPSReq != nil {
+				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListPSReq.List {
+					out.FailedToSetup = append(out.FailedToSetup, PDUSessionFailedSetupItem{
+						PDUSessionID:                         uint8(item.PDUSessionID.Value),
+						PathSwitchRequestSetupFailedTransfer: []byte(item.PathSwitchRequestSetupFailedTransfer),
+					})
+				}
+			}
 		}
 	}
 	return out
 }
 
+// bitmap16 reads the first two bytes of a 16-bit NGAP bit string as a big-endian bitmap.
+func bitmap16(b []byte) uint16 {
+	var v uint16
+	if len(b) > 0 {
+		v = uint16(b[0]) << 8
+	}
+	if len(b) > 1 {
+		v |= uint16(b[1])
+	}
+	return v
+}
+
+// maxAllowedNSSAI is maxnoofAllowedS-NSSAIs. Ref: TS 38.413 §9.4.5.
+const maxAllowedNSSAI = 8
+
+// allowedNSSAIItems converts subscribed S-NSSAIs to NGAP Allowed NSSAI items,
+// de-duplicated on (SST, SD) — the subscription type also carries a per-slice DNN,
+// so the same slice can appear twice — and capped at maxnoofAllowedS-NSSAIs.
+// Returns nil for an empty input. Ref: TS 38.413 §9.3.1.31.
+func allowedNSSAIItems(in []amfctx.SNSSAISubscribed) []ngapType.AllowedNSSAIItem {
+	type key struct {
+		sst uint8
+		sd  string
+	}
+	seen := make(map[key]struct{}, len(in))
+	var items []ngapType.AllowedNSSAIItem
+	for _, s := range in {
+		k := key{s.SST, s.SD}
+		if _, dup := seen[k]; dup || len(items) >= maxAllowedNSSAI {
+			continue
+		}
+		seen[k] = struct{}{}
+		items = append(items, ngapType.AllowedNSSAIItem{
+			SNSSAI: buildNGAPSNSSAI(s.SST, snssaiSDBytes(s.SD)),
+		})
+	}
+	return items
+}
+
+// PDUSessionReleasedItem is one PDU session of a PDU Session Resource Released List
+// PSAck (Path Switch Request Acknowledge) or PSFail (Path Switch Request Failure),
+// with the cause carried in its PathSwitchRequestUnsuccessfulTransfer
+// (TS 38.413 §9.3.4 "Path Switch Request Unsuccessful Transfer"). CausePresent is an ngapType.CausePresent* value.
+type PDUSessionReleasedItem struct {
+	PDUSessionID uint8
+	CausePresent int
+	CauseValue   int64
+	// Transfer, when non-empty, is the SMF-supplied PathSwitchRequestUnsuccessfulTransfer
+	// (n2SmInfoType PATH_SWITCH_REQ_FAIL), already decode-checked, used verbatim instead
+	// of {Cause} built from CausePresent/CauseValue.
+	Transfer []byte
+}
+
+// buildUnsuccessfulTransfer encodes a PathSwitchRequestUnsuccessfulTransfer{Cause}.
+func buildUnsuccessfulTransfer(causePresent int, causeValue int64) ([]byte, error) {
+	return aper.MarshalWithParams(ngapType.PathSwitchRequestUnsuccessfulTransfer{
+		Cause: buildCause(causePresent, causeValue),
+	}, "valueExt")
+}
+
+// releasedTransfer returns the PathSwitchRequestUnsuccessfulTransfer bytes of a
+// released item: the SMF bytes when present, else {Cause} built by the AMF.
+func releasedTransfer(r PDUSessionReleasedItem) ([]byte, error) {
+	if len(r.Transfer) > 0 {
+		return r.Transfer, nil
+	}
+	return buildUnsuccessfulTransfer(r.CausePresent, r.CauseValue)
+}
+
+// PathSwitchAckParams are the inputs of BuildPathSwitchRequestAcknowledge.
+type PathSwitchAckParams struct {
+	AMFUENGAPId, RANUENGAPId int64
+	// UESecCap, when non-nil, is echoed as UE Security Capabilities (IE 119): only
+	// set when the capabilities received from the target differ from the stored ones.
+	UESecCap *UESecCapBitmaps
+	// NCC / NH is the Security Context (IE 93), the next pair of the per-UE chain.
+	NCC uint8
+	NH  [32]byte
+	// Switched are the sessions in the PDU Session Resource Switched List (IE 77, M).
+	Switched []PDUSessionSwitchItem
+	// Released are sessions not switched (IE 68, omitted when empty).
+	Released []PDUSessionReleasedItem
+	// AllowedNSSAI is IE 0 (M); must be non-empty.
+	AllowedNSSAI []amfctx.SNSSAISubscribed
+}
+
 // BuildPathSwitchRequestAcknowledge builds an NGAP PathSwitchRequestAcknowledge.
-// Ref: TS 38.413 §8.9.4 (Xn Handover — path switch)
-func BuildPathSwitchRequestAcknowledge(amfUENGAPId, ranUENGAPId int64, switchedPDUSessions []PDUSessionSwitchItem) []byte {
+// IEs are appended in TS 38.413 Table 9.2.3.9-1 order: AMF UE NGAP ID (10),
+// RAN UE NGAP ID (85), [UE Security Capabilities (119)], Security Context (93),
+// PDU Session Resource Switched List (77), [Released List PSAck (68)], Allowed NSSAI (0).
+// Returns nil when a mandatory IE cannot be built (empty Switched or AllowedNSSAI).
+// Ref: TS 38.413 §8.4.4.2, §9.2.3.9, §9.3.1.18.
+func BuildPathSwitchRequestAcknowledge(p PathSwitchAckParams) []byte {
+	nssaiItems := allowedNSSAIItems(p.AllowedNSSAI)
+	if len(p.Switched) == 0 || len(nssaiItems) == 0 {
+		return nil
+	}
 	pdu := ngapType.NGAPPDU{Present: ngapType.NGAPPDUPresentSuccessfulOutcome}
 	pdu.SuccessfulOutcome = new(ngapType.SuccessfulOutcome)
 	pdu.SuccessfulOutcome.ProcedureCode.Value = ngapType.ProcedureCodePathSwitchRequest
@@ -2161,54 +2608,155 @@ func BuildPathSwitchRequestAcknowledge(amfUENGAPId, ranUENGAPId int64, switchedP
 	ack := new(ngapType.PathSwitchRequestAcknowledge)
 	pdu.SuccessfulOutcome.Value.PathSwitchRequestAcknowledge = ack
 
-	// IE: AMF UE NGAP ID (mandatory)
-	{
-		ie := ngapType.PathSwitchRequestAcknowledgeIEs{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAMFUENGAPID},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
-			Value: ngapType.PathSwitchRequestAcknowledgeIEsValue{
-				Present:     ngapType.PathSwitchRequestAcknowledgeIEsPresentAMFUENGAPID,
-				AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUENGAPId},
-			},
-		}
-		ack.ProtocolIEs.List = append(ack.ProtocolIEs.List, ie)
-	}
-	// IE: RAN UE NGAP ID (mandatory)
-	{
-		ie := ngapType.PathSwitchRequestAcknowledgeIEs{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRANUENGAPID},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
-			Value: ngapType.PathSwitchRequestAcknowledgeIEsValue{
-				Present:     ngapType.PathSwitchRequestAcknowledgeIEsPresentRANUENGAPID,
-				RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUENGAPId},
-			},
-		}
-		ack.ProtocolIEs.List = append(ack.ProtocolIEs.List, ie)
-	}
-	// IE: PDU Session Resource Switched List (required if any sessions switched)
-	if len(switchedPDUSessions) > 0 {
-		switchedList := &ngapType.PDUSessionResourceSwitchedList{}
-		for _, sess := range switchedPDUSessions {
-			ackTransfer, _ := aper.MarshalWithParams(
-				ngapType.PathSwitchRequestAcknowledgeTransfer{}, "valueExt")
-			switchedList.List = append(switchedList.List,
-				ngapType.PDUSessionResourceSwitchedItem{
-					PDUSessionID:                         ngapType.PDUSessionID{Value: int64(sess.PDUSessionID)},
-					PathSwitchRequestAcknowledgeTransfer: aper.OctetString(ackTransfer),
-				},
-			)
-		}
-		ie := ngapType.PathSwitchRequestAcknowledgeIEs{
-			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceSwitchedList},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
-			Value: ngapType.PathSwitchRequestAcknowledgeIEsValue{
-				Present:                        ngapType.PathSwitchRequestAcknowledgeIEsPresentPDUSessionResourceSwitchedList,
-				PDUSessionResourceSwitchedList: switchedList,
-			},
-		}
-		ack.ProtocolIEs.List = append(ack.ProtocolIEs.List, ie)
+	add := func(id int64, crit aper.Enumerated, v ngapType.PathSwitchRequestAcknowledgeIEsValue) {
+		ack.ProtocolIEs.List = append(ack.ProtocolIEs.List, ngapType.PathSwitchRequestAcknowledgeIEs{
+			Id:          ngapType.ProtocolIEID{Value: id},
+			Criticality: ngapType.Criticality{Value: crit},
+			Value:       v,
+		})
 	}
 
+	// (1) AMF UE NGAP ID — M, ignore
+	add(ngapType.ProtocolIEIDAMFUENGAPID, ngapType.CriticalityPresentIgnore,
+		ngapType.PathSwitchRequestAcknowledgeIEsValue{
+			Present:     ngapType.PathSwitchRequestAcknowledgeIEsPresentAMFUENGAPID,
+			AMFUENGAPID: &ngapType.AMFUENGAPID{Value: p.AMFUENGAPId},
+		})
+	// (2) RAN UE NGAP ID — M, ignore
+	add(ngapType.ProtocolIEIDRANUENGAPID, ngapType.CriticalityPresentIgnore,
+		ngapType.PathSwitchRequestAcknowledgeIEsValue{
+			Present:     ngapType.PathSwitchRequestAcknowledgeIEsPresentRANUENGAPID,
+			RANUENGAPID: &ngapType.RANUENGAPID{Value: p.RANUENGAPId},
+		})
+	// (3) UE Security Capabilities — O, reject (only on mismatch)
+	if p.UESecCap != nil {
+		add(ngapType.ProtocolIEIDUESecurityCapabilities, ngapType.CriticalityPresentReject,
+			ngapType.PathSwitchRequestAcknowledgeIEsValue{
+				Present:                ngapType.PathSwitchRequestAcknowledgeIEsPresentUESecurityCapabilities,
+				UESecurityCapabilities: buildUESecurityCapabilities(p.UESecCap.Enc, p.UESecCap.Int),
+			})
+	}
+	// (4) Security Context {NCC, NH} — M, reject (TS 38.413 §9.3.1.18)
+	nh := p.NH
+	add(ngapType.ProtocolIEIDSecurityContext, ngapType.CriticalityPresentReject,
+		ngapType.PathSwitchRequestAcknowledgeIEsValue{
+			Present: ngapType.PathSwitchRequestAcknowledgeIEsPresentSecurityContext,
+			SecurityContext: &ngapType.SecurityContext{
+				NextHopChainingCount: ngapType.NextHopChainingCount{Value: int64(p.NCC)},
+				NextHopNH: ngapType.SecurityKey{
+					Value: aper.BitString{Bytes: nh[:], BitLength: 256},
+				},
+			},
+		})
+	// (6) PDU Session Resource Switched List — M, ignore
+	// Per-PSI transfer: the SMF-returned PathSwitchRequestAcknowledgeTransfer
+	// (TS 23.502 §4.9.1.2.2 step 7), or an empty one (all IEs optional) when the SMF
+	// supplied none — docs/procedures/XnHandover.md §7.4.2.
+	switchedList := &ngapType.PDUSessionResourceSwitchedList{}
+	for _, sess := range p.Switched {
+		ackTransfer := sess.AckTransfer
+		if len(ackTransfer) == 0 {
+			var err error
+			ackTransfer, err = aper.MarshalWithParams(ngapType.PathSwitchRequestAcknowledgeTransfer{}, "valueExt")
+			if err != nil {
+				return nil
+			}
+		}
+		switchedList.List = append(switchedList.List, ngapType.PDUSessionResourceSwitchedItem{
+			PDUSessionID:                         ngapType.PDUSessionID{Value: int64(sess.PDUSessionID)},
+			PathSwitchRequestAcknowledgeTransfer: aper.OctetString(ackTransfer),
+		})
+	}
+	add(ngapType.ProtocolIEIDPDUSessionResourceSwitchedList, ngapType.CriticalityPresentIgnore,
+		ngapType.PathSwitchRequestAcknowledgeIEsValue{
+			Present:                        ngapType.PathSwitchRequestAcknowledgeIEsPresentPDUSessionResourceSwitchedList,
+			PDUSessionResourceSwitchedList: switchedList,
+		})
+	// (7) PDU Session Resource Released List PSAck — O, ignore
+	if len(p.Released) > 0 {
+		rel := &ngapType.PDUSessionResourceReleasedListPSAck{}
+		for _, r := range p.Released {
+			tr, err := releasedTransfer(r)
+			if err != nil {
+				return nil
+			}
+			rel.List = append(rel.List, ngapType.PDUSessionResourceReleasedItemPSAck{
+				PDUSessionID:                          ngapType.PDUSessionID{Value: int64(r.PDUSessionID)},
+				PathSwitchRequestUnsuccessfulTransfer: aper.OctetString(tr),
+			})
+		}
+		add(ngapType.ProtocolIEIDPDUSessionResourceReleasedListPSAck, ngapType.CriticalityPresentIgnore,
+			ngapType.PathSwitchRequestAcknowledgeIEsValue{
+				Present:                             ngapType.PathSwitchRequestAcknowledgeIEsPresentPDUSessionResourceReleasedListPSAck,
+				PDUSessionResourceReleasedListPSAck: rel,
+			})
+	}
+	// (8) Allowed NSSAI — M, reject
+	add(ngapType.ProtocolIEIDAllowedNSSAI, ngapType.CriticalityPresentReject,
+		ngapType.PathSwitchRequestAcknowledgeIEsValue{
+			Present:      ngapType.PathSwitchRequestAcknowledgeIEsPresentAllowedNSSAI,
+			AllowedNSSAI: &ngapType.AllowedNSSAI{List: nssaiItems},
+		})
+
+	b, err := libngap.Encoder(pdu)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// BuildPathSwitchRequestFailure builds an NGAP PathSwitchRequestFailure
+// (UnsuccessfulOutcome, procedure code 25): AMF UE NGAP ID (10), RAN UE NGAP ID (85),
+// PDU Session Resource Released List PSFail (69, M, SIZE 1..). The cause travels per
+// session in PathSwitchRequestUnsuccessfulTransfer — there is no message-level Cause.
+// Returns nil when released is empty. Ref: TS 38.413 §8.4.4.3, §9.2.3.10.
+func BuildPathSwitchRequestFailure(amfUENGAPId, ranUENGAPId int64, released []PDUSessionReleasedItem) []byte {
+	if len(released) == 0 {
+		return nil
+	}
+	list := &ngapType.PDUSessionResourceReleasedListPSFail{}
+	for _, r := range released {
+		tr, err := releasedTransfer(r)
+		if err != nil {
+			return nil
+		}
+		list.List = append(list.List, ngapType.PDUSessionResourceReleasedItemPSFail{
+			PDUSessionID:                          ngapType.PDUSessionID{Value: int64(r.PDUSessionID)},
+			PathSwitchRequestUnsuccessfulTransfer: aper.OctetString(tr),
+		})
+	}
+	fail := &ngapType.PathSwitchRequestFailure{}
+	add := func(id int64, v ngapType.PathSwitchRequestFailureIEsValue) {
+		fail.ProtocolIEs.List = append(fail.ProtocolIEs.List, ngapType.PathSwitchRequestFailureIEs{
+			Id:          ngapType.ProtocolIEID{Value: id},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value:       v,
+		})
+	}
+	add(ngapType.ProtocolIEIDAMFUENGAPID, ngapType.PathSwitchRequestFailureIEsValue{
+		Present:     ngapType.PathSwitchRequestFailureIEsPresentAMFUENGAPID,
+		AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUENGAPId},
+	})
+	add(ngapType.ProtocolIEIDRANUENGAPID, ngapType.PathSwitchRequestFailureIEsValue{
+		Present:     ngapType.PathSwitchRequestFailureIEsPresentRANUENGAPID,
+		RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUENGAPId},
+	})
+	add(ngapType.ProtocolIEIDPDUSessionResourceReleasedListPSFail, ngapType.PathSwitchRequestFailureIEsValue{
+		Present:                              ngapType.PathSwitchRequestFailureIEsPresentPDUSessionResourceReleasedListPSFail,
+		PDUSessionResourceReleasedListPSFail: list,
+	})
+
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentUnsuccessfulOutcome,
+		UnsuccessfulOutcome: &ngapType.UnsuccessfulOutcome{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodePathSwitchRequest},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.UnsuccessfulOutcomeValue{
+				Present:                  ngapType.UnsuccessfulOutcomePresentPathSwitchRequestFailure,
+				PathSwitchRequestFailure: fail,
+			},
+		},
+	}
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
 		return nil

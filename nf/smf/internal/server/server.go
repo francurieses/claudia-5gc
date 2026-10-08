@@ -31,6 +31,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
@@ -57,9 +58,19 @@ type Session struct {
 	ARPPriority  int     // ARP priority level 1-15 (TS 29.571 §5.5.2)
 	AMBRULMbps   int     // Session AMBR uplink in Mbps
 	AMBRDLMbps   int     // Session AMBR downlink in Mbps
+	AMBRULKbps   uint64  // exact Session AMBR uplink in kbps (PFCP MBR)
+	AMBRDLKbps   uint64  // exact Session AMBR downlink in kbps (PFCP MBR)
 	QoSSource    string  // where the 5QI came from (see QoSSource* constants in qos.go)
-	State        string  // ACTIVE | IDLE (user plane deactivated)
+	State        string  // ACTIVE | IDLE (user plane deactivated) | RELEASING (PFCP node recovery in progress)
 	CreatedAt    time.Time
+	// N4EstablishedAt is when the UPF accepted the PFCP Session Establishment
+	// (zero until then; CreatedAt is the fallback). Compared with the UPF
+	// Recovery Time Stamp to find sessions lost in a UPF restart.
+	// Ref: TS 23.007 §19A, TS 23.527 §4.3.
+	N4EstablishedAt time.Time
+	// N4Stale is set when the UPF restarted: its PFCP session table is empty, so
+	// no N4 signalling (Deletion/Modification) must be sent for this session.
+	N4Stale bool
 	// PDUSessionType is the granted type (PDUSessionTypeIPv4|IPv6|IPv4v6).
 	// Ref: TS 24.501 §9.11.4.11.
 	PDUSessionType uint8
@@ -67,6 +78,35 @@ type Session struct {
 	// the prefix is advertised to the UE via RA on the UPF TUN (escalated,
 	// UPF-001). Empty for IPv4-only sessions. Ref: TS 23.501 §5.8.2.2.
 	UEIPv6Prefix string
+
+	// HOTargetGNBIP / HOTargetDLTEID hold the target gNB DL NG-U GTP tunnel
+	// received in the HandoverRequestAcknowledgeTransfer (n2SmInfoType
+	// HANDOVER_REQ_ACK). Stored for N2 HO step 12 (DL switch at HANDOVER
+	// NOTIFY, TS 23.502 §4.9.1.3.3); used by handleHandoverComplete for the
+	// DL path switch and cleared after it. In-memory only — not persisted.
+	HOTargetGNBIP  net.IP
+	HOTargetDLTEID uint32
+	// HOState is the N2 handover state tracked from the AMF's UpdateSMContext
+	// hoState values (hoState* constants). In-memory only.
+	// Ref: TS 29.502 §6.1.6.3 (HoState), §5.2.2.3.4.
+	HOState string
+	// HODirectForwarding is true when the source NG-RAN signalled a direct
+	// data forwarding path (HandoverRequiredTransfer.DirectForwardingPathAvailability).
+	// Ref: TS 38.413 §9.3.4.14; TS 23.502 §4.9.1.3.2 step 3.
+	HODirectForwarding bool
+	// HOTargetFailed is set by HANDOVER_RES_ALLOC_FAIL (the target could not set the
+	// PDU session up); the release-or-deactivate decision (HOReleaseOnDeactivate, rule R1)
+	// is executed when the AMF later signals upCnxState DEACTIVATED. Cleared by
+	// DEACTIVATED, PREPARING, ACTIVATING and a successful COMPLETED.
+	// Ref: TS 23.502 §4.3.7 step 1, §4.9.1.3.2 step 10; docs/procedures/N2Handover.md §7.8.
+	HOTargetFailed bool
+	// HOReleaseOnDeactivate is the rule R1 result: true = release the PDU session,
+	// false = deactivate the UP connection.
+	HOReleaseOnDeactivate bool
+	// UPSecurityRequired is true when the session's UP security enforcement policy is
+	// "Required" (TS 23.501 §5.10.3). This SMF never signals Required (the Security
+	// Indication IE is omitted), so it is false today; rule R1 reads it.
+	UPSecurityRequired bool
 }
 
 // smPolicyQoS carries the QoS parameters extracted from the PCF SM Policy response.
@@ -76,6 +116,8 @@ type smPolicyQoS struct {
 	ARPPriority int
 	AMBRULMbps  int
 	AMBRDLMbps  int
+	AMBRULKbps  uint64 // exact Session-AMBR UL in kbps (PFCP MBR, TS 29.244 §8.2.8)
+	AMBRDLKbps  uint64 // exact Session-AMBR DL in kbps
 	Source      string // QoSSource* constant
 }
 
@@ -112,6 +154,16 @@ type Server struct {
 	// n1n2Push defaults to s.pushN1N2Message; overridable in tests to capture
 	// the NAS bytes pushed towards the UE without needing a live mTLS AMF peer.
 	n1n2Push func(ctx context.Context, supi string, psi uint8, n1SmMsg, n2SmInfo []byte, n2SmInfoType string) (string, error)
+
+	// PFCP node-level supervision (SMF-004), see pfcp_node.go.
+	recoveryTS time.Time      // SMF local Recovery Time Stamp (TS 29.244 §8.2.65), seconds resolution
+	pfcpTimers pfcpNodeTimers // T1/N1/heartbeat/retry timers; tests may override
+	assoc      pfcpAssociation
+	assocKick  chan struct{} // nudges an immediate Association Setup attempt
+	recoverCh  chan struct{} // supervisor wake-up after a detection event
+	releaseWG  sync.WaitGroup
+	guardWG    sync.WaitGroup // RELEASING guard timers (pfcp_node.go)
+	hoWG       sync.WaitGroup // detached target-failed release/deactivation tasks (pfcp_ho.go)
 }
 
 type IPPool struct {
@@ -271,7 +323,12 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		secondaryAuthDNNs: secondaryAuthDNNs,
 		dnAAA:             newSimulatedDNAAAClient(dnAAAUnreachableDNNs),
 		pendingAuth:       make(map[string]*pendingSecondaryAuth),
+		recoveryTS:        time.Now().UTC().Truncate(time.Second),
+		pfcpTimers:        pfcpTimersFromConfig(cfg.N4),
+		assocKick:         make(chan struct{}, 1),
+		recoverCh:         make(chan struct{}, 1),
 	}
+	s.assoc.state = assocSetupPending
 	s.n1n2Push = s.pushN1N2Message
 	if db != nil {
 		if err := s.loadFromStore(context.Background()); err != nil {
@@ -364,6 +421,14 @@ func (s *Server) cleanupAllSessions(ctx context.Context) {
 	for ref, sess := range sessions {
 		s.deleteSession(ctx, ref)
 		s.deleteSMPolicy(ctx, sess.SmPolicyID)
+		// A session N4Stale (UPF restarted, SEID unknown to the new UPF) gets no
+		// PFCP deletion. Ref: TS 23.527 §4.3, TS 29.244 §7.5.6.
+		s.sessionMu.Lock()
+		n4Stale := sess.N4Stale
+		s.sessionMu.Unlock()
+		if n4Stale {
+			continue
+		}
 		go s.sendPFCPSessionDeletion(context.Background(), sess)
 	}
 	s.logger.Info("SMF: released all sessions on shutdown", "count", len(sessions))
@@ -450,6 +515,7 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info("Nsmf_PDUSession_CreateSMContext received")
+	s.warnIfNotAssociated(r.Context(), corrID)
 
 	// Extract request fields
 	supi, _ := req["supi"].(string)
@@ -673,6 +739,8 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		ARPPriority:    policyQoS.ARPPriority,
 		AMBRULMbps:     policyQoS.AMBRULMbps,
 		AMBRDLMbps:     policyQoS.AMBRDLMbps,
+		AMBRULKbps:     policyQoS.AMBRULKbps,
+		AMBRDLKbps:     policyQoS.AMBRDLKbps,
 		QoSSource:      policyQoS.Source,
 		State:          "ACTIVE",
 		CreatedAt:      time.Now(),
@@ -744,25 +812,54 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-// handleUpdateSMContext handles three cases:
+// handleUpdateSMContext handles these cases:
 //  1. N2SM response from gNB (PDU session resource setup): activates DL GTP-U forwarding in UPF.
 //  2. AN release notification (upCnxState=DEACTIVATED): deactivates DL forwarding in UPF.
 //  3. Xn path switch (n2SmInfoType=PATH_SWITCH_REQ): updates DL GTP-U to target gNB endpoint.
+//  4. N2 handover (hoState PREPARING / COMPLETED, n2SmInfoType HANDOVER_REQ_ACK /
+//     HANDOVER_RES_ALLOC_FAIL): PREPARING / REQ_ACK / RES_ALLOC_FAIL are SBI + in-memory only;
+//     COMPLETED switches the UPF DL FAR synchronously (pfcp_ho.go) before answering.
 //
-// Ref: TS 29.502 §5.2.2.3.2, TS 23.502 §4.3.2.2.1 step 9, TS 23.502 §4.2.6, TS 23.502 §4.9.1.2
+// Ref: TS 29.502 §5.2.2.3.2 (UP activation), §5.2.2.3.3 (Xn handover), §5.2.2.3.4 (N2 handover),
+// TS 23.502 §4.3.2.2.1 step 9, §4.2.6, §4.9.1.2.2, §4.9.1.3.2
 func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 	smContextRef := r.PathValue("smContextRef")
 
 	spanCtx, span := tracing.Tracer("SMF", "procedures").Start(r.Context(), "Nsmf_PDUSession_UpdateSMContext")
 	span.SetAttributes(attribute.String("sm_context_ref", smContextRef))
 	defer span.End()
+	if corrID := r.Header.Get("X-Correlation-Id"); corrID != "" {
+		spanCtx = logging.WithCorrelationID(spanCtx, corrID)
+	}
 	r = r.WithContext(spanCtx)
 
+	// hoLog carries no `procedure` key: the handover branches add their own
+	// (XnHandover / N2Handover) so every line has exactly one.
+	hoLog := s.logger.With("smContextRef", smContextRef,
+		"correlation_id", r.Header.Get("X-Correlation-Id"))
 	log := s.logger.With("procedure", "SmContextUpdate", "smContextRef", smContextRef)
 
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", err.Error())
+		return
+	}
+
+	// N2 handover branches keyed on hoState / n2SmInfoType. They are dispatched before
+	// the "no N2SM info" fallback because PREPARING (without n2SmInfo) and COMPLETED
+	// carry none. Only COMPLETED sends PFCP (synchronous DL switch).
+	// Ref: TS 29.502 §5.2.2.3.4; TS 23.502 §4.9.1.3.2, §4.9.1.3.3
+	n2SmInfoType, _ := body["n2SmInfoType"].(string)
+	hoState, _ := body["hoState"].(string)
+	switch {
+	case hoState == hoStatePreparing:
+		s.handleHandoverPreparing(w, hoLog, smContextRef, n2SmInfoType, body)
+		return
+	case hoState == hoStateCompleted:
+		s.handleHandoverComplete(r.Context(), w, hoLog, smContextRef)
+		return
+	case n2SmInfoType == n2SmInfoTypeHandoverResAllocFail:
+		s.handleHandoverResAllocFail(w, hoLog, smContextRef, body)
 		return
 	}
 
@@ -781,6 +878,12 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "sm context not found")
 			return
 		}
+		if s.rejectIfReleasing(w, log, sess, "UP activation", false) {
+			return
+		}
+		s.sessionMu.Lock()
+		sess.HOTargetFailed, sess.HOReleaseOnDeactivate = false, false
+		s.sessionMu.Unlock()
 
 		n2SmInfo, err := buildPDUSessionResourceSetupRequestTransfer(
 			net.ParseIP(s.cfg.UPFN3Addr), sess.ULTEID, 1 /* QFI */, int64(sess.FiveQI),
@@ -825,6 +928,30 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Target-failed PDU session (HANDOVER_RES_ALLOC_FAIL earlier): the AMF indicates the
+		// executed handover with DEACTIVATED, which triggers the stored release-or-deactivate
+		// decision (rule R1). Ref: TS 23.502 §4.3.7 step 1, §4.9.1.3.3.
+		s.sessionMu.Lock()
+		failed, release := sess.HOTargetFailed, sess.HOReleaseOnDeactivate
+		sess.HOTargetFailed, sess.HOReleaseOnDeactivate = false, false
+		releasing := sess.State == sessionStateReleasing
+		s.sessionMu.Unlock()
+		if failed && !releasing {
+			action := targetFailedDeactivate
+			if release {
+				action = targetFailedRelease
+			}
+			hoLog.Info("target-failed PDU session: AMF indicated handover executed (DEACTIVATED)",
+				"procedure", "N2Handover", "interface", "Nsmf", "direction", "IN",
+				"up_cnx_state", "DEACTIVATED", "target_failed_action", action,
+				"supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID, "seid", sess.SEID,
+				"result", "OK", "spec_ref", "TS 23.502 §4.3.7 step 1; §4.9.1.3.3")
+			w.WriteHeader(http.StatusOK)
+			dctx := context.WithoutCancel(r.Context())
+			s.goHO(func() { s.runTargetFailedAction(dctx, hoLog, "N2Handover", sess, release) })
+			return
+		}
+
 		log.Info("AN Release — deactivating UPF DL forwarding",
 			"interface", "N4",
 			"direction", "OUT",
@@ -833,7 +960,9 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			"spec_ref", "TS 23.502 §4.2.6",
 		)
 		s.sessionMu.Lock()
-		sess.State = "IDLE"
+		if sess.State != sessionStateReleasing {
+			sess.State = "IDLE"
+		}
 		s.sessionMu.Unlock()
 		go s.sendPFCPSessionDeactivation(context.Background(), sess)
 		w.WriteHeader(http.StatusOK)
@@ -889,6 +1018,8 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 		sess.FiveQI = fiveQI
 		sess.AMBRDLMbps = ambrDL
 		sess.AMBRULMbps = ambrUL
+		sess.AMBRDLKbps = granted.AMBRDLKbps
+		sess.AMBRULKbps = granted.AMBRULKbps
 		if sess.QoSSource != QoSSourceManualOverride {
 			sess.QoSSource = QoSSourceNWModification
 		}
@@ -969,6 +1100,8 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 					sess.FiveQI = granted.FiveQI
 					sess.AMBRULMbps = granted.AMBRULMbps
 					sess.AMBRDLMbps = granted.AMBRDLMbps
+					sess.AMBRULKbps = granted.AMBRULKbps
+					sess.AMBRDLKbps = granted.AMBRDLKbps
 					sess.QoSSource = granted.Source
 					s.sessionMu.Unlock()
 					if upfAck := s.sendPFCPQoSModification(r.Context(), sess); !upfAck {
@@ -1014,29 +1147,34 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Choose decoder based on n2SmInfoType: PATH_SWITCH_REQ uses PathSwitchRequestTransfer.
-	n2SmInfoType, _ := body["n2SmInfoType"].(string)
-	var (
-		gnbIP  net.IP
-		dlTEID uint32
-	)
-	if n2SmInfoType == "PATH_SWITCH_REQ" {
-		gnbIP, dlTEID, err = extractPathSwitchTunnelInfo(n2SmInfoBytes)
-		if err != nil {
-			log.Error("extractPathSwitchTunnelInfo failed", "error", err)
-			problem(w, http.StatusUnprocessableEntity, "SYSTEM_FAILURE", err.Error())
-			return
-		}
-		log.Info("Xn Handover: target gNB DL tunnel info", "gnbIP", gnbIP, "dlTEID", dlTEID,
-			"spec_ref", "TS 23.502 §4.9.1.2")
-	} else {
-		gnbIP, dlTEID, err = extractGNBTunnelInfo(n2SmInfoBytes)
-		if err != nil {
-			log.Error("extractGNBTunnelInfo failed", "error", err)
-			problem(w, http.StatusUnprocessableEntity, "SYSTEM_FAILURE", err.Error())
-			return
-		}
-		log.Info("gNB DL tunnel info", "gnbIP", gnbIP, "dlTEID", dlTEID)
+
+	// N2 HO steps 10-12: HANDOVER_REQ_ACK -> HANDOVER_CMD, SBI response only (no PFCP, indirect forwarding out of scope).
+	// Ref: TS 23.502 §4.9.1.3.2 steps 10-12, TS 29.502 §5.2.2.3.4
+	if n2SmInfoType == n2SmInfoTypeHandoverReqAck {
+		s.handleHandoverReqAck(w, hoLog, smContextRef, n2SmInfoBytes)
+		return
 	}
+	// Xn path switch failed-to-setup PSI: 204, then detached deactivate/release (rule R1).
+	// Ref: TS 23.502 §4.9.1.2.2 step 2 (PathSwitchRequestSetupFailedTransfer relayed by the AMF)
+	if n2SmInfoType == n2SmInfoTypePathSwitchSetupFail {
+		s.handlePathSwitchSetupFail(r.Context(), w, hoLog, smContextRef, n2SmInfoBytes)
+		return
+	}
+
+	// Xn path switch: synchronous DL switch, answered after the PFCP response.
+	// Ref: TS 23.502 §4.9.1.2.2 steps 2-6, TS 29.502 §5.2.2.3.3.
+	if n2SmInfoType == "PATH_SWITCH_REQ" {
+		s.handlePathSwitchReq(r.Context(), w, hoLog, smContextRef, n2SmInfoBytes)
+		return
+	}
+
+	gnbIP, dlTEID, err := extractGNBTunnelInfo(n2SmInfoBytes)
+	if err != nil {
+		log.Error("extractGNBTunnelInfo failed", "error", err)
+		problem(w, http.StatusUnprocessableEntity, "SYSTEM_FAILURE", err.Error())
+		return
+	}
+	log.Info("gNB DL tunnel info", "gnbIP", gnbIP, "dlTEID", dlTEID)
 
 	s.sessionMu.Lock()
 	sess := s.sessions[smContextRef]
@@ -1048,12 +1186,344 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessionMu.Lock()
-	sess.State = "ACTIVE"
-	s.sessionMu.Unlock()
-	go s.sendPFCPSessionModification(context.Background(), sess, dlTEID, gnbIP)
+	if s.rejectIfReleasing(w, log, sess, "N2 SM info update", false) {
+		return
+	}
+	if s.markSessionActive(sess) {
+		go s.sendPFCPSessionModification(context.Background(), sess, dlTEID, gnbIP)
+	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// pathSwitchAckEncodeFailure answers a PATH_SWITCH_REQ whose
+// PathSwitchRequestAcknowledgeTransfer could not be encoded: SmContextUpdateError
+// (500 SYSTEM_FAILURE) carrying a PathSwitchRequestUnsuccessfulTransfer with radioNetwork
+// cause ho-failure-in-target-5GC-ngran-node-or-target-system (7), n2SmInfoType
+// PATH_SWITCH_REQ_FAIL, so the AMF can send PATH SWITCH REQUEST FAILURE.
+// Ref: TS 29.502 §5.2.2.3.3, §6.1.6.2; TS 23.502 §4.9.1.2.2 step 6; TS 38.413 §9.3.1.2.
+func pathSwitchAckEncodeFailure(w http.ResponseWriter, encErr error) {
+	smContextUpdateError(w, http.StatusInternalServerError, "SYSTEM_FAILURE", encErr.Error(),
+		pathSwitchUnsuccessfulTransfer(ngapType.CausePresentRadioNetwork,
+			ngapType.CauseRadioNetworkPresentHoFailureInTarget5GCNgranNodeOrTargetSystem),
+		n2SmInfoTypePathSwitchReqFail)
+}
+
+// n2SmInfoType values exchanged with the AMF during handover.
+// Ref: TS 29.502 §6.1.6.3 (N2SmInfoType), docs/procedures/XnHandover.md §4.6.
+const (
+	n2SmInfoTypeHandoverReqAck      = "HANDOVER_REQ_ACK"
+	n2SmInfoTypeHandoverCmd         = "HANDOVER_CMD"
+	n2SmInfoTypeHandoverRequired    = "HANDOVER_REQUIRED"
+	n2SmInfoTypeHandoverPrepFail    = "HANDOVER_PREP_FAIL"
+	n2SmInfoTypePduResSetupReq      = "PDU_RES_SETUP_REQ"
+	n2SmInfoTypePathSwitchReqAck    = "PATH_SWITCH_REQ_ACK"
+	n2SmInfoTypePathSwitchReqFail   = "PATH_SWITCH_REQ_FAIL"
+	n2SmInfoTypePathSwitchSetupFail = "PATH_SWITCH_SETUP_FAIL"
+	// n2SmInfoTypeHandoverResAllocFail carries the target's
+	// HandoverResourceAllocationUnsuccessfulTransfer (TS 23.502 §4.9.1.3.2 step 10).
+	n2SmInfoTypeHandoverResAllocFail = "HANDOVER_RES_ALLOC_FAIL"
+)
+
+// HoState values (SmContextUpdateData / SmContextUpdatedData.hoState).
+// Ref: TS 29.502 §6.1.6.3 (HoState), §5.2.2.3.4.
+const (
+	hoStatePreparing = "PREPARING"
+	hoStatePrepared  = "PREPARED"
+	hoStateCompleted = "COMPLETED"
+	// hoStateNone: no handover in progress / handover preparation failed or was cancelled
+	// (the SMF-side value after HANDOVER_RES_ALLOC_FAIL, TS 29.502 §5.2.2.3.4).
+	hoStateNone = "NONE"
+)
+
+// causeSessionReleasing is the problem cause returned for an UpdateSMContext that
+// would (re)activate the user plane of a session being released after a UPF
+// restart/failure. DEVIATION: TS 29.502 §5.2.2.3 defines no dedicated cause for
+// an SM context in release; 409 Conflict with this cause is used (pattern of the
+// AMBIGUOUS_SESSION 409 in this NF) so the AMF rejects the update and the
+// session release proceeds. Ref: TS 23.527 §4.3, TS 23.502 §4.3.4.2.
+const causeSessionReleasing = "PDU_SESSION_RELEASING"
+
+// markSessionActive sets State=ACTIVE unless the session turned RELEASING after
+// the rejectIfReleasing check (check-and-set in one critical section, so a
+// concurrent recovery marking is never overwritten). It returns false when the
+// session is RELEASING, in which case no N4 Session Modification must follow.
+// Ref: TS 23.527 §4.3.2.
+func (s *Server) markSessionActive(sess *Session) bool {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if sess.State == sessionStateReleasing {
+		return false
+	}
+	sess.State = "ACTIVE"
+	return true
+}
+
+// rejectIfReleasing answers 409 and returns true when sess is RELEASING; no N4
+// signalling and no N2 SM info are produced. For Xn path switch the error is an
+// SmContextUpdateError carrying PATH_SWITCH_REQ_FAIL (TS 29.502 §5.2.2.3.3).
+func (s *Server) rejectIfReleasing(w http.ResponseWriter, log *slog.Logger, sess *Session, op string, pathSwitch bool) bool {
+	s.sessionMu.Lock()
+	releasing := sess.State == sessionStateReleasing
+	s.sessionMu.Unlock()
+	if !releasing {
+		return false
+	}
+	log.Warn("UpdateSMContext rejected — session RELEASING after UPF restart/failure",
+		"interface", "Nsmf", "direction", "OUT", "result", "REJECT", "cause", causeSessionReleasing,
+		"operation", op, "supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID,
+		"spec_ref", "TS 29.502 §5.2.2.3; TS 23.527 §4.3")
+	detail := "PDU session is being released after a UPF restart/failure"
+	if pathSwitch {
+		smContextUpdateError(w, http.StatusConflict, causeSessionReleasing, detail,
+			pathSwitchUnsuccessfulTransfer(ngapType.CausePresentRadioNetwork, ngapType.CauseRadioNetworkPresentUnspecified),
+			n2SmInfoTypePathSwitchReqFail)
+		return true
+	}
+	problem(w, http.StatusConflict, causeSessionReleasing, detail)
+	return true
+}
+
+// smContextUpdateError writes an SmContextUpdateError (TS 29.502 §6.1.6.2): the nested
+// ProblemDetails in "error" plus, when n2SmInfo is non-empty, the N2 SM transfer and its
+// n2SmInfoType the AMF can relay (PATH_SWITCH_REQ_FAIL, HANDOVER_PREP_FAIL, ...).
+// Content-Type is application/json (the body is not a bare ProblemDetails).
+// Ref: TS 29.502 §5.2.2.3.3 / §5.2.2.3.4, §6.1.6.2; TS 23.502 §4.9.1.2.2 step 6, §4.9.1.3.2 step 12.
+func smContextUpdateError(w http.ResponseWriter, status int, cause, detail string, n2SmInfo []byte, n2SmInfoType string) {
+	out := map[string]interface{}{
+		"error": map[string]interface{}{"status": status, "cause": cause, "detail": detail},
+	}
+	if len(n2SmInfo) > 0 {
+		out["n2SmInfo"] = base64.StdEncoding.EncodeToString(n2SmInfo)
+		out["n2SmInfoType"] = n2SmInfoType
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// ngapCause builds an NGAP Cause CHOICE for the radioNetwork / protocol groups.
+// Ref: TS 38.413 §9.3.1.2.
+func ngapCause(present int, value aper.Enumerated) ngapType.Cause {
+	c := ngapType.Cause{Present: present}
+	switch present {
+	case ngapType.CausePresentRadioNetwork:
+		c.RadioNetwork = &ngapType.CauseRadioNetwork{Value: value}
+	case ngapType.CausePresentProtocol:
+		c.Protocol = &ngapType.CauseProtocol{Value: value}
+	}
+	return c
+}
+
+// pathSwitchUnsuccessfulTransfer encodes PathSwitchRequestUnsuccessfulTransfer{Cause}
+// (nil on encode failure). Ref: TS 38.413 §9.3.4 (Path Switch Request Unsuccessful Transfer).
+func pathSwitchUnsuccessfulTransfer(causePresent int, causeValue aper.Enumerated) []byte {
+	b, err := aper.MarshalWithParams(ngapType.PathSwitchRequestUnsuccessfulTransfer{
+		Cause: ngapCause(causePresent, causeValue)}, "valueExt")
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// handoverPrepFailTransfer encodes HandoverPreparationUnsuccessfulTransfer{Cause}
+// (nil on encode failure). Ref: TS 38.413 §9.3.4 (Handover Preparation Unsuccessful Transfer).
+func handoverPrepFailTransfer(causePresent int, causeValue aper.Enumerated) []byte {
+	b, err := aper.MarshalWithParams(ngapType.HandoverPreparationUnsuccessfulTransfer{
+		Cause: ngapCause(causePresent, causeValue)}, "valueExt")
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// handoverPrepFailTransferCause encodes HandoverPreparationUnsuccessfulTransfer{Cause} with an
+// already-built NGAP Cause (relayed unchanged, any group). nil on encode failure.
+// Ref: TS 38.413 §9.3.4 (Handover Preparation Unsuccessful Transfer).
+func handoverPrepFailTransferCause(c ngapType.Cause) []byte {
+	b, err := aper.MarshalWithParams(ngapType.HandoverPreparationUnsuccessfulTransfer{Cause: c}, "valueExt")
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// handleHandoverReqAck serves n2SmInfoType HANDOVER_REQ_ACK: decodes the
+// HandoverRequestAcknowledgeTransfer, stores the target DL NG-U tunnel on the
+// session, sets HOState PREPARED and answers with a HandoverCommandTransfer. When the
+// source signalled a direct forwarding path and the target returned a DL forwarding
+// tunnel, the command carries that tunnel and the forwarded QoS flows (direct data
+// forwarding); otherwise it is empty (indirect forwarding would need UPF forwarding
+// tunnels = PFCP, not done). No PFCP is sent and the session State is unchanged (the DL
+// switch happens at HANDOVER NOTIFY). Errors answer SmContextUpdateError with a
+// HANDOVER_PREP_FAIL transfer.
+// Ref: TS 23.502 §4.9.1.3.2 steps 10-12; TS 29.502 §5.2.2.3.4; TS 38.413 §9.3.4.10, §9.3.4.11.
+func (s *Server) handleHandoverReqAck(w http.ResponseWriter, log *slog.Logger, smContextRef string, n2SmInfo []byte) {
+	log = log.With("procedure", "N2Handover", "interface", "Nsmf",
+		"n2_sm_info_type", n2SmInfoTypeHandoverReqAck)
+
+	s.sessionMu.Lock()
+	sess := s.sessions[smContextRef]
+	s.sessionMu.Unlock()
+	if sess == nil {
+		log.Warn("N2 HO: session not found", "direction", "IN", "result", "REJECT", "cause", "CONTEXT_NOT_FOUND",
+			"spec_ref", "TS 29.502 §5.2.2.3.4; TS 23.502 §4.9.1.3.2 step 10")
+		smContextUpdateError(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "sm context not found",
+			handoverPrepFailTransfer(ngapType.CausePresentRadioNetwork, ngapType.CauseRadioNetworkPresentUnknownPDUSessionID),
+			n2SmInfoTypeHandoverPrepFail)
+		return
+	}
+
+	ack, gnbIP, dlTEID, err := decodeHandoverAck(n2SmInfo)
+	if err != nil {
+		log.Error("N2 HO: decode HandoverRequestAcknowledgeTransfer failed", "direction", "IN",
+			"supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID, "result", "REJECT", "error", err,
+			"spec_ref", "TS 23.502 §4.9.1.3.2 step 10")
+		smContextUpdateError(w, http.StatusUnprocessableEntity, "SYSTEM_FAILURE", err.Error(),
+			handoverPrepFailTransfer(ngapType.CausePresentProtocol, ngapType.CauseProtocolPresentSemanticError),
+			n2SmInfoTypeHandoverPrepFail)
+		return
+	}
+
+	s.sessionMu.Lock()
+	direct := sess.HODirectForwarding
+	s.sessionMu.Unlock()
+
+	cmdTransfer, forwarding, fwdReason := buildHandoverCommandTransfer(direct, ack)
+	cmd, err := aper.MarshalWithParams(cmdTransfer, "valueExt")
+	if err != nil {
+		log.Error("N2 HO: encode HandoverCommandTransfer failed", "direction", "OUT", "result", "FAILURE",
+			"supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID, "error", err,
+			"spec_ref", "TS 23.502 §4.9.1.3.2 step 12")
+		smContextUpdateError(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error(),
+			handoverPrepFailTransfer(ngapType.CausePresentRadioNetwork, ngapType.CauseRadioNetworkPresentHoFailureInTarget5GCNgranNodeOrTargetSystem),
+			n2SmInfoTypeHandoverPrepFail)
+		return
+	}
+
+	s.sessionMu.Lock()
+	sess.HOTargetGNBIP = gnbIP
+	sess.HOTargetDLTEID = dlTEID
+	sess.HOState = hoStatePrepared
+	s.sessionMu.Unlock()
+
+	log.Info("N2 HO: target DL tunnel stored, HandoverCommandTransfer returned (no PFCP)",
+		"direction", "OUT", "supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID,
+		"gnbIP", gnbIP, "dlTEID", dlTEID, "ho_state", hoStatePrepared, "data_forwarding", forwarding,
+		"data_forwarding_reason", fwdReason,
+		"result", "OK", "spec_ref", "TS 23.502 §4.9.1.3.2 step 12")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"hoState":      hoStatePrepared,
+		"n2SmInfo":     base64.StdEncoding.EncodeToString(cmd),
+		"n2SmInfoType": n2SmInfoTypeHandoverCmd,
+	})
+}
+
+// Values of the data_forwarding log field.
+const (
+	dataForwardingDirect      = "direct"
+	dataForwardingNotPossible = "not-possible"
+	// dataForwardingNone: no forwarding tunnel returned (indirect forwarding would need PFCP).
+	dataForwardingNone = "none"
+)
+
+// Values of the data_forwarding_reason log field (set when data_forwarding is "none").
+const (
+	// forwardingReasonNoDirectPath: no direct forwarding path (or no PREPARING); indirect
+	// forwarding would need UPF forwarding tunnels via PFCP, not implemented.
+	forwardingReasonNoDirectPath = "no-direct-forwarding-path"
+	// forwardingReasonNoTunnel: direct path, but the ack transfer has no DLForwardingUPTNLInformation.
+	forwardingReasonNoTunnel = "target-provided-no-forwarding-tunnel"
+	// forwardingReasonNoFlow: no QoS flow with DataForwardingAccepted.
+	forwardingReasonNoFlow = "no-flow-accepted-for-forwarding"
+)
+
+// buildHandoverCommandTransfer builds the HandoverCommandTransfer for HANDOVER_CMD. With a
+// direct forwarding path (source signalled DirectForwardingPathAvailability) and a target
+// DLForwardingUPTNLInformation it carries that tunnel and the QoS flows whose
+// DataForwardingAccepted is present (omitted if none). It returns the data_forwarding value and, for "none", the reason.
+// Ref: TS 38.413 §9.3.4.10 (Handover Command Transfer), §9.3.4.11; TS 23.502 §4.9.1.3.2 step 12.
+func buildHandoverCommandTransfer(direct bool, ack *ngapType.HandoverRequestAcknowledgeTransfer) (ngapType.HandoverCommandTransfer, string, string) {
+	var cmd ngapType.HandoverCommandTransfer
+	if !direct {
+		return cmd, dataForwardingNone, forwardingReasonNoDirectPath
+	}
+	if ack.DLForwardingUPTNLInformation == nil {
+		return cmd, dataForwardingNone, forwardingReasonNoTunnel
+	}
+	var list []ngapType.QosFlowToBeForwardedItem
+	for _, f := range ack.QosFlowSetupResponseList.List {
+		if f.DataForwardingAccepted != nil {
+			list = append(list, ngapType.QosFlowToBeForwardedItem{QosFlowIdentifier: f.QosFlowIdentifier})
+		}
+	}
+	if len(list) == 0 {
+		return cmd, dataForwardingNone, forwardingReasonNoFlow
+	}
+	cmd.DLForwardingUPTNLInformation = ack.DLForwardingUPTNLInformation
+	cmd.QosFlowToBeForwardedList = &ngapType.QosFlowToBeForwardedList{List: list}
+	return cmd, dataForwardingDirect, ""
+}
+
+// ngapCauseValue returns the numeric value of the selected NGAP Cause choice.
+func ngapCauseValue(c ngapType.Cause) int64 {
+	switch c.Present {
+	case ngapType.CausePresentRadioNetwork:
+		if c.RadioNetwork != nil {
+			return int64(c.RadioNetwork.Value)
+		}
+	case ngapType.CausePresentTransport:
+		if c.Transport != nil {
+			return int64(c.Transport.Value)
+		}
+	case ngapType.CausePresentNas:
+		if c.Nas != nil {
+			return int64(c.Nas.Value)
+		}
+	case ngapType.CausePresentProtocol:
+		if c.Protocol != nil {
+			return int64(c.Protocol.Value)
+		}
+	case ngapType.CausePresentMisc:
+		if c.Misc != nil {
+			return int64(c.Misc.Value)
+		}
+	}
+	return -1
+}
+
+// extractHandoverAckTunnelInfo decodes the APER-encoded HandoverRequestAcknowledgeTransfer
+// and returns the target gNB DL NG-U GTP tunnel (IP, TEID).
+// Ref: TS 38.413 §9.3.4.11
+func extractHandoverAckTunnelInfo(n2SmInfo []byte) (net.IP, uint32, error) {
+	_, ip, teid, err := decodeHandoverAck(n2SmInfo)
+	return ip, teid, err
+}
+
+// decodeHandoverAck decodes the HandoverRequestAcknowledgeTransfer and returns it with the
+// target gNB DL NG-U GTP tunnel (IP, TEID). Ref: TS 38.413 §9.3.4.11
+func decodeHandoverAck(n2SmInfo []byte) (*ngapType.HandoverRequestAcknowledgeTransfer, net.IP, uint32, error) {
+	var transfer ngapType.HandoverRequestAcknowledgeTransfer
+	if err := aper.UnmarshalWithParams(n2SmInfo, &transfer, "valueExt"); err != nil {
+		return nil, nil, 0, fmt.Errorf("smf: decode HandoverRequestAcknowledgeTransfer: %w", err)
+	}
+	gtpTunnel := transfer.DLNGUUPTNLInformation.GTPTunnel
+	if gtpTunnel == nil {
+		return nil, nil, 0, fmt.Errorf("smf: GTPTunnel is nil in HandoverRequestAcknowledgeTransfer")
+	}
+	teidBytes := []byte(gtpTunnel.GTPTEID.Value)
+	if len(teidBytes) != 4 {
+		return nil, nil, 0, fmt.Errorf("smf: unexpected TEID length %d in handover ack", len(teidBytes))
+	}
+	ipBytes := gtpTunnel.TransportLayerAddress.Value.Bytes
+	if len(ipBytes) < 4 {
+		return nil, nil, 0, fmt.Errorf("smf: unexpected IP length %d in handover ack", len(ipBytes))
+	}
+	gnbIP := make(net.IP, 4)
+	copy(gnbIP, ipBytes[:4])
+	return &transfer, gnbIP, binary.BigEndian.Uint32(teidBytes), nil
 }
 
 func (s *Server) handleDeleteSMContext(w http.ResponseWriter, r *http.Request) {
@@ -1063,38 +1533,63 @@ func (s *Server) handleDeleteSMContext(w http.ResponseWriter, r *http.Request) {
 
 	s.sessionMu.Lock()
 	sess := s.sessions[smContextRef]
-	if sess != nil {
-		pool := s.ipPools[sess.DNN]
-		if pool == nil {
-			pool = s.ipPools["internet"]
-		}
-		if pool != nil && sess.UEIP != nil {
-			pool.Release(sess.UEIP)
-		}
-		if v6pool := s.ipv6Pools[sess.DNN]; v6pool != nil && sess.UEIPv6Prefix != "" {
-			if _, prefix, perr := net.ParseCIDR(sess.UEIPv6Prefix); perr == nil {
-				v6pool.Release(prefix)
-			}
-		}
-	}
-	delete(s.sessions, smContextRef)
 	s.sessionMu.Unlock()
-	s.deleteSession(r.Context(), smContextRef)
 
 	if sess != nil {
-		metrics.PDUSessionsActive.WithLabelValues("SMF", sess.DNN).Dec()
-		log.Info("Nsmf_PDUSession_DeleteSMContext — releasing session",
-			"supi", sess.SUPI, "ueIP", sess.UEIP, "seid", sess.SEID,
-			"spec_ref", "TS 29.502 §5.2.2.3.3",
-		)
-		// Delete SM Policy association with PCF (TS 29.512 §5.2.2.4; TS 23.502 §4.3.4.2 step 3b)
-		s.deleteSMPolicy(r.Context(), sess.SmPolicyID)
-		go s.sendPFCPSessionDeletion(context.Background(), sess)
+		// Idempotent: a concurrent local release (PFCP node recovery fallback)
+		// may have removed the session already; releaseSessionLocal then no-ops.
+		if s.releaseSessionLocal(r.Context(), smContextRef, sess, true) {
+			log.Info("Nsmf_PDUSession_DeleteSMContext — releasing session",
+				"supi", sess.SUPI, "ueIP", sess.UEIP, "seid", sess.SEID,
+				"spec_ref", "TS 29.502 §5.2.2.4",
+			)
+		}
 	} else {
+		s.deleteSession(r.Context(), smContextRef)
 		log.Warn("Nsmf_PDUSession_DeleteSMContext — session not found")
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// releaseSessionLocal frees every SMF-side resource of a PDU session: UE IPv4
+// address and IPv6 prefix, the session table and store entries, the active-session
+// gauge and the SM policy association. When sendN4 is true and the session is not
+// N4Stale (UPF restarted, its session table is empty) a best-effort PFCP Session
+// Deletion is sent. It is shared by the Nsmf release handler and the PFCP
+// node-recovery local-release fallback, and is idempotent: it returns false and
+// does nothing when ref no longer maps to sess (never double-frees an address).
+// Ref: TS 29.502 §5.2.2.4, TS 23.502 §4.3.4.2, TS 29.244 §7.5.6.
+func (s *Server) releaseSessionLocal(ctx context.Context, ref string, sess *Session, sendN4 bool) bool {
+	s.sessionMu.Lock()
+	if s.sessions[ref] != sess {
+		s.sessionMu.Unlock()
+		return false
+	}
+	pool := s.ipPools[sess.DNN]
+	if pool == nil {
+		pool = s.ipPools["internet"]
+	}
+	if pool != nil && sess.UEIP != nil {
+		pool.Release(sess.UEIP)
+	}
+	if v6pool := s.ipv6Pools[sess.DNN]; v6pool != nil && sess.UEIPv6Prefix != "" {
+		if _, prefix, perr := net.ParseCIDR(sess.UEIPv6Prefix); perr == nil {
+			v6pool.Release(prefix)
+		}
+	}
+	delete(s.sessions, ref)
+	n4Stale := sess.N4Stale
+	s.sessionMu.Unlock()
+	s.deleteSession(ctx, ref)
+
+	metrics.PDUSessionsActive.WithLabelValues("SMF", sess.DNN).Dec()
+	// Delete SM Policy association with PCF (TS 29.512 §5.2.2.4; TS 23.502 §4.3.4.2 step 3b)
+	s.deleteSMPolicy(ctx, sess.SmPolicyID)
+	if sendN4 && !n4Stale {
+		go s.sendPFCPSessionDeletion(context.Background(), sess)
+	}
+	return true
 }
 
 // sendPFCPSessionDeletion sends a PFCP Session Deletion Request to the UPF.
@@ -1112,7 +1607,7 @@ func (s *Server) sendPFCPSessionDeletion(ctx context.Context, sess *Session) {
 	}
 	defer conn.Close()
 
-	seq := s.pfcpSeq.Add(1)
+	seq := s.nextPFCPSeq()
 	req := pfcpmsg.NewSessionDeletionRequest(0, 0, sess.SEID, seq, 0)
 
 	b, err := req.Marshal()
@@ -1148,6 +1643,9 @@ func (s *Server) sendPFCPSessionDeletion(ctx context.Context, sess *Session) {
 // sendPFCPSessionModification re-enables DL forwarding with the new gNB tunnel.
 // Ref: TS 29.244 §6.3.3, TS 23.502 §4.2.6
 func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session) {
+	if s.skipN4ForReleasing(sess, "SessionDeactivation") {
+		return
+	}
 	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
 	if err != nil {
 		s.logger.Error("PFCP: resolve UPF address", "error", err)
@@ -1160,15 +1658,12 @@ func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session)
 	}
 	defer conn.Close()
 
-	seq := s.pfcpSeq.Add(1)
+	seq := s.nextPFCPSeq()
 	// Update the DL FAR: remove outer header creation (DROP action = no forwarding).
 	// ApplyAction 0x01 = DROP per TS 29.244 Table 7.5.2.3-1.
 	req := pfcpmsg.NewSessionModificationRequest(
 		0, 0, sess.SEID, seq, 0,
-		pfcpie.NewUpdateFAR(
-			pfcpie.NewFARID(1),
-			pfcpie.NewApplyAction(0x01), // DROP — UPF discards DL packets
-		),
+		buildDLDropFAR(),
 	)
 
 	b, err := req.Marshal()
@@ -1214,13 +1709,15 @@ func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session)
 // defaults (non-fatal; session proceeds).
 // Ref: TS 29.512 §5.2.2.2 (Npcf_SMPolicyControl_Create), §5.6.2.3 (SmPolicyContextData)
 func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, slice SliceID, subQoS *subscribedQoS) (string, smPolicyQoS) {
-	fallback := smPolicyQoS{FiveQI: 9, ARPPriority: 8, AMBRULMbps: 100, AMBRDLMbps: 100, Source: QoSSourceOperatorDefault}
+	fallback := smPolicyQoS{FiveQI: 9, ARPPriority: 8, AMBRULMbps: 100, AMBRDLMbps: 100, AMBRULKbps: 100_000, AMBRDLKbps: 100_000, Source: QoSSourceOperatorDefault}
 	if subQoS != nil {
 		fallback = smPolicyQoS{
 			FiveQI:      uint8(subQoS.FiveQI),
 			ARPPriority: subQoS.ARPPriority,
 			AMBRULMbps:  subQoS.AMBRULMbps,
 			AMBRDLMbps:  subQoS.AMBRDLMbps,
+			AMBRULKbps:  kbpsOrMbps(subQoS.AMBRULKbps, subQoS.AMBRULMbps),
+			AMBRDLKbps:  kbpsOrMbps(subQoS.AMBRDLKbps, subQoS.AMBRDLMbps),
 			Source:      QoSSourceUDMSubscription,
 		}
 	}
@@ -1295,6 +1792,8 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 		ARPPriority: fallback.ARPPriority,
 		AMBRULMbps:  fallback.AMBRULMbps,
 		AMBRDLMbps:  fallback.AMBRDLMbps,
+		AMBRULKbps:  fallback.AMBRULKbps,
+		AMBRDLKbps:  fallback.AMBRDLKbps,
 		Source:      QoSSourceOperatorDefault,
 	}
 	var respBody map[string]interface{}
@@ -1322,10 +1821,10 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 				if rule, ok := v.(map[string]interface{}); ok {
 					if ambr, ok := rule["sessAmbr"].(map[string]interface{}); ok {
 						if ul, ok := ambr["uplink"].(string); ok {
-							qos.AMBRULMbps = parseMbps(ul, fallback.AMBRULMbps)
+							qos.AMBRULKbps, qos.AMBRULMbps = parseAMBR(ul, fallback.AMBRULKbps, fallback.AMBRULMbps)
 						}
 						if dl, ok := ambr["downlink"].(string); ok {
-							qos.AMBRDLMbps = parseMbps(dl, fallback.AMBRDLMbps)
+							qos.AMBRDLKbps, qos.AMBRDLMbps = parseAMBR(dl, fallback.AMBRDLKbps, fallback.AMBRDLMbps)
 						}
 					}
 					break
@@ -1341,20 +1840,6 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 		"spec_ref", "TS 29.512 §5.2.2.2",
 	)
 	return smPolicyID, qos
-}
-
-// parseMbps extracts the integer Mbps value from a string like "100 Mbps".
-// Returns fallback if parsing fails.
-func parseMbps(s string, fallback int) int {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return fallback
-	}
-	var v int
-	if _, err := fmt.Sscanf(fields[0], "%d", &v); err != nil || v <= 0 {
-		return fallback
-	}
-	return v
 }
 
 // deleteSMPolicy calls PCF to delete an SM Policy association.
@@ -1399,6 +1884,8 @@ func (s *Server) updateSMPolicy(ctx context.Context, sess *Session, reqFiveQI ui
 		ARPPriority: sess.ARPPriority,
 		AMBRULMbps:  reqAMBRULMbps,
 		AMBRDLMbps:  reqAMBRDLMbps,
+		AMBRULKbps:  kbpsOrMbps(sess.AMBRULKbps, reqAMBRULMbps),
+		AMBRDLKbps:  kbpsOrMbps(sess.AMBRDLKbps, reqAMBRDLMbps),
 		Source:      QoSSourceNWModification,
 	}
 	if s.cfg.Peers.PCF == "" || sess.SmPolicyID == "" {
@@ -1472,10 +1959,10 @@ func (s *Server) updateSMPolicy(ctx context.Context, sess *Session, reqFiveQI ui
 				if rule, ok := v.(map[string]interface{}); ok {
 					if ambr, ok := rule["sessAmbr"].(map[string]interface{}); ok {
 						if ul, ok := ambr["uplink"].(string); ok {
-							granted.AMBRULMbps = parseMbps(ul, reqAMBRULMbps)
+							granted.AMBRULKbps, granted.AMBRULMbps = parseAMBR(ul, requested.AMBRULKbps, reqAMBRULMbps)
 						}
 						if dl, ok := ambr["downlink"].(string); ok {
-							granted.AMBRDLMbps = parseMbps(dl, reqAMBRDLMbps)
+							granted.AMBRDLKbps, granted.AMBRDLMbps = parseAMBR(dl, requested.AMBRDLKbps, reqAMBRDLMbps)
 						}
 					}
 					break
@@ -1508,7 +1995,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 }
 
 // buildPDUSessionResourceSetupRequestTransfer encodes N2SM transfer info
-// Ref: TS 38.413 §9.3.4.5 - PDU Session Resource Setup Request Transfer
+// Ref: TS 38.413 §9.3.4.1 - PDU Session Resource Setup Request Transfer
 //
 // Transfer includes (orden idéntico al de free5GC):
 // - IE 130: PDUSessionAggregateMaximumBitRate (AMBR)
@@ -1524,7 +2011,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 // buildPDUSessionResourceSetupRequestTransfer encodes N2SM transfer info.
 // ambrULBps and ambrDLBps are bit rates in bits per second.
 // fiveQI is the 5QI value to include in the QoS Flow Setup Request List.
-// Ref: TS 38.413 §9.3.4.5 — PDU Session Resource Setup Request Transfer
+// Ref: TS 38.413 §9.3.4.1 — PDU Session Resource Setup Request Transfer
 // ngapPDUSessionType maps a 5GSM PDU session type value (TS 24.501 §9.11.4.11)
 // to the NGAP PDUSessionType enumeration (TS 38.413 §9.3.1.51).
 func ngapPDUSessionType(t uint8) aper.Enumerated {
@@ -1539,6 +2026,16 @@ func ngapPDUSessionType(t uint8) aper.Enumerated {
 }
 
 func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qfi uint8, fiveQI, ambrULBps, ambrDLBps int64, pduType aper.Enumerated) ([]byte, error) {
+	return buildPDUSessionResourceSetupRequestTransferOpts(upfIP, dlTEID, qfi, fiveQI, ambrULBps, ambrDLBps, pduType, false)
+}
+
+// buildPDUSessionResourceSetupRequestTransferOpts is the variant used by the N2 handover
+// PREPARING answer: with dataFwdNotPossible it adds the optional IE DataForwardingNotPossible
+// (id 127, criticality reject) between ULNGUUPTNLInformation and PDUSessionType, which is the
+// ASN.1 IE-set order (130, 139, [AdditionalUL..], 127, 134, ..., 136). With false the output is
+// byte-identical to buildPDUSessionResourceSetupRequestTransfer.
+// Ref: TS 38.413 §9.3.4.1 (PDU Session Resource Setup Request Transfer), §9.3.1.43 (Data Forwarding Not Possible).
+func buildPDUSessionResourceSetupRequestTransferOpts(upfIP net.IP, dlTEID uint32, qfi uint8, fiveQI, ambrULBps, ambrDLBps int64, pduType aper.Enumerated, dataFwdNotPossible bool) ([]byte, error) {
 	transfer := ngapType.PDUSessionResourceSetupRequestTransfer{
 		ProtocolIEs: ngapType.ProtocolIEContainerPDUSessionResourceSetupRequestTransferIEs{
 			List: []ngapType.PDUSessionResourceSetupRequestTransferIEs{
@@ -1593,6 +2090,22 @@ func buildPDUSessionResourceSetupRequestTransfer(upfIP net.IP, dlTEID uint32, qf
 				},
 			},
 		},
+	}
+
+	if dataFwdNotPossible {
+		// Insert IE 127 after the UL NG-U UP TNL Information (index 1) to keep ASN.1 order.
+		ie := ngapType.PDUSessionResourceSetupRequestTransferIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDDataForwardingNotPossible},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.PDUSessionResourceSetupRequestTransferIEsValue{
+				Present: ngapType.PDUSessionResourceSetupRequestTransferIEsPresentDataForwardingNotPossible,
+				DataForwardingNotPossible: &ngapType.DataForwardingNotPossible{
+					Value: ngapType.DataForwardingNotPossiblePresentDataForwardingNotPossible},
+			},
+		}
+		l := transfer.ProtocolIEs.List
+		l = append(l[:2], append([]ngapType.PDUSessionResourceSetupRequestTransferIEs{ie}, l[2:]...)...)
+		transfer.ProtocolIEs.List = l
 	}
 
 	encoded, err := aper.MarshalWithParams(transfer, "valueExt")
@@ -1726,6 +2239,61 @@ const reportingTriggersPerioVolth uint16 = 0x0300
 // Ref: TS 29.244 §8.2.13.
 const volumeThresholdFlagTOVOL uint8 = 0x01
 
+// sessionAMBRQERID is the Session-AMBR QER, referenced by the PDRs of all
+// non-GBR QoS flows of the PDU session. Ref: TS 29.244 §7.5.2.5, TS 23.501 §5.7.2.6.
+const sessionAMBRQERID uint32 = 1
+
+// defaultFlowQERID is the QoS-flow QER of the default (non-GBR) QoS flow.
+// Ref: TS 29.244 §7.5.2.5, §8.2.89.
+const defaultFlowQERID uint32 = 2
+
+// defaultQFI is the QFI of the default QoS flow of a PDU session.
+// Ref: TS 29.244 §8.2.89, TS 23.501 §5.7.1.1.
+const defaultQFI uint8 = 1
+
+// sessionAMBRKbps returns the exact Session-AMBR (UL, DL) in kbps for the
+// PFCP MBR IE (TS 29.244 §8.2.8), falling back to the Mbps fields for sessions
+// created without the exact value.
+func sessionAMBRKbps(sess *Session) (ul, dl uint64) {
+	return kbpsOrMbps(sess.AMBRULKbps, sess.AMBRULMbps), kbpsOrMbps(sess.AMBRDLKbps, sess.AMBRDLMbps)
+}
+
+// buildSessionAMBRCreateQER builds Create QER 1: gates open, MBR = Session-AMBR
+// (kbps, TS 29.244 §8.2.8), no QFI. The MBR IE is omitted when either AMBR is
+// 0/unknown (MBR=0 is not defined as "unlimited"); the caller logs a WARN for
+// that misconfiguration. Ref: TS 29.244 §7.5.2.5, TS 23.501 §5.7.2.6.
+func buildSessionAMBRCreateQER(ulKbps, dlKbps uint64) *pfcpie.IE {
+	ies := []*pfcpie.IE{pfcpie.NewQERID(sessionAMBRQERID), pfcpie.NewGateStatus(0, 0)}
+	if ulKbps > 0 && dlKbps > 0 {
+		ies = append(ies, pfcpie.NewMBR(ulKbps, dlKbps))
+	}
+	return pfcpie.NewCreateQER(ies...)
+}
+
+// buildDefaultFlowCreateQER builds Create QER 2 for the default non-GBR flow:
+// gates open, QFI 1, no MBR (MFBR applies to GBR flows only, TS 23.501 §5.7.2.5).
+// Ref: TS 29.244 §7.5.2.5.
+func buildDefaultFlowCreateQER() *pfcpie.IE {
+	return pfcpie.NewCreateQER(
+		pfcpie.NewQERID(defaultFlowQERID),
+		pfcpie.NewGateStatus(0, 0),
+		pfcpie.NewQFI(defaultQFI),
+	)
+}
+
+// buildSessionAMBRUpdateQER builds Update QER 1 carrying the new Session-AMBR
+// (kbps; no QFI). When either rate is 0/unknown the MBR IE is omitted, which per
+// TS 29.244 §7.5.4.5 means "unchanged": the UPF keeps the previous limit. MBR=0
+// is deliberately never sent (it is not "unlimited"); sendPFCPQoSModification
+// logs a WARN in that case. Ref: TS 29.244 §7.5.4.5.
+func buildSessionAMBRUpdateQER(ulKbps, dlKbps uint64) *pfcpie.IE {
+	ies := []*pfcpie.IE{pfcpie.NewQERID(sessionAMBRQERID), pfcpie.NewGateStatus(0, 0)}
+	if ulKbps > 0 && dlKbps > 0 {
+		ies = append(ies, pfcpie.NewMBR(ulKbps, dlKbps))
+	}
+	return pfcpie.NewUpdateQER(ies...)
+}
+
 // sendPFCPSessionEstablishment sends a PFCP Session Establishment Request to UPF.
 // Tells UPF: packets arriving on N3 with TEID=sess.ULTEID belong to UE sess.UEIP.
 // Also installs a Usage Reporting Rule (Create URR, TS 29.244 §7.5.2.4) so the
@@ -1733,6 +2301,7 @@ const volumeThresholdFlagTOVOL uint8 = 0x01
 // back to the SMF's persistent PFCP receiver — see pfcp_report.go.
 // Ref: TS 29.244 §6.3.2
 func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session) {
+	ambrULKbps, ambrDLKbps := sessionAMBRKbps(sess)
 	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
 	if err != nil {
 		s.logger.Error("PFCP: resolve UPF address", "error", err)
@@ -1754,7 +2323,7 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 		return
 	}
 
-	seq := s.pfcpSeq.Add(1)
+	seq := s.nextPFCPSeq()
 	req := pfcpmsg.NewSessionEstablishmentRequest(
 		0, 0, 0, seq, 0,
 		pfcpie.NewNodeID("", "", "smf"),
@@ -1774,7 +2343,9 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			),
 			pfcpie.NewOuterHeaderRemoval(0, 0),
 			pfcpie.NewFARID(1),
-			pfcpie.NewQERID(1),
+			// QER ID list: Session-AMBR QER + QoS-flow QER (TS 29.244 §7.5.2.2).
+			pfcpie.NewQERID(sessionAMBRQERID),
+			pfcpie.NewQERID(defaultFlowQERID),
 			// URR ID list within the PDR — links this PDR to the Usage
 			// Reporting Rule below so the UPF measures traffic it forwards.
 			// Ref: TS 29.244 §7.5.2.2.
@@ -1784,15 +2355,10 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			pfcpie.NewFARID(1),
 			pfcpie.NewApplyAction(0x02), // FORWARD (DL header added via Modification later)
 		),
-		// QoS Enforcement Rule for the default flow (QFI=1): gates open, MBR set
-		// to the session AMBR. The MBR values are in kbps per TS 29.244 §8.2.8.
-		// Ref: TS 29.244 §7.5.2.5 (Create QER), §8.2.27 (QER correlation/contents)
-		pfcpie.NewCreateQER(
-			pfcpie.NewQERID(1),
-			pfcpie.NewGateStatus(0, 0), // UL/DL OPEN
-			pfcpie.NewMBR(uint64(sess.AMBRULMbps)*1000, uint64(sess.AMBRDLMbps)*1000),
-			pfcpie.NewQFI(1),
-		),
+		// Session-AMBR QER (shared by all non-GBR PDRs) and QoS-flow QER of the
+		// default flow. Ref: TS 29.244 §7.5.2.5, TS 23.501 §5.7.2.6.
+		buildSessionAMBRCreateQER(ambrULKbps, ambrDLKbps),
+		buildDefaultFlowCreateQER(),
 		// Usage Reporting Rule — active usage reporting (volume-threshold +
 		// periodic), consumed by the SMF's persistent PFCP receiver
 		// (pfcp_report.go). Ref: TS 29.244 §7.5.2.4, §5.2.2.4.
@@ -1816,12 +2382,22 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 		return
 	}
 
+	if (ambrULKbps == 0) != (ambrDLKbps == 0) {
+		s.logger.Warn("Session-AMBR set in one direction only: QER MBR IE omitted (no rate limiting)",
+			"interface", "N4", "direction", "OUT", "seid", sess.SEID,
+			"ambr_ul_kbps", ambrULKbps, "ambr_dl_kbps", ambrDLKbps,
+			"spec_ref", "TS 29.244 §7.5.2.5")
+	}
+
 	s.logger.Info("PFCP SessionEstablishment sent",
 		"seid", sess.SEID, "ulTEID", sess.ULTEID, "ueIP", sess.UEIP, "ueIPv6", ueIPv6,
-		"qer_qfi", 1, "qer_mbr_ul_kbps", sess.AMBRULMbps*1000, "qer_mbr_dl_kbps", sess.AMBRDLMbps*1000,
+		"interface", "N4", "direction", "OUT",
+		"ambr_qer_id", sessionAMBRQERID, "ambr_qer_mbr_ul_kbps", ambrULKbps,
+		"ambr_qer_mbr_dl_kbps", ambrDLKbps,
+		"flow_qer_id", defaultFlowQERID, "flow_qer_qfi", defaultQFI,
 		"urr_id", usageReportingURRID, "vol_threshold_bytes", s.cfg.N4.VolumeThresholdBytes,
 		"meas_period_s", s.cfg.N4.MeasurementPeriodSeconds,
-		"spec_ref", "TS 29.244 §7.5.2.4")
+		"spec_ref", "TS 29.244 §7.5.2.5")
 
 	// Read response (best-effort, no retransmission for now)
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -1837,6 +2413,13 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 		return
 	}
 	s.logger.Info("PFCP SessionEstablishment response", "type", msg.MessageTypeName())
+	if rsp, ok := msg.(*pfcpmsg.SessionEstablishmentResponse); ok && rsp.Cause != nil {
+		if c, cerr := rsp.Cause.Cause(); cerr == nil && c == pfcpie.CauseRequestAccepted {
+			s.sessionMu.Lock()
+			sess.N4EstablishedAt = time.Now()
+			s.sessionMu.Unlock()
+		}
+	}
 }
 
 // sendPFCPQoSModification sends a PFCP Session Modification Request updating the
@@ -1844,6 +2427,9 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 // Returns true when the UPF acknowledged the modification.
 // Ref: TS 29.244 §7.5.4 (Session Modification), §7.5.2.5 (Update QER)
 func (s *Server) sendPFCPQoSModification(ctx context.Context, sess *Session) bool {
+	if s.skipN4ForReleasing(sess, "QoSModification") {
+		return false
+	}
 	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
 	if err != nil {
 		s.logger.Error("PFCP: resolve UPF address", "error", err)
@@ -1858,20 +2444,23 @@ func (s *Server) sendPFCPQoSModification(ctx context.Context, sess *Session) boo
 
 	s.sessionMu.Lock()
 	seid := sess.SEID
-	mbrUL := uint64(sess.AMBRULMbps) * 1000
-	mbrDL := uint64(sess.AMBRDLMbps) * 1000
+	mbrUL, mbrDL := sessionAMBRKbps(sess)
 	fiveQI := sess.FiveQI
 	s.sessionMu.Unlock()
 
-	seq := s.pfcpSeq.Add(1)
+	if mbrUL == 0 || mbrDL == 0 {
+		// TS 29.244 §7.5.4.5: an Update QER without MBR leaves the previous limit
+		// in force at the UPF. We do not send MBR=0, so the old AMBR persists.
+		s.logger.Warn("Session-AMBR 0/unknown in QoS modification: MBR omitted, UPF keeps previous limit",
+			"interface", "N4", "direction", "OUT", "procedure", "AmbrEnforcement",
+			"seid", seid, "mbr_ul_kbps", mbrUL, "mbr_dl_kbps", mbrDL,
+			"spec_ref", "TS 29.244 §7.5.4.5")
+	}
+
+	seq := s.nextPFCPSeq()
 	req := pfcpmsg.NewSessionModificationRequest(
 		0, 0, seid, seq, 0,
-		pfcpie.NewUpdateQER(
-			pfcpie.NewQERID(1),
-			pfcpie.NewGateStatus(0, 0), // UL/DL OPEN
-			pfcpie.NewMBR(mbrUL, mbrDL),
-			pfcpie.NewQFI(1),
-		),
+		buildSessionAMBRUpdateQER(mbrUL, mbrDL),
 	)
 	b, err := req.Marshal()
 	if err != nil {
@@ -1883,10 +2472,10 @@ func (s *Server) sendPFCPQoSModification(ctx context.Context, sess *Session) boo
 		return false
 	}
 	s.logger.Info("PFCP QER modification sent",
-		"interface", "N4", "direction", "OUT",
-		"seid", seid, "5qi", fiveQI,
+		"interface", "N4", "direction", "OUT", "procedure", "AmbrEnforcement",
+		"seid", seid, "5qi", fiveQI, "qer_id", sessionAMBRQERID,
 		"mbr_ul_kbps", mbrUL, "mbr_dl_kbps", mbrDL,
-		"spec_ref", "TS 29.244 §7.5.4",
+		"spec_ref", "TS 29.244 §7.5.4.5",
 	)
 
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -1912,6 +2501,9 @@ func (s *Server) sendPFCPQoSModification(ctx context.Context, sess *Session) boo
 // After this, UPF knows to encapsulate downlink packets in GTP-U with dlTEID towards gnbIP.
 // Ref: TS 29.244 §6.3.3
 func (s *Server) sendPFCPSessionModification(ctx context.Context, sess *Session, dlTEID uint32, gnbIP net.IP) {
+	if s.skipN4ForReleasing(sess, "SessionModification") {
+		return
+	}
 	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
 	if err != nil {
 		s.logger.Error("PFCP: resolve UPF address", "error", err)
@@ -1924,19 +2516,12 @@ func (s *Server) sendPFCPSessionModification(ctx context.Context, sess *Session,
 	}
 	defer conn.Close()
 
-	seq := s.pfcpSeq.Add(1)
+	seq := s.nextPFCPSeq()
 	// SEID in header = UP SEID assigned by UPF during establishment.
 	// Our UPF assigns UP SEID = CP SEID for simplicity.
 	req := pfcpmsg.NewSessionModificationRequest(
 		0, 0, sess.SEID, seq, 0,
-		pfcpie.NewUpdateFAR(
-			pfcpie.NewFARID(1),
-			pfcpie.NewApplyAction(0x02), // FORWARD
-			pfcpie.NewUpdateForwardingParameters(
-				// Outer header: GTP-U/UDP/IPv4 (desc=0x0100), DL TEID, gNB N3 IP
-				pfcpie.NewOuterHeaderCreation(0x0100, dlTEID, gnbIP.String(), "", 0, 0, 0),
-			),
-		),
+		buildDLSwitchFAR(dlTEID, gnbIP),
 	)
 
 	b, err := req.Marshal()

@@ -16,15 +16,18 @@ import (
 )
 
 // TestBuildInitialContextSetupRequest_SubscribedAMBR verifies the UE-AMBR IE
-// carries the subscribed values (bit/s) instead of a hardcoded default.
-// Ref: TS 38.413 §9.3.1.58
+// carries the subscribed values (bit/s) instead of a hardcoded default, when the
+// ICS Request has a PDU session list (conditional presence).
+// Ref: TS 38.413 §9.3.1.58, Table 9.2.2.1-1
 func TestBuildInitialContextSetupRequest_SubscribedAMBR(t *testing.T) {
 	const ulBps, dlBps = 200_000_000, 500_000_000
 	raw := BuildInitialContextSetupRequest(
 		1, 2, []byte{0x01}, testSecKey, 0x8000, 0x8000,
 		"001", "01", 0x80, 1, 0x01,
 		[]amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
-		ulBps, dlBps, 1, nil,
+		ulBps, dlBps, 1,
+		// UE-AMBR is C-ifPDUsessionResourceSetup: needs a PDU session list to be present.
+		[]PDUSessionSetupItemCxtReq{{PDUSessionID: 5, SST: 1, SD: []byte{0, 0, 1}, Transfer: []byte{0x01}}},
 	)
 	pdu, err := libngap.Decoder(raw)
 	if err != nil {

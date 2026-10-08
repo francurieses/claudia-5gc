@@ -75,7 +75,9 @@ func TestBuildInitialContextSetupRequest_WithRFSP(t *testing.T) {
 // this guards: IndexToRFSP (id=31, position 15) must precede NAS-PDU (id=38,
 // position 17) — an earlier build appended them reversed. Ref: TS 38.413 §8.1.
 func TestBuildInitialContextSetupRequest_IEOrder(t *testing.T) {
-	raw := buildTestICSR(1) // rfsp>0 and nasPDU non-empty → both tail IEs present
+	// No PDU sessions → UE-AMBR (C-ifPDUsessionResourceSetup) must be absent.
+	// rfsp>0 and nasPDU non-empty → both tail IEs present.
+	raw := buildTestICSR(1)
 	if raw == nil {
 		t.Fatal("encoder returned nil")
 	}
@@ -90,15 +92,14 @@ func TestBuildInitialContextSetupRequest_IEOrder(t *testing.T) {
 
 	// Expected order of the IEs this builder emits, per the spec table.
 	wantOrder := []int64{
-		ngapType.ProtocolIEIDAMFUENGAPID,               // 10
-		ngapType.ProtocolIEIDRANUENGAPID,               // 85
-		ngapType.ProtocolIEIDUEAggregateMaximumBitRate, // 110
-		ngapType.ProtocolIEIDGUAMI,                     // 28
-		ngapType.ProtocolIEIDAllowedNSSAI,              // 0
-		ngapType.ProtocolIEIDUESecurityCapabilities,    // 119
-		ngapType.ProtocolIEIDSecurityKey,               // 94
-		ngapType.ProtocolIEIDIndexToRFSP,               // 31 — must come BEFORE NAS-PDU
-		ngapType.ProtocolIEIDNASPDU,                    // 38
+		ngapType.ProtocolIEIDAMFUENGAPID,            // 10
+		ngapType.ProtocolIEIDRANUENGAPID,            // 85
+		ngapType.ProtocolIEIDGUAMI,                  // 28
+		ngapType.ProtocolIEIDAllowedNSSAI,           // 0
+		ngapType.ProtocolIEIDUESecurityCapabilities, // 119
+		ngapType.ProtocolIEIDSecurityKey,            // 94
+		ngapType.ProtocolIEIDIndexToRFSP,            // 31 — must come BEFORE NAS-PDU
+		ngapType.ProtocolIEIDNASPDU,                 // 38
 	}
 	var got []int64
 	for _, ie := range req.ProtocolIEs.List {

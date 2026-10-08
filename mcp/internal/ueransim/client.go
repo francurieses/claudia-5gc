@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrNotDeployed is returned when mgmt-portal reports UERANSIM is not part of
+// the current deployment mode (HTTP 409 code RAN_TOOL_NOT_DEPLOYED).
+var ErrNotDeployed = errors.New("UERANSIM not deployed (standalone core) — run: make up RAN=ueransim")
 
 // UEStatus captures nr-cli STATUS output for one UE.
 type UEStatus struct {
@@ -84,6 +89,14 @@ type nrCLIResult struct {
 	Output   string `json:"output"`
 }
 
+// isNotDeployed reports whether a 409 body carries code RAN_TOOL_NOT_DEPLOYED.
+func isNotDeployed(body []byte) bool {
+	var e struct {
+		Code string `json:"code"`
+	}
+	return json.Unmarshal(body, &e) == nil && e.Code == "RAN_TOOL_NOT_DEPLOYED"
+}
+
 func (c *PortalClient) nrCLI(ctx context.Context, supi, command string) (string, error) {
 	start := time.Now()
 	reqBody, _ := json.Marshal(map[string]string{
@@ -107,6 +120,9 @@ func (c *PortalClient) nrCLI(ctx context.Context, supi, command string) (string,
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
+	if resp.StatusCode == http.StatusConflict && isNotDeployed(body) {
+		return "", ErrNotDeployed
+	}
 	if resp.StatusCode != http.StatusOK {
 		c.log.InfoContext(ctx, "ueransim nr-cli",
 			"container", c.container, "command", command,

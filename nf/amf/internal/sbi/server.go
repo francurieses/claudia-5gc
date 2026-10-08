@@ -38,7 +38,7 @@ type Config struct {
 }
 
 // Pager triggers an NGAP Paging for a CM-IDLE UE. Implemented by the NGAP server.
-// Ref: TS 38.413 §9.2.8, TS 23.502 §4.2.3.3.
+// Ref: TS 38.413 §8.5.1 / §9.2.4.1, TS 23.502 §4.2.3.3 step 4b.
 type Pager interface {
 	SendPaging(ue *amfctx.UEContext) error
 }
@@ -357,6 +357,19 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 	ue.Lock()
 	ue.PendingN1N2 = true
 	ue.Unlock()
+	if req.PduSessionID != nil {
+		// Remember which session the paging serves: the paging-triggered Service
+		// Request carries no Uplink Data Status, so the AMF re-activates this one.
+		// Ref: TS 23.502 §4.2.3.3 step 3a
+		ue.AddPagedPDUSession(*req.PduSessionID)
+		// Fresh logger (not log): log already carries procedure and spec_ref,
+		// and this record needs the step-specific spec_ref.
+		logging.NewProcedureLogger(ctx, s.logger, "NetworkTriggeredServiceRequest").Info(
+			"paged PDU session recorded for UP re-activation",
+			"nf", "AMF", "interface", "Namf", "direction", "IN",
+			"supi", supi, "pdu_session_id", psi,
+			"spec_ref", "TS 23.502 §4.2.3.3 step 3a")
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)

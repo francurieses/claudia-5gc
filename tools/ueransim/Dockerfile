@@ -76,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 \
         iptables \
         iputils-ping \
+        iperf3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/ /ueransim/

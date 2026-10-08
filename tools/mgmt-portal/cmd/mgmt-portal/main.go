@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/api"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/assets"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/config"
+	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/deployment"
 	dockerclient "github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/docker"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/nrf"
 	promclient "github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/prometheus"
@@ -34,6 +36,10 @@ func main() {
 	udrURL := envOr("UDR_URL", "https://udr:8005")
 	pcfURL := envOr("PCF_URL", "https://pcf:8006")
 	lmfURL := envOr("LMF_URL", "https://lmf:8012")
+	// AMF management endpoints queried by the gNBs page (comma-separated).
+	amfMgmtURLs := splitList(envOr("AMF_MGMT_URLS", amfURL))
+	// RAN simulator detection: auto (probe Docker) | none | ueransim | packetrusher | both.
+	ranTools := envOr("PORTAL_RAN_TOOLS", "auto")
 	nfConfigsPath := envOr("NF_CONFIGS_PATH", "/app/nf-configs")
 	certFile := envOr("PORTAL_CERT_FILE", "")
 	keyFile := envOr("PORTAL_KEY_FILE", "")
@@ -70,19 +76,30 @@ func main() {
 		defer docker.Close()
 	}
 
+	// Deployment detector. A nil *docker.Client must not become a non-nil
+	// interface, hence the explicit branch.
+	var lister deployment.Lister
+	if docker != nil {
+		lister = docker
+	}
+	detector := deployment.NewDetector(lister, ranTools)
+
 	deps := api.Deps{
-		Store:      db,
-		Docker:     docker,
-		NRF:        nrf.New(nrfURL, sbiClient),
-		Prometheus: promclient.New(promURL),
-		Config:     config.New(nfConfigsPath),
-		SMFBaseURL: smfURL,
-		AMFBaseURL: amfURL,
-		UDMBaseURL: udmURL,
-		UDRBaseURL: udrURL,
-		PCFBaseURL: pcfURL,
-		LMFBaseURL: lmfURL,
-		MTLSClient: sbiClient,
+		AMFMgmtURLs: amfMgmtURLs,
+		Deployment:  detector,
+		Store:       db,
+		Docker:      docker,
+		NRF:         nrf.New(nrfURL, sbiClient),
+		Prometheus:  promclient.New(promURL),
+		Config:      config.New(nfConfigsPath),
+		SMFBaseURL:  smfURL,
+		AMFBaseURL:  amfURL,
+		UDMBaseURL:  udmURL,
+		UDRBaseURL:  udrURL,
+		PCFBaseURL:  pcfURL,
+		LMFBaseURL:  lmfURL,
+		IperfImage:  os.Getenv("PORTAL_IPERF_IMAGE"),
+		MTLSClient:  sbiClient,
 	}
 
 	handler := api.NewRouter(deps, http.FS(assets.FS()))
@@ -109,6 +126,17 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	srv.Shutdown(shutCtx) //nolint:errcheck
+}
+
+// splitList splits a comma-separated list, trimming blanks and empty entries.
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

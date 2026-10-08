@@ -1,3 +1,4 @@
+<!-- tier: public -->
 # Security Policy
 
 ## Reporting Vulnerabilities

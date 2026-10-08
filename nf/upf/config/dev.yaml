@@ -28,6 +28,23 @@ metrics:
 n3:
     address: 0.0.0.0:2152
     ip: 172.30.3.100
+    # Datapath tuning (docs/performance/user-plane-throughput.md): 8 MiB GTP-U socket buffers.
+    socket_buffer_bytes: 8388608
 n4:
     address: 0.0.0.0:8805
 nf_instance_id: 00000000-0000-4005-8000-000000000001
+# UPF-003: recompute wrong TCP/UDP checksums on N6 downlink packets (Docker
+# Desktop for macOS userspace proxy delivers complete but incorrect checksums).
+# Set false to forward unmodified.
+n6:
+    l4_checksum_repair: true
+    # 1456 = 1500 - 44 (IPv4 20 + UDP 8 + GTP-U 8 + NG-U ext 8): DL packets never fragment on N3.
+    tun_mtu: 1456
+    tun_txqueuelen: 1000
+    tcp_mss_clamp: true
+# UPF-005: police traffic above the QER MBR and the Session-AMBR (TS 23.501 §5.7.1.8).
+# mbr_enforcement=false restores line-rate forwarding (Gate Status CLOSED still enforced);
+# burst_ms is the token-bucket depth in ms of traffic at the MBR (4500 B floor always applies).
+qos:
+    mbr_enforcement: true
+    burst_ms: 100

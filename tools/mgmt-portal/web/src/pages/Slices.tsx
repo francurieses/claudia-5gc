@@ -11,6 +11,7 @@ import {
   TableHeaderCell, TableRow, useToast, Tabs } from '../components/ui'
 import type { SelectOption } from '../components/ui'
 import { useTabParam } from '../lib/useTabParam'
+import SessionAmbrPanel from '../components/SessionAmbrPanel'
 
 const SST_NAMES: Record<number, string> = { 1: 'eMBB', 2: 'URLLC', 3: 'MIoT', 4: 'V2X' }
 
@@ -77,7 +78,7 @@ function restartNotice(restarted: string[] | undefined): string {
 }
 
 export default function Slices() {
-  const [tab, setTab] = useTabParam(['slices', 'dnns'] as const, 'slices')
+  const [tab, setTab] = useTabParam(['slices', 'dnns', 'session-ambr'] as const, 'slices')
   const qc = useQueryClient()
   const { toast } = useToast()
 
@@ -662,6 +663,11 @@ export default function Slices() {
 
               </div>
             ),
+          },
+          {
+            id: 'session-ambr',
+            label: 'Session-AMBR',
+            content: <SessionAmbrPanel />,
           },
         ]}
       />

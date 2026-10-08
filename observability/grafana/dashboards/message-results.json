@@ -364,6 +364,251 @@
         "dedupStrategy": "none"
       },
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 52 }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "NetworkTriggeredServiceRequest UP Activation by Result",
+      "description": "Paged PDU session UP re-activation outcome in the AMF on Service Request (OK = added to ICS list, REJECT = excluded by UE PDU session status, FAILURE = unknown session or SMF activation failed). TS 23.502 §4.2.3.3.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"NetworkTriggeredServiceRequestUPActivation\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"NetworkTriggeredServiceRequest\"}[5m]))",
+          "legendFormat": "paging {{result}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 62 }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Handover SMF Leg (UpdateSMContext) by Procedure and Result",
+      "description": "AMF per-PDU-session Nsmf_PDUSession_UpdateSMContext leg during handover: XnHandoverSMFUpdate (path switch), XnHandoverSMFSetupFail, XnHandoverSMFDeactivate (unlisted sessions), N2HandoverSMFPreparing (HANDOVER REQUIRED, PREPARING), N2HandoverSMFPrepare (HANDOVER REQUEST ACKNOWLEDGE, PREPARED), N2HandoverSMFResAllocFail (target-failed PSIs), N2HandoverSMFComplete (HANDOVER NOTIFY, COMPLETED). TS 23.502 §4.9.1.2.2 steps 2-7, §4.9.1.3.2 steps 3-12, §4.9.1.3.3.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (procedure, result) (rate(fivegc_procedure_total{nf=\"AMF\",procedure=~\"XnHandoverSMF.*|N2HandoverSMF.*\"}[5m]))",
+          "legendFormat": "{{procedure}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 70 }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "PFCP Association Setup (SMF-UPF) by Result",
+      "description": "SMF-initiated PFCP Association Setup towards the UPF. TS 29.244 §6.2.6.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"SMF\",procedure=\"PfcpAssociationSetup\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 78
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "PFCP Heartbeat Failures (lost transactions)",
+      "description": "PfcpHeartbeat FAILURE per lost Heartbeat transaction (T1/N1 exhausted). TS 29.244 §6.2.2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(fivegc_procedure_total{nf=\"SMF\",procedure=\"PfcpHeartbeat\",result=\"FAILURE\"}[5m]))",
+          "legendFormat": "heartbeat failures",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 78
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "PFCP Node-Level Recovery: detections and local-release fallbacks",
+      "description": "OK = peer restart/failure detection events; FAILURE = sessions released locally (AMF release failed or release guard expired). TS 23.502 §4.4.1.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"SMF\",procedure=\"PfcpNodeLevelRecovery\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 86
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "UDR Slice/DNN Session-AMBR Config (PUT/DELETE) by Result",
+      "description": "SliceSessionAmbrConfig on the non-3GPP /nudr-internal/v1/slice-dnn-qos endpoints. OK = 2xx; REJECT = 4xx; FAILURE = 5xx. TS 23.501 §5.7.2.6.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"UDR\",procedure=\"SliceSessionAmbrConfig\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 94
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Handover DL Path Switch (SMF-UPF N4) N2 / Xn by Result",
+      "description": "SMF PFCP Session Modification Update FAR (FORW to target gNB TEID) at N2 hoState COMPLETED (N2HandoverDLSwitch) and synchronous Xn path switch (XnHandoverDLSwitch). OK / REJECT (precondition) / FAILURE (N4 error or timeout). TS 23.502 §4.9.1.3.3, §4.9.1.2.2; TS 29.244 §7.5.4.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (procedure, result) (rate(fivegc_procedure_total{nf=\"SMF\",procedure=~\"N2HandoverDLSwitch|XnHandoverDLSwitch\"}[5m]))",
+          "legendFormat": "{{procedure}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 102 }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Handover Target-Failed PDU Sessions: Deactivate / Release by Result",
+      "description": "SMF action on PDU sessions the target NG-RAN failed to set up: HandoverTargetFailedDeactivate (UP deactivation via N4) or HandoverTargetFailedRelease (full release). TS 23.502 §4.9.1.3.3.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (procedure, result) (rate(fivegc_procedure_total{nf=\"SMF\",procedure=~\"HandoverTargetFailedDeactivate|HandoverTargetFailedRelease\"}[5m]))",
+          "legendFormat": "{{procedure}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 102 }
     }
   ]
 }

@@ -22,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/mgmt"
 	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
@@ -413,7 +414,7 @@ func main() {
 		SNSSAIs:  amfSNSSAIs,
 	}, logger)
 	// Configure UE lifecycle timer durations.
-	// Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach), TS 38.413 §8.3.5
+	// Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach), TS 38.413 §8.3.3
 	ngapSrv.WithTimerConfig(ngap.TimerConfig{
 		MobileReachable: time.Duration(cfg.Timers.T3512Secs+cfg.Timers.MobileReachableGuardSecs) * time.Second,
 		ImplicitDetach:  time.Duration(cfg.Timers.ImplicitDetachSecs) * time.Second,
@@ -639,23 +640,21 @@ func main() {
 		)
 	})
 
-	// Xn Handover: when target gNB sends PathSwitchRequest, update PFCP in SMF
-	// with the new DL GTP-U endpoint from the PathSwitchRequestTransfer.
-	// Ref: TS 23.502 §4.9.1.2 step 6
-	ngapSrv.SetPathSwitchHandler(func(ctx context.Context, smContextRef string, pathSwitchTransfer []byte) {
-		if err := smfClient.UpdatePathSwitch(ctx, smContextRef, pathSwitchTransfer); err != nil {
-			logger.Warn("SMF UpdatePathSwitch failed on Xn handover",
-				"smContextRef", smContextRef, "error", err,
-				"spec_ref", "TS 23.502 §4.9.1.2",
-			)
-		} else {
-			logger.Info("SMF path switch update complete",
-				"procedure", "XnHandover",
-				"smContextRef", smContextRef,
-				"spec_ref", "TS 23.502 §4.9.1.2",
-			)
-		}
-	})
+	// Handover SMF leg (AMF-012): the AMF waits for each Nsmf_PDUSession_UpdateSMContext
+	// answer and relays the SMF N2 SM information (wiring only — logic in internal/ngap).
+	// Xn: PATH_SWITCH_REQ per switched PSI, PATH_SWITCH_SETUP_FAIL per failed-to-setup PSI,
+	// upCnxState=DEACTIVATED for PSIs in neither list. N2: PREPARING (HANDOVER_REQUIRED ->
+	// PDU_RES_SETUP_REQ) at HANDOVER REQUIRED; HANDOVER_REQ_ACK -> HANDOVER_CMD and
+	// HANDOVER_RES_ALLOC_FAIL at HANDOVER REQUEST ACKNOWLEDGE; hoState COMPLETED after
+	// HANDOVER NOTIFY.
+	// Ref: TS 23.502 §4.9.1.2.2 steps 2-7, §4.9.1.3.2 steps 3-12, §4.9.1.3.3
+	ngapSrv.SetPathSwitchHandler(smfClient.UpdatePathSwitch)
+	ngapSrv.SetPathSwitchSetupFailHandler(smfClient.UpdatePathSwitchSetupFail)
+	ngapSrv.SetUPDeactivateHandler(smfClient.NotifyANRelease)
+	ngapSrv.SetHandoverRequiredHandler(smfClient.PrepareHandoverRequired)
+	ngapSrv.SetHandoverRequestAckHandler(smfClient.PrepareHandover)
+	ngapSrv.SetHandoverResAllocFailHandler(smfClient.HandoverResourceAllocationFailed)
+	ngapSrv.SetHandoverCompleteHandler(smfClient.CompleteHandover)
 
 	// ---- Start servers -----------------------------------------------------
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -701,7 +700,7 @@ func main() {
 			os.Exit(1)
 		}
 		// Wire NGAP paging trigger for N1N2MessageTransfer (CN paging of CM-IDLE UEs).
-		// Ref: TS 23.502 §4.2.3.3, TS 38.413 §9.2.8.
+		// Ref: TS 23.502 §4.2.3.3 step 4b, TS 38.413 §8.5.1 / §9.2.4.1.
 		sbiSrv.SetPager(ngapSrv)
 		// Wire NGAP location trigger for Namf_Location_ProvideLocationInfo.
 		// The NGAP server sends LocationReportingControl and delivers the LocationReport
@@ -730,12 +729,24 @@ func main() {
 	// DELETE /amf/v1/ue-contexts/{supi}                        → NW-initiated Deregistration (§4.2.2.3.3)
 	// DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}     → NW-initiated PDU Session Release (§4.3.4.3)
 	// POST   /amf/v1/ue-contexts/{supi}/push-policies          → Trigger UCU with fresh URSP from PCF (TS 23.502 §4.2.4)
+	// GET    /amf/v1/ran/gnbs                                  → gNBs connected over N2 + recently disconnected (TS 38.413 §8.7.1)
 	mgmtAddr := getEnvDefault("MANAGEMENT_ADDRESS", "0.0.0.0:9002")
 	mgmtMux := http.NewServeMux()
 
 	mgmtMux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+
+	// GET /amf/v1/ran/gnbs — gNB registry (read-only). Consumed by the portal
+	// gNBs page and the MCP ran_gnb_list tool.
+	mgmtMux.Handle("GET /amf/v1/ran/gnbs", mgmt.GNBListHandler(ngapSrv, mgmt.AMFInfo{
+		Name:     "5GC-AMF",
+		MCC:      cfg.PLMN.MCC,
+		MNC:      cfg.PLMN.MNC,
+		RegionID: uint(cfg.AMFRegionID),
+		SetID:    uint(cfg.AMFSetID),
+		AMFID:    uint(cfg.AMFID),
+	}, logger))
 
 	// GET /amf/v1/ue-contexts — list all active UE context snapshots (read-only).
 	// Consumed by the MCP server's ue_list tool.
@@ -1302,7 +1313,7 @@ type Config struct {
 	} `yaml:"metrics"`
 	// Timers configures UE lifecycle timers. All values in seconds.
 	// Ref: TS 23.501 §5.3.2 (Mobile Reachable / Implicit Detach),
-	//      TS 24.501 §10.2 (T3512), TS 38.413 §8.3.5 (PendingRemoval watchdog).
+	//      TS 24.501 §10.2 (T3512), TS 38.413 §8.3.3 (PendingRemoval watchdog).
 	// To change: edit nf/amf/config/dev.yaml section "timers:" and restart the AMF.
 	Timers struct {
 		T3512Secs                  int `yaml:"t3512_secs"`

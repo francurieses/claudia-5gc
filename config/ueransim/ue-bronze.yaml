@@ -1,4 +1,4 @@
-supi: 'imsi-001010000000004'
+supi: 'imsi-001010000000204'
 mcc: '001'
 mnc: '01'
 protectionScheme: 0
@@ -10,7 +10,7 @@ amf: 'b9b9'
 imei: '356938035643806'
 imeiSv: '4370816125816154'
 gnbSearchList:
-  - ueransim-gnb
+  - ueransim-gnb-ms
 uacAic:
   mps: false
   mcs: false

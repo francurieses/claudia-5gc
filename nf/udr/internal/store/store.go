@@ -8,6 +8,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -83,7 +84,7 @@ type SNSSAISubscribed struct {
 
 // SessionManagementSubscriptionData holds the per-slice session management
 // subscription, including the subscribed default QoS profile per DNN.
-// Ref: TS 29.503 §6.1.6.2.7 (SessionManagementSubscriptionData), TS 29.505 §5.2.2
+// Ref: TS 29.503 §6.1.6.2.8 (SessionManagementSubscriptionData), TS 29.505 §5.2.2
 type SessionManagementSubscriptionData struct {
 	SingleNSSAI       SNSSAIKey                   `json:"singleNssai"`
 	DNNConfigurations map[string]DNNConfiguration `json:"dnnConfigurations"`
@@ -96,7 +97,7 @@ type SNSSAIKey struct {
 }
 
 // DNNConfiguration holds per-DNN session subscription data.
-// Ref: TS 29.503 §6.1.6.2.8 (DnnConfiguration)
+// Ref: TS 29.503 §6.1.6.2.9 (DnnConfiguration)
 type DNNConfiguration struct {
 	PDUSessionTypes PDUSessionTypes `json:"pduSessionTypes"`
 	// DefaultQos is the subscribed default QoS profile; serialized as
@@ -111,7 +112,7 @@ type PDUSessionTypes struct {
 	AllowedSessionTypes []string `json:"allowedSessionTypes,omitempty"`
 }
 
-// FiveGQoSProfile is the subscribed default QoS (TS 29.503 §6.1.6.2.9).
+// FiveGQoSProfile is the subscribed default QoS (TS 29.503 §6.1.6.2.9, 5gQosProfile).
 type FiveGQoSProfile struct {
 	FiveQI        int `json:"5qi"`
 	ARP           ARP `json:"arp"`
@@ -190,6 +191,24 @@ type Store interface {
 	GetSmPolicyData(supi string) (*SmPolicyData, error)
 	PutSmPolicyData(data *SmPolicyData) error
 	PatchSmPolicyData(supi string, patch *SmPolicyData) error
+
+	// Per (S-NSSAI, DNN) subscribed Session-AMBR (UDR-003, non-3GPP store of
+	// record; TS 23.501 §5.7.2.6). Keys are normalised by NewSliceKey.
+	//
+	// GetSliceDNNQoS returns nil, nil when absent. PutSliceDNNQoSEdited upserts
+	// source=edited (seed carries SeedAMBR/SeedSource used only on insert).
+	// RevertSliceDNNQoS restores the seed value (ErrNotFound when no row; the
+	// bool is true when an edited row was reverted). SeedSliceDNNQoS inserts or
+	// refreshes seed rows in one transaction and never overwrites the effective
+	// value of an edited row. ListSUPIsForSliceDNN applies the ""->"internet"
+	// effective-DNN rule; ListSliceKeysInUse lists the keys used in am-data.
+	ListSliceDNNQoS(ctx context.Context) ([]SliceDNNQoS, error)
+	GetSliceDNNQoS(ctx context.Context, sst uint8, sd, dnn string) (*SliceDNNQoS, error)
+	PutSliceDNNQoSEdited(ctx context.Context, sst uint8, sd, dnn string, ambr AMBR, seed SliceDNNQoS) (created, changed bool, err error)
+	RevertSliceDNNQoS(ctx context.Context, sst uint8, sd, dnn string) (*SliceDNNQoS, bool, error)
+	SeedSliceDNNQoS(ctx context.Context, rows []SliceDNNQoS) (SeedCounts, error)
+	ListSUPIsForSliceDNN(ctx context.Context, sst uint8, sd, dnn string) ([]string, error)
+	ListSliceKeysInUse(ctx context.Context) ([]SliceKey, error)
 }
 
 // ErrNotFound is returned by PatchSmPolicyData when the target record is absent.
@@ -206,6 +225,7 @@ type InMemory struct {
 	smSubs     map[string][]SessionManagementSubscriptionData
 	policySubs map[string]*PolicySubscription // keyed by SUPI; "" = operator default
 	smPolicy   map[string]*SmPolicyData       // keyed by SUPI
+	sliceQoS   map[SliceKey]SliceDNNQoS       // per (S-NSSAI, DNN) Session-AMBR
 }
 
 func NewInMemory() *InMemory {
@@ -216,6 +236,7 @@ func NewInMemory() *InMemory {
 		smSubs:     make(map[string][]SessionManagementSubscriptionData),
 		policySubs: make(map[string]*PolicySubscription),
 		smPolicy:   make(map[string]*SmPolicyData),
+		sliceQoS:   make(map[SliceKey]SliceDNNQoS),
 	}
 }
 
@@ -398,12 +419,16 @@ func SeedTestSubscriberWithNSSAI(s Store, supi, kHex, opcHex, amfHex, sqnHex str
 		return err
 	}
 
-	return s.PutSMSubscriptions(supi, BuildSMSubscriptions(snssais))
+	ambrFor, err := SessionAMBRResolver(context.Background(), s)
+	if err != nil {
+		return err
+	}
+	return s.PutSMSubscriptions(supi, BuildSMSubscriptions(snssais, ambrFor))
 }
 
 // BuildSMSubscriptions derives session management subscription data from a
 // subscriber's allowed S-NSSAIs: one entry per slice, each with a non-zero
-// subscribed default 5QI (TS 29.503 §6.1.6.2.7).
+// subscribed default 5QI (TS 29.503 §6.1.6.2.8).
 //
 // This is the single place that maps a slice to its DNN configuration. Both the
 // dev seed and the portal-driven resync (SyncSMDataFromAM) go through it, so a
@@ -413,12 +438,20 @@ func SeedTestSubscriberWithNSSAI(s Store, supi, kHex, opcHex, amfHex, sqnHex str
 // falling back to "internet" — the DNN every dev slice is expected to carry.
 // Without this, a slice provisioned with a non-default DNN would have no
 // matching DNNConfiguration and the SMF would fall back to OPERATOR_DEFAULT QoS.
-func BuildSMSubscriptions(snssais []SNSSAISubscribed) []SessionManagementSubscriptionData {
+//
+// The subscribed Session-AMBR (DnnConfiguration.sessionAmbr, TS 29.503
+// §6.1.6.2.9) comes from ambrFor, normally SessionAMBRResolver (slice_dnn_qos).
+// A nil ambrFor means DefaultAMBRForSlice.
+func BuildSMSubscriptions(snssais []SNSSAISubscribed, ambrFor SessionAMBRFunc) []SessionManagementSubscriptionData {
 	smSubs := make([]SessionManagementSubscriptionData, 0, len(snssais))
 	for _, n := range snssais {
 		dnn := n.DNN
 		if dnn == "" {
-			dnn = "internet"
+			dnn = DefaultDNN
+		}
+		ambr := DefaultAMBRForSlice(n.SST, n.SD)
+		if ambrFor != nil {
+			ambr = ambrFor(n.SST, n.SD, dnn)
 		}
 		smSubs = append(smSubs, SessionManagementSubscriptionData{
 			SingleNSSAI: SNSSAIKey{SST: n.SST, SD: n.SD},
@@ -429,7 +462,7 @@ func BuildSMSubscriptions(snssais []SNSSAISubscribed) []SessionManagementSubscri
 						AllowedSessionTypes: []string{"IPV4"},
 					},
 					DefaultQos:  DefaultQoSForSlice(n.SST, n.SD),
-					SessionAMBR: DefaultAMBRForSlice(n.SST, n.SD),
+					SessionAMBR: ambr,
 				},
 			},
 		})
@@ -447,6 +480,12 @@ func BuildSMSubscriptions(snssais []SNSSAISubscribed) []SessionManagementSubscri
 // for it and silently fell back to OPERATOR_DEFAULT QoS. Calling this after an
 // am-data write keeps the two consistent.
 func SyncSMDataFromAM(s Store, supi string) (int, error) {
+	return SyncSMDataFromAMContext(context.Background(), s, supi)
+}
+
+// SyncSMDataFromAMContext is SyncSMDataFromAM with a caller context; the
+// Session-AMBR of each slice/DNN is read from slice_dnn_qos.
+func SyncSMDataFromAMContext(ctx context.Context, s Store, supi string) (int, error) {
 	am, err := s.GetAMSubscription(supi)
 	if err != nil {
 		return 0, fmt.Errorf("udr: sync sm-data: read am subscription: %w", err)
@@ -454,7 +493,11 @@ func SyncSMDataFromAM(s Store, supi string) (int, error) {
 	if am == nil {
 		return 0, fmt.Errorf("udr: sync sm-data: no am subscription for %s", supi)
 	}
-	smSubs := BuildSMSubscriptions(am.NSSAI.SNSSAIs)
+	ambrFor, err := SessionAMBRResolver(ctx, s)
+	if err != nil {
+		return 0, fmt.Errorf("udr: sync sm-data: %w", err)
+	}
+	smSubs := BuildSMSubscriptions(am.NSSAI.SNSSAIs, ambrFor)
 	if err := s.PutSMSubscriptions(supi, smSubs); err != nil {
 		return 0, fmt.Errorf("udr: sync sm-data: write sm subscriptions: %w", err)
 	}
@@ -481,6 +524,10 @@ func DefaultQoSForSlice(sst uint8, sd string) FiveGQoSProfile {
 }
 
 // DefaultAMBRForSlice maps the dev slices to subscribed session AMBR values.
+//
+// Seed/fallback default only: the store of record for the subscribed
+// Session-AMBR is the slice_dnn_qos table (UDR-003). This is the only place rate
+// literals remain.
 func DefaultAMBRForSlice(sst uint8, sd string) AMBR {
 	switch {
 	case sst == 1 && sd == "000002": // gold

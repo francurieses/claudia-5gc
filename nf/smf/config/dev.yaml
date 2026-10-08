@@ -14,8 +14,13 @@ dnns:
 metrics:
     address: 0.0.0.0:9105
 n4:
+    association_retry_initial_seconds: 1
+    association_retry_max_seconds: 5
+    heartbeat_interval_seconds: 2
     measurement_period_seconds: 60
+    n1_retransmissions: 3
     report_listen: 0.0.0.0:8805
+    t1_seconds: 3
     volume_threshold_bytes: 1000000
 nf_instance_id: 00000000-0000-4004-8000-000000000001
 peers:

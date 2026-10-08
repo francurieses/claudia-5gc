@@ -1,7 +1,7 @@
 package ngap
 
 // an_release_test.go — unit tests for the AN Release procedure codec.
-// Ref: 3GPP TS 38.413 §8.3.4, §8.3.5
+// Ref: 3GPP TS 38.413 §8.3.4, §8.3.3
 
 import (
 	"testing"

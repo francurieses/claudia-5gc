@@ -539,8 +539,8 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 			"defaultSingleNssais": snssais,
 		},
 		"subscribedUeAmbr": map[string]any{
-			"uplink":   fmt.Sprintf("%dKbps", amData.AMBRUplink),
-			"downlink": fmt.Sprintf("%dKbps", amData.AMBRDownlink),
+			"uplink":   fmt.Sprintf("%d Kbps", amData.AMBRUplink),
+			"downlink": fmt.Sprintf("%d Kbps", amData.AMBRDownlink),
 		},
 	})
 }
@@ -983,3 +983,6 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 	}
 	return amData, nil
 }
+
+// bitRateKbpsPattern is the TS 29.571 §5.5.2 BitRate regex (space mandatory).
+const bitRateKbpsPattern = `^\d+(\.\d+)? (bps|Kbps|Mbps|Gbps|Tbps)$`

@@ -14,9 +14,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/server"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/store"
+	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
@@ -33,6 +33,8 @@ func main() {
 			return a
 		},
 	}))
+	// base carries no "nf": server.New adds it itself (avoids a duplicate key).
+	base := logger
 	logger = logger.With("nf", "UDR")
 	slog.SetDefault(logger)
 
@@ -55,6 +57,21 @@ func main() {
 	} else {
 		logger.Warn("DATABASE_URL not set — using in-memory store (DEV ONLY, data lost on restart)")
 		st = store.NewInMemory()
+	}
+
+	// Per (S-NSSAI, DNN) subscribed Session-AMBR (UDR-003): seed slice_dnn_qos from
+	// operator.yaml / DefaultAMBRForSlice before any subscriber is seeded, so new
+	// subscribers get table values. Edited rows are never overwritten; sm-data of
+	// subscribers on a key whose value changed is re-derived.
+	// Ref: TS 23.501 §5.7.2.6.
+	op, opErr := operatorcfg.LoadOperator("")
+	if opErr != nil {
+		logger.Warn("loading operator config failed, using defaults", "error", opErr)
+		op = nil
+	}
+	if _, err := store.SeedAndResyncSliceDNNQoS(context.Background(), st, op, logger); err != nil {
+		logger.Error("seeding slice_dnn_qos", "error", err)
+		os.Exit(1)
 	}
 
 	// Seed development subscribers only if they do not already exist.
@@ -81,7 +98,7 @@ func main() {
 		{SST: 2, SD: "000001"},
 		{SST: 3, SD: "000001"},
 	}
-	if op, err := operatorcfg.LoadOperator(""); err == nil && op != nil && len(op.Slices()) > 0 {
+	if len(op.Slices()) > 0 {
 		opSlices = op.Slices()
 	}
 	internet := store.SNSSAISubscribed{SST: uint8(opSlices[0].SST), SD: opSlices[0].SD}
@@ -117,6 +134,38 @@ func main() {
 		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
 	}
 
+	// SEED_EXTRA_SUPIS: comma-separated SUPIs seeded outside the UE_COUNT range
+	// (e.g. the PacketRusher UE, imsi-001010000000101, so it never collides with
+	// the UERANSIM UEs). Same dev K/OPc/AMF/SQN, slice profile cycled by MSIN.
+	extraSUPIs, rejected := store.ParseSeedSUPIs(os.Getenv("SEED_EXTRA_SUPIS"))
+	for _, bad := range rejected {
+		logger.Warn("SEED_EXTRA_SUPIS entry ignored (expected imsi-<15 digits>)", "entry", bad)
+	}
+	for _, supi := range extraSUPIs {
+		if existing, _ := st.GetAuthSubscription(supi); existing != nil {
+			logger.Info("subscriber already provisioned, skipping seed", "supi", supi)
+			continue
+		}
+		// Same cyclic slice rule as the UE_COUNT range, keyed on the SUPI's MSIN.
+		profile := store.SliceProfileForSUPI(supi, sliceProfiles)
+		if err := store.SeedTestSubscriberWithNSSAI(st,
+			supi,
+			"465b5ce8b199b49faa5f0a2ee238a6bc",
+			"cd63cb71954a9f4e48a5994e37a02baf",
+			"b9b9",
+			"000000000020",
+			profile,
+		); err != nil {
+			logger.Error("seed subscriber failed", "supi", supi, "error", err)
+			continue
+		}
+		snssaiLog := make([]string, len(profile))
+		for j, sn := range profile {
+			snssaiLog[j] = fmt.Sprintf("SST=%d/SD=%s", sn.SST, sn.SD)
+		}
+		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
+	}
+
 	// ---- Tracing ---------------------------------------------------------
 	otlpEndpoint := getEnvDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318")
 	if tp, err := tracing.Init(context.Background(), "UDR", otlpEndpoint); err != nil {
@@ -143,11 +192,19 @@ func main() {
 		CertFile: cfg.SBI.TLS.CertFile,
 		KeyFile:  cfg.SBI.TLS.KeyFile,
 		CAFile:   cfg.SBI.TLS.CAFile,
-	}, st, logger)
+	}, st, base)
 	if err != nil {
 		logger.Error("building SBI server", "error", err)
 		os.Exit(1)
 	}
+
+	// Entries were already validated (and warned about) by the seed above.
+	srv.SetSliceQoSSeed(store.OperatorSeedEntries(op, slog.New(slog.DiscardHandler)))
+	dnnNames := make([]string, 0, len(op.DNNList()))
+	for _, d := range op.DNNList() {
+		dnnNames = append(dnnNames, d.Name)
+	}
+	srv.SetKnownDNNs(dnnNames)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -175,7 +232,7 @@ func main() {
 					ServiceName:       "nudr-dr",
 					Scheme:            "https",
 					NFServiceStatus:   "REGISTERED",
-					Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
+					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
 				}},
 			}
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {

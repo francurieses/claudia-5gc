@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom'
-import { ChevronDown, Menu, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
+import { ChevronDown, Layers, Menu, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Subscribers from './pages/Subscribers'
 import Slices from './pages/Slices'
@@ -14,16 +14,34 @@ import Policies from './pages/Policies'
 import QoS from './pages/QoS'
 import Location from './pages/Location'
 import PublicWarning from './pages/PublicWarning'
+import RAN from './pages/RAN'
+import RequiresTool from './components/RequiresTool'
 import ThemeToggle from './components/ThemeToggle'
-import { IconButton, useFocusTrap } from './components/ui'
+import { Badge, IconButton, useFocusTrap } from './components/ui'
 import {
   ALL_GROUP_IDS,
   NAV_COLLAPSED_KEY,
   NAV_GROUPS,
   NAV_GROUPS_KEY,
   groupForPath,
+  visibleNavGroups,
 } from './lib/navigation'
+import { modeLabel, useDeployment } from './lib/deployment'
 import { usePersistentState } from './lib/usePersistentState'
+
+/**
+ * ClaudIA-5GC brand artwork (served from `public/brand/`). The `-dark` files carry
+ * dark ink for light backgrounds; the unsuffixed files carry white ink for dark ones.
+ */
+function BrandLogo({ variant, className = '' }: { variant: 'horizontal' | 'mark'; className?: string }) {
+  const base = `/brand/${variant === 'horizontal' ? 'logo-horizontal' : 'mark'}`
+  return (
+    <>
+      <img src={`${base}-dark.svg`} alt="ClaudIA 5GC" className={`dark:hidden ${className}`} />
+      <img src={`${base}.svg`} alt="ClaudIA 5GC" className={`hidden dark:block ${className}`} />
+    </>
+  )
+}
 
 /** Page components keyed by route path — mirrors `NAV_ROUTES`. */
 const PAGES: Record<string, () => JSX.Element> = {
@@ -34,9 +52,18 @@ const PAGES: Record<string, () => JSX.Element> = {
   '/sessions': Sessions,
   '/qos': QoS,
   '/policies': Policies,
-  '/ueransim': UERANSim,
+  '/ran': RAN,
+  '/ueransim': () => (
+    <RequiresTool tool="ueransim">
+      <UERANSim />
+    </RequiresTool>
+  ),
   '/location': Location,
-  '/packetrusher': PacketRusher,
+  '/packetrusher': () => (
+    <RequiresTool tool="packetrusher">
+      <PacketRusher />
+    </RequiresTool>
+  ),
   '/pws': PublicWarning,
   '/logs': Logs,
   '/pcap': PCAP,
@@ -52,6 +79,12 @@ function AppShell() {
   const [collapsed, setCollapsed] = usePersistentState<boolean>(NAV_COLLAPSED_KEY, false)
   const [drawerOpen, setDrawerOpen] = useState(false)
   const menuButtonRef = useRef<HTMLButtonElement>(null)
+
+  const deployment = useDeployment()
+  const navGroups = useMemo(
+    () => visibleNavGroups(NAV_GROUPS, deployment.caps, deployment.failed),
+    [deployment.caps, deployment.failed],
+  )
 
   const activeGroup = useMemo(() => groupForPath(location.pathname), [location.pathname])
 
@@ -113,8 +146,22 @@ function AppShell() {
           </IconButton>
         </div>
 
+        <div
+          className={`hidden h-14 flex-shrink-0 items-center border-b border-border px-4 lg:flex ${
+            collapsed ? 'lg:justify-center lg:px-0' : ''
+          }`}
+        >
+          <NavLink to="/" aria-label="ClaudIA 5GC — Dashboard" className="flex items-center">
+            {collapsed ? (
+              <BrandLogo variant="mark" className="h-7 w-auto" />
+            ) : (
+              <BrandLogo variant="horizontal" className="h-7 w-auto" />
+            )}
+          </NavLink>
+        </div>
+
         <nav aria-label="Primary" className="scroll-thin flex-1 overflow-y-auto p-2">
-          {NAV_GROUPS.map(group => {
+          {navGroups.map(group => {
             const open = openGroups[group.id] ?? true
             const isActiveGroup = activeGroup === group.id
             const panelId = `nav-group-${group.id}`
@@ -199,13 +246,21 @@ function AppShell() {
             <Menu size={18} />
           </IconButton>
 
+          <NavLink to="/" aria-label="ClaudIA 5GC — Dashboard" className="flex flex-shrink-0 items-center lg:hidden">
+            <BrandLogo variant="horizontal" className="h-6 w-auto" />
+          </NavLink>
+
           <div className="min-w-0 flex-1">
-            <p className="truncate text-sm font-bold uppercase tracking-widest text-primary-text">
-              ClaudIA 5GC
-            </p>
-            <p className="truncate text-xs text-muted-fg">Management Portal</p>
+            <p className="truncate text-sm font-semibold text-fg">Management Portal</p>
           </div>
 
+          {deployment.caps && (
+            <Badge
+              label={modeLabel(deployment.caps.mode)}
+              variant={deployment.caps.mode === 'standalone' ? 'neutral' : 'info'}
+              icon={<Layers size={12} />}
+            />
+          )}
           <ThemeToggle />
         </header>
 

@@ -1,6 +1,6 @@
 # PacketRusher configuration for Xn Handover testing
 # https://github.com/HewlettPackard/PacketRusher
-# Used with: make handover-test (docker compose --profile handover)
+# Used with: make handover-test / make up-obs RAN=packetrusher (docker compose --profile handover)
 # Xn handover is triggered via CLI: multi-ue-pdu --timeBeforeXnHandover 5000
 
 gnodeb:
@@ -20,7 +20,9 @@ gnodeb:
     sd: "000001"
 
 ue:
-  msin: "0000000001"
+  # imsi-001010000000101: outside the UERANSIM range (001..UE_COUNT) so both
+  # simulators can run together (RAN=both). Seeded by the UDR via SEED_EXTRA_SUPIS.
+  msin: "0000000101"
   key: "465b5ce8b199b49faa5f0a2ee238a6bc"
   opc: "cd63cb71954a9f4e48a5994e37a02baf"
   amf: "b9b9"
@@ -39,7 +41,11 @@ ue:
     nia2: true
     nia3: false
   ciphering:
-    nea0: false
+    # NEA0 is mandatory for every UE (TS 33.501 §5.11.1.1), so a real UE always
+    # sets the 5G-EA0 bit (TS 24.501 §9.11.3.54). The dev AMF runs
+    # security.null_ciphering (selects NEA0); PacketRusher >= acf96b5 rejects an
+    # SMC that selects an algorithm it did not offer (backlog PR-001).
+    nea0: true
     nea1: false
     nea2: true
     nea3: false

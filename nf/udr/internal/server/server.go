@@ -27,6 +27,7 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	"github.com/francurieses/claudia-5gc/nf/udr/internal/qos"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/store"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
@@ -44,6 +45,11 @@ type Server struct {
 	logger  *slog.Logger
 	httpSrv *http.Server
 	addr    string
+
+	// operatorSeed / knownDNNs configure the slice-dnn-qos endpoints (see
+	// SetSliceQoSSeed, SetKnownDNNs); both are optional.
+	operatorSeed map[store.SliceKey]store.AMBR
+	knownDNNs    map[string]struct{}
 }
 
 func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
@@ -82,7 +88,7 @@ func New(addr string, tlsCfg TLSConfig, st store.Store, logger *slog.Logger) (*S
 		s.handleGetAMData)
 
 	// SM subscription data — per-slice session management subscription with the
-	// subscribed default 5G QoS profile (TS 29.503 §6.1.6.2.7, TS 29.505)
+	// subscribed default 5G QoS profile (TS 29.503 §6.1.6.2.8, TS 29.505)
 	mux.HandleFunc("GET /nudr-dr/v2/subscription-data/{supi}/{servingPlmnId}/provisioned-data/sm-data",
 		s.handleGetSMData)
 	mux.HandleFunc("PUT /nudr-dr/v2/subscription-data/{supi}/{servingPlmnId}/provisioned-data/sm-data",
@@ -119,6 +125,8 @@ func New(addr string, tlsCfg TLSConfig, st store.Store, logger *slog.Logger) (*S
 	// the UDR instead of being duplicated in the portal.
 	mux.HandleFunc("POST /nudr-internal/v1/subscribers/{supi}/sync-sm-data",
 		s.handleSyncSMData)
+
+	s.registerSliceQoS(mux)
 
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
@@ -229,7 +237,7 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET sm-data — session management subscription data with subscribed default QoS
-// Ref: TS 29.504 §5.2.2.2, TS 29.503 §6.1.6.2.7 (SessionManagementSubscriptionData)
+// Ref: TS 29.504 §5.2.2.2, TS 29.503 §6.1.6.2.8 (SessionManagementSubscriptionData)
 func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetSMData", supi)
@@ -477,7 +485,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 // The management portal writes subscription_am directly when it provisions a
 // slice; without this, sm-data kept the slice set it was seeded with, so a
 // portal-added slice had no DNNConfiguration and the SMF fell back to
-// OPERATOR_DEFAULT QoS. Ref: TS 29.503 §6.1.6.2.7.
+// OPERATOR_DEFAULT QoS. Ref: TS 29.503 §6.1.6.2.8.
 func (s *Server) handleSyncSMData(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "SyncSMData", supi)
@@ -490,7 +498,7 @@ func (s *Server) handleSyncSMData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info("sm-data resynced from am-data", "direction", "OUT",
-		"slice_count", slices, "spec_ref", "TS 29.503 §6.1.6.2.7")
+		"slice_count", slices, "spec_ref", "TS 29.503 §6.1.6.2.8")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"supi": supi, "slices": slices})
 }
@@ -544,8 +552,8 @@ func amSubToJSON(s *store.AccessAndMobilitySubscriptionData) map[string]any {
 			"defaultSingleNssais": snssais,
 		},
 		"subscribedUeAmbr": map[string]any{
-			"uplink":   fmt.Sprintf("%dKbps", s.SubscribedUEAMBRUplink),
-			"downlink": fmt.Sprintf("%dKbps", s.SubscribedUEAMBRDownlink),
+			"uplink":   fmt.Sprintf("%d Kbps", s.SubscribedUEAMBRUplink),
+			"downlink": fmt.Sprintf("%d Kbps", s.SubscribedUEAMBRDownlink),
 		},
 	}
 }
@@ -558,3 +566,6 @@ func supiPath(path string) string {
 	}
 	return ""
 }
+
+// bitRateKbpsPattern is the TS 29.571 §5.5.2 BitRate regex (space mandatory).
+const bitRateKbpsPattern = qos.BitRatePattern

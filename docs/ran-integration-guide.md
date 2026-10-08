@@ -1,3 +1,4 @@
+<!-- tier: public -->
 # Real RAN Integration Guide
 
 This guide covers every parameter and network change required to connect a physical or third-party

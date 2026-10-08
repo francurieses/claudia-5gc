@@ -75,6 +75,22 @@ type N4Config struct {
 	// MeasurementPeriodSeconds is the periodic reporting cadence installed
 	// in the Create URR's Measurement Period IE. Ref: TS 29.244 §8.2.42.
 	MeasurementPeriodSeconds int `yaml:"measurement_period_seconds"`
+
+	// PFCP node-level supervision (SMF-004). Zero/absent values select the
+	// defaults defined in internal/server/pfcp_node.go. 3GPP gives no values for
+	// any of these: TS 29.244 §6.4 only states that T1 and N1 are configurable and
+	// the Heartbeat period is an operator choice.
+	// HeartbeatIntervalSeconds is the PFCP Heartbeat Request period (TS 29.244 §6.2.2).
+	HeartbeatIntervalSeconds int `yaml:"heartbeat_interval_seconds"`
+	// T1Seconds is the PFCP request retransmission timer T1 (TS 29.244 §6.4).
+	T1Seconds int `yaml:"t1_seconds"`
+	// N1Retransmissions is the maximum number of retransmissions N1 (TS 29.244 §6.4).
+	N1Retransmissions int `yaml:"n1_retransmissions"`
+	// AssociationRetryInitialSeconds is the first back-off between failed
+	// PFCP Association Setup attempts (TS 29.244 §6.2.6.2).
+	AssociationRetryInitialSeconds int `yaml:"association_retry_initial_seconds"`
+	// AssociationRetryMaxSeconds caps the exponential Association Setup back-off.
+	AssociationRetryMaxSeconds int `yaml:"association_retry_max_seconds"`
 }
 
 // DNNConfig holds the per-DNN IP pool configuration for the SMF.

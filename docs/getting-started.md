@@ -1,6 +1,7 @@
+<!-- tier: public -->
 # Getting Started — ClaudIA 5GC
 
-Long-form setup and operations guide. The [README](../README.md) has the 6-command quickstart;
+Long-form setup and operations guide. The [README](../README.md) has the quickstart;
 this page holds everything else: prerequisites, troubleshooting, the Make reference, scenario
 toggles and UERANSIM usage. `make help` is the canonical list of Make targets.
 
@@ -19,19 +20,56 @@ The following tools must be installed and accessible to your user (not just root
 
 ## Quickstart variants
 
+The core deploys **standalone** by default (no RAN simulator built or started). Add UERANSIM and/or
+PacketRusher with `RAN=` — see [RAN simulators](#ran-simulators-optional).
+
 ```bash
 make pki                # Generate dev PKI (CA + cert per NF) — first time only
 
-make ueransim           # Core + obs + gNB + UE_COUNT UEs (default 1)
-make full               # Everything: 13 NFs + obs + portal + 4 multi-slice UEs
-make portal             # Core + observability + portal (no UERANSIM)
-make ueransim-slices    # Core + obs + 4 UEs multi-slice (no portal)
-make up-obs             # Core + observability only
-make up                 # Core only
+make 5gcsa             # Standalone core + observability + portal
+make up-obs             # Standalone core + observability only
+make up                 # Standalone core only
 
-make down               # Stop and remove volumes (core / ueransim / portal variants)
+make 5gcsa MCP=on      # Standalone core + obs + portal + MCP server container (SSE :9300)
+make full               # Everything: 13 NFs + obs + portal + 4 multi-slice UEs + PacketRusher containers
+make down               # Stop and remove volumes (every profile, every simulator)
 make full-down          # Same, for the full stack
 ```
+
+### MCP server (optional)
+
+`MCP=on` (default `off`) works on `make up`, `make up-obs` and `make 5gcsa`, alone or combined with `RAN=`:
+
+```bash
+make 5gcsa MCP=on                 # standalone core + portal + MCP server
+make 5gcsa RAN=both MCP=on        # everything: both simulators + MCP server
+curl -s localhost:9300/mcp/health # {"status":"ok","tools":36}
+make mcp-start MCP=on             # add the MCP container to an already running core
+```
+
+The container (`profile tools`, SSE transport on `:9300`) reaches the NRF, AMF, SMF, UDM, Jaeger, Prometheus and the
+portal over the Docker networks. `make mcp-up` is the older all-in-one equivalent. `make down` removes it.
+Set `MCP_BEARER_TOKEN` to require Bearer auth. Tool list and client setup: [`mcp/docs/clients.md`](../mcp/docs/clients.md).
+
+### RAN simulators (optional)
+
+`RAN=none|ueransim|packetrusher|both` (default `none`) works on `make up`, `make up-obs` and `make 5gcsa`.
+
+| Mode | Command | Starts |
+|------|---------|--------|
+| Standalone | `make 5gcsa` | Core only |
+| + UERANSIM | `make 5gcsa RAN=ueransim` | Core + UERANSIM gNB + `UE_COUNT` UEs (builds the UERANSIM image) |
+| + PacketRusher | `make 5gcsa RAN=packetrusher` | Core + PacketRusher; `PR_SCENARIO=xn` (default), `n2`, or `none` to only create the containers |
+| + both | `make 5gcsa RAN=both` | Core + UERANSIM + PacketRusher (PacketRusher UE is `imsi-001010000000101`, so the two never collide) |
+
+Shortcuts that keep working: `make ueransim` (= `make up-obs RAN=ueransim`), `make up-test`,
+`make ueransim-slices`, `make handover-test` (Xn), `make handover-n2-test` (N2). Add or remove only the
+simulators on a running core with `make ran-up RAN=…` / `make ran-down`.
+
+The portal detects the active mode at runtime. In standalone mode the UERANSIM and PacketRusher pages are
+hidden; the **gNBs (RAN)** page lists every gNB attached to the AMF (name, Global gNB ID, IP address, status,
+slices, UEs) in all modes. PacketRusher may stop on the URSP policy container the AMF sends by default; start the
+AMF with `URSP_ENABLED=false` for PacketRusher-only runs.
 
 | Service | URL | Notes |
 |---------|-----|-------|
@@ -86,7 +124,7 @@ Run `make help` for the full, always-current list. The main groups:
 
 | Command | Description |
 |---------|-------------|
-| `make portal` | Build image + bring up core + obs + portal |
+| `make 5gcsa` | Standalone 5GC: build image + bring up core + obs + portal (`make portal` is kept as an alias) |
 | `make docker-portal` | Build portal Docker image only |
 | `make portal-build` | Alias for `docker-portal` |
 
@@ -99,7 +137,11 @@ Run `make help` for the full, always-current list. The main groups:
 | `make ueransim-no-ursp` | Build + bring up the full core + obs + UERANSIM **without URSP delivery** |
 | `make ueransim-only` | Bring up UERANSIM only (without touching core). Accepts `UE_COUNT=N` |
 | `make ueransim-down` | Stop UERANSIM containers |
-| `make ueransim-slices` | Bring up core + obs + 4 UEs multi-slice (internet/gold/silver/bronze) |
+| `make ueransim-all` | Bring up core + obs + **every** UERANSIM scenario (default gNB/UEs, multi-slice, SUCI Profile A) side by side |
+| `make ueransim-all-down` | Remove the 8 UERANSIM services (core keeps running) |
+| `make ueransim-status` | Containers, AMF gNB registry and nr-cli state per gNB/UE (`STATUS_CMD_TIMEOUT`, default 8 s) |
+| `make ueransim-iperf` | Per-UE iperf3 TCP/UDP UL+DL through the UPF (`IPERF_DURATION`, `IPERF_MIN_MBPS`, `IPERF_UDP_BW`, `IPERF_MAX_LOSS`, `UES`, `IPERF_CLIENT`) |
+| `make ueransim-slices` | Bring up core + obs + 4 UEs multi-slice (internet/gold/silver/bronze, SUPIs 201-204); coexists with the other scenarios |
 | `make ueransim-slices-down` | Stop multi-slice profile containers |
 | `make ueransim-profile-a` | Bring up core + obs + gNB + SUCI Profile A UE (X25519 ECIES, TS 33.501 §C.3) |
 | `make ueransim-profile-a-down` | Stop SUCI Profile A containers |
@@ -225,10 +267,13 @@ Four development slices (TS 23.501 §5.15):
 
 | Slice | SST | SD | Type | Assigned IMSI |
 |-------|-----|----|------|---------------|
-| internet | 1 | 000001 | eMBB default | imsi-001010000000001 |
-| gold | 1 | 000002 | eMBB premium | imsi-001010000000002 |
-| silver | 2 | 000001 | URLLC | imsi-001010000000003 |
-| bronze | 3 | 000001 | MIoT | imsi-001010000000004 |
+| internet | 1 | 000001 | eMBB default | imsi-001010000000201 |
+| gold | 1 | 000002 | eMBB premium | imsi-001010000000202 |
+| silver | 2 | 000001 | URLLC | imsi-001010000000203 |
+| bronze | 3 | 000001 | MIoT | imsi-001010000000204 |
+
+> Upgrading: the UDR skips SUPIs already in Postgres, so rows for 202-204 seeded before UERAN-001 keep
+> internet-only slices. Reseed with `make down` + `make ueransim-all`.
 
 ```bash
 make ueransim-slices      # core + obs + 4 UEs
@@ -236,7 +281,7 @@ make test-slices          # suite T0–T9 (wait ~2 min)
 make logs-slices          # tail logs
 
 # Or manage from the portal:
-make portal               # http://localhost:8080/ueransim
+make 5gcsa               # http://localhost:8080/ueransim
 ```
 
 ### How NSSAI validation works (TS 23.502 §4.2.2.2.2 + §4.2.9)
@@ -287,9 +332,9 @@ make ueransim-profile-a-down
 # http://localhost:8080/ueransim  →  Scenarios  →  SUCI Profile A  →  Start
 ```
 
-The UE config is `config/ueransim/ue-profile-a.yaml` (`protectionScheme: 1`). The portal's
-**Scenarios** panel lets you switch between Standard, Multi-Slice, and SUCI Profile A with one
-click — it automatically stops conflicting containers before starting the new scenario.
+The UE config is `config/ueransim/ue-profile-a.yaml` (`protectionScheme: 1`, SUPI `imsi-001010000000301`).
+The portal's **Scenarios** panel starts/stops Standard, Multi-Slice and SUCI Profile A independently —
+scenarios coexist (no conflicts), as with `make ueransim-all`.
 
 ### nr-cli commands
 
@@ -304,22 +349,21 @@ docker exec ueransim-ue nr-cli --dump    # list all active UEs
 
 > The `/ueransim` portal executes these same commands via the Docker exec API.
 
-## Unit and BDD tests
+## Verify your deployment
+
+After `make ueransim` (or `make up-obs` plus your own gNB):
 
 ```bash
-go test ./...
-go test ./shared/nas/...              # NAS codec
-go test ./nf/amf/internal/ngap/...   # NGAP codec AMF
-go test ./nf/smf/internal/server/... # SMF handlers + N2SM APER
-go test ./shared/crypto/...           # SUCI deconcealment, NIA2, NEA2
-
-# BDD (godog)
-cd nf/nrf && make test-functional                        # 3 in-process scenarios, no stack needed
-make ueransim && cd nf/amf && E2E_TEST=1 make test-functional   # E2E; without E2E_TEST=1 → pending (exit 0)
+docker ps                                    # every NF "healthy"
+docker exec ueransim-ue nr-cli imsi-001010000000001 --dump   # MM-REGISTERED/NORMAL-SERVICE
+docker exec ueransim-ue nr-cli imsi-001010000000001 -e "ps-establish default internet"
+docker exec ueransim-ue ping -c3 -I uesimtun0 172.30.3.100   # no packet loss
+make test-slices                             # multi-slice suite T0–T9 (after make ueransim-slices)
 ```
 
-The multi-slice T0–T9 suite and the per-feature validation recipes live in
-[validation-commands.md](validation-commands.md).
+Something off? See [`troubleshooting.md`](troubleshooting.md); metrics, traces and logs are in
+[`observability.md`](observability.md). Per-feature recipes with expected logs are part of the
+[members documentation](https://www.claudia5gc.dev/docs/members/).
 
 ## Create a new NF
 

@@ -1,6 +1,15 @@
 package gtpu
 
-import "testing"
+import (
+	"context"
+	"log/slog"
+	"testing"
+	"time"
+
+	"github.com/francurieses/claudia-5gc/nf/upf/internal/pfcp"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+)
 
 // TestBuildDLPDUSessionContainerWireFormat pins the exact byte layout of the
 // NG-U extension block a DL GTP-U packet must carry (TS 29.281 §5.2.1, TS
@@ -74,5 +83,77 @@ func TestDLPacketRoundTripsThroughULParser(t *testing.T) {
 	got := string(pkt[hdrLen:])
 	if got != string(inner) {
 		t.Errorf("recovered inner payload = %q, want %q", got, string(inner))
+	}
+}
+
+// TestEncapGolden pins the in-place DL encapsulation (putDLHeader) to the
+// original hdr+buildDLPDUSessionContainer+inner construction, byte for byte
+// (TS 29.281 §5.1/§5.2.1, TS 38.415 §5.5.2.1).
+func TestEncapGolden(t *testing.T) {
+	inner := []byte("0123456789abcdef-inner-ip-packet")
+	for _, qfi := range []uint8{1, 5, 0x3F, 0xFF} {
+		ext := buildDLPDUSessionContainer(qfi)
+		want := make([]byte, 8, 8+len(ext)+len(inner))
+		want[0], want[1] = 0x34, msgTypeTPDU
+		want[2], want[3] = byte((len(ext)+len(inner))>>8), byte(len(ext)+len(inner))
+		want[4], want[5], want[6], want[7] = 0xDE, 0xAD, 0xBE, 0xEF
+		want = append(append(want, ext...), inner...)
+
+		got := make([]byte, dlHeadroom+len(inner))
+		copy(got[dlHeadroom:], inner)
+		putDLHeader(got, 0xDEADBEEF, qfi, len(inner))
+		if string(got) != string(want) {
+			t.Errorf("qfi=%d\n got % X\nwant % X", qfi, got, want)
+		}
+	}
+}
+
+// TestServerStopsOnCancel: with the per-packet read deadline gone, shutdown
+// relies on the watcher closing the socket; Start must return promptly.
+func TestServerStopsOnCancel(t *testing.T) {
+	s, err := New(Config{Address: "127.0.0.1:0", N3IP: "127.0.0.1"}, benchLogger(slog.LevelInfo), pfcp.NewSessionTable(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start did not return within 1s of cancel")
+	}
+}
+
+func counterValue(t *testing.T, c prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := c.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// TestDropCounters: a failing TUN write and an unknown TEID must increment
+// their drop reasons (previously silent or lumped together).
+func TestDropCounters(t *testing.T) {
+	s, sess, pw, _ := benchServer2(t)
+	pw.Close() // every TUN write now fails
+
+	beforeW := counterValue(t, s.dropTunWrite)
+	s.handlePacket(benchGTPU(sess.ULTEID, benchInnerUDP(sess.UEIP, 100)))
+	if got := counterValue(t, s.dropTunWrite) - beforeW; got != 1 {
+		t.Errorf("tun_write_error delta = %v, want 1", got)
+	}
+
+	beforeN := counterValue(t, s.dropNoSession)
+	s.handlePacket(benchGTPU(0x12345678, benchInnerUDP(sess.UEIP, 100)))
+	if got := counterValue(t, s.dropNoSession) - beforeN; got != 1 {
+		t.Errorf("no_session delta = %v, want 1", got)
 	}
 }

@@ -332,7 +332,42 @@
           "refId": "A"
         }
       ]
-    }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 50},
+      "id": 106,
+      "panels": [],
+      "title": "N6 Downlink L4 Checksum Repair (UPF-003)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "description": "Downlink TCP/UDP packets read from the N6 TUN whose L4 checksum was wrong and was rewritten by the UPF before GTP-U encapsulation (UPF-003). RFC 1071, RFC 793 s3.1, RFC 768, RFC 8200 s8.1.",
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "ops"},
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 51},
+      "id": 14,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "multi"}
+      },
+      "title": "N6 downlink L4 checksum repairs/s",
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "expr": "sum by (proto, ip) (rate(fivegc_upf_l4_checksum_repaired_total[1m]))",
+          "legendFormat": "{{proto}} {{ip}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 59}, "id": 107, "panels": [], "title": "AMBR Enforcement (UPF-005)", "type": "row"},
+    {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "description": "Downlink TCP/UDP packets read from the N6 TUN whose L4 checksum was wrong and was rewritten by the UPF before GTP-U encapsulation (UPF-003). RFC 1071, RFC 793 s3.1, RFC 768, RFC 8200 s8.1.", "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "ops"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 60}, "id": 15, "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}, "title": "QER drops/s (MBR exceeded vs gate closed)", "type": "timeseries", "targets": [{"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "sum by (reason) (rate(fivegc_upf_packet_drops_total{reason=~\"qer_mbr_exceeded|qer_gate_closed\"}[1m]))", "legendFormat": "{{reason}}", "refId": "A"}]},
+    {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "description": "Downlink TCP/UDP packets read from the N6 TUN whose L4 checksum was wrong and was rewritten by the UPF before GTP-U encapsulation (UPF-003). RFC 1071, RFC 793 s3.1, RFC 768, RFC 8200 s8.1.", "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"lineWidth": 2}, "unit": "ops"}, "overrides": []}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 60}, "id": 16, "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}, "title": "AmbrEnforcement QER operations/s by result (PFCP N4)", "type": "timeseries", "targets": [{"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"UPF\",procedure=\"AmbrEnforcement\"}[5m]))", "legendFormat": "{{result}}", "refId": "A"}]}
   ],
   "refresh": "10s",
   "schemaVersion": 38,

@@ -182,3 +182,14 @@ func TestAcceptsHTML(t *testing.T) {
 		}
 	}
 }
+
+// TestSliceQoSRoutesDoNotHitDeleteSlice: /slices/qos/{sst}/{sd}/{dnn} must reach
+// the Session-AMBR handler, not the /slices/{sst}/{sd} param route (UDR-003).
+func TestSliceQoSRoutesDoNotHitDeleteSlice(t *testing.T) {
+	// Deps{} has no UDR/mTLS client: handleDeleteSliceQoS answers 502 "UDR
+	// unreachable"; handleDeleteSlice would dereference a nil Config instead.
+	rec := do(t, newFakeRouter(t), http.MethodDelete, "/api/v1/slices/qos/1/-/internet", "")
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "UDR unreachable") {
+		t.Fatalf("DELETE /slices/qos/1/-/internet: want 502 UDR unreachable, got %d %q", rec.Code, rec.Body.String())
+	}
+}

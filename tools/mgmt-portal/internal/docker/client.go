@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
 	dockernetwork "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -238,4 +240,118 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[pos:])
+}
+
+// ensureImage pulls ref when it is not present locally.
+func (c *Client) ensureImage(ctx context.Context, ref string) error {
+	if _, _, err := c.cli.ImageInspectWithRaw(ctx, ref); err == nil {
+		return nil
+	}
+	rc, err := c.cli.ImagePull(ctx, ref, image.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	_, err = io.Copy(io.Discard, rc)
+	return err
+}
+
+// StartDetached creates and starts a throw-away container attached to the given
+// Docker network and returns its IP on that network. The caller must remove it
+// with ForceRemove.
+func (c *Client) StartDetached(ctx context.Context, name, imageRef, network string, cmd []string) (string, error) {
+	if err := c.ensureImage(ctx, imageRef); err != nil {
+		return "", err
+	}
+	resp, err := c.cli.ContainerCreate(ctx,
+		&container.Config{Image: imageRef, Cmd: cmd},
+		&container.HostConfig{NetworkMode: container.NetworkMode(network)},
+		nil, nil, name)
+	if err != nil {
+		return "", err
+	}
+	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		_ = c.ForceRemove(context.Background(), name)
+		return "", err
+	}
+	insp, err := c.cli.ContainerInspect(ctx, resp.ID)
+	if err != nil {
+		_ = c.ForceRemove(context.Background(), name)
+		return "", err
+	}
+	if ep := insp.NetworkSettings.Networks[network]; ep != nil && ep.IPAddress != "" {
+		return ep.IPAddress, nil
+	}
+	_ = c.ForceRemove(context.Background(), name)
+	return "", errors.New("container has no IP on network " + network)
+}
+
+// RunOnce runs a throw-away container to completion, joining networkMode
+// (for example "container:<name>" to share another container's network
+// namespace), and returns its combined output and exit code.
+func (c *Client) RunOnce(ctx context.Context, name, imageRef, networkMode string, cmd []string) (ExecResult, error) {
+	if err := c.ensureImage(ctx, imageRef); err != nil {
+		return ExecResult{}, err
+	}
+	resp, err := c.cli.ContainerCreate(ctx,
+		&container.Config{Image: imageRef, Cmd: cmd},
+		&container.HostConfig{NetworkMode: container.NetworkMode(networkMode)},
+		nil, nil, name)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	defer func() { _ = c.ForceRemove(context.Background(), name) }()
+	if err := c.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return ExecResult{}, err
+	}
+	waitCh, errCh := c.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	var code int
+	select {
+	case <-ctx.Done():
+		return ExecResult{}, ctx.Err()
+	case err := <-errCh:
+		return ExecResult{}, err
+	case w := <-waitCh:
+		code = int(w.StatusCode)
+	}
+	out, err := c.logsString(context.Background(), resp.ID)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	return ExecResult{ExitCode: code, Output: out}, nil
+}
+
+// ContainerLogs returns the combined stdout+stderr of a container as a string.
+func (c *Client) ContainerLogs(ctx context.Context, name string) (string, error) {
+	return c.logsString(ctx, name)
+}
+
+func (c *Client) logsString(ctx context.Context, name string) (string, error) {
+	rc, err := c.cli.ContainerLogs(ctx, name, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	var out, errb bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errb, rc); err != nil {
+		return "", err
+	}
+	return out.String() + errb.String(), nil
+}
+
+// ForceRemove stops and removes a container regardless of its state.
+func (c *Client) ForceRemove(ctx context.Context, name string) error {
+	return c.cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
+}
+
+// IPOnNetwork returns a running container's IP on a Docker network ("" if none).
+func (c *Client) IPOnNetwork(ctx context.Context, name, network string) string {
+	insp, err := c.cli.ContainerInspect(ctx, name)
+	if err != nil || insp.NetworkSettings == nil {
+		return ""
+	}
+	if ep := insp.NetworkSettings.Networks[network]; ep != nil {
+		return ep.IPAddress
+	}
+	return ""
 }
