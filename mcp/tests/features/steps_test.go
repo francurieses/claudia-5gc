@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"io"
 	"log/slog"
 	"net/http"
@@ -52,7 +53,7 @@ func (c *mcpCtx) startServer(ctx context.Context, _ *godog.Scenario) (context.Co
 		return ctx, err
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	disp := server.NewDispatcher(reg, logger)
+	disp := server.NewDispatcher(reg, guard.New(guard.Options{Mode: guard.ModeLab}, logger), logger)
 	mgr := session.NewManager(logger)
 	cfg := &config.Config{Transport: config.TransportSSE, SSE: config.SSE{Debug: true}}
 	sse := transport.NewSSE(disp, reg, mgr, cfg, logger)
@@ -314,6 +315,11 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	})
 	sc.Step(`^each client receives only its own response$`, c.eachClientReceivesOnlyItsOwnResponse)
 	sc.Step(`^the live session count returns to zero after both disconnect$`, c.sessionCountReturnsToZero)
+	g := registerGuardrailSteps(sc, c)
+	a := registerAnalysisSteps(sc, c, g)
+	registerWave2Steps(sc, c, g, a)
+	registerControlSteps(sc, c, g, a)
+	registerRuntimeSteps(sc, c, g, a)
 }
 
 func TestFeatures(t *testing.T) {

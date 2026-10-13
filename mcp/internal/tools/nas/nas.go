@@ -21,6 +21,7 @@ import (
 func All() []registry.Tool {
 	return []registry.Tool{
 		DecodeTool{}, EncodeTool{}, IEValidateTool{}, TLVInspectTool{},
+		ngapDecodeTool{}, pfcpDecodeTool{},
 	}
 }
 
@@ -79,7 +80,8 @@ func schema(s string) json.RawMessage { return json.RawMessage(s) }
 // DecodeTool decodes a NAS-5GS PDU hex string into a structured representation.
 type DecodeTool struct{}
 
-func (DecodeTool) Name() string { return "nas_decode" }
+func (DecodeTool) Name() string        { return "nas_decode" }
+func (DecodeTool) Risk() registry.Risk { return registry.ReadOnly }
 func (DecodeTool) Description() string {
 	return "Decode a 5GS NAS PDU (hex) into a structured message: protocol discriminator, " +
 		"security header, message type (with name + TS 24.501 clause), the typed message body, " +
@@ -162,7 +164,8 @@ func (DecodeTool) Invoke(_ context.Context, in json.RawMessage) (any, error) {
 // validates the result by re-parsing it. Round-trips nas_decode's raw_body_hex.
 type EncodeTool struct{}
 
-func (EncodeTool) Name() string { return "nas_encode" }
+func (EncodeTool) Name() string        { return "nas_encode" }
+func (EncodeTool) Risk() registry.Risk { return registry.ReadOnly }
 func (EncodeTool) Description() string {
 	return "Assemble a plain 5GS NAS PDU from an extended protocol discriminator, security " +
 		"header type, message type and raw body bytes (hex). Returns the encoded PDU hex and its " +
@@ -261,7 +264,8 @@ func parseMessageType(v any) (byte, *mcperr.Error) {
 // tag / 8-bit length (Type-4 TLV) optional-IE format of TS 24.007 §11.2.4.
 type IEValidateTool struct{}
 
-func (IEValidateTool) Name() string { return "ie_validate" }
+func (IEValidateTool) Name() string        { return "ie_validate" }
+func (IEValidateTool) Risk() registry.Risk { return registry.ReadOnly }
 func (IEValidateTool) Description() string {
 	return "Validate the TLV length fields of an optional-IE byte sequence (hex). Walks " +
 		"[IEI][length][value] entries and flags the first length field that overflows the " +
@@ -299,7 +303,8 @@ func (IEValidateTool) Invoke(_ context.Context, in json.RawMessage) (any, error)
 // semantic decoding. Tolerates malformed input, reporting where parsing breaks.
 type TLVInspectTool struct{}
 
-func (TLVInspectTool) Name() string { return "tlv_inspect" }
+func (TLVInspectTool) Name() string        { return "tlv_inspect" }
+func (TLVInspectTool) Risk() registry.Risk { return registry.ReadOnly }
 func (TLVInspectTool) Description() string {
 	return "Break a TLV-encoded byte sequence (hex) into annotated entries: byte offset, IEI " +
 		"tag, declared length, and value bytes. Stops at the first truncation, reporting the " +

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/francurieses/claudia-5gc/nf/pcf/internal/config"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 	"github.com/francurieses/claudia-5gc/shared/types"
 )
@@ -139,7 +141,7 @@ type Server struct {
 	logger            *slog.Logger
 	httpSrv           *http.Server
 	policies          map[string]map[string]interface{}
-	policiesMu        sync.Mutex
+	policiesMu        sync.RWMutex
 	smPolicyOverrides map[string]SMPolicyOverride // key: overrideKey(supi, dnn)
 	udrClient         UDRClient                   // optional; nil disables UDR lookup (config defaults used)
 	bsfClient         BSFClient                   // optional; nil when BSF not configured (fail-open)
@@ -222,6 +224,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	mux.HandleFunc("POST /npcf-policyauthorization/v1/app-sessions", s.handleCreateAppSession)
 	mux.HandleFunc("DELETE /npcf-policyauthorization/v1/app-sessions/{appSessionId}", s.handleDeleteAppSession)
 	// Internal management — per-subscriber SM policy QoS overrides (not a 3GPP SBI)
+	mux.HandleFunc("GET /pcf-internal/v1/sm-policy-overrides", s.handleListQoSOverrides)
 	mux.HandleFunc("PUT /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleSetQoSOverride)
 	mux.HandleFunc("GET /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleGetQoSOverride)
 	mux.HandleFunc("DELETE /pcf-internal/v1/subscribers/{supi}/sm-policy-override", s.handleDeleteQoSOverride)
@@ -574,6 +577,56 @@ func (s *Server) handleGetQoSOverride(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ov)
+}
+
+// SMPolicyOverrideEntry is one element of the override list: the override's own
+// JSON fields (5qi, dnn, ...) plus the owning SUPI.
+type SMPolicyOverrideEntry struct {
+	SUPI string `json:"supi"`
+	SMPolicyOverride
+}
+
+// handleListQoSOverrides returns every in-memory SM policy override as a JSON array
+// (never null), sorted by (supi, dnn); optional ?supi= filter.
+// GET /pcf-internal/v1/sm-policy-overrides — internal management API, not a 3GPP SBI.
+// Context: TS 29.512 §5.2.2.2 (SM policy association).
+func (s *Server) handleListQoSOverrides(w http.ResponseWriter, r *http.Request) {
+	supiFilter := r.URL.Query().Get("supi")
+	entries := make([]SMPolicyOverrideEntry, 0)
+	s.policiesMu.RLock()
+	for key, ov := range s.smPolicyOverrides {
+		supi, _, _ := strings.Cut(key, "|")
+		if supiFilter != "" && supi != supiFilter {
+			continue
+		}
+		entries = append(entries, SMPolicyOverrideEntry{SUPI: supi, SMPolicyOverride: ov})
+	}
+	s.policiesMu.RUnlock()
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].SUPI != entries[j].SUPI {
+			return entries[i].SUPI < entries[j].SUPI
+		}
+		return entries[i].DNN < entries[j].DNN
+	})
+	body, err := json.Marshal(entries)
+	if err != nil {
+		metrics.ProcedureTotal.WithLabelValues("PCF", "SmPolicyOverrideList", "FAILURE").Inc()
+		problem(w, http.StatusInternalServerError, "ENCODE_ERROR", err.Error())
+		return
+	}
+	metrics.ProcedureTotal.WithLabelValues("PCF", "SmPolicyOverrideList", "OK").Inc()
+	s.logger.InfoContext(r.Context(), "SM policy override list",
+		"procedure", "SmPolicyOverrideList",
+		"correlation_id", r.Header.Get("X-Correlation-Id"),
+		"interface", "OAM",
+		"direction", "IN",
+		"spec_ref", "TS 29.512 §5.2.2.2",
+		"result", "OK",
+		"count", len(entries),
+	)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 // handleDeleteQoSOverride removes a per-subscriber override; subsequent sessions revert to defaults.

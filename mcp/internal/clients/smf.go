@@ -109,3 +109,27 @@ func (c *SMF) get(ctx context.Context, u string) (json.RawMessage, error) {
 	}
 	return body, nil
 }
+
+// DLDataNotify simulates a downlink data notification for one PDU session, which
+// makes the SMF page the UE. Calls POST /nsmf-management/v1/sessions/{psi}/dl-data-notification.
+// Ref: TS 23.502 §4.2.3.3 (network-triggered service request).
+func (c *SMF) DLDataNotify(ctx context.Context, psi int, supi string) (int, []byte, error) {
+	u := fmt.Sprintf("%s/nsmf-management/v1/sessions/%d/dl-data-notification", c.baseURL, psi)
+	if supi != "" {
+		u += "?supi=" + url.QueryEscape(supi)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, nil)
+	if err != nil {
+		return 0, nil, fmt.Errorf("smf: build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("smf: dl-data-notification: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("smf: read body: %w", err)
+	}
+	return resp.StatusCode, raw, nil
+}

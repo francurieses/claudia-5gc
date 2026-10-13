@@ -13,7 +13,7 @@ Legend: ✅ complete for the supported scope · 🟡 working, with documented ga
 | NF | Status | Notes | 3GPP specs |
 |---|---|---|---|
 | NRF | ✅ | Register / Discover / Deregister, heartbeat eviction, OAuth2 access tokens, mTLS, Redis-backed state | TS 29.510 |
-| AMF | ✅ | Registration and mobility (incl. periodic update), PDU session establishment/release/modification relay, NAS security (NIA2/NEA2), slice (NSSAI) validation via NSSF, slice-specific authentication (NSSAA), CN paging and service request, Xn and N2 handover, UE context transfer, Public Warning System broadcast, PostgreSQL UE contexts | TS 23.501, TS 23.502, TS 24.501, TS 38.413, TS 29.518, TS 33.501 |
+| AMF | ✅ | Registration and mobility (incl. periodic update), PDU session establishment/release/modification relay, NAS security (NIA2/NEA2), slice (NSSAI) validation via NSSF, slice-specific authentication (NSSAA), CN paging and service request, O&M-triggered AN release, runtime timer config (T3512 / mobile reachable / implicit detach), Xn and N2 handover, UE context transfer, Public Warning System broadcast, PostgreSQL UE contexts | TS 23.501, TS 23.502, TS 24.501, TS 38.413, TS 29.518, TS 33.501 |
 | AUSF | 🟡 | 5G-AKA, EAP-AKA′, NSSAA EAP relay (simulated AAA server), SUCI null-scheme and Profile A | TS 33.501, TS 29.509, RFC 5448 |
 | UDM | 🟡 | Authentication data, access & mobility data, UE context management, subscription data notifications, SUCI deconcealment | TS 29.503, TS 33.501 |
 | UDR | ✅ | PostgreSQL-backed subscriber and policy data (UE policy / URSP, SM policy), per slice/DNN Session-AMBR, auto-migrated, seeded subscribers | TS 29.504, TS 29.519 |
@@ -25,7 +25,7 @@ Legend: ✅ complete for the supported scope · 🟡 working, with documented ga
 | BSF | ✅ | Binding registration, deregistration and discovery; PCF binds sessions automatically | TS 29.521 |
 | NEF | 🟡 | AF session with required QoS (create / get / delete) with OAuth2, mapped onto PCF policy authorization | TS 29.522, TS 29.514 |
 | LMF | 🟡 | UE location: Cell-ID, E-CID (NRPPa) and GNSS (LPP) with automatic fallback; periodic and area-of-interest event subscriptions. MT location paging and GMLC interface not yet implemented | TS 29.572, TS 38.455, TS 37.355, TS 23.273 |
-| MCP | ✅ | AI-tooling server (stdio + SSE, port 9300): NAS codec, NF discovery, UE inspection, QoS, crypto, metrics and UERANSIM control tools | — |
+| MCP | ✅ | AI-tooling server (stdio + SSE, port 9300): NAS codec, NF discovery, UE inspection, QoS, crypto, metrics, status and analysis tools, network-control tools, runtime-config and subscriber tools (74 tools) | — |
 
 Per-procedure conformance, sequence diagrams and validation recipes are part of the
 members documentation. See the [documentation overview](https://www.claudia5gc.dev/docs/members/).

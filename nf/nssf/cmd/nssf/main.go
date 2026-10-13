@@ -13,6 +13,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
@@ -27,7 +28,7 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logging.Level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))
@@ -54,7 +55,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
-	metricsSrv := metrics.MetricsServer(cfg.Metrics.Address)
+	metricsSrv := metrics.MetricsServerWithAdmin(cfg.Metrics.Address, logging.NewLevelAdmin(logging.Level, logger))
 	go func() {
 		logger.Info("metrics server listening", "addr", cfg.Metrics.Address)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -100,7 +101,7 @@ func main() {
 					ServiceName:       "nnssf-nsselection",
 					Scheme:            "https",
 					NFServiceStatus:   "REGISTERED",
-					Versions: []nrf.NFServiceVersion{{APIVersionInURI: "v2", APIFullVersion: "2.0.0"}},
+					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v2", APIFullVersion: "2.0.0"}},
 				}},
 			}
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {

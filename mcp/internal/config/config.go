@@ -6,10 +6,14 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// metricsHostRe is the accepted shape of metrics_host_override: a bare host name or IPv4.
+var metricsHostRe = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
 
 // Transport selects which MCP transport(s) to run.
 type Transport string
@@ -29,20 +33,25 @@ type Config struct {
 	Auth Auth `yaml:"auth"`
 
 	// Upstream service addresses consumed by Group B/C/D/H tools.
-	NRFAddr        string `yaml:"nrf_addr"`
-	AMFAddr        string `yaml:"amf_addr"`
-	PCFAddr        string `yaml:"pcf_addr"`
-	SMFAddr        string `yaml:"smf_addr"`
-	UDMAddr        string `yaml:"udm_addr"`
+	NRFAddr string `yaml:"nrf_addr"`
+	AMFAddr string `yaml:"amf_addr"`
+	PCFAddr string `yaml:"pcf_addr"`
+	SMFAddr string `yaml:"smf_addr"`
+	UDMAddr string `yaml:"udm_addr"`
+	// BSFAddr is the BSF Nbsf_Management SBI (mTLS), used by pcf_binding_list.
+	BSFAddr string `yaml:"bsf_addr"`
+	// NEFAddr is the NEF Nnef_AFsessionWithQoS SBI (mTLS), used by af_qos_session_*.
+	NEFAddr string `yaml:"nef_addr"`
+	// SMSFAddr is the SMSF internal MT-SMS trigger (mTLS), used by sms_send_mt.
+	SMSFAddr       string `yaml:"smsf_addr"`
 	JaegerAddr     string `yaml:"jaeger_addr"`
 	PrometheusAddr string `yaml:"prometheus_addr"`
-	// PortalAddr is mgmt-portal's plain-HTTP API, used by Group F to reach
-	// UERANSIM containers via POST /api/v1/ueransim/nr-cli. MCP never talks to
-	// Docker directly: it is reachable over SSE by external LLM clients, so
-	// mounting the Docker socket into it would hand out root-equivalent host
-	// access to whoever can drive a tool call. mgmt-portal already holds that
-	// socket (read-only mount, internal network only) and exposes exec as a
-	// narrow, validated HTTP endpoint.
+	// PortalAddr is mgmt-portal's plain-HTTP API, used by the status, control,
+	// runtime-config and PCAP tools. MCP never talks to Docker directly: it is
+	// reachable over SSE by external LLM clients, so mounting the Docker socket
+	// into it would hand out root-equivalent host access to whoever can drive a
+	// tool call. mgmt-portal already holds that socket (read-only mount, internal
+	// network only) and exposes the few actions MCP needs as validated endpoints.
 	PortalAddr string `yaml:"portal_addr"`
 
 	// Upstream TLS material for reaching the NRF SBI (which enforces mTLS).
@@ -52,23 +61,37 @@ type Config struct {
 	ClientCertFile string `yaml:"client_cert_file"`
 	ClientKeyFile  string `yaml:"client_key_file"`
 
-	// UERANSIM configures Group F orchestration tools.
-	UERANSIM UERANSIMConfig `yaml:"ueransim"`
-
 	// Prometheus configures Group G metrics tools (overrides prometheus_addr timeout).
 	Prometheus PrometheusConfig `yaml:"prometheus"`
+
+	// LokiAddr is the Loki query API used by log_query and procedure_timeline.
+	LokiAddr string `yaml:"loki_addr"`
+
+	// MetricsHostOverride replaces the host part of each NF metrics address that
+	// Prometheus reports (smf:9105 becomes localhost:9105), keeping the port. Set it
+	// when MCP runs on the host and cannot resolve Docker container names. Empty
+	// (default) leaves the addresses unchanged.
+	MetricsHostOverride string `yaml:"metrics_host_override"`
+
+	// AccessMode caps the risk level the server exposes: read-only | operator | lab.
+	AccessMode string `yaml:"access_mode"`
+	// AllowServiceControl must be true before nf_service_control can run. It is
+	// refused in every mode other than lab, even with an admin token.
+	AllowServiceControl bool `yaml:"allow_service_control"`
+
+	Guardrails Guardrails `yaml:"guardrails"`
 }
 
-// UERANSIMConfig holds Group F tool parameters.
-type UERANSIMConfig struct {
-	// ContainerName is the docker container running nr-ue (default: ueransim-ue).
-	ContainerName string `yaml:"container_name"`
-	// ExecTimeoutSec is the per-command HTTP timeout to mgmt-portal's nr-cli
-	// proxy, in seconds (default: 25). Must exceed mgmt-portal's own internal
-	// exec timeout (20s, tools/mgmt-portal/internal/api/ueransim.go) — otherwise
-	// this client cancels the request context first, which propagates into
-	// mgmt-portal's handler and kills its in-flight docker exec early.
-	ExecTimeoutSec int `yaml:"exec_timeout_sec"`
+// Guardrails bounds the side effects of tool calls.
+type Guardrails struct {
+	// MinIntervalMs is the minimum gap between two confirmed disruptive calls
+	// across all tools (default 2000).
+	MinIntervalMs int `yaml:"min_interval_ms"`
+	// MaxResultBytes caps a single tool result; larger results return an error
+	// asking the caller to narrow the query (default 262144).
+	MaxResultBytes int `yaml:"max_result_bytes"`
+	// AuditSize is the number of audit entries kept in memory (default 256).
+	AuditSize int `yaml:"audit_size"`
 }
 
 // PrometheusConfig holds Group G tool parameters (supplements prometheus_addr).
@@ -99,13 +122,22 @@ type TLS struct {
 func (t TLS) Enabled() bool { return t.CertFile != "" && t.KeyFile != "" }
 
 // Auth configures optional Bearer-token authentication on the SSE transport.
-// Empty token ⇒ authentication disabled (dev default).
+// No token configured ⇒ authentication disabled (dev default; callers act as
+// operator). bearer_token is the operator token; tokens map other tokens to a
+// role. MCP_TOKEN_VIEWER / MCP_TOKEN_OPERATOR / MCP_TOKEN_ADMIN add entries.
 type Auth struct {
-	BearerToken string `yaml:"bearer_token"`
+	BearerToken string      `yaml:"bearer_token"`
+	Tokens      []AuthToken `yaml:"tokens"`
+}
+
+// AuthToken binds a bearer token to a caller role (viewer | operator | admin).
+type AuthToken struct {
+	Token string `yaml:"token"`
+	Role  string `yaml:"role"`
 }
 
 // Enabled reports whether Bearer authentication is required.
-func (a Auth) Enabled() bool { return a.BearerToken != "" }
+func (a Auth) Enabled() bool { return a.BearerToken != "" || len(a.Tokens) > 0 }
 
 // Load reads YAML from path (defaults to /etc/5gc/config.yaml), applies env
 // overrides, fills defaults, and validates.
@@ -154,6 +186,15 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("UDM_ADDR"); v != "" {
 		c.UDMAddr = v
 	}
+	if v := os.Getenv("BSF_ADDR"); v != "" {
+		c.BSFAddr = v
+	}
+	if v := os.Getenv("NEF_ADDR"); v != "" {
+		c.NEFAddr = v
+	}
+	if v := os.Getenv("SMSF_ADDR"); v != "" {
+		c.SMSFAddr = v
+	}
 	if v := os.Getenv("JAEGER_ADDR"); v != "" {
 		c.JaegerAddr = v
 	}
@@ -162,6 +203,24 @@ func (c *Config) applyEnv() {
 	}
 	if v := os.Getenv("PORTAL_ADDR"); v != "" {
 		c.PortalAddr = v
+	}
+	if v := os.Getenv("LOKI_ADDR"); v != "" {
+		c.LokiAddr = v
+	}
+	if v := os.Getenv("MCP_METRICS_HOST_OVERRIDE"); v != "" {
+		c.MetricsHostOverride = v
+	}
+	if v := os.Getenv("MCP_ACCESS_MODE"); v != "" {
+		c.AccessMode = strings.ToLower(v)
+	}
+	for _, t := range []struct{ env, role string }{
+		{"MCP_TOKEN_VIEWER", "viewer"},
+		{"MCP_TOKEN_OPERATOR", "operator"},
+		{"MCP_TOKEN_ADMIN", "admin"},
+	} {
+		if v := os.Getenv(t.env); v != "" {
+			c.Auth.Tokens = append(c.Auth.Tokens, AuthToken{Token: v, Role: t.role})
+		}
 	}
 }
 
@@ -187,6 +246,15 @@ func (c *Config) applyDefaults() {
 	if c.UDMAddr == "" {
 		c.UDMAddr = "https://udm:8003"
 	}
+	if c.BSFAddr == "" {
+		c.BSFAddr = "https://bsf:8010"
+	}
+	if c.NEFAddr == "" {
+		c.NEFAddr = "https://nef:8011"
+	}
+	if c.SMSFAddr == "" {
+		c.SMSFAddr = "https://smsf:8009"
+	}
 	if c.JaegerAddr == "" {
 		c.JaegerAddr = "http://jaeger:16686"
 	}
@@ -196,14 +264,23 @@ func (c *Config) applyDefaults() {
 	if c.PortalAddr == "" {
 		c.PortalAddr = "http://mgmt-portal:8080"
 	}
-	if c.UERANSIM.ContainerName == "" {
-		c.UERANSIM.ContainerName = "ueransim-ue"
-	}
-	if c.UERANSIM.ExecTimeoutSec <= 0 {
-		c.UERANSIM.ExecTimeoutSec = 25
-	}
 	if c.Prometheus.QueryTimeoutSec <= 0 {
 		c.Prometheus.QueryTimeoutSec = 5
+	}
+	if c.LokiAddr == "" {
+		c.LokiAddr = "http://loki:3100"
+	}
+	if c.AccessMode == "" {
+		c.AccessMode = "read-only"
+	}
+	if c.Guardrails.MinIntervalMs <= 0 {
+		c.Guardrails.MinIntervalMs = 2000
+	}
+	if c.Guardrails.MaxResultBytes <= 0 {
+		c.Guardrails.MaxResultBytes = 256 << 10
+	}
+	if c.Guardrails.AuditSize <= 0 {
+		c.Guardrails.AuditSize = 256
 	}
 }
 
@@ -227,6 +304,24 @@ func (c *Config) validate() error {
 	}
 	if c.SSE.TLS.CertFile != "" && c.SSE.TLS.KeyFile == "" {
 		return fmt.Errorf("sse.tls.key_file required when cert_file is set")
+	}
+	switch c.AccessMode {
+	case "read-only", "operator", "lab":
+	default:
+		return fmt.Errorf("access_mode must be read-only|operator|lab, got %q", c.AccessMode)
+	}
+	if c.MetricsHostOverride != "" && !metricsHostRe.MatchString(c.MetricsHostOverride) {
+		return fmt.Errorf("metrics_host_override must be a host name or IP without scheme or port, got %q", c.MetricsHostOverride)
+	}
+	for i, t := range c.Auth.Tokens {
+		if t.Token == "" {
+			return fmt.Errorf("auth.tokens[%d]: token is empty", i)
+		}
+		switch t.Role {
+		case "viewer", "operator", "admin":
+		default:
+			return fmt.Errorf("auth.tokens[%d]: role must be viewer|operator|admin, got %q", i, t.Role)
+		}
 	}
 	return nil
 }

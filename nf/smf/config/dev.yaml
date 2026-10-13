@@ -11,6 +11,8 @@ dnns:
     - name: gold
       ue_ip_pool: 10.63.0.0/24
       ue_ipv6_prefix: 2001:db8:63::/56
+    - name: bronze
+      ue_ip_pool: 10.64.0.0/24
 metrics:
     address: 0.0.0.0:9105
 n4:

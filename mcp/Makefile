@@ -5,9 +5,12 @@ NF := mcp
 BIN := bin/$(NF)
 PKG := ./...
 
+# BUILD_COMMIT is stamped into mcp_info (build_commit); "unknown" outside a git checkout.
+BUILD_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+
 build:
 	@mkdir -p bin
-	go build -o $(BIN) ./cmd/$(NF)
+	go build -ldflags "-X main.buildCommit=$(BUILD_COMMIT)" -o $(BIN) ./cmd/$(NF)
 
 test:
 	go test -race -cover $(shell go list -f '{{if .TestGoFiles}}{{.ImportPath}}{{end}}' $(PKG))
@@ -24,7 +27,7 @@ lint:
 	golangci-lint run ./...
 
 docker:
-	cd .. && docker build -f mcp/Dockerfile -t 5gc/mcp:dev .
+	cd .. && docker build -f mcp/Dockerfile --build-arg BUILD_COMMIT=$(BUILD_COMMIT) -t 5gc/mcp:dev .
 
 run: build
 	CONFIG_PATH=$(PWD)/config/dev.yaml ./$(BIN)

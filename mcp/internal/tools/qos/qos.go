@@ -1,6 +1,7 @@
-// Package qos implements MCP Group H tools: per-subscriber QoS policy write operations.
-// These tools allow an LLM or operator to configure 5QI + AMBR per subscriber in the PCF
-// and orchestrate new PDU session establishment that carries those QoS parameters end-to-end.
+// Package qos implements the MCP QoS tools: per-subscriber SM policy overrides in
+// the PCF (this file) and PDU session QoS state in the SMF and UDM (sessions.go).
+// The policy tools configure 5QI and AMBR per subscriber, optionally scoped to a
+// DNN, so the next PDU session establishment picks them up.
 //
 // 3GPP references:
 //   - TS 23.501 §5.7 — QoS model (5QI table, non-GBR / GBR flows)
@@ -10,45 +11,47 @@ package qos
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/clients"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
 	"github.com/francurieses/claudia-5gc/mcp/internal/tools/registry"
-	ueclient "github.com/francurieses/claudia-5gc/mcp/internal/ueransim"
+	"github.com/francurieses/claudia-5gc/mcp/internal/tools/toolutil"
 )
 
-// All returns the five Group H tools bound to a PCF client, AMF client, and UERANSIM client.
-func All(pcf *clients.PCF, amf *clients.AMF, ue ueclient.Client) []registry.Tool {
+// All returns the PCF-backed policy tools.
+func All(pcf *clients.PCF) []registry.Tool {
 	return []registry.Tool{
 		setPolicyTool{pcf},
 		getPolicyTool{pcf},
 		deletePolicyTool{pcf},
-		establishWithQoSTool{pcf: pcf, ue: ue},
-		modifyQoSTool{pcf: pcf, amf: amf},
+		listPolicyTool{pcf},
 	}
 }
 
 func schema(s string) json.RawMessage { return json.RawMessage(s) }
 
-func hashSUPI(supi string) string {
-	h := sha256.Sum256([]byte(supi))
-	return hex.EncodeToString(h[:4])
+// optionalDNN validates a DNN argument that may be absent. Empty means "all DNNs".
+func optionalDNN(dnn string) *mcperr.Error {
+	if dnn == "" {
+		return nil
+	}
+	return toolutil.ValidDNN(dnn)
 }
 
 // ---- qos_policy_set ---------------------------------------------------------
 
 type setPolicyTool struct{ pcf *clients.PCF }
 
-func (setPolicyTool) Name() string { return "qos_policy_set" }
+func (setPolicyTool) Name() string        { return "qos_policy_set" }
+func (setPolicyTool) Risk() registry.Risk { return registry.Mutating }
 func (setPolicyTool) Description() string {
 	return "Set a per-subscriber SM policy QoS override in the PCF. " +
-		"The configured 5QI and AMBR will be applied the next time this SUPI establishes a PDU session. " +
+		"The configured 5QI and AMBR apply the next time this SUPI establishes a PDU session " +
+		"(an active session keeps its QoS until pdu_session_qos_set). Optional dnn limits the override to one DNN. " +
 		"Common 5QI values: 1 (voice), 7 (real-time streaming), 8 (video), 9 (best-effort internet). " +
 		"Ref: TS 29.512 §5.2.2.2 (qosDecs), TS 23.501 §5.7 (QoS model)."
 }
@@ -57,20 +60,22 @@ func (setPolicyTool) InputSchema() json.RawMessage {
 "type":"object",
 "properties":{
   "supi":             {"type":"string","description":"Subscriber SUPI, e.g. imsi-001010000000001"},
-  "5qi":              {"type":"integer","description":"5QI value (1-86). Standard non-GBR: 5,7,8,9. GBR voice: 1."},
-  "ambr_uplink":      {"type":"string","description":"Session AMBR uplink, e.g. '50 Mbps'. Omit to keep default (100 Mbps)."},
-  "ambr_downlink":    {"type":"string","description":"Session AMBR downlink, e.g. '200 Mbps'. Omit to keep default (100 Mbps)."},
+  "dnn":              {"type":"string","description":"Optional DNN the override applies to (e.g. internet). Omit for all DNNs."},
+  "5qi":              {"type":"integer","description":"5QI value: standardised (TS 23.501 Table 5.7.4-1) or operator-defined 128-254."},
+  "ambr_uplink":      {"type":"string","description":"Session AMBR uplink, e.g. '50 Mbps'. Omit to keep the subscription default."},
+  "ambr_downlink":    {"type":"string","description":"Session AMBR downlink, e.g. '200 Mbps'. Omit to keep the subscription default."},
   "arp_priority_level":{"type":"integer","description":"ARP priority level 1-15 (lower = higher priority). Default 8."}
 },
 "required":["supi","5qi"]}`)
 }
 func (setPolicyTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"applied":{"type":"boolean"},"supi":{},"5qi":{},"ambr_uplink":{},"ambr_downlink":{}}}`)
+	return schema(`{"type":"object","properties":{"applied":{"type":"boolean"},"supi":{},"dnn":{},"5qi":{},"ambr_uplink":{},"ambr_downlink":{}}}`)
 }
 
 func (t setPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
 	var a struct {
 		SUPI             string `json:"supi"`
+		DNN              string `json:"dnn"`
 		FiveQI           int    `json:"5qi"`
 		AMBRUplink       string `json:"ambr_uplink"`
 		AMBRDownlink     string `json:"ambr_downlink"`
@@ -79,14 +84,23 @@ func (t setPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, err
 	if err := json.Unmarshal(in, &a); err != nil {
 		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "qos_policy_set args: %v", err)
 	}
-	if a.SUPI == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "supi is required", nil)
+	if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+		return nil, perr
 	}
-	if a.FiveQI <= 0 || a.FiveQI > 86 {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "5qi must be 1-86, got %d", a.FiveQI)
+	if perr := optionalDNN(a.DNN); perr != nil {
+		return nil, perr
+	}
+	if !toolutil.ValidFiveQI(a.FiveQI) {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil,
+			"5qi %d is neither standardised (TS 23.501 Table 5.7.4-1) nor operator-defined (128-254)", a.FiveQI)
+	}
+	if a.ARPPriorityLevel != 0 && (a.ARPPriorityLevel < 1 || a.ARPPriorityLevel > 15) {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil,
+			"arp_priority_level must be 1-15, got %d", a.ARPPriorityLevel)
 	}
 
 	p := clients.PCFQoSPolicy{
+		DNN:              a.DNN,
 		FiveQI:           a.FiveQI,
 		AMBRUplink:       a.AMBRUplink,
 		AMBRDownlink:     a.AMBRDownlink,
@@ -98,15 +112,17 @@ func (t setPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, err
 
 	slog.InfoContext(ctx, "QoS policy set",
 		"tool_name", "qos_policy_set",
-		"supi_hash", hashSUPI(a.SUPI),
+		"supi_hash", toolutil.HashSUPI(a.SUPI),
+		"dnn", a.DNN,
 		"5qi", a.FiveQI,
 	)
 	return map[string]any{
 		"applied":       true,
 		"supi":          a.SUPI,
+		"dnn":           a.DNN,
 		"5qi":           a.FiveQI,
-		"ambr_uplink":   strOrDefault(a.AMBRUplink, "100 Mbps (default)"),
-		"ambr_downlink": strOrDefault(a.AMBRDownlink, "100 Mbps (default)"),
+		"ambr_uplink":   a.AMBRUplink,
+		"ambr_downlink": a.AMBRDownlink,
 	}, nil
 }
 
@@ -114,49 +130,53 @@ func (t setPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, err
 
 type getPolicyTool struct{ pcf *clients.PCF }
 
-func (getPolicyTool) Name() string { return "qos_policy_get" }
+func (getPolicyTool) Name() string        { return "qos_policy_get" }
+func (getPolicyTool) Risk() registry.Risk { return registry.ReadOnly }
 func (getPolicyTool) Description() string {
-	return "Get the active per-subscriber SM policy QoS override for a SUPI. " +
-		"Returns the configured 5QI and AMBR, or indicates that the operator default (5QI=9) is in use. " +
-		"Ref: TS 29.512 §5.2.2.2."
+	return "Get the PCF QoS override for a SUPI (and optional DNN). Returns the override's 5QI and AMBR, " +
+		"or is_override:false when none is set. It never invents a default: for the subscription " +
+		"values use subscription_qos_get. Ref: TS 29.512 §5.2.2.2."
 }
 func (getPolicyTool) InputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"supi":{"type":"string"}},"required":["supi"]}`)
+	return schema(`{"type":"object","properties":{"supi":{"type":"string"},"dnn":{"type":"string","description":"Optional DNN scope."}},"required":["supi"]}`)
 }
 func (getPolicyTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"supi":{},"5qi":{},"ambr_uplink":{},"ambr_downlink":{},"is_override":{"type":"boolean"}}}`)
+	return schema(`{"type":"object","properties":{"supi":{},"dnn":{},"5qi":{},"ambr_uplink":{},"ambr_downlink":{},"is_override":{"type":"boolean"},"hint":{}}}`)
 }
 
 func (t getPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
 	var a struct {
 		SUPI string `json:"supi"`
+		DNN  string `json:"dnn"`
 	}
 	if err := json.Unmarshal(in, &a); err != nil {
 		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "qos_policy_get args: %v", err)
 	}
-	if a.SUPI == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "supi is required", nil)
+	if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+		return nil, perr
+	}
+	if perr := optionalDNN(a.DNN); perr != nil {
+		return nil, perr
 	}
 
-	p, err := t.pcf.GetQoSPolicy(ctx, a.SUPI)
+	p, err := t.pcf.GetQoSPolicy(ctx, a.SUPI, a.DNN)
 	if err != nil {
 		return nil, mcperr.ToolError(fmt.Errorf("qos_policy_get: %w", err), nil)
 	}
 	if p == nil {
 		return map[string]any{
-			"supi":          a.SUPI,
-			"5qi":           9,
-			"ambr_uplink":   "100 Mbps",
-			"ambr_downlink": "100 Mbps",
-			"is_override":   false,
-			"note":          "No per-subscriber override; operator default (5QI=9) will be applied.",
+			"supi":        a.SUPI,
+			"dnn":         a.DNN,
+			"is_override": false,
+			"hint":        "no PCF override for this scope; the subscription QoS applies (see subscription_qos_get)",
 		}, nil
 	}
 	return map[string]any{
 		"supi":          a.SUPI,
+		"dnn":           p.DNN,
 		"5qi":           p.FiveQI,
-		"ambr_uplink":   strOrDefault(p.AMBRUplink, "100 Mbps (default)"),
-		"ambr_downlink": strOrDefault(p.AMBRDownlink, "100 Mbps (default)"),
+		"ambr_uplink":   p.AMBRUplink,
+		"ambr_downlink": p.AMBRDownlink,
 		"is_override":   true,
 	}, nil
 }
@@ -165,257 +185,101 @@ func (t getPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, err
 
 type deletePolicyTool struct{ pcf *clients.PCF }
 
-func (deletePolicyTool) Name() string { return "qos_policy_delete" }
+func (deletePolicyTool) Name() string        { return "qos_policy_delete" }
+func (deletePolicyTool) Risk() registry.Risk { return registry.Mutating }
 func (deletePolicyTool) Description() string {
-	return "Remove the per-subscriber QoS override for a SUPI. " +
-		"Subsequent PDU sessions will use the operator default (5QI=9, 100 Mbps). " +
-		"Idempotent: no error if no override exists."
+	return "Remove the PCF QoS override for a SUPI (and optional DNN). Later PDU sessions use the " +
+		"subscription QoS. Idempotent: no error if no override exists."
 }
 func (deletePolicyTool) InputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"supi":{"type":"string"}},"required":["supi"]}`)
+	return schema(`{"type":"object","properties":{"supi":{"type":"string"},"dnn":{"type":"string","description":"Optional DNN scope."}},"required":["supi"]}`)
 }
 func (deletePolicyTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"cleared":{"type":"boolean"},"supi":{}}}`)
+	return schema(`{"type":"object","properties":{"cleared":{"type":"boolean"},"supi":{},"dnn":{}}}`)
 }
 
 func (t deletePolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
 	var a struct {
 		SUPI string `json:"supi"`
+		DNN  string `json:"dnn"`
 	}
 	if err := json.Unmarshal(in, &a); err != nil {
 		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "qos_policy_delete args: %v", err)
 	}
-	if a.SUPI == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "supi is required", nil)
+	if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+		return nil, perr
+	}
+	if perr := optionalDNN(a.DNN); perr != nil {
+		return nil, perr
 	}
 
-	if err := t.pcf.DeleteQoSPolicy(ctx, a.SUPI); err != nil {
+	if err := t.pcf.DeleteQoSPolicy(ctx, a.SUPI, a.DNN); err != nil {
 		return nil, mcperr.ToolError(fmt.Errorf("qos_policy_delete: %w", err), nil)
 	}
-	slog.InfoContext(ctx, "QoS policy deleted", "tool_name", "qos_policy_delete", "supi_hash", hashSUPI(a.SUPI))
-	return map[string]any{"cleared": true, "supi": a.SUPI}, nil
+	slog.InfoContext(ctx, "QoS policy deleted", "tool_name", "qos_policy_delete",
+		"supi_hash", toolutil.HashSUPI(a.SUPI), "dnn", a.DNN)
+	return map[string]any{"cleared": true, "supi": a.SUPI, "dnn": a.DNN}, nil
 }
 
-// ---- pdu_session_establish_with_qos -----------------------------------------
+// ---- qos_policy_list --------------------------------------------------------
 
-type establishWithQoSTool struct {
-	pcf *clients.PCF
-	ue  ueclient.Client
-}
+type listPolicyTool struct{ pcf *clients.PCF }
 
-func (establishWithQoSTool) Name() string { return "pdu_session_establish_with_qos" }
-func (establishWithQoSTool) Description() string {
-	return "Orchestrates end-to-end QoS-aware PDU session establishment: " +
-		"(1) sets a per-subscriber 5QI + AMBR override in the PCF, " +
-		"(2) triggers UERANSIM to establish a new PDU session, " +
-		"(3) returns the result with the configured QoS parameters. " +
-		"The SMF reads the 5QI from the PCF response and encodes it in N1SM (QoS Rules) and N2SM (NGAP QoS Flow). " +
-		"Spec: TS 23.502 §4.3.2.2, TS 29.512 §5.2.2.2, TS 23.501 §5.7."
+func (listPolicyTool) Name() string        { return "qos_policy_list" }
+func (listPolicyTool) Risk() registry.Risk { return registry.ReadOnly }
+func (listPolicyTool) Description() string {
+	return "List every per-subscriber SM policy QoS override the PCF holds (optionally only one SUPI). " +
+		"Each entry has supi, dnn (when the override is DNN-scoped), 5qi, arp, ambr_ul and ambr_dl; arp and the " +
+		"AMBRs are null when the override does not set them. An empty list means no override exists. " +
+		"Overrides are created with qos_policy_set. Ref: TS 29.512 §5.2.2.2 (qosDecs, sessRules)."
 }
-func (establishWithQoSTool) InputSchema() json.RawMessage {
-	return schema(`{
-"type":"object",
-"properties":{
-  "supi":          {"type":"string","description":"Subscriber SUPI, e.g. imsi-001010000000001"},
-  "5qi":           {"type":"integer","description":"5QI for the new session (1-86). 1=voice, 7=streaming, 9=internet."},
-  "dnn":           {"type":"string","description":"Data Network Name. Defaults to 'internet'."},
-  "ambr_uplink":   {"type":"string","description":"Session AMBR UL e.g. '50 Mbps'. Default: 100 Mbps."},
-  "ambr_downlink": {"type":"string","description":"Session AMBR DL e.g. '200 Mbps'. Default: 100 Mbps."}
-},
-"required":["supi","5qi"]}`)
+func (listPolicyTool) InputSchema() json.RawMessage {
+	return schema(`{"type":"object","properties":{"supi":{"type":"string","description":"Optional filter, e.g. imsi-001010000000001"}},"additionalProperties":false}`)
 }
-func (establishWithQoSTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"success":{},"pdu_session_id":{},"ue_ip":{},"5qi_configured":{},"ambr_uplink":{},"ambr_downlink":{},"establish_time_ms":{},"steps":{},"error":{}}}`)
-}
+func (listPolicyTool) OutputSchema() json.RawMessage { return schema(`{"type":"array"}`) }
 
-func (t establishWithQoSTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
-	start := time.Now()
+func (t listPolicyTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
 	var a struct {
-		SUPI         string `json:"supi"`
-		FiveQI       int    `json:"5qi"`
-		DNN          string `json:"dnn"`
-		AMBRUplink   string `json:"ambr_uplink"`
-		AMBRDownlink string `json:"ambr_downlink"`
+		SUPI string `json:"supi"`
 	}
-	if err := json.Unmarshal(in, &a); err != nil {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_establish_with_qos args: %v", err)
+	if len(in) > 0 {
+		if err := json.Unmarshal(in, &a); err != nil {
+			return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "qos_policy_list args: %v", err)
+		}
 	}
-	if a.SUPI == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "supi is required", nil)
+	if a.SUPI != "" {
+		if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+			return nil, perr
+		}
 	}
-	if a.FiveQI <= 0 || a.FiveQI > 86 {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "5qi must be 1-86, got %d", a.FiveQI)
-	}
-	if a.DNN == "" {
-		a.DNN = "internet"
-	}
-
-	steps := make([]map[string]any, 0, 2)
-
-	// Step 1: Set QoS policy override in PCF.
-	t1 := time.Now()
-	policy := clients.PCFQoSPolicy{
-		FiveQI:       a.FiveQI,
-		AMBRUplink:   a.AMBRUplink,
-		AMBRDownlink: a.AMBRDownlink,
-	}
-	if err := t.pcf.SetQoSPolicy(ctx, a.SUPI, policy); err != nil {
-		steps = append(steps, stepResult("set_qos_policy", false, time.Since(t1), err.Error()))
-		return map[string]any{"success": false, "steps": steps, "error": err.Error()}, nil
-	}
-	steps = append(steps, stepResult("set_qos_policy", true, time.Since(t1), ""))
-
-	// Step 2: Trigger UERANSIM PDU session establishment.
-	t2 := time.Now()
-	sess, err := t.ue.PDUSessionEstablish(ctx, a.SUPI, a.DNN)
+	list, err := t.pcf.ListQoSOverrides(ctx, a.SUPI)
 	if err != nil {
-		steps = append(steps, stepResult("pdu_session_establish", false, time.Since(t2), err.Error()))
-		return map[string]any{"success": false, "steps": steps, "error": err.Error()}, nil
+		data := map[string]any{}
+		var se *clients.PCFStatusError
+		if errors.As(err, &se) {
+			data["status"] = se.Status
+		}
+		return nil, mcperr.ToolError(fmt.Errorf("qos_policy_list: %w", err), data)
 	}
-	steps = append(steps, stepResult("pdu_session_establish", true, time.Since(t2), ""))
-
-	slog.InfoContext(ctx, "PDU session with QoS established",
-		"tool_name", "pdu_session_establish_with_qos",
-		"supi_hash", hashSUPI(a.SUPI),
-		"5qi", a.FiveQI,
-		"dnn", a.DNN,
-		"session_id", sess.SessionID,
-		"establish_time_ms", time.Since(start).Milliseconds(),
-	)
-
-	return map[string]any{
-		"success":           true,
-		"pdu_session_id":    sess.SessionID,
-		"ue_ip":             sess.UEAddr,
-		"5qi_configured":    a.FiveQI,
-		"ambr_uplink":       strOrDefault(a.AMBRUplink, "100 Mbps (default)"),
-		"ambr_downlink":     strOrDefault(a.AMBRDownlink, "100 Mbps (default)"),
-		"establish_time_ms": time.Since(start).Milliseconds(),
-		"steps":             steps,
-	}, nil
-}
-
-// ---- pdu_session_qos_modify -------------------------------------------------
-
-type modifyQoSTool struct {
-	pcf *clients.PCF
-	amf *clients.AMF
-}
-
-func (modifyQoSTool) Name() string { return "pdu_session_qos_modify" }
-func (modifyQoSTool) Description() string {
-	return "Triggers a NW-initiated QoS modification on an active PDU session: " +
-		"(1) sets a per-subscriber 5QI + AMBR override in the PCF, " +
-		"(2) triggers the AMF to issue a PDU Session Modification Command to the UE and gNB. " +
-		"The UE must be CM-CONNECTED. " +
-		"Spec: TS 23.502 §4.3.3.2 (NW-initiated PDU Session Modification)."
-}
-func (modifyQoSTool) InputSchema() json.RawMessage {
-	return schema(`{
-"type":"object",
-"properties":{
-  "supi":            {"type":"string","description":"Subscriber SUPI, e.g. imsi-001010000000001"},
-  "pdu_session_id":  {"type":"integer","description":"PDU session ID to modify (1-15). Default: 1."},
-  "5qi":             {"type":"integer","description":"New 5QI value (1-86). 1=voice, 7=streaming, 9=internet."},
-  "ambr_dl_mbps":    {"type":"integer","description":"New Session AMBR downlink in Mbps. Default: 100."},
-  "ambr_ul_mbps":    {"type":"integer","description":"New Session AMBR uplink in Mbps. Default: 100."}
-},
-"required":["supi","5qi"]}`)
-}
-func (modifyQoSTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"success":{},"supi":{},"pdu_session_id":{},"5qi_applied":{},"ambr_dl_mbps":{},"ambr_ul_mbps":{},"modify_time_ms":{},"steps":{},"error":{}}}`)
-}
-
-func (t modifyQoSTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
-	start := time.Now()
-	var a struct {
-		SUPI         string `json:"supi"`
-		PDUSessionID int    `json:"pdu_session_id"`
-		FiveQI       int    `json:"5qi"`
-		AMBRDLMbps   int    `json:"ambr_dl_mbps"`
-		AMBRULMbps   int    `json:"ambr_ul_mbps"`
+	out := make([]map[string]any, 0, len(list))
+	for _, o := range list {
+		e := map[string]any{"supi": o.SUPI, "5qi": o.FiveQI, "arp": nil, "ambr_ul": nil, "ambr_dl": nil}
+		if o.DNN != "" {
+			e["dnn"] = o.DNN
+		}
+		if o.ARPPriorityLevel != nil {
+			e["arp"] = *o.ARPPriorityLevel
+		}
+		if o.AMBRUplink != "" {
+			e["ambr_ul"] = o.AMBRUplink
+		}
+		if o.AMBRDownlink != "" {
+			e["ambr_dl"] = o.AMBRDownlink
+		}
+		out = append(out, e)
 	}
-	if err := json.Unmarshal(in, &a); err != nil {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_qos_modify args: %v", err)
-	}
-	if a.SUPI == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "supi is required", nil)
-	}
-	if a.FiveQI <= 0 || a.FiveQI > 86 {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "5qi must be 1-86, got %d", a.FiveQI)
-	}
-	if a.PDUSessionID == 0 {
-		a.PDUSessionID = 1
-	}
-	if a.AMBRDLMbps <= 0 {
-		a.AMBRDLMbps = 100
-	}
-	if a.AMBRULMbps <= 0 {
-		a.AMBRULMbps = 100
-	}
-
-	steps := make([]map[string]any, 0, 2)
-
-	// Step 1: Set QoS policy override in PCF.
-	t1 := time.Now()
-	policy := clients.PCFQoSPolicy{
-		FiveQI:       a.FiveQI,
-		AMBRDownlink: fmt.Sprintf("%d Mbps", a.AMBRDLMbps),
-		AMBRUplink:   fmt.Sprintf("%d Mbps", a.AMBRULMbps),
-	}
-	if err := t.pcf.SetQoSPolicy(ctx, a.SUPI, policy); err != nil {
-		steps = append(steps, stepResult("set_qos_policy", false, time.Since(t1), err.Error()))
-		return map[string]any{"success": false, "steps": steps, "error": err.Error()}, nil
-	}
-	steps = append(steps, stepResult("set_qos_policy", true, time.Since(t1), ""))
-
-	// Step 2: Trigger NW-initiated modification via AMF management API.
-	t2 := time.Now()
-	_, err := t.amf.ModifyPDUSessionQoS(ctx, a.SUPI, a.PDUSessionID, a.FiveQI, a.AMBRDLMbps, a.AMBRULMbps)
-	if err != nil {
-		steps = append(steps, stepResult("amf_qos_modify", false, time.Since(t2), err.Error()))
-		return map[string]any{"success": false, "steps": steps, "error": err.Error()}, nil
-	}
-	steps = append(steps, stepResult("amf_qos_modify", true, time.Since(t2), ""))
-
-	slog.InfoContext(ctx, "NW QoS modification triggered",
-		"tool_name", "pdu_session_qos_modify",
-		"supi_hash", hashSUPI(a.SUPI),
-		"pdu_session_id", a.PDUSessionID,
-		"5qi", a.FiveQI,
-		"ambr_dl_mbps", a.AMBRDLMbps,
-		"ambr_ul_mbps", a.AMBRULMbps,
-		"modify_time_ms", time.Since(start).Milliseconds(),
-	)
-	return map[string]any{
-		"success":        true,
-		"supi":           a.SUPI,
-		"pdu_session_id": a.PDUSessionID,
-		"5qi_applied":    a.FiveQI,
-		"ambr_dl_mbps":   a.AMBRDLMbps,
-		"ambr_ul_mbps":   a.AMBRULMbps,
-		"modify_time_ms": time.Since(start).Milliseconds(),
-		"steps":          steps,
-	}, nil
-}
-
-// ---- helpers ----------------------------------------------------------------
-
-func stepResult(name string, ok bool, d time.Duration, errMsg string) map[string]any {
-	m := map[string]any{
-		"step":        name,
-		"success":     ok,
-		"duration_ms": d.Milliseconds(),
-	}
-	if errMsg != "" {
-		m["error"] = errMsg
-	}
-	return m
-}
-
-func strOrDefault(s, def string) string {
-	if s == "" {
-		return def
-	}
-	return s
+	slog.InfoContext(ctx, "QoS policy overrides listed", "nf", "MCP", "procedure", "QosPolicyList",
+		"interface", "Npcf", "direction", "OUT", "spec_ref", "TS 29.512 §5.2.2.2",
+		"tool_name", "qos_policy_list", "supi_hash", toolutil.HashSUPI(a.SUPI), "count", len(out))
+	return out, nil
 }

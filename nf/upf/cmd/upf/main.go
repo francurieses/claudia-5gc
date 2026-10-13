@@ -13,10 +13,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/nf/upf/internal/admin"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/gtpu"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/pfcp"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/tun"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 )
@@ -90,17 +92,19 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
-	// Metrics server
-	metricsSrv := metrics.MetricsServer(cfg.Metrics.Address)
+	// Shared session table
+	sessionTable := pfcp.NewSessionTable()
+
+	// Metrics server, plus the read-only N4 session admin view (MCP-012,
+	// TS 29.244 §5.2) on the internal metrics port.
+	metricsSrv := metrics.MetricsServerWithAdmin(cfg.Metrics.Address, logging.NewLevelAdmin(logging.Level, logger),
+		metrics.AdminRoute{Pattern: "/admin/v1/n4-sessions", Handler: admin.NewN4SessionsHandler(sessionTable, logger)})
 	go func() {
 		logger.Info("metrics server listening", "addr", cfg.Metrics.Address)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("metrics server error", "error", err)
 		}
 	}()
-
-	// Shared session table
-	sessionTable := pfcp.NewSessionTable()
 
 	// N6 TUN interface setup — one TUN per DNN for subnet isolation.
 	// Each TUN is bound to a distinct UE subnet; packets are routed to the

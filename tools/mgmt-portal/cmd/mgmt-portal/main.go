@@ -21,6 +21,15 @@ import (
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/store"
 )
 
+const (
+	// storeConnectAttempts is the number of times store.New is tried at startup
+	// before the portal degrades to Store == nil. The postgres hostname may not
+	// resolve yet when the container starts (dev tool, not a 3GPP value).
+	storeConnectAttempts = 10
+	// storeConnectBackoff is the wait between failed store connection attempts.
+	storeConnectBackoff = 3 * time.Second
+)
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -52,9 +61,14 @@ func main() {
 	slog.Info("mgmt-portal starting", "addr", addr)
 
 	// PostgreSQL store (gracefully degrade if unavailable)
-	db, err := store.New(ctx, dbURL)
+	db, err := store.ConnectWithRetry(ctx, store.ConnectOptions{
+		Attempts: storeConnectAttempts,
+		Backoff:  storeConnectBackoff,
+		Connect:  func(ctx context.Context) (*store.Store, error) { return store.New(ctx, dbURL) },
+	})
 	if err != nil {
 		slog.Warn("postgres unavailable — subscriber/session features disabled", "err", err)
+		db = nil
 	} else {
 		slog.Info("postgres connected")
 		defer db.Close()

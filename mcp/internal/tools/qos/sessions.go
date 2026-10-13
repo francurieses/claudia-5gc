@@ -17,35 +17,30 @@ import (
 	"github.com/francurieses/claudia-5gc/mcp/internal/clients"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
 	"github.com/francurieses/claudia-5gc/mcp/internal/tools/registry"
+	"github.com/francurieses/claudia-5gc/mcp/internal/tools/toolutil"
 )
 
-// Sessions returns the SMF/UDM-backed PDU session QoS tools.
-func Sessions(smf *clients.SMF, udm *clients.UDM) []registry.Tool {
+// Sessions returns the SMF/UDM-backed PDU session QoS tools, plus the deprecated
+// pdu_session_qos_modify alias. The alias now drives the SMF (TS 23.502 §4.3.3.2:
+// the SMF initiates the modification) instead of the non-conformant AMF PATCH path.
+func Sessions(smf *clients.SMF, udm *clients.UDM, pcf *clients.PCF) []registry.Tool {
+	set := sessionQoSSetTool{smf: smf, pcf: pcf}
 	return []registry.Tool{
 		sessionListTool{smf},
 		sessionQoSGetTool{smf},
-		sessionQoSSetTool{smf},
+		set,
 		subscriptionQoSGetTool{udm},
+		subscriptionAMGetTool{udm},
+		toolutil.Deprecated("pdu_session_qos_modify", modifyLegacySchema, set, mapModifyLegacy),
 	}
-}
-
-// validFiveQI mirrors the SMF-side validation: standardised 5QIs per
-// TS 23.501 Table 5.7.4-1 plus the operator-defined range 128-254.
-func validFiveQI(v int) bool {
-	switch v {
-	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-		65, 66, 67, 69, 70, 71, 72, 73, 74, 75, 76,
-		79, 80, 82, 83, 84, 85, 86, 87, 88, 89, 90:
-		return true
-	}
-	return v >= 128 && v <= 254
 }
 
 // ---- pdu_session_list -------------------------------------------------------
 
 type sessionListTool struct{ smf *clients.SMF }
 
-func (sessionListTool) Name() string { return "pdu_session_list" }
+func (sessionListTool) Name() string        { return "pdu_session_list" }
+func (sessionListTool) Risk() registry.Risk { return registry.ReadOnly }
 func (sessionListTool) Description() string {
 	return "List all active PDU sessions held by the SMF session store. " +
 		"Returns supi, pduSessionId, dnn, sNssai, current5qi, qosSource, session AMBR, " +
@@ -75,7 +70,8 @@ func (t sessionListTool) Invoke(ctx context.Context, in json.RawMessage) (any, e
 
 type sessionQoSGetTool struct{ smf *clients.SMF }
 
-func (sessionQoSGetTool) Name() string { return "pdu_session_qos_get" }
+func (sessionQoSGetTool) Name() string        { return "pdu_session_qos_get" }
+func (sessionQoSGetTool) Risk() registry.Risk { return registry.ReadOnly }
 func (sessionQoSGetTool) Description() string {
 	return "Get the QoS state of an active PDU session: current 5QI, ARP, session AMBR, " +
 		"QoS flow list, SMF-side PFCP QER state, and the source of the 5QI " +
@@ -144,21 +140,26 @@ func (t sessionQoSGetTool) Invoke(ctx context.Context, in json.RawMessage) (any,
 	}
 	out["found"] = true
 	slog.InfoContext(ctx, "PDU session QoS read",
-		"tool_name", "pdu_session_qos_get", "supi_hash", hashSUPI(a.SUPI), "pdu_session_id", psi)
+		"tool_name", "pdu_session_qos_get", "supi_hash", toolutil.HashSUPI(a.SUPI), "pdu_session_id", psi)
 	return out, nil
 }
 
 // ---- pdu_session_qos_set ----------------------------------------------------
 
-type sessionQoSSetTool struct{ smf *clients.SMF }
+type sessionQoSSetTool struct {
+	smf *clients.SMF
+	pcf *clients.PCF
+}
 
-func (sessionQoSSetTool) Name() string { return "pdu_session_qos_set" }
+func (sessionQoSSetTool) Name() string        { return "pdu_session_qos_set" }
+func (sessionQoSSetTool) Risk() registry.Risk { return registry.Disruptive }
 func (sessionQoSSetTool) Description() string {
-	return "Change the 5QI of an ACTIVE PDU session via the SMF management endpoint " +
-		"(POST /nsmf-management/v1/sessions/{id}/qos). Triggers the full NW-initiated " +
-		"PDU Session Modification: PFCP QER update to the UPF (N4), then N2 PDU Session " +
-		"Resource Modify Request and NAS PDU Session Modification Command to the UE. " +
-		"The UE must be CM-CONNECTED. Spec: TS 23.502 §4.3.3.2."
+	return "Change the 5QI and optionally the session AMBR of an ACTIVE PDU session via the SMF " +
+		"(POST /nsmf-management/v1/sessions/{id}/qos). This triggers the NW-initiated PDU Session " +
+		"Modification: PFCP QER update to the UPF (N4), then N2 PDU Session Resource Modify Request and " +
+		"NAS PDU Session Modification Command to the UE. The UE must be CM-CONNECTED. " +
+		"With persist_policy:true the same 5QI/AMBR is also written as the PCF override (scoped to dnn " +
+		"when given), so a later re-establishment keeps it. Spec: TS 23.502 §4.3.3.2."
 }
 func (sessionQoSSetTool) InputSchema() json.RawMessage {
 	return schema(`{
@@ -167,37 +168,89 @@ func (sessionQoSSetTool) InputSchema() json.RawMessage {
   "pdu_session_id": {"type":"integer","description":"PDU session ID to modify (1-15)."},
   "new5qi":         {"type":"integer","description":"New 5QI: standardised (TS 23.501 Table 5.7.4-1, e.g. 1=voice, 7=streaming, 9=best-effort) or operator-defined (128-254)."},
   "reason":         {"type":"string","description":"Operator reason for the change (required, logged)."},
-  "supi":           {"type":"string","description":"Optional SUPI to disambiguate when several UEs share the PDU session ID."},
+  "supi":           {"type":"string","description":"SUPI of the UE. Required with persist_policy; otherwise disambiguates when several UEs share the PDU session ID."},
+  "dnn":            {"type":"string","description":"Optional DNN scope for the persisted PCF override."},
+  "persist_policy": {"type":"boolean","description":"Also write the PCF override so a later PDU session establishment keeps this QoS. Default false."},
   "ambr_dl_mbps":   {"type":"integer","description":"Optional new session AMBR downlink in Mbps."},
   "ambr_ul_mbps":   {"type":"integer","description":"Optional new session AMBR uplink in Mbps."}
 },
 "required":["pdu_session_id","new5qi","reason"]}`)
 }
 func (sessionQoSSetTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object","properties":{"result":{},"previous5qi":{},"new5qi":{},"modifiedAt":{}}}`)
+	return schema(`{"type":"object","properties":{"result":{},"previous5qi":{},"new5qi":{},"modifiedAt":{},"policy_persisted":{}}}`)
 }
 
-func (t sessionQoSSetTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
-	var a struct {
-		PDUSessionID int    `json:"pdu_session_id"`
-		New5QI       int    `json:"new5qi"`
-		Reason       string `json:"reason"`
-		SUPI         string `json:"supi"`
-		AMBRDLMbps   int    `json:"ambr_dl_mbps"`
-		AMBRULMbps   int    `json:"ambr_ul_mbps"`
+// setArgs is the validated form of pdu_session_qos_set arguments.
+type setArgs struct {
+	PDUSessionID  int    `json:"pdu_session_id"`
+	New5QI        int    `json:"new5qi"`
+	Reason        string `json:"reason"`
+	SUPI          string `json:"supi"`
+	DNN           string `json:"dnn"`
+	PersistPolicy bool   `json:"persist_policy"`
+	AMBRDLMbps    int    `json:"ambr_dl_mbps"`
+	AMBRULMbps    int    `json:"ambr_ul_mbps"`
+}
+
+func (a setArgs) validate() *mcperr.Error {
+	if perr := toolutil.ValidPSI(a.PDUSessionID); perr != nil {
+		return perr
 	}
-	if err := json.Unmarshal(in, &a); err != nil {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_qos_set args: %v", err)
-	}
-	if a.PDUSessionID <= 0 || a.PDUSessionID > 255 {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_id must be 1-255, got %d", a.PDUSessionID)
-	}
-	if !validFiveQI(a.New5QI) {
-		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil,
+	if !toolutil.ValidFiveQI(a.New5QI) {
+		return mcperr.Newf(mcperr.CodeInvalidParams, nil,
 			"new5qi %d is neither standardised (TS 23.501 Table 5.7.4-1) nor operator-defined (128-254)", a.New5QI)
 	}
 	if a.Reason == "" {
-		return nil, mcperr.New(mcperr.CodeInvalidParams, "reason is required", nil)
+		return mcperr.New(mcperr.CodeInvalidParams, "reason is required", nil)
+	}
+	if a.SUPI != "" {
+		if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+			return perr
+		}
+	}
+	if a.PersistPolicy && a.SUPI == "" {
+		return mcperr.New(mcperr.CodeInvalidParams, "supi is required when persist_policy is true", nil)
+	}
+	if a.DNN != "" {
+		if perr := toolutil.ValidDNN(a.DNN); perr != nil {
+			return perr
+		}
+	}
+	return nil
+}
+
+// Plan describes the effect of a confirmed call: the session as the SMF holds it
+// now, next to the requested change. It reads only.
+func (t sessionQoSSetTool) Plan(ctx context.Context, in json.RawMessage) (any, error) {
+	var a setArgs
+	if err := json.Unmarshal(in, &a); err != nil {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_qos_set args: %v", err)
+	}
+	if perr := a.validate(); perr != nil {
+		return nil, perr
+	}
+	current, err := t.smf.GetSession(ctx, a.PDUSessionID, a.SUPI)
+	if err != nil {
+		return nil, mcperr.ToolError(fmt.Errorf("pdu_session_qos_set plan: %w", err), nil)
+	}
+	return map[string]any{
+		"pdu_session_id":  a.PDUSessionID,
+		"new5qi":          a.New5QI,
+		"ambr_dl_mbps":    a.AMBRDLMbps,
+		"ambr_ul_mbps":    a.AMBRULMbps,
+		"persist_policy":  a.PersistPolicy,
+		"current_session": json.RawMessage(current),
+		"effect":          "PFCP QER update to UPF, then NAS PDU Session Modification to the UE (CM-CONNECTED only)",
+	}, nil
+}
+
+func (t sessionQoSSetTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
+	var a setArgs
+	if err := json.Unmarshal(in, &a); err != nil {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_qos_set args: %v", err)
+	}
+	if perr := a.validate(); perr != nil {
+		return nil, perr
 	}
 
 	raw, err := t.smf.SetSessionQoS(ctx, a.PDUSessionID, a.New5QI, a.Reason, a.SUPI, a.AMBRDLMbps, a.AMBRULMbps)
@@ -208,20 +261,89 @@ func (t sessionQoSSetTool) Invoke(ctx context.Context, in json.RawMessage) (any,
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, mcperr.ToolError(fmt.Errorf("pdu_session_qos_set: decode SMF response: %w", err), nil)
 	}
+
+	persisted := false
+	if a.PersistPolicy {
+		p := clients.PCFQoSPolicy{DNN: a.DNN, FiveQI: a.New5QI}
+		if a.AMBRDLMbps > 0 {
+			p.AMBRDownlink = fmt.Sprintf("%d Mbps", a.AMBRDLMbps)
+		}
+		if a.AMBRULMbps > 0 {
+			p.AMBRUplink = fmt.Sprintf("%d Mbps", a.AMBRULMbps)
+		}
+		if err := t.pcf.SetQoSPolicy(ctx, a.SUPI, p); err != nil {
+			// The session change already reached the UE. Report the partial result
+			// instead of hiding it behind a tool error.
+			out["policy_persisted"] = false
+			out["policy_error"] = err.Error()
+			return out, nil
+		}
+		persisted = true
+	}
+	out["policy_persisted"] = persisted
+
 	slog.InfoContext(ctx, "PDU session QoS modified",
 		"tool_name", "pdu_session_qos_set",
-		"supi_hash", hashSUPI(a.SUPI),
+		"supi_hash", toolutil.HashSUPI(a.SUPI),
 		"pdu_session_id", a.PDUSessionID,
 		"new_5qi", a.New5QI,
+		"policy_persisted", persisted,
 	)
 	return out, nil
+}
+
+// modifyLegacySchema is the input schema of the deprecated pdu_session_qos_modify.
+var modifyLegacySchema = schema(`{
+"type":"object",
+"properties":{
+  "supi":            {"type":"string","description":"Subscriber SUPI, e.g. imsi-001010000000001"},
+  "pdu_session_id":  {"type":"integer","description":"PDU session ID (1-15). Default 1."},
+  "5qi":             {"type":"integer","description":"New 5QI value."},
+  "ambr_dl_mbps":    {"type":"integer","description":"Session AMBR downlink in Mbps. Default 100."},
+  "ambr_ul_mbps":    {"type":"integer","description":"Session AMBR uplink in Mbps. Default 100."}
+},
+"required":["supi","5qi"]}`)
+
+// mapModifyLegacy rewrites deprecated pdu_session_qos_modify arguments into
+// pdu_session_qos_set arguments. Like the old tool it persists the override, and
+// it keeps the old defaults (PSI 1, AMBR 100 Mbps).
+func mapModifyLegacy(in json.RawMessage) (json.RawMessage, error) {
+	var old struct {
+		SUPI         string `json:"supi"`
+		PDUSessionID int    `json:"pdu_session_id"`
+		FiveQI       int    `json:"5qi"`
+		AMBRDLMbps   int    `json:"ambr_dl_mbps"`
+		AMBRULMbps   int    `json:"ambr_ul_mbps"`
+	}
+	if err := json.Unmarshal(in, &old); err != nil {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "pdu_session_qos_modify args: %v", err)
+	}
+	if old.PDUSessionID == 0 {
+		old.PDUSessionID = 1
+	}
+	if old.AMBRDLMbps <= 0 {
+		old.AMBRDLMbps = 100
+	}
+	if old.AMBRULMbps <= 0 {
+		old.AMBRULMbps = 100
+	}
+	return json.Marshal(setArgs{
+		PDUSessionID:  old.PDUSessionID,
+		New5QI:        old.FiveQI,
+		Reason:        "via deprecated pdu_session_qos_modify",
+		SUPI:          old.SUPI,
+		PersistPolicy: true,
+		AMBRDLMbps:    old.AMBRDLMbps,
+		AMBRULMbps:    old.AMBRULMbps,
+	})
 }
 
 // ---- subscription_qos_get ---------------------------------------------------
 
 type subscriptionQoSGetTool struct{ udm *clients.UDM }
 
-func (subscriptionQoSGetTool) Name() string { return "subscription_qos_get" }
+func (subscriptionQoSGetTool) Name() string        { return "subscription_qos_get" }
+func (subscriptionQoSGetTool) Risk() registry.Risk { return registry.ReadOnly }
 func (subscriptionQoSGetTool) Description() string {
 	return "Get the subscriber's default QoS from the UDM (GET /nudm-sdm/v2/{supi}/sm-data): " +
 		"per-slice default 5QI, ARP (priority, preemption capability/vulnerability) and " +
@@ -291,6 +413,49 @@ func (t subscriptionQoSGetTool) Invoke(ctx context.Context, in json.RawMessage) 
 		}
 	}
 	slog.InfoContext(ctx, "subscription QoS read",
-		"tool_name", "subscription_qos_get", "supi_hash", hashSUPI(a.SUPI), "entries", len(subs))
+		"tool_name", "subscription_qos_get", "supi_hash", toolutil.HashSUPI(a.SUPI), "entries", len(subs))
 	return map[string]any{"supi": a.SUPI, "found": true, "subscriptions": subs}, nil
+}
+
+// ---- subscription_am_get ----------------------------------------------------
+
+type subscriptionAMGetTool struct{ udm *clients.UDM }
+
+func (subscriptionAMGetTool) Name() string        { return "subscription_am_get" }
+func (subscriptionAMGetTool) Risk() registry.Risk { return registry.ReadOnly }
+func (subscriptionAMGetTool) Description() string {
+	return "Get the subscriber's Access and Mobility subscription data from the UDM " +
+		"(GET /nudm-sdm/v2/{supi}/am-data): subscribed NSSAI (default and other single NSSAIs), " +
+		"subscribed UE-AMBR and other AM fields, passed through unchanged. Answers a structured error " +
+		"when the UDM has no AM data for the SUPI. Ref: TS 29.503 §5.2.2.2, TS 23.501 §5.15 (slices)."
+}
+func (subscriptionAMGetTool) InputSchema() json.RawMessage {
+	return schema(`{"type":"object","properties":{"supi":{"type":"string","description":"Subscriber SUPI, e.g. imsi-001010000000001"}},"required":["supi"]}`)
+}
+func (subscriptionAMGetTool) OutputSchema() json.RawMessage {
+	return schema(`{"type":"object","properties":{"nssai":{"type":"object"},"subscribedUeAmbr":{"type":"object"}}}`)
+}
+
+func (t subscriptionAMGetTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
+	var a struct {
+		SUPI string `json:"supi"`
+	}
+	if err := json.Unmarshal(in, &a); err != nil {
+		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "subscription_am_get args: %v", err)
+	}
+	if perr := toolutil.ValidSUPI(a.SUPI); perr != nil {
+		return nil, perr
+	}
+	raw, err := t.udm.GetAMData(ctx, a.SUPI)
+	if err != nil {
+		return nil, mcperr.ToolError(fmt.Errorf("subscription_am_get: %w", err), nil)
+	}
+	if raw == nil {
+		return nil, mcperr.Newf(mcperr.CodeToolError, map[string]any{"supi_hash": toolutil.HashSUPI(a.SUPI)},
+			"no AM subscription data for the SUPI (UDM answered 404)")
+	}
+	slog.InfoContext(ctx, "AM subscription read", "nf", "MCP", "procedure", "McpStatusAnalysisWave2",
+		"tool_name", "subscription_am_get", "interface", "Nudm", "direction", "OUT",
+		"spec_ref", "TS 29.503 §5.2.2.2", "supi_hash", toolutil.HashSUPI(a.SUPI))
+	return raw, nil
 }

@@ -204,6 +204,26 @@
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 26 }
     },
     {
+      "id": 23,
+      "type": "timeseries",
+      "title": "O&M AN Release (ANRelease) by Result",
+      "description": "AMF O&M-triggered AN Release via POST /amf/v1/ue-contexts/{supi}/an-release. OK = UE Context Release Command sent (202), REJECT = 404/405/409/503, FAILURE = NGAP send error (500). Counts the trigger only, not the gNB Release Complete. TS 23.502 §4.2.6 step 2; TS 38.413 §8.3.3.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"ANRelease\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 110 }
+    },
+    {
       "id": 14,
       "type": "timeseries",
       "title": "SBI Latency P95 per NF",
@@ -609,6 +629,126 @@
         "legend": { "displayMode": "list", "placement": "bottom" }
       },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 102 }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "AMF Runtime Timer Config Changes (TimerConfigChange) by Result",
+      "description": "PUT /amf/v1/config/timers: OK = applied/reset; REJECT = 4xx validation failure. TS 24.501 \u00a710.2 / \u00a75.3.5.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"AMF\",procedure=\"TimerConfigChange\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 110
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "PCF SM Policy Override List (SmPolicyOverrideList) by Result",
+      "description": "GET list of per-subscriber SM policy overrides (internal OAM API). OK = 200; FAILURE = encode error. TS 29.512 \u00a75.2.2.2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"PCF\",procedure=\"SmPolicyOverrideList\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 110
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "UPF N4 Session Inspection (N4SessionInspection) by Result",
+      "description": "GET /admin/v1/n4-sessions (internal OAM API). OK = 200; REJECT = 4xx (bad query / method). TS 29.244 \u00a75.2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(fivegc_procedure_total{nf=\"UPF\",procedure=\"N4SessionInspection\"}[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 118
+      }
     }
   ]
 }

@@ -50,7 +50,9 @@ Read the referenced 3GPP TS first, then follow these steps — do not skip any:
 - `gofmt` + `goimports` are mandatory. `golangci-lint` does not yet support Go 1.26.2, so the
   CI lint job is disabled; if `make lint` fails, check the failure is pre-existing on a clean tree.
 - No new external dependencies without justification in the PR description.
-- Do not copy code from Open5GS (AGPL). free5GC codecs (Apache-2.0) are acceptable.
+- Do not copy code from Open5GS. free5GC codecs (Apache-2.0) are acceptable.
+- Contributions are licensed under GPL-3.0-or-later. New dependencies must be GPL-3.0-compatible
+  (no proprietary or GPL-2.0-only licenses).
 - No `panic` in production code (allowed in `init()` and tests).
 - Every blocking or network function must take `ctx context.Context` as its first parameter.
 - Structured JSON logging only via `slog` — no `fmt.Println` or `log.Printf`.

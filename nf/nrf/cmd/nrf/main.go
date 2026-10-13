@@ -24,6 +24,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/registry"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 )
 
 const nfName = "NRF"
@@ -42,7 +43,7 @@ func main() {
 
 	// Logger estructurado JSON a stdout (CLAUDE.md §5)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logging.Level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))

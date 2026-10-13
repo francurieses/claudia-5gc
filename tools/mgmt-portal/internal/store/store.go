@@ -25,9 +25,18 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("store: pgxpool.New: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("store: postgres ping: %w", err)
 	}
 	return &Store{pool: pool}, nil
+}
+
+// Ping checks that the connection pool can reach PostgreSQL.
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("store: ping: %w", err)
+	}
+	return nil
 }
 
 // Close shuts down the connection pool.

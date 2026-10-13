@@ -1,7 +1,7 @@
 # 5GC Rel-17 — Root Makefile
 # Conventions in CLAUDE.md §7
 
-.PHONY: help all build test lint docker-nfs docker-ran ran-up ran-down mcp-start up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs
+.PHONY: help all build test lint docker-nfs docker-ran ran-up ran-down mcp-start mcp-e2e up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs
 
 NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef lmf
 COMPOSE := docker compose
@@ -98,6 +98,9 @@ mcp-build: ## Build the MCP server binary
 mcp-test: ## Unit + functional tests for the MCP server
 	$(MAKE) -C mcp test
 	$(MAKE) -C mcp test-functional
+
+mcp-e2e: ## Live smoke test of every MCP tool, with a coverage guard (MUTATE=1 state changes, DISRUPT=1 confirmed N1/N2 tools, LAB_URL=<lab mcp> ADMIN tools + roles; each reverted)
+	./scripts/mcp-smoke.sh
 
 mcp-docker: ## Build the MCP server Docker image
 	$(MAKE) -C mcp docker

@@ -17,8 +17,10 @@ RUN go mod download
 COPY shared/ ./shared/
 COPY mcp/ ./mcp/
 
+# BUILD_COMMIT is stamped into mcp_info (build_commit).
+ARG BUILD_COMMIT=unknown
 ENV CGO_ENABLED=0
-RUN go build -ldflags="-s -w" -o /out/mcp ./mcp/cmd/mcp
+RUN go build -ldflags="-s -w -X main.buildCommit=${BUILD_COMMIT}" -o /out/mcp ./mcp/cmd/mcp
 
 # ---- runtime -------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"github.com/francurieses/claudia-5gc/mcp/internal/jsonrpc"
 	"github.com/francurieses/claudia-5gc/mcp/internal/server"
 )
@@ -71,7 +72,9 @@ func (s *Stdio) handle(ctx context.Context, frame []byte) {
 		s.write(jsonrpc.NewError(nil, perr))
 		return
 	}
-	resp := s.disp.Dispatch(ctx, req)
+	// The stdio client is the local user who started the process; it acts as
+	// operator. The access mode still caps what is exposed.
+	resp := s.disp.Dispatch(guard.WithRole(ctx, guard.RoleOperator), req)
 	if req.IsNotification() {
 		return // no response for notifications
 	}

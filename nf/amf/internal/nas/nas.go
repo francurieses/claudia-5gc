@@ -658,6 +658,16 @@ func (h *Handler) handleRegistrationComplete(
 		"result", "OK",
 		"spec_ref", "TS 23.502 §4.2.2.2.2 step 21",
 	)
+	// Registration time is refreshed only when a Registration Complete arrives.
+	// Per TS 24.501 §5.5.1.3.4 the UE sends it only when the Registration Accept
+	// carried a new 5G-GUTI (or another IE requiring acknowledgement), i.e. on
+	// initial registration and on updates that reallocate the GUTI; a periodic or
+	// mobility update accepted without a new GUTI does not refresh it. Surfaced
+	// in the UE snapshot.
+	ue.Lock()
+	ue.RegistrationTime = time.Now()
+	ue.Unlock()
+
 	// Persist the fully registered UE context so it survives AMF restarts.
 	h.reg.PersistUE(ctx, ue)
 

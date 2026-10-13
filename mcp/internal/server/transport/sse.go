@@ -2,17 +2,21 @@ package transport
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/config"
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"github.com/francurieses/claudia-5gc/mcp/internal/jsonrpc"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
 	"github.com/francurieses/claudia-5gc/mcp/internal/server"
@@ -130,19 +134,43 @@ func (s *SSE) loadTLS() (*tls.Config, error) {
 	return cfg, nil
 }
 
-// auth wraps a handler with optional Bearer-token enforcement. /mcp/health is
+// auth wraps a handler with Bearer-token enforcement and attaches the caller's
+// role to the request context. With no token configured the caller is an
+// operator (dev default; the access mode still caps what runs). /mcp/health is
 // never wrapped so liveness probes succeed regardless of auth config.
 func (s *SSE) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Auth.Enabled() {
-			if r.Header.Get("Authorization") != "Bearer "+s.cfg.Auth.BearerToken {
-				w.Header().Set("WWW-Authenticate", "Bearer")
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
+		role, ok := s.resolveRole(r.Header.Get("Authorization"))
+		if !ok {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
-		next(w, r)
+		next(w, r.WithContext(guard.WithRole(r.Context(), role)))
 	}
+}
+
+// resolveRole maps an Authorization header to a role. The comparison is constant
+// time so the token cannot be recovered from response timing.
+func (s *SSE) resolveRole(header string) (guard.Role, bool) {
+	if !s.cfg.Auth.Enabled() {
+		return guard.RoleOperator, true
+	}
+	token, found := strings.CutPrefix(header, "Bearer ")
+	if !found {
+		return "", false
+	}
+	if s.cfg.Auth.BearerToken != "" &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Auth.BearerToken)) == 1 {
+		return guard.RoleOperator, true
+	}
+	for _, t := range s.cfg.Auth.Tokens {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(t.Token)) == 1 {
+			role, err := guard.ParseRole(t.Role)
+			return role, err == nil
+		}
+	}
+	return "", false
 }
 
 // corsHeaders sets permissive CORS headers required by Electron/Chromium-based
@@ -168,7 +196,7 @@ func (s *SSE) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *SSE) handleTools(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"tools": s.reg.Manifest()})
+	writeJSON(w, http.StatusOK, map[string]any{"tools": s.disp.Manifest()})
 }
 
 func (s *SSE) handleSessions(w http.ResponseWriter, _ *http.Request) {
@@ -242,7 +270,12 @@ func (s *SSE) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	sid := sessionID(r)
 	ctx := r.Context()
-	if sid != "" {
+	if ip := remoteIP(r); ip != "" {
+		ctx = session.WithRemoteAddr(ctx, ip)
+	}
+	// Only a session this server knows labels the audit trail; an unknown
+	// client-supplied id would otherwise forge the label. Fall back to http:<ip>.
+	if _, live := s.mgr.Get(sid); sid != "" && live {
 		ctx = session.WithID(ctx, sid)
 	}
 	resp := s.disp.Dispatch(ctx, req)
@@ -263,6 +296,16 @@ func (s *SSE) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	// Inline delivery (curl / stateless clients).
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// remoteIP returns the IP of the connection's peer. Forwarding headers
+// (X-Forwarded-For and the like) are deliberately not consulted.
+func remoteIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // sessionID extracts the session id from the query string or header.

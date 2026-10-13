@@ -1,8 +1,10 @@
 <!-- tier: public -->
 # 5GC MCP Server — Client Integration Guide
 
-The MCP server exposes 36 tools (NAS codec, NF lifecycle, UE context,
-traces/metrics, UERANSIM orchestration) over two transports that run concurrently:
+The MCP server exposes 74 tools (codecs, NF discovery, UE contexts, traces, metrics, QoS,
+status, analysis, core control and runtime configuration) over two transports that run concurrently.
+Tools are classified by risk, and a client's access depends on the server's `access_mode` and its
+bearer token; see [`docs/mcp-tools.md`](../../docs/mcp-tools.md):
 
 | Transport | When to use |
 |---|---|
@@ -30,7 +32,7 @@ make pki                    # produces pki/ca.crt + pki/mcp.{crt,key}
 Quick liveness check:
 
 ```bash
-curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":36}
+curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":77}  (74 tools + 3 deprecated aliases)
 ```
 
 ---
@@ -327,7 +329,7 @@ make up                    # 5GC stack (needed for NF/UE tools)
 # Health check
 curl -s http://localhost:9300/mcp/health
 
-# List all 36 tools
+# List every tool visible to this caller
 curl -s http://localhost:9300/mcp -X POST \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | jq '.result.tools[].name'

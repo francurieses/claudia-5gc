@@ -14,6 +14,7 @@ import (
 // PCFQoSPolicy holds per-subscriber QoS parameters stored in the PCF.
 // Ref: TS 29.512 §5.2.2.2 — qosDecs and sessRules returned by PCF.
 type PCFQoSPolicy struct {
+	DNN              string `json:"dnn,omitempty"`
 	FiveQI           int    `json:"5qi"`
 	ARPPriorityLevel int    `json:"arp_priority_level,omitempty"`
 	AMBRUplink       string `json:"ambr_uplink,omitempty"`
@@ -56,9 +57,19 @@ func (c *PCF) SetQoSPolicy(ctx context.Context, supi string, p PCFQoSPolicy) err
 	return nil
 }
 
-// GetQoSPolicy retrieves the active per-subscriber override, or (nil, nil) if none is set.
-func (c *PCF) GetQoSPolicy(ctx context.Context, supi string) (*PCFQoSPolicy, error) {
+// overrideURL builds the sm-policy-override URL, scoped to a DNN when one is given.
+func (c *PCF) overrideURL(supi, dnn string) string {
 	u := c.baseURL + "/pcf-internal/v1/subscribers/" + url.PathEscape(supi) + "/sm-policy-override"
+	if dnn != "" {
+		u += "?dnn=" + url.QueryEscape(dnn)
+	}
+	return u
+}
+
+// GetQoSPolicy retrieves the active per-subscriber override (for dnn when set),
+// or (nil, nil) if none is set.
+func (c *PCF) GetQoSPolicy(ctx context.Context, supi, dnn string) (*PCFQoSPolicy, error) {
+	u := c.overrideURL(supi, dnn)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pcf: get qos policy: %w", err)
@@ -83,8 +94,8 @@ func (c *PCF) GetQoSPolicy(ctx context.Context, supi string) (*PCFQoSPolicy, err
 
 // DeleteQoSPolicy removes the per-subscriber override; subsequent sessions revert to defaults.
 // Returns nil if the override did not exist (idempotent).
-func (c *PCF) DeleteQoSPolicy(ctx context.Context, supi string) error {
-	u := c.baseURL + "/pcf-internal/v1/subscribers/" + url.PathEscape(supi) + "/sm-policy-override"
+func (c *PCF) DeleteQoSPolicy(ctx context.Context, supi, dnn string) error {
+	u := c.overrideURL(supi, dnn)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
 	if err != nil {
 		return fmt.Errorf("pcf: delete qos policy: %w", err)
@@ -98,4 +109,52 @@ func (c *PCF) DeleteQoSPolicy(ctx context.Context, supi string) error {
 		return nil
 	}
 	return fmt.Errorf("pcf: delete qos policy: status %d", resp.StatusCode)
+}
+
+// PCFQoSOverride is one entry of the PCF override list. Ref: TS 29.512 §5.2.2.2.
+type PCFQoSOverride struct {
+	SUPI             string `json:"supi"`
+	DNN              string `json:"dnn,omitempty"`
+	FiveQI           int    `json:"5qi"`
+	ARPPriorityLevel *int   `json:"arp_priority_level,omitempty"`
+	AMBRUplink       string `json:"ambr_uplink,omitempty"`
+	AMBRDownlink     string `json:"ambr_downlink,omitempty"`
+}
+
+// PCFStatusError is a non-200 reply from the PCF management API.
+type PCFStatusError struct {
+	Op     string
+	Status int
+}
+
+// Error implements error.
+func (e *PCFStatusError) Error() string {
+	return fmt.Sprintf("pcf: %s: status %d", e.Op, e.Status)
+}
+
+// ListQoSOverrides reads every SM policy override the PCF holds, optionally for one
+// SUPI. Calls GET /pcf-internal/v1/sm-policy-overrides[?supi=].
+func (c *PCF) ListQoSOverrides(ctx context.Context, supi string) ([]PCFQoSOverride, error) {
+	u := c.baseURL + "/pcf-internal/v1/sm-policy-overrides"
+	if supi != "" {
+		u += "?supi=" + url.QueryEscape(supi)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("pcf: list qos overrides: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("pcf: list qos overrides: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &PCFStatusError{Op: "list qos overrides", Status: resp.StatusCode}
+	}
+	var out []PCFQoSOverride
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("pcf: list qos overrides: decode: %w", err)
+	}
+	return out, nil
 }

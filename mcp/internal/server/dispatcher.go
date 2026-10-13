@@ -6,12 +6,11 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"github.com/francurieses/claudia-5gc/mcp/internal/jsonrpc"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
 	"github.com/francurieses/claudia-5gc/mcp/internal/session"
@@ -27,15 +26,23 @@ const (
 	serverVersion = "0.1.0"
 )
 
-// Dispatcher routes JSON-RPC methods to the tool registry.
+// Dispatcher routes JSON-RPC methods to the tool registry. Every tools/call goes
+// through the guard, which enforces the access mode, the caller's role and
+// confirmation before the tool runs.
 type Dispatcher struct {
 	reg    *registry.Registry
+	guard  *guard.Guard
 	logger *slog.Logger
 }
 
-// NewDispatcher returns a Dispatcher over the given registry.
-func NewDispatcher(reg *registry.Registry, logger *slog.Logger) *Dispatcher {
-	return &Dispatcher{reg: reg, logger: logger.With("component", "dispatcher")}
+// NewDispatcher returns a Dispatcher over the given registry and guard.
+func NewDispatcher(reg *registry.Registry, g *guard.Guard, logger *slog.Logger) *Dispatcher {
+	return &Dispatcher{reg: reg, guard: g, logger: logger.With("component", "dispatcher")}
+}
+
+// Manifest returns the tools visible at the configured access mode.
+func (d *Dispatcher) Manifest() []registry.ManifestEntry {
+	return d.reg.ManifestFor(d.guard.Ceiling())
 }
 
 // Dispatch handles a single request and returns the response. For notifications
@@ -54,7 +61,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, req *jsonrpc.Request) jsonrpc
 	case "ping":
 		return jsonrpc.NewResult(req.ID, map[string]any{})
 	case "tools/list":
-		return jsonrpc.NewResult(req.ID, map[string]any{"tools": d.reg.Manifest()})
+		return jsonrpc.NewResult(req.ID, map[string]any{"tools": d.Manifest()})
 	case "tools/call":
 		return d.callTool(ctx, req)
 	default:
@@ -89,18 +96,25 @@ func (d *Dispatcher) callTool(ctx context.Context, req *jsonrpc.Request) jsonrpc
 		params.Arguments = json.RawMessage("{}")
 	}
 
-	sid := session.IDFrom(ctx)
-	if sid == "" {
-		sid = "stdio"
+	sid := session.Label(ctx)
+
+	decision := d.guard.Check(ctx, tool, params.Arguments)
+	switch decision.Verdict {
+	case guard.Refused:
+		return jsonrpc.NewResult(req.ID, toolErrorContent(decision.Err))
+	case guard.DryRun:
+		return jsonrpc.NewResult(req.ID, toolContent(decision.Result, d.guard.MaxResultBytes()))
 	}
+
 	start := time.Now()
 	result, err := tool.Invoke(ctx, params.Arguments)
 	latency := time.Since(start).Milliseconds()
+	d.guard.Record(ctx, tool, params.Arguments, err)
 
 	logArgs := []any{
 		"tool_name", params.Name,
 		"session_id", sid,
-		"input_hash", inputHash(params.Arguments),
+		"input_hash", guard.HashFor(tool, params.Arguments),
 		"latency_ms", latency,
 	}
 	if err != nil {
@@ -111,15 +125,23 @@ func (d *Dispatcher) callTool(ctx context.Context, req *jsonrpc.Request) jsonrpc
 		return jsonrpc.NewResult(req.ID, toolErrorContent(e))
 	}
 	d.logger.Info("tool invocation ok", append(logArgs, "error", "")...)
-	return jsonrpc.NewResult(req.ID, toolContent(result))
+	return jsonrpc.NewResult(req.ID, toolContent(result, d.guard.MaxResultBytes()))
 }
 
-// toolContent wraps a successful tool result as MCP tool content.
-func toolContent(result any) map[string]any {
+// toolContent wraps a successful tool result as MCP tool content. A result larger
+// than maxBytes is replaced by an error that asks the caller to narrow the query,
+// so one call cannot flood an LLM context.
+func toolContent(result any, maxBytes int) map[string]any {
 	text, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return toolErrorContent(mcperr.Newf(mcperr.CodeInternal, nil,
 			"marshal tool result: %v", err))
+	}
+	if len(text) > maxBytes {
+		return toolErrorContent(mcperr.Newf(mcperr.CodeToolError,
+			map[string]any{"size_bytes": len(text), "max_result_bytes": maxBytes},
+			"result is %d bytes, above max_result_bytes %d: narrow the query (fewer series, rows or a shorter window)",
+			len(text), maxBytes))
 	}
 	// isError is omitted on success; per MCP spec it defaults to false when absent.
 	// Some Claude Desktop versions misinterpret isError:false as an error state.
@@ -137,11 +159,4 @@ func toolErrorContent(e *mcperr.Error) map[string]any {
 		"content": []map[string]any{{"type": "text", "text": string(text)}},
 		"isError": true,
 	}
-}
-
-// inputHash returns the first 8 bytes of the SHA-256 of the raw input as hex.
-// Hashing avoids logging PII (SUPI, keys) while still correlating identical calls.
-func inputHash(in json.RawMessage) string {
-	sum := sha256.Sum256(in)
-	return fmt.Sprintf("%x", sum[:8])
 }

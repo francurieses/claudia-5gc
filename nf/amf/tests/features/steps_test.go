@@ -109,6 +109,15 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Synchronous SMF leg of Xn / N2 handover (AMF-012): SMF fake behind the ngap hooks,
 	// builds on the world of the Xn steps above.
 	initHandoverSMFLegSteps(sc)
+
+	// O&M-triggered AN release (TS 23.502 §4.2.6, TS 38.413 §8.3.3) — in-process:
+	// real mgmt routes + real ngap.Server with a fake SCTP transport.
+	initANReleaseNwSteps(sc)
+
+	// AMF runtime timer configuration via O&M (MCP-011; TS 24.501 §5.3.7, §10.2) —
+	// in-process: real mgmt route, timercfg store, Registration Accept builders
+	// and ngap timer arming.
+	initTimerConfigSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

@@ -34,6 +34,7 @@ observability and the portal) → **http://localhost:8080**.
 - **Metrics.** Charts use a curated Prometheus endpoint; an empty window shows a gap, never a fake 0 %.
 - **Accessibility.** Built to WCAG 2.1 AA: keyboard operable, visible focus, status not conveyed by colour alone.
 - **Multiple AMFs.** Set `AMF_MGMT_URLS` (comma list) to aggregate gNBs from several AMFs.
+- **Database health.** `GET /api/v1/health` always answers 200 with `{"status":"ok","store":"up"|"down"}`; `store` is `down` when PostgreSQL was unreachable (the portal retries at start-up before degrading), and store-backed pages and MCP tools then report the store as unavailable.
 - **Auth.** The portal is a lab tool: do not expose port 8080 to untrusted networks.
 
 See [`configuration.md`](configuration.md) for portal environment variables and

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"io"
 	"log/slog"
 	"net/http"
@@ -27,7 +28,7 @@ func testSSE(t *testing.T) *httptest.Server {
 		t.Fatalf("register: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	disp := server.NewDispatcher(reg, logger)
+	disp := server.NewDispatcher(reg, guard.New(guard.Options{Mode: guard.ModeLab}, logger), logger)
 	mgr := session.NewManager(logger)
 	cfg := &config.Config{Transport: config.TransportSSE, SSE: config.SSE{Debug: true}}
 	sse := NewSSE(disp, reg, mgr, cfg, logger)
@@ -58,8 +59,8 @@ func TestHealthAndTools(t *testing.T) {
 	if err := json.NewDecoder(resp2.Body).Decode(&tl); err != nil {
 		t.Fatalf("decode tools: %v", err)
 	}
-	if len(tl.Tools) != 4 {
-		t.Fatalf("tools: got %d, want 4", len(tl.Tools))
+	if len(tl.Tools) != 6 {
+		t.Fatalf("tools: got %d, want 6", len(tl.Tools))
 	}
 }
 
@@ -188,4 +189,83 @@ func waitSessions(t *testing.T, baseURL string, want int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("session count never reached %d", want)
+}
+
+// TestAuditSessionLabel: a stateless POST /mcp is audited as http:<ip>, not stdio.
+func TestAuditSessionLabel(t *testing.T) {
+	reg := registry.New()
+	if err := reg.RegisterAll(nastools.All()...); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := guard.New(guard.Options{Mode: guard.ModeLab}, logger)
+	disp := server.NewDispatcher(reg, g, logger)
+	cfg := &config.Config{Transport: config.TransportSSE}
+	srv := httptest.NewServer(NewSSE(disp, reg, session.NewManager(logger), cfg, logger).Handler())
+	defer srv.Close()
+
+	// Mutating tool via a stub registered alongside, so the guard audits it.
+	if err := reg.Register(auditedStub{}); err != nil {
+		t.Fatalf("register stub: %v", err)
+	}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"audited_stub","arguments":{}}}`
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/mcp", strings.NewReader(body))
+	req.Header.Set("X-Forwarded-For", "203.0.113.9") // must be ignored
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	got := g.Audit().Recent(1)
+	if len(got) != 1 {
+		t.Fatalf("audit entries: %d", len(got))
+	}
+	if got[0].Session != "http:127.0.0.1" || got[0].RemoteAddr != "127.0.0.1" {
+		t.Fatalf("entry: %+v", got[0])
+	}
+}
+
+type auditedStub struct{}
+
+func (auditedStub) Name() string                  { return "audited_stub" }
+func (auditedStub) Description() string           { return "stub" }
+func (auditedStub) InputSchema() json.RawMessage  { return json.RawMessage(`{"type":"object"}`) }
+func (auditedStub) OutputSchema() json.RawMessage { return json.RawMessage(`{}`) }
+func (auditedStub) Risk() registry.Risk           { return registry.Mutating }
+func (auditedStub) Invoke(context.Context, json.RawMessage) (any, error) {
+	return map[string]any{"ok": true}, nil
+}
+
+// TestAuditSessionLabelIgnoresUnknownSession: a client-supplied ?session= / Mcp-Session-Id
+// that names no live session must not label the audit trail; a live one does.
+func TestAuditSessionLabelIgnoresUnknownSession(t *testing.T) {
+	reg := registry.New()
+	if err := reg.Register(auditedStub{}); err != nil {
+		t.Fatalf("register stub: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	g := guard.New(guard.Options{Mode: guard.ModeLab}, logger)
+	disp := server.NewDispatcher(reg, g, logger)
+	mgr := session.NewManager(logger)
+	cfg := &config.Config{Transport: config.TransportSSE}
+	srv := httptest.NewServer(NewSSE(disp, reg, mgr, cfg, logger).Handler())
+	defer srv.Close()
+
+	live := mgr.Register("10.0.0.1:1234", "test")
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"audited_stub","arguments":{}}}`
+	for _, c := range []struct{ query, wantSession string }{
+		{"?session=forged-id", "http:127.0.0.1"},
+		{"?session=" + live.ID, live.ID},
+	} {
+		resp, err := http.Post(srv.URL+"/mcp"+c.query, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_ = resp.Body.Close()
+		got := g.Audit().Recent(1)
+		if len(got) != 1 || got[0].Session != c.wantSession {
+			t.Errorf("%s: audit = %+v, want session %q", c.query, got, c.wantSession)
+		}
+	}
 }

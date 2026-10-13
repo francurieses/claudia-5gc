@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -149,11 +150,12 @@ type RegistrationHandler struct {
 	// ABBA value (0x0000 for initial registration without interworking)
 	// Ref: TS 33.501 §A.7.1
 	abba nas.ABBA
-	// t3512Secs is the T3512 Periodic Registration Timer value in seconds.
-	// Sent to the UE in Registration Accept (IEI 0x5E, GPRS Timer 3 encoding).
-	// Configured via nf/amf/config/dev.yaml "timers.t3512_secs".
+	// timers holds the T3512 Periodic Registration Timer value, read at use
+	// time (runtime-changeable through the O&M API). Sent to the UE in
+	// Registration Accept (IEI 0x5E, GPRS Timer 3 encoding). Base value from
+	// nf/amf/config/dev.yaml "timers.t3512_secs".
 	// Ref: TS 24.501 §8.2.7.1, §10.2
-	t3512Secs int
+	timers *timercfg.Store
 	// nullSecurity forces NEA0 (no ciphering) + NIA0 (no integrity) for all UEs.
 	// Dev/debug only — NAS PDUs travel in plain text, visible in Wireshark.
 	// Set via nf/amf/config/dev.yaml "security.null_ciphering: true".
@@ -248,8 +250,36 @@ func rfspSource(pcfRFSP, defaultRFSP int) string {
 // WithT3512 sets the T3512 Periodic Registration Timer value (seconds) sent to the UE
 // in Registration Accept. Configure via nf/amf/config/dev.yaml "timers.t3512_secs".
 // Ref: TS 24.501 §8.2.7.1 (IEI 0x5E), §10.2 (default 54 min)
+// It installs a private store; use WithTimerStore to share the runtime store.
 func (h *RegistrationHandler) WithT3512(secs int) {
-	h.t3512Secs = secs
+	h.timers = timercfg.New(timercfg.Values{T3512Secs: secs})
+}
+
+// WithTimerStore shares the runtime timer store, so a T3512 change made through
+// the O&M API is used by every Registration Accept built afterwards.
+// Call before serving.
+func (h *RegistrationHandler) WithTimerStore(s *timercfg.Store) {
+	h.timers = s
+}
+
+// T3512 returns the effective T3512 in seconds (0 when none is configured).
+func (h *RegistrationHandler) T3512() int {
+	if h.timers == nil {
+		return 0
+	}
+	return h.timers.T3512Secs()
+}
+
+// setT3512Value fills IEI 0x5E in ra from the effective T3512, loaded once, and
+// records the value sent on the UE (lowered-T3512 mitigation, TS 24.501 §5.3.7).
+func (h *RegistrationHandler) setT3512Value(ra *nas.RegistrationAccept, ue *amfctx.UEContext) {
+	secs := h.T3512()
+	if secs <= 0 {
+		return
+	}
+	t3512 := nas.EncodeGPRSTimer3(secs)
+	ra.T3512Value = &t3512
+	ue.SetT3512SentSecs(secs)
 }
 
 // WithServedTACs sets the operator-configured TACs that form the registration
@@ -916,10 +946,7 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 	}
 	// IEI 0x5E: T3512 Periodic Registration Timer (GPRS Timer 3 encoding).
 	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1
-	if h.t3512Secs > 0 {
-		t3512 := nas.EncodeGPRSTimer3(h.t3512Secs)
-		ra.T3512Value = &t3512
-	}
+	h.setT3512Value(ra, ue)
 	return ra, nil
 }
 
@@ -1065,10 +1092,7 @@ func (h *RegistrationHandler) BuildRegistrationUpdateAccept(
 		// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
 		NetworkFeatureSupport: nas.NewNetworkFeatureSupport(h.imsVoPS3GPP),
 	}
-	if h.t3512Secs > 0 {
-		t3512 := nas.EncodeGPRSTimer3(h.t3512Secs)
-		ra.T3512Value = &t3512
-	}
+	h.setT3512Value(ra, ue)
 	return ra, nil
 }
 

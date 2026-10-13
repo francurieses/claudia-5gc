@@ -45,3 +45,28 @@ func (c *UDM) GetSMData(ctx context.Context, supi string) (json.RawMessage, erro
 	}
 	return body, nil
 }
+
+// GetAMData returns the Access and Mobility Subscription Data for a SUPI
+// (GET /nudm-sdm/v2/{supi}/am-data, TS 29.503 §5.2.2.2). Returns (nil, nil)
+// when the UDM answers 404.
+func (c *UDM) GetAMData(ctx context.Context, supi string) (json.RawMessage, error) {
+	u := c.baseURL + "/nudm-sdm/v2/" + url.PathEscape(supi) + "/am-data"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("udm: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("udm: get am-data: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("udm: get am-data: status %d: %s", resp.StatusCode, body)
+	}
+	return body, nil
+}

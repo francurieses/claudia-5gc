@@ -33,11 +33,18 @@ back to the operator-default QoS. Details on slices: [`getting-started.md`](gett
 | `UDM_ADDR` / `UDM_URL` | host:port / URL | AUSF, portal | UDM endpoint |
 | `PCF_URL` | URL | SMF, AMF | PCF endpoint |
 | `PCF_ADDR` | URL | MCP | PCF internal-API endpoint (QoS override tools) |
-| `PORTAL_ADDR` | URL | MCP | Management-portal endpoint (UERANSIM control tools) |
+| `PORTAL_ADDR` | URL | MCP | Management-portal endpoint (status, control, runtime-config and PCAP tools) |
 | `CONFIG_PATH` | path | NRF, AUSF | Explicit YAML config file (default: image `config/`) |
 | `HEALTHCHECK_ADDR` | host:port | NRF, MCP | Container health-probe listen address |
 | `MCP_SSE_LISTEN_ADDR` | host:port | MCP | SSE transport listen address (default `:9300`) |
 | `MCP_BEARER_TOKEN` | string | MCP | Bearer token required on the SSE transport (unset = no auth, lab only) |
+| `MCP_TOKEN_VIEWER` / `MCP_TOKEN_OPERATOR` / `MCP_TOKEN_ADMIN` | string | MCP | Bearer token per role (viewer, operator, admin). Each adds an entry to `auth.tokens`. |
+| `MCP_METRICS_HOST_OVERRIDE` | bare host | MCP | Replaces the host of Prometheus scrape targets (default empty). Use `localhost` for host-mode stdio: `smf:9105` becomes `localhost:9105`. |
+| `MCP_ACCESS_MODE` | `read-only`\|`operator`\|`lab` | MCP | Highest risk the server exposes (default `read-only`; dev config `operator`). |
+| `LOKI_ADDR` | URL | MCP | Loki query API for `log_query` and `procedure_timeline` (default `http://loki:3100`). |
+| `BSF_ADDR` | URL | MCP | BSF Nbsf_Management endpoint for `pcf_binding_list` and `core_consistency_check`, over mTLS (default `https://bsf:8010`; `https://localhost:8010` in host mode). Config key `bsf_addr`. |
+| `NEF_ADDR` | URL | MCP | NEF endpoint for `af_qos_session_*`, over mTLS (default `https://nef:8011`; `https://localhost:8011` in host mode). Config key `nef_addr`. |
+| `SMSF_ADDR` | URL | MCP | SMSF endpoint for `sms_send_mt`, over mTLS (default `https://smsf:8009`; `https://localhost:8009` in host mode). Config key `smsf_addr`. |
 | `LMF_URL` | URL | portal | LMF endpoint for the UE Location page (Nlmf_Location; default `https://lmf:8012`) |
 | `DATABASE_URL` | DSN | AMF, SMF, UDR | PostgreSQL connection |
 | `REDIS_URL` | URL | NRF, AMF, AUSF | Redis connection |

@@ -1,6 +1,8 @@
 package context
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,5 +61,24 @@ func TestManagerListContexts(t *testing.T) {
 	got := m.ListContexts()
 	if len(got) != 2 {
 		t.Fatalf("ListContexts: got %d, want 2", len(got))
+	}
+}
+
+// TestUESnapshotPDUSessionIDsJSONNumbers verifies pdu_session_ids marshals as a
+// JSON array of numbers (not a base64 string, which []uint8 would produce).
+func TestUESnapshotPDUSessionIDsJSONNumbers(t *testing.T) {
+	ue := &UEContext{
+		SUPI: "imsi-001010000000001",
+		PDUSessions: map[uint8]*PDUSession{
+			2: {PDUSessionID: 2},
+			1: {PDUSessionID: 1},
+		},
+	}
+	b, err := json.Marshal(ue.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"pdu_session_ids":[1,2]`) {
+		t.Errorf("want numeric pdu_session_ids [1,2], got %s", b)
 	}
 }

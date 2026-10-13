@@ -14,29 +14,48 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/clients"
 	"github.com/francurieses/claudia-5gc/mcp/internal/config"
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	promclient "github.com/francurieses/claudia-5gc/mcp/internal/prometheus"
 	"github.com/francurieses/claudia-5gc/mcp/internal/server"
 	"github.com/francurieses/claudia-5gc/mcp/internal/server/transport"
 	"github.com/francurieses/claudia-5gc/mcp/internal/session"
+	analysistools "github.com/francurieses/claudia-5gc/mcp/internal/tools/analysis"
+	controltools "github.com/francurieses/claudia-5gc/mcp/internal/tools/control"
 	cryptotools "github.com/francurieses/claudia-5gc/mcp/internal/tools/crypto"
 	metricstools "github.com/francurieses/claudia-5gc/mcp/internal/tools/metrics"
 	nastools "github.com/francurieses/claudia-5gc/mcp/internal/tools/nas"
 	nftools "github.com/francurieses/claudia-5gc/mcp/internal/tools/nf"
 	qostools "github.com/francurieses/claudia-5gc/mcp/internal/tools/qos"
 	"github.com/francurieses/claudia-5gc/mcp/internal/tools/registry"
+	runtimetools "github.com/francurieses/claudia-5gc/mcp/internal/tools/runtimecfg"
+	statustools "github.com/francurieses/claudia-5gc/mcp/internal/tools/status"
 	tracetools "github.com/francurieses/claudia-5gc/mcp/internal/tools/trace"
 	uetools "github.com/francurieses/claudia-5gc/mcp/internal/tools/ue"
-	ueransimtools "github.com/francurieses/claudia-5gc/mcp/internal/tools/ueransim"
-	ueclient "github.com/francurieses/claudia-5gc/mcp/internal/ueransim"
+	"github.com/francurieses/claudia-5gc/shared/oauth2"
 )
 
 const nfName = "MCP"
+
+// mcpNFInstanceID identifies the MCP server as the OAuth2 client in NRF token requests
+// (TS 29.510 §6.3.5.2.3 nfInstanceId). The MCP is not an NRF-registered NF.
+const mcpNFInstanceID = "6d63702d-0000-4000-8000-000000000010"
+
+// nefAFSessionScope is the OAuth2 scope of Nnef_AFsessionWithQoS (TS 29.522 §6.1).
+const nefAFSessionScope = "nnef-afsessionwithqos"
+
+// version is the MCP server release reported by `version`, the startup log and mcp_info.
+const version = "0.1.0"
+
+// buildCommit is the git revision of this build, set at link time with
+// -ldflags "-X main.buildCommit=<sha>". It reads "unknown" for an unstamped build.
+var buildCommit = "unknown"
 
 func main() {
 	configFlag := flag.String("config", "", "path to config YAML (overrides CONFIG_PATH env var)")
@@ -47,7 +66,7 @@ func main() {
 		case "healthcheck":
 			os.Exit(healthcheck())
 		case "version":
-			fmt.Println("mcp v0.1.0 (5GC Rel-17 MCP server)")
+			fmt.Printf("mcp v%s (%s) (5GC Rel-17 MCP server)\n", version, buildCommit)
 			os.Exit(0)
 		}
 	}
@@ -74,20 +93,38 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("starting MCP server",
-		"version", "0.1.0",
+		"version", version,
+		"build_commit", buildCommit,
 		"transport", cfg.Transport,
 		"sse_addr", cfg.SSE.ListenAddr,
 	)
 
+	mode, err := guard.ParseAccessMode(cfg.AccessMode)
+	if err != nil {
+		logger.Error("access mode", "error", err)
+		os.Exit(1)
+	}
+	if !cfg.Auth.Enabled() {
+		logger.Warn("SSE authentication is disabled: every caller acts as operator",
+			"access_mode", string(mode))
+	}
+	g := guard.New(guard.Options{
+		Mode:           mode,
+		MinInterval:    time.Duration(cfg.Guardrails.MinIntervalMs) * time.Millisecond,
+		AuditSize:      cfg.Guardrails.AuditSize,
+		MaxResultBytes: cfg.Guardrails.MaxResultBytes,
+	}, logger)
+
 	// Build the single shared registry and register every tool group once.
 	reg := registry.New()
-	if err := registerTools(reg, cfg, logger); err != nil {
+	if err := registerTools(reg, cfg, g, logger); err != nil {
 		logger.Error("registering tools", "error", err)
 		os.Exit(1)
 	}
-	logger.Info("tools registered", "count", len(reg.List()))
+	logger.Info("tools registered", "count", len(reg.List()),
+		"visible", len(reg.ManifestFor(g.Ceiling())), "access_mode", string(mode))
 
-	disp := server.NewDispatcher(reg, logger)
+	disp := server.NewDispatcher(reg, g, logger)
 	mgr := session.NewManager(logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -149,10 +186,11 @@ func main() {
 	logger.Info("MCP server stopped cleanly")
 }
 
-// registerTools wires every tool group into the shared registry. Group A (NAS
-// codec) is pure; Groups B/C/D bind upstream clients built from config.
-func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logger) error {
-	// Group A: NAS codec (pure, no network I/O)
+// registerTools wires every tool group into the shared registry. Each upstream
+// client is built once here and shared by the groups that use it. Groups A and E
+// are pure and need no client.
+func registerTools(reg *registry.Registry, cfg *config.Config, g *guard.Guard, logger *slog.Logger) error {
+	// Group A: NAS, NGAP and PFCP codecs (pure, no network I/O)
 	if err := reg.RegisterAll(nastools.All()...); err != nil {
 		return fmt.Errorf("group A (nas): %w", err)
 	}
@@ -162,8 +200,8 @@ func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logg
 		return fmt.Errorf("group E (crypto): %w", err)
 	}
 
-	// NRF SBI enforces mTLS HTTP/2; AMF management API and Jaeger/Prometheus are
-	// plain HTTP, so use a standard client for those.
+	// NRF SBI enforces mTLS HTTP/2; AMF management API, the portal, Loki, Jaeger
+	// and Prometheus are plain HTTP, so use a standard client for those.
 	sbiClient, err := clients.NewSBIClient(cfg.CAFile, cfg.ClientCertFile, cfg.ClientKeyFile)
 	if err != nil {
 		return fmt.Errorf("build SBI client: %w", err)
@@ -172,6 +210,21 @@ func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logg
 	nrfClient := clients.NewNRF(cfg.NRFAddr, sbiClient)
 	amfClient := clients.NewAMF(cfg.AMFAddr, plainClient)
 	obsClient := clients.NewObs(cfg.JaegerAddr, cfg.PrometheusAddr, plainClient)
+	pcfClient := clients.NewPCF(cfg.PCFAddr, sbiClient)
+	smfClient := clients.NewSMF(cfg.SMFAddr, sbiClient)
+	udmClient := clients.NewUDM(cfg.UDMAddr, sbiClient)
+	portal := clients.NewPortal(cfg.PortalAddr, plainClient)
+	bsfClient := clients.NewBSF(cfg.BSFAddr, sbiClient)
+	smsfClient := clients.NewSMSF(cfg.SMSFAddr, sbiClient)
+	// The NEF needs an NRF access token (scope nnef-afsessionwithqos, TS 33.501 §13.4.1).
+	nefTokens := oauth2.NewTokenCache(sbiClient, strings.TrimRight(cfg.NRFAddr, "/")+"/oauth2/v1/token",
+		mcpNFInstanceID, nefAFSessionScope)
+	nefClient := clients.NewNEF(cfg.NEFAddr, sbiClient, nefTokens)
+	loki := clients.NewLoki(cfg.LokiAddr, plainClient)
+	prom := promclient.New(cfg.EffectivePrometheusAddr(), plainClient,
+		time.Duration(cfg.Prometheus.QueryTimeoutSec)*time.Second)
+
+	targets := clients.NewTargets(prom, cfg.MetricsHostOverride)
 
 	if err := reg.RegisterAll(nftools.All(nrfClient)...); err != nil {
 		return fmt.Errorf("group B (nf): %w", err)
@@ -183,37 +236,73 @@ func registerTools(reg *registry.Registry, cfg *config.Config, logger *slog.Logg
 		return fmt.Errorf("group D (trace): %w", err)
 	}
 
-	// Group F: UERANSIM orchestration, proxied through mgmt-portal's nr-cli
-	// endpoint rather than a mounted Docker socket (see clients/ueransim doc).
-	uePortalClient := ueclient.NewPortalClient(
-		cfg.PortalAddr,
-		cfg.UERANSIM.ContainerName,
-		time.Duration(cfg.UERANSIM.ExecTimeoutSec)*time.Second,
-		logger,
-	)
-	if err := reg.RegisterAll(ueransimtools.All(uePortalClient)...); err != nil {
-		return fmt.Errorf("group F (ueransim): %w", err)
-	}
-
-	// Group G: Prometheus metrics
-	prom := promclient.New(cfg.EffectivePrometheusAddr(), plainClient,
-		time.Duration(cfg.Prometheus.QueryTimeoutSec)*time.Second)
+	// Group F: Prometheus metrics
 	if err := reg.RegisterAll(metricstools.All(prom)...); err != nil {
-		return fmt.Errorf("group G (metrics): %w", err)
+		return fmt.Errorf("group F (metrics): %w", err)
 	}
 
-	// Group H: QoS policy write operations (PCF overrides + PDU session with QoS)
-	pcfClient := clients.NewPCF(cfg.PCFAddr, sbiClient)
-	if err := reg.RegisterAll(qostools.All(pcfClient, amfClient, uePortalClient)...); err != nil {
+	// Group H: QoS policy overrides in the PCF.
+	if err := reg.RegisterAll(qostools.All(pcfClient)...); err != nil {
 		return fmt.Errorf("group H (qos): %w", err)
 	}
 
-	// Group I: PDU session QoS management (SMF session store + UDM SDM).
-	// SMF management endpoints share the SBI listener (mTLS); UDM SDM is mTLS.
-	smfClient := clients.NewSMF(cfg.SMFAddr, sbiClient)
-	udmClient := clients.NewUDM(cfg.UDMAddr, sbiClient)
-	if err := reg.RegisterAll(qostools.Sessions(smfClient, udmClient)...); err != nil {
+	// Group I: PDU session QoS management (SMF session store + UDM SDM), plus the
+	// deprecated pdu_session_qos_modify alias that drives the SMF.
+	if err := reg.RegisterAll(qostools.Sessions(smfClient, udmClient, pcfClient)...); err != nil {
 		return fmt.Errorf("group I (qos sessions): %w", err)
+	}
+
+	// Group J: status (core health, deployment, subscribers, config, PWS).
+	if err := reg.RegisterAll(statustools.All(statustools.Deps{
+		NRF: nrfClient, Portal: portal, Prom: prom, HTTP: plainClient, Targets: targets,
+		AMF: amfClient, SMF: smfClient, BSF: bsfClient, SBI: sbiClient,
+		Registry: reg, Guard: g, Version: version, BuildCommit: buildCommit,
+		Upstreams: []statustools.Upstream{
+			{Name: "nrf", Addr: cfg.NRFAddr, MTLS: true},
+			{Name: "amf", Addr: cfg.AMFAddr},
+			{Name: "smf", Addr: cfg.SMFAddr, MTLS: true},
+			{Name: "udm", Addr: cfg.UDMAddr, MTLS: true},
+			{Name: "pcf", Addr: cfg.PCFAddr, MTLS: true},
+			{Name: "bsf", Addr: cfg.BSFAddr, MTLS: true},
+			{Name: "nef", Addr: cfg.NEFAddr, MTLS: true},
+			{Name: "smsf", Addr: cfg.SMSFAddr, MTLS: true},
+			{Name: "portal", Addr: cfg.PortalAddr},
+			{Name: "prometheus", Addr: cfg.EffectivePrometheusAddr()},
+			{Name: "loki", Addr: cfg.LokiAddr},
+			{Name: "jaeger", Addr: cfg.JaegerAddr},
+		},
+		Probes: []statustools.Probe{
+			{Name: "loki", URL: strings.TrimRight(cfg.LokiAddr, "/") + "/ready"},
+			{Name: "jaeger", URL: strings.TrimRight(cfg.JaegerAddr, "/") + "/"},
+		},
+	})...); err != nil {
+		return fmt.Errorf("group J (status): %w", err)
+	}
+
+	// Group L: core-side control (deregister, release, policy push, page, NSSAA, PWS).
+	// Each tool is Disruptive: the guard returns a dry-run unless confirm is true.
+	if err := reg.RegisterAll(controltools.All(controltools.Deps{
+		AMF: amfClient, SMF: smfClient, Portal: portal, NEF: nefClient, SMSF: smsfClient,
+	})...); err != nil {
+		return fmt.Errorf("group L (control): %w", err)
+	}
+
+	// Group M: runtime configuration (slice AMBR, RFSP, URSP, NF service control,
+	// NF log level, AMF timers, subscriber provisioning) and the audit-log reader.
+	if err := reg.RegisterAll(runtimetools.All(runtimetools.Deps{
+		Portal: portal, AMF: amfClient, Guard: g, AllowServiceControl: cfg.AllowServiceControl,
+		Prom: prom, Targets: targets, HTTP: plainClient,
+	})...); err != nil {
+		return fmt.Errorf("group M (runtime): %w", err)
+	}
+
+	// Group K: analysis (logs, procedure timeline, UE diagnosis, procedure stats)
+	// and PCAP control.
+	if err := reg.RegisterAll(analysistools.All(analysistools.Deps{
+		Loki: loki, Obs: obsClient, Prom: prom, AMF: amfClient, SMF: smfClient,
+		PCF: pcfClient, UDM: udmClient, Portal: portal, Targets: targets, HTTP: plainClient,
+	})...); err != nil {
+		return fmt.Errorf("group K (analysis): %w", err)
 	}
 
 	return nil

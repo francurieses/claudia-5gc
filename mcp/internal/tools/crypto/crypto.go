@@ -126,7 +126,8 @@ func logInvoke(ctx context.Context, toolName string, start time.Time, err error)
 
 type milenageRunTool struct{}
 
-func (milenageRunTool) Name() string { return "milenage_run" }
+func (milenageRunTool) Name() string        { return "milenage_run" }
+func (milenageRunTool) Risk() registry.Risk { return registry.ReadOnly }
 func (milenageRunTool) Description() string {
 	return "Compute the Milenage AKA functions (f1–f5) for a given subscriber key, " +
 		"OPc, RAND, SQN, and AMF. Returns XRES, CK, IK, AK, and MAC-A. " +
@@ -200,7 +201,8 @@ func (t milenageRunTool) Invoke(ctx context.Context, in json.RawMessage) (any, e
 
 type suciDeriveTool struct{}
 
-func (suciDeriveTool) Name() string { return "suci_derive" }
+func (suciDeriveTool) Name() string        { return "suci_derive" }
+func (suciDeriveTool) Risk() registry.Risk { return registry.ReadOnly }
 func (suciDeriveTool) Description() string {
 	return "Derive a SUCI (Subscription Concealed Identifier) from a SUPI using ECIES. " +
 		"Profile A uses X25519 + AES-128-CTR + HMAC-SHA-256. " +
@@ -224,10 +226,10 @@ func (suciDeriveTool) OutputSchema() json.RawMessage {
 func (t suciDeriveTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
 	start := time.Now()
 	var a struct {
-		SUPI                  string `json:"supi"`
-		HomeNetworkPublicKey  string `json:"home_network_public_key"`
-		ProtectionScheme      string `json:"protection_scheme"`
-		KeyID                 *int   `json:"key_id"`
+		SUPI                 string `json:"supi"`
+		HomeNetworkPublicKey string `json:"home_network_public_key"`
+		ProtectionScheme     string `json:"protection_scheme"`
+		KeyID                *int   `json:"key_id"`
 	}
 	if err := json.Unmarshal(in, &a); err != nil {
 		return nil, mcperr.Newf(mcperr.CodeInvalidParams, nil, "suci_derive args: %v", err)
@@ -294,7 +296,8 @@ func (t suciDeriveTool) Invoke(ctx context.Context, in json.RawMessage) (any, er
 
 type xresStarComputeTool struct{}
 
-func (xresStarComputeTool) Name() string { return "xres_star_compute" }
+func (xresStarComputeTool) Name() string        { return "xres_star_compute" }
+func (xresStarComputeTool) Risk() registry.Risk { return registry.ReadOnly }
 func (xresStarComputeTool) Description() string {
 	return "Compute XRES* and HXRES* from CK, IK, RAND, XRES, and Serving Network Name. " +
 		"XRES* is stored in the AUSF; HXRES* is compared against RES* from the UE. " +
@@ -360,7 +363,8 @@ func (t xresStarComputeTool) Invoke(ctx context.Context, in json.RawMessage) (an
 
 type resStarVerifyTool struct{}
 
-func (resStarVerifyTool) Name() string { return "res_star_verify" }
+func (resStarVerifyTool) Name() string        { return "res_star_verify" }
+func (resStarVerifyTool) Risk() registry.Risk { return registry.ReadOnly }
 func (resStarVerifyTool) Description() string {
 	return "Compare RES* received from the UE against the stored XRES*. Returns verified: true " +
 		"on match, false with mismatch_detail on failure. Uses constant-time comparison. " +
@@ -420,7 +424,8 @@ func (t resStarVerifyTool) Invoke(ctx context.Context, in json.RawMessage) (any,
 
 type kdfComputeTool struct{}
 
-func (kdfComputeTool) Name() string { return "kdf_compute" }
+func (kdfComputeTool) Name() string        { return "kdf_compute" }
+func (kdfComputeTool) Risk() registry.Risk { return registry.ReadOnly }
 func (kdfComputeTool) Description() string {
 	return "Compute KDF(key, FC || P0 || L0 || ...) = HMAC-SHA-256 per TS 33.220 §B.2. " +
 		"FC codes (TS 33.501 Annex A): 0x6A=KAUSF, 0x6B=XRES*, 0x6C=KSEAF, 0x6D=KAMF, " +
@@ -505,7 +510,8 @@ func (t kdfComputeTool) Invoke(ctx context.Context, in json.RawMessage) (any, er
 
 type akaFullRunTool struct{}
 
-func (akaFullRunTool) Name() string { return "aka_full_run" }
+func (akaFullRunTool) Name() string        { return "aka_full_run" }
+func (akaFullRunTool) Risk() registry.Risk { return registry.ReadOnly }
 func (akaFullRunTool) Description() string {
 	return "Run the complete 5G-AKA authentication vector generation in one call: Milenage → " +
 		"KAUSF → KSEAF → KAMF, deriving all keys needed by the AUSF and AMF. Returns the " +

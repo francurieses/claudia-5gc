@@ -151,3 +151,9 @@ func (s *Server) StartHandoverRequestAcknowledgeForTest(ctx context.Context, tar
 func (s *Server) HandleUplinkNASTransportForTest(ctx context.Context, gnb *GNBContext, msg *UplinkNASTransport) {
 	s.handleUplinkNASTransport(ctx, gnb, &Message{ProcedureCode: ProcUplinkNASTransport, Value: msg})
 }
+
+// DispatchNGAPForTest feeds a gNB-originated NGAP PDU through the server's
+// dispatcher, as if it had arrived on the gNB's SCTP association.
+func (s *Server) DispatchNGAPForTest(ctx context.Context, gnb *GNBContext, pdu []byte) {
+	s.dispatch(ctx, gnb, pdu)
+}

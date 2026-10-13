@@ -7,13 +7,15 @@ import (
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/clients"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
+	"github.com/francurieses/claudia-5gc/mcp/internal/tools/registry"
 )
 
 // ---- ran_gnb_list ---------------------------------------------------------
 
 type ranGNBListTool struct{ amf *clients.AMF }
 
-func (ranGNBListTool) Name() string { return "ran_gnb_list" }
+func (ranGNBListTool) Name() string        { return "ran_gnb_list" }
+func (ranGNBListTool) Risk() registry.Risk { return registry.ReadOnly }
 func (ranGNBListTool) Description() string {
 	return "List the gNBs known to the AMF over N2: Global gNB ID, RAN node name, PLMN, supported " +
 		"TAs and slices, SCTP remote address, state (SCTP_UP, NG_READY, DISCONNECTED with reason), " +

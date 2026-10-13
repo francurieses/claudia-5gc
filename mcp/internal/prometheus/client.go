@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,19 +40,19 @@ func New(baseURL string, httpClient *http.Client, queryTimeout time.Duration) *C
 
 // QueryResult is the structured response from /api/v1/query.
 type QueryResult struct {
-	Status string     `json:"status"`
-	Data   QueryData  `json:"data"`
+	Status string    `json:"status"`
+	Data   QueryData `json:"data"`
 }
 
 // QueryData holds the result type and result set.
 type QueryData struct {
-	ResultType string        `json:"resultType"`
+	ResultType string         `json:"resultType"`
 	Result     []VectorSample `json:"result"`
 }
 
 // VectorSample is one instant-query result row.
 type VectorSample struct {
-	Metric map[string]string `json:"metric"`
+	Metric map[string]string  `json:"metric"`
 	Value  [2]json.RawMessage `json:"value"` // [timestamp, "value_string"]
 }
 
@@ -59,10 +60,12 @@ type VectorSample struct {
 func (v VectorSample) Float64() float64 {
 	var s string
 	if err := json.Unmarshal(v.Value[1], &s); err != nil {
-		return 0
+		return math.NaN()
 	}
 	var f float64
-	fmt.Sscanf(s, "%f", &f)
+	if _, err := fmt.Sscanf(s, "%f", &f); err != nil {
+		return math.NaN()
+	}
 	return f
 }
 
@@ -171,4 +174,72 @@ func (c *Client) Alerts(ctx context.Context) ([]Alert, error) {
 		return []Alert{}, nil
 	}
 	return res.Data.Alerts, nil
+}
+
+// MatrixSeries is one series of a range query: a label set and its samples.
+type MatrixSeries struct {
+	Metric map[string]string `json:"metric"`
+	Values [][2]any          `json:"values"` // [unix seconds, "value_string"]
+}
+
+// maxRangePoints bounds a range query so one call cannot return an unbounded
+// number of points. Prometheus itself rejects more than 11 000 points per series.
+const maxRangePoints = 11000
+
+// QueryRange runs /api/v1/query_range over [start, end] at the given step. The
+// step is raised to the smallest value that keeps the series under maxRangePoints.
+// It returns the series and the effective step.
+func (c *Client) QueryRange(ctx context.Context, promql string, start, end time.Time, step time.Duration) ([]MatrixSeries, time.Duration, error) {
+	if !end.After(start) {
+		return nil, 0, fmt.Errorf("prometheus range: end must be after start")
+	}
+	minStep := time.Duration(math.Ceil(end.Sub(start).Seconds()/maxRangePoints)) * time.Second
+	if step < minStep {
+		step = minStep
+	}
+	if step < time.Second {
+		step = time.Second
+	}
+
+	tCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	q := url.Values{}
+	q.Set("query", promql)
+	q.Set("start", start.UTC().Format(time.RFC3339))
+	q.Set("end", end.UTC().Format(time.RFC3339))
+	q.Set("step", fmt.Sprintf("%d", int64(step.Seconds())))
+	req, err := http.NewRequestWithContext(tCtx, http.MethodGet, c.base+"/api/v1/query_range?"+q.Encode(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("prometheus range: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("prometheus range: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, 0, fmt.Errorf("prometheus range: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("prometheus range: status %d: %s", resp.StatusCode, body)
+	}
+
+	var res struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string         `json:"resultType"`
+			Result     []MatrixSeries `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		return nil, 0, fmt.Errorf("prometheus range: decode response: %w", err)
+	}
+	if res.Status != "success" {
+		return nil, 0, fmt.Errorf("prometheus range: non-success status: %s", res.Status)
+	}
+	return res.Data.Result, step, nil
 }

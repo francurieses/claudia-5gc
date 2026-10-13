@@ -30,6 +30,7 @@ import (
 	"github.com/ishidawataru/sctp"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -330,7 +331,7 @@ type AMFConfig struct {
 // ---- Timer Config --------------------------------------------------------
 
 // TimerConfig holds the durations for UE lifecycle timers managed by the NGAP server.
-// Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach),
+// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1 (Mobile Reachable, Implicit Detach),
 //
 //	TS 38.413 §8.3.3 (PendingRemoval watchdog).
 //
@@ -393,7 +394,7 @@ type Server struct {
 	// onImplicitDetach is called when the Implicit Detach Timer fires for a UE.
 	// The callback must release PDU sessions at SMF, deregister from UDM, and
 	// remove the UE context. Runs in a timer goroutine.
-	// Ref: TS 23.501 §5.3.2
+	// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 	onImplicitDetach func(ctx context.Context, ue *amfctx.UEContext)
 
 	// onPathSwitchPDUSession performs Nsmf_PDUSession_UpdateSMContext (n2SmInfoType
@@ -464,6 +465,9 @@ type Server struct {
 
 	// timerCfg holds the timer durations for UE lifecycle management.
 	timerCfg TimerConfig
+	// timers, when set, supplies the Mobile Reachable / Implicit Detach
+	// durations at arm time (runtime-changeable); otherwise timerCfg is used.
+	timers *timercfg.Store
 
 	// pws holds active/completed Public Warning System broadcasts keyed by
 	// (MessageIdentifier, SerialNumber) — the only correlation available for
@@ -539,7 +543,7 @@ func (s *Server) SetGNBDisconnectHandler(fn func(ctx context.Context, ue *amfctx
 // Timer fires for a CM-IDLE UE that has not been reachable since its Mobile Reachable
 // Timer expired. The callback must release SMF sessions, deregister from UDM, and
 // remove the UE context.
-// Ref: TS 23.501 §5.3.2
+// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 func (s *Server) SetImplicitDetachHandler(fn func(ctx context.Context, ue *amfctx.UEContext)) {
 	s.onImplicitDetach = fn
 }
@@ -606,6 +610,48 @@ func (s *Server) WithTimerConfig(cfg TimerConfig) {
 	s.timerCfg = cfg
 }
 
+// WithTimerStore shares the runtime timer store. When set, Mobile Reachable
+// (T3512 + guard) and Implicit Detach durations are read from it at arm time;
+// PendingRemoval stays startup-only (WithTimerConfig). Call before Start().
+func (s *Server) WithTimerStore(st *timercfg.Store) {
+	s.timers = st
+}
+
+// TimerConfigSnapshot returns the durations a timer armed now would use.
+func (s *Server) TimerConfigSnapshot() TimerConfig {
+	cfg := s.timerCfg
+	if s.timers != nil {
+		v := s.timers.Effective()
+		cfg.MobileReachable = v.MobileReachable()
+		cfg.ImplicitDetach = v.ImplicitDetach()
+	}
+	return cfg
+}
+
+// mobileReachableDuration is the Mobile Reachable duration for ue, loaded at
+// arm time: max(T3512 sent to the UE, effective T3512) + effective guard, so an
+// O&M lowering of T3512 never makes it shorter than the T3512 the UE holds.
+// Ref: TS 24.501 §5.3.7.
+func (s *Server) mobileReachableDuration(ue *amfctx.UEContext) time.Duration {
+	if s.timers == nil {
+		return s.timerCfg.MobileReachable
+	}
+	v := s.timers.Effective()
+	t3512 := v.T3512Secs
+	if sent := ue.T3512SentSecs; sent > t3512 { // caller holds ue.mu
+		t3512 = sent
+	}
+	return time.Duration(t3512+v.GuardSecs) * time.Second
+}
+
+// implicitDetachDuration is the Implicit Detach duration, loaded at arm time.
+func (s *Server) implicitDetachDuration() time.Duration {
+	if s.timers == nil {
+		return s.timerCfg.ImplicitDetach
+	}
+	return s.timers.Effective().ImplicitDetach()
+}
+
 // ---- UE lifecycle timer helpers -------------------------------------------
 // These run from timer goroutines (time.AfterFunc) and must not hold ue.mu
 // when making external calls.
@@ -616,16 +662,19 @@ func (s *Server) WithTimerConfig(cfg TimerConfig) {
 // signalling connection and is reachable by definition (T3512 periodic
 // registration only runs at the UE in 5GMM-IDLE, TS 24.501 §5.3.7). Call this
 // on AN Release; call StopUETimers when the UE enters CM-CONNECTED.
-// Ref: TS 23.501 §5.3.2
+// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 func (s *Server) StartMobileReachableTimer(ue *amfctx.UEContext) {
-	if s.timerCfg.MobileReachable == 0 {
+	ue.Lock()
+	mrDur := s.mobileReachableDuration(ue)
+	if mrDur == 0 {
+		ue.Unlock()
 		return
 	}
-	ue.Lock()
 	if ue.MobileReachableTimer != nil {
 		ue.MobileReachableTimer.Stop()
 	}
-	ue.MobileReachableTimer = time.AfterFunc(s.timerCfg.MobileReachable, func() {
+	ue.MobileReachableDur = mrDur
+	ue.MobileReachableTimer = time.AfterFunc(mrDur, func() {
 		ue.Lock()
 		connected := ue.CMState == amfctx.CMConnected
 		ue.Unlock()
@@ -637,8 +686,8 @@ func (s *Server) StartMobileReachableTimer(ue *amfctx.UEContext) {
 		s.logger.Info("Mobile Reachable Timer expired — starting Implicit Detach Timer",
 			"procedure", "ImplicitDetach",
 			"supi", ue.SUPI,
-			"mobile_reachable_dur", s.timerCfg.MobileReachable,
-			"spec_ref", "TS 23.501 §5.3.2",
+			"mobile_reachable_dur", mrDur,
+			"spec_ref", "TS 24.501 §5.3.7; TS 23.501 §5.4.1.1",
 		)
 		s.startImplicitDetachTimer(ue)
 	})
@@ -649,7 +698,7 @@ func (s *Server) StartMobileReachableTimer(ue *amfctx.UEContext) {
 // Call whenever the UE enters CM-CONNECTED (registration complete, service
 // request, registration update): a UE with a NAS signalling connection is
 // reachable, so the CM-IDLE watchdogs must not run.
-// Ref: TS 23.501 §5.3.2
+// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 func (s *Server) StopUETimers(ue *amfctx.UEContext) {
 	ue.Lock()
 	if ue.MobileReachableTimer != nil {
@@ -663,16 +712,18 @@ func (s *Server) StopUETimers(ue *amfctx.UEContext) {
 
 // startImplicitDetachTimer arms (or resets) the Implicit Detach Timer for ue.
 // When it fires it calls onImplicitDetach (releases PDU sessions, deregisters UDM,
-// removes context). Ref: TS 23.501 §5.3.2
+// removes context). Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 func (s *Server) startImplicitDetachTimer(ue *amfctx.UEContext) {
-	if s.timerCfg.ImplicitDetach == 0 {
+	idDur := s.implicitDetachDuration()
+	if idDur == 0 {
 		return
 	}
 	ue.Lock()
 	if ue.ImplicitDetachTimer != nil {
 		ue.ImplicitDetachTimer.Stop()
 	}
-	ue.ImplicitDetachTimer = time.AfterFunc(s.timerCfg.ImplicitDetach, func() {
+	ue.ImplicitDetachDur = idDur
+	ue.ImplicitDetachTimer = time.AfterFunc(idDur, func() {
 		ue.Lock()
 		connected := ue.CMState == amfctx.CMConnected
 		ue.Unlock()
@@ -684,9 +735,9 @@ func (s *Server) startImplicitDetachTimer(ue *amfctx.UEContext) {
 		s.logger.Info("Implicit Detach Timer expired — performing implicit detach",
 			"procedure", "ImplicitDetach",
 			"supi", ue.SUPI,
-			"implicit_detach_dur", s.timerCfg.ImplicitDetach,
+			"implicit_detach_dur", idDur,
 			"result", "OK",
-			"spec_ref", "TS 23.501 §5.3.2",
+			"spec_ref", "TS 24.501 §5.3.7; TS 23.501 §5.4.1.1",
 		)
 		s.removeUEFromIdleUEs(ue)
 		if s.onImplicitDetach != nil {
@@ -1383,7 +1434,7 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 			}
 			ue.CMState = amfctx.CMConnected
 			// UE is reconnecting — cancel Mobile Reachable and Implicit Detach timers.
-			// Ref: TS 23.501 §5.3.2
+			// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 			ue.StopAllTimers()
 			ue.Unlock()
 
@@ -1819,12 +1870,31 @@ func (s *Server) SendPDUSessionResourceReleaseCommand(ue *amfctx.UEContext, pduS
 	return err
 }
 
+// ErrNoN2Association is returned by SendUEContextReleaseCommandForUEStrict when
+// the UE has no live serving gNB association, so nothing was sent.
+var ErrNoN2Association = errors.New("amf: no N2 association for UE")
+
 // SendUEContextReleaseCommandForUE sends a UE Context Release Command to the gNB
 // that is currently serving the given UE. Used for AMF-initiated releases such as
 // network-side deregistration and UE deregistration while CM-CONNECTED.
-// If the UE is already CM-IDLE (no gNB entry), this is a no-op.
+// If the UE is already CM-IDLE (no gNB entry), this is a no-op returning nil.
+// Callers that must distinguish "sent" from "skipped" use
+// SendUEContextReleaseCommandForUEStrict.
 // Ref: TS 38.413 §8.3.3
 func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePresent int, causeValue int64) error {
+	err := s.SendUEContextReleaseCommandForUEStrict(ue, causePresent, causeValue)
+	if errors.Is(err, ErrNoN2Association) {
+		return nil
+	}
+	return err
+}
+
+// SendUEContextReleaseCommandForUEStrict behaves like
+// SendUEContextReleaseCommandForUE but returns ErrNoN2Association (instead of
+// nil) when no serving gNB is found and nothing was sent. The gNB lookup and the
+// send happen in one call, so there is no check/send window for the caller.
+// Ref: TS 38.413 §8.3.3
+func (s *Server) SendUEContextReleaseCommandForUEStrict(ue *amfctx.UEContext, causePresent int, causeValue int64) error {
 	gnb := s.findGNBForUE(ue)
 	if gnb == nil {
 		// UE is already CM-IDLE or not tracked — no N2 connection to release.
@@ -1838,7 +1908,7 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 			"supi", ue.SUPI,
 			"spec_ref", "TS 38.413 §8.3.3",
 		)
-		return nil
+		return ErrNoN2Association
 	}
 	if err := s.SendUEContextReleaseCommand(gnb, ue.AMFUENGAPId, ue.RANUENGAPId, causePresent, causeValue); err != nil {
 		return err
@@ -1854,6 +1924,14 @@ func (s *Server) SendUEContextReleaseCommandForUE(ue *amfctx.UEContext, causePre
 		s.startPendingRemovalTimer(ue)
 	}
 	return nil
+}
+
+// HasN2Association reports whether the UE has a serving gNB with a live N2
+// association (GNBAddr resolves to a tracked gNB). It lets callers distinguish
+// "release sent" from the silent skip of SendUEContextReleaseCommandForUE.
+// Ref: TS 38.413 §8.3.3
+func (s *Server) HasN2Association(ue *amfctx.UEContext) bool {
+	return s.findGNBForUE(ue) != nil
 }
 
 // SendPaging emits an NGAP Paging for a CM-IDLE UE to every connected gNB whose
@@ -2089,7 +2167,7 @@ func (s *Server) handleUEContextReleaseComplete(ctx context.Context, gnb *GNBCon
 	// Start Mobile Reachable Timer: UE is now CM-IDLE. If it does not reconnect
 	// (Service Request or Periodic Registration) before this expires, the AMF
 	// will initiate implicit detach.
-	// Ref: TS 23.501 §5.3.2
+	// Ref: TS 24.501 §5.3.7; TS 23.501 §5.4.1.1
 	s.StartMobileReachableTimer(ue)
 }
 

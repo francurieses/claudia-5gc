@@ -28,6 +28,8 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
 	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/oauth2"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -131,7 +133,7 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logging.Level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))
@@ -172,7 +174,7 @@ func main() {
 	if metricsAddr == "" {
 		metricsAddr = "0.0.0.0:9101"
 	}
-	metricsSrv := metrics.MetricsServer(metricsAddr)
+	metricsSrv := metrics.MetricsServerWithAdmin(metricsAddr, logging.NewLevelAdmin(logging.Level, logger))
 	go func() {
 		logger.Info("metrics server listening", "addr", metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -365,7 +367,14 @@ func main() {
 	// T3512 Periodic Registration Timer sent to UE in Registration Accept.
 	// Configure via timers.t3512_secs in nf/amf/config/dev.yaml.
 	// Ref: TS 24.501 §8.2.7.1 (IEI 0x5E), §10.2
-	regHandler.WithT3512(cfg.Timers.T3512Secs)
+	// Runtime store shared with the NGAP server and the O&M timer API: values are
+	// read at use time, so PUT /amf/v1/config/timers takes effect without restart.
+	timerStore := timercfg.New(timercfg.Values{
+		T3512Secs:          cfg.Timers.T3512Secs,
+		GuardSecs:          cfg.Timers.MobileReachableGuardSecs,
+		ImplicitDetachSecs: cfg.Timers.ImplicitDetachSecs,
+	})
+	regHandler.WithTimerStore(timerStore)
 	// Registration area (TAI list, IEI 0x54) sent in every Registration Accept.
 	// Ref: TS 24.501 §9.11.3.9
 	regHandler.WithServedTACs(cfg.ServedTACs)
@@ -414,12 +423,13 @@ func main() {
 		SNSSAIs:  amfSNSSAIs,
 	}, logger)
 	// Configure UE lifecycle timer durations.
-	// Ref: TS 23.501 §5.3.2 (Mobile Reachable, Implicit Detach), TS 38.413 §8.3.3
+	// Ref: TS 24.501 §5.3.7, TS 23.501 §5.4.1.1 (Mobile Reachable, Implicit Detach), TS 38.413 §8.3.3
 	ngapSrv.WithTimerConfig(ngap.TimerConfig{
 		MobileReachable: time.Duration(cfg.Timers.T3512Secs+cfg.Timers.MobileReachableGuardSecs) * time.Second,
 		ImplicitDetach:  time.Duration(cfg.Timers.ImplicitDetachSecs) * time.Second,
 		PendingRemoval:  time.Duration(cfg.Timers.PendingRemovalWatchdogSecs) * time.Second,
 	})
+	ngapSrv.WithTimerStore(timerStore)
 
 	// ---- NAS handler -------------------------------------------------------
 	// Create wrapper that implements Sender interface with SMF capability
@@ -1092,6 +1102,15 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(status)
 	})
+
+	// O&M-triggered AN release: POST /amf/v1/ue-contexts/{supi}/an-release
+	// (+ method-less 405 pattern so non-POST never reaches the catch-all below).
+	// Ref: TS 23.502 §4.2.6, TS 38.413 §8.3.3
+	mgmt.RegisterANRelease(mgmtMux, mgr, ngapSrv, logger)
+
+	// Runtime timer configuration: GET/PUT /amf/v1/config/timers (T3512, guard,
+	// implicit detach; runtime only). Ref: TS 24.501 §5.3.7, §10.2.
+	mgmt.RegisterTimerConfig(mgmtMux, timerStore, logger)
 
 	// NW-initiated PDU Session Release: DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}
 	// Also handles GET /amf/v1/ue-contexts/ (Go's ServeMux redirects the no-slash

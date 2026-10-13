@@ -24,10 +24,9 @@ amf_addr: "http://amf:9002"
 jaeger_addr: "http://jaeger:16686"
 prometheus_addr: "http://prometheus:9090"
 
-# mgmt-portal's plain-HTTP API — Group F reaches UERANSIM containers via
-# POST /api/v1/ueransim/nr-cli instead of a mounted Docker socket (MCP is
-# reachable over SSE by external LLM clients, so it never touches Docker
-# directly; mgmt-portal already holds that socket, read-only, internal-net-only).
+# mgmt-portal's plain-HTTP API. The status, control, runtime-config and PCAP
+# tools go through it; the portal holds the Docker socket (read-only, internal
+# network only), so MCP never touches Docker directly.
 portal_addr: "http://mgmt-portal:8080"
 
 # Group I: PDU session QoS tools — SMF management API (shares the SBI listener,
@@ -35,20 +34,40 @@ portal_addr: "http://mgmt-portal:8080"
 smf_addr: "https://smf:8004"
 udm_addr: "https://udm:8003"
 
+# pcf_binding_list: BSF Nbsf_Management SBI (mTLS). Env: BSF_ADDR.
+bsf_addr: "https://bsf:8010"
+
+# af_qos_session_*: NEF Nnef_AFsessionWithQoS SBI (mTLS + NRF bearer token). Env: NEF_ADDR.
+nef_addr: "https://nef:8011"
+
+# sms_send_mt: SMSF internal MT-SMS trigger (mTLS). Env: SMSF_ADDR.
+smsf_addr: "https://smsf:8009"
+
 # TLS material for the NRF SBI (which enforces mTLS). The AMF management API and
 # Jaeger/Prometheus are plain HTTP and need none of this.
 ca_file: "/etc/5gc/pki/ca.crt"
 client_cert_file: "/etc/5gc/pki/mcp.crt"
 client_key_file: "/etc/5gc/pki/mcp.key"
 
-# Group F: UERANSIM orchestration tools (via mgmt-portal, see portal_addr above).
-ueransim:
-  container_name: ueransim-ue   # matches docker-compose container_name
-  # Must exceed mgmt-portal's own internal nr-cli exec timeout (20s), or this
-  # client cancels the request first and kills mgmt-portal's exec early.
-  exec_timeout_sec: 25
+# Host override for NF metrics addresses read from Prometheus (smf:9105 -> <host>:9105).
+# Empty inside Docker (container names resolve). Set to "localhost" only when MCP runs on
+# the host; see config/local.yaml.example. Env: MCP_METRICS_HOST_OVERRIDE.
+metrics_host_override: ""
 
 # Group G: Prometheus metrics tools (supplements prometheus_addr above).
 prometheus:
   addr: ""                       # empty = use top-level prometheus_addr
   query_timeout_sec: 5
+
+# Guardrails (see mcp/internal/guard). access_mode caps what is exposed:
+# read-only | operator | lab. dev runs operator so mutating and disruptive
+# tools are available with confirm:true; admin tools need lab.
+access_mode: operator
+allow_service_control: false
+guardrails:
+  min_interval_ms: 2000      # minimum gap between two confirmed disruptive calls
+  max_result_bytes: 262144   # 256 KiB cap on any single tool result
+  audit_size: 256
+
+# Loki query API used by log_query and procedure_timeline (obs-net).
+loki_addr: "http://loki:3100"

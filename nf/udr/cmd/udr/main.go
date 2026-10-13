@@ -17,6 +17,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/server"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/store"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
@@ -25,7 +26,7 @@ import (
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logging.Level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
 				a.Value = slog.StringValue(time.Now().UTC().Format(time.RFC3339Nano))
@@ -180,7 +181,7 @@ func main() {
 
 	// ---- Metrics server --------------------------------------------------
 	metricsAddr := getEnvDefault("METRICS_ADDRESS", "0.0.0.0:9104")
-	metricsSrv := metrics.MetricsServer(metricsAddr)
+	metricsSrv := metrics.MetricsServerWithAdmin(metricsAddr, logging.NewLevelAdmin(logging.Level, logger))
 	go func() {
 		logger.Info("metrics server listening", "addr", metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

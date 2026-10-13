@@ -39,7 +39,10 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Build all NFs without workspace
-        run: GOWORK=off go build ./nf/... ./shared/...
+        run: GOWORK=off go build ./nf/... ./shared/... ./mcp/...
+
+      - name: Test MCP server (guardrails, registry, transports)
+        run: GOWORK=off go test -race ./mcp/...
 
   docs-lint:
     name: Docs drift — code vs documentation (warning-only)

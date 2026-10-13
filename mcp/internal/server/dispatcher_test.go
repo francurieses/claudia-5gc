@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"io"
 	"log/slog"
 	"testing"
@@ -19,7 +20,7 @@ func testDispatcher(t *testing.T) *Dispatcher {
 	if err := reg.RegisterAll(nastools.All()...); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	return NewDispatcher(reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewDispatcher(reg, guard.New(guard.Options{Mode: guard.ModeLab}, slog.New(slog.NewTextHandler(io.Discard, nil))), slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 func req(t *testing.T, method string, params any) *jsonrpc.Request {
@@ -70,8 +71,8 @@ func TestToolsList(t *testing.T) {
 	if err := json.Unmarshal(resp.Result, &r); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(r.Tools) != 4 { // nas_decode, nas_encode, ie_validate, tlv_inspect
-		t.Fatalf("tools count: got %d, want 4", len(r.Tools))
+	if len(r.Tools) != 6 { // nas_decode, nas_encode, ie_validate, tlv_inspect, ngap_decode, pfcp_decode
+		t.Fatalf("tools count: got %d, want 6", len(r.Tools))
 	}
 }
 

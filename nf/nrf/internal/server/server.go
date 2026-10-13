@@ -2,13 +2,13 @@
 //
 // Endpoints implemented (3GPP TS 29.510 v17):
 //
-//   PUT    /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFRegister
-//   PATCH  /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFUpdate
-//   DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFDeregister
-//   GET    /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFProfileRetrieve
-//   GET    /nnrf-disc/v1/nf-instances                    NFDiscover
-//   GET    /healthz                                      Liveness probe
-//   GET    /metrics                                      Prometheus metrics
+//	PUT    /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFRegister
+//	PATCH  /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFUpdate
+//	DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFDeregister
+//	GET    /nnrf-nfm/v1/nf-instances/{nfInstanceId}      NFProfileRetrieve
+//	GET    /nnrf-disc/v1/nf-instances                    NFDiscover
+//	GET    /healthz                                      Liveness probe
+//	GET    /metrics                                      Prometheus metrics
 package server
 
 import (
@@ -35,6 +35,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/registry"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
@@ -110,6 +111,8 @@ func New(cfg *config.Config, reg registry.Registry, logger *slog.Logger) (*Serve
 	// Metrics server (separado para no exponer Prometheus en SBI)
 	mmux := http.NewServeMux()
 	mmux.Handle("/metrics", promhttp.Handler())
+	// Runtime log level (see shared/logging): internal metrics port only.
+	mmux.Handle("/admin/v1/log-level", logging.NewLevelAdmin(logging.Level, logger))
 	s.metrics = &http.Server{
 		Addr:              cfg.Metrics.Address,
 		Handler:           mmux,

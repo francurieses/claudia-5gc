@@ -65,34 +65,6 @@ func (c *AMF) GetContext(ctx context.Context, supi string) (json.RawMessage, err
 	return body, nil
 }
 
-// ModifyPDUSessionQoS triggers a NW-initiated QoS modification on an active PDU session.
-// Calls PATCH /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}/qos.
-// Ref: TS 23.502 §4.3.3.2
-func (c *AMF) ModifyPDUSessionQoS(ctx context.Context, supi string, pduSessionID int, fiveQI, ambrDLMbps, ambrULMbps int) (json.RawMessage, error) {
-	body, _ := json.Marshal(map[string]any{
-		"5qi":         fiveQI,
-		"ambr_dl_mbps": ambrDLMbps,
-		"ambr_ul_mbps": ambrULMbps,
-	})
-	u := fmt.Sprintf("%s/amf/v1/ue-contexts/%s/pdu-sessions/%d/qos",
-		c.baseURL, url.PathEscape(supi), pduSessionID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, u, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("amf: build qos modify request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("amf: qos modify: %w", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode != http.StatusAccepted {
-		return nil, fmt.Errorf("amf: qos modify: status %d: %s", resp.StatusCode, string(respBody))
-	}
-	return respBody, nil
-}
-
 func (c *AMF) do(ctx context.Context, u string) (json.RawMessage, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -103,10 +75,91 @@ func (c *AMF) do(ctx context.Context, u string) (json.RawMessage, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("amf: request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("amf: read body: %w", err)
 	}
 	return body, resp.StatusCode, nil
+}
+
+// sendAMF performs a management-API call that changes state and returns the
+// status code and the (capped) body. Non-2xx codes are returned, not errors, so
+// each control tool maps the codes it expects (for example 409 CM-IDLE).
+func (c *AMF) sendAMF(ctx context.Context, method, u string, body any) (int, []byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, fmt.Errorf("amf: encode body: %w", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
+	if err != nil {
+		return 0, nil, fmt.Errorf("amf: build request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("amf: %s: %w", method, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("amf: read body: %w", err)
+	}
+	return resp.StatusCode, raw, nil
+}
+
+// DeregisterUE triggers a network-initiated deregistration with re-registration
+// required. Calls DELETE /amf/v1/ue-contexts/{supi}. Ref: TS 23.502 §4.2.2.3.3.
+func (c *AMF) DeregisterUE(ctx context.Context, supi string) (int, []byte, error) {
+	return c.sendAMF(ctx, http.MethodDelete, c.baseURL+"/amf/v1/ue-contexts/"+url.PathEscape(supi), nil)
+}
+
+// ReleasePDUSession triggers a network-initiated PDU session release. Calls
+// DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}. Ref: TS 23.502 §4.3.4.3.
+func (c *AMF) ReleasePDUSession(ctx context.Context, supi string, psi int) (int, []byte, error) {
+	u := fmt.Sprintf("%s/amf/v1/ue-contexts/%s/pdu-sessions/%d", c.baseURL, url.PathEscape(supi), psi)
+	return c.sendAMF(ctx, http.MethodDelete, u, nil)
+}
+
+// PushPolicies asks the AMF to send the current URSP (UE policy) to a registered
+// UE. Calls POST /amf/v1/ue-contexts/{supi}/push-policies. 409 means CM-IDLE:
+// delivery is deferred. Ref: TS 23.502 §4.2.4.3.
+func (c *AMF) PushPolicies(ctx context.Context, supi string) (int, []byte, error) {
+	return c.sendAMF(ctx, http.MethodPost, c.baseURL+"/amf/v1/ue-contexts/"+url.PathEscape(supi)+"/push-policies", nil)
+}
+
+// NSSAA runs an AAA-initiated slice re-authentication or revocation. Calls
+// POST /amf/v1/ue-contexts/{supi}/nssaa/{action} with {sst, sd}. action is
+// "reauth" or "revoke". Ref: TS 23.502 §4.2.9.3 (re-auth), §4.2.9.4 (revoke).
+func (c *AMF) NSSAA(ctx context.Context, supi, action string, sst int, sd string) (int, []byte, error) {
+	u := c.baseURL + "/amf/v1/ue-contexts/" + url.PathEscape(supi) + "/nssaa/" + action
+	return c.sendAMF(ctx, http.MethodPost, u, map[string]any{"sst": sst, "sd": sd})
+}
+
+// ANRelease asks the AMF to release the AN connection of a CM-CONNECTED UE (UE
+// Context Release Command, cause O&M intervention). Calls
+// POST /amf/v1/ue-contexts/{supi}/an-release. Ref: TS 23.502 §4.2.6, TS 38.413 §8.3.3.
+func (c *AMF) ANRelease(ctx context.Context, supi string) (int, []byte, error) {
+	return c.sendAMF(ctx, http.MethodPost, c.baseURL+"/amf/v1/ue-contexts/"+url.PathEscape(supi)+"/an-release", nil)
+}
+
+// TimerConfigPath is the AMF management path for the runtime NAS timers.
+const TimerConfigPath = "/amf/v1/config/timers"
+
+// GetTimerConfig reads the effective and base AMF timers. Calls
+// GET /amf/v1/config/timers. Ref: TS 24.501 §5.3.7, §10.2 Table 10.2.1.
+func (c *AMF) GetTimerConfig(ctx context.Context) (int, []byte, error) {
+	return c.sendAMF(ctx, http.MethodGet, c.baseURL+TimerConfigPath, nil)
+}
+
+// PutTimerConfig changes (or with reset:true restores) the AMF timers at runtime.
+// Calls PUT /amf/v1/config/timers. Non-2xx codes are returned, not errors.
+func (c *AMF) PutTimerConfig(ctx context.Context, body map[string]any) (int, []byte, error) {
+	return c.sendAMF(ctx, http.MethodPut, c.baseURL+TimerConfigPath, body)
 }

@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -306,17 +307,70 @@ var (
 // MetricsServer builds a standalone HTTP server for the /metrics endpoint.
 // Addr is the listen address (e.g. "0.0.0.0:9101").
 func MetricsServer(addr string) *http.Server {
+	return MetricsServerWithAdmin(addr, nil)
+}
+
+// logLevelAdminPath is the built-in admin route of MetricsServerWithAdmin; extra
+// routes may not shadow it.
+const logLevelAdminPath = "/admin/v1/log-level"
+
+// adminPathPrefix is the only namespace extra AdminRoutes may use.
+const adminPathPrefix = "/admin/"
+
+// AdminRoute is an extra operator-facing handler mounted by
+// MetricsServerWithAdmin. Like the log-level route it has no authentication, so
+// it is served on the internal metrics port only.
+type AdminRoute struct {
+	// Pattern is the http.ServeMux pattern; it must start with "/admin/".
+	Pattern string
+	// Handler serves the route; a nil Handler makes the route be skipped.
+	Handler http.Handler
+}
+
+// MetricsServerWithAdmin is MetricsServer plus an optional admin handler mounted
+// at /admin/v1/log-level (see shared/logging.LevelAdmin) and any number of extra
+// AdminRoutes. The admin routes have no authentication, so they must stay on the
+// internal metrics port.
+//
+// A route is skipped (no panic, ServeMux.Handle would panic on duplicates) when
+// its Handler is nil, its Pattern is outside "/admin/", or it duplicates
+// /admin/v1/log-level or an earlier route.
+func MetricsServerWithAdmin(addr string, logLevel http.Handler, routes ...AdminRoute) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"UP"}`))
 	})
+	mounted := map[string]bool{logLevelAdminPath: true}
+	if logLevel != nil {
+		mux.Handle(logLevelAdminPath, logLevel)
+	}
+	for _, rt := range routes {
+		if rt.Handler == nil || !strings.HasPrefix(rt.Pattern, adminPathPrefix) || mounted[rt.Pattern] {
+			continue
+		}
+		if handleSafely(mux, rt) {
+			mounted[rt.Pattern] = true
+		}
+	}
 	return &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+// handleSafely mounts rt, converting a ServeMux pattern panic (malformed
+// pattern) into a skipped route.
+func handleSafely(mux *http.ServeMux, rt AdminRoute) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	mux.Handle(rt.Pattern, rt.Handler)
+	return true
 }
 
 // SBIMiddleware wraps an http.Handler and records SBI metrics for the given NF.

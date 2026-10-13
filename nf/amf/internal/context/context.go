@@ -284,7 +284,19 @@ type UEContext struct {
 	// context is force-removed to prevent a permanent leak.
 	MobileReachableTimer *time.Timer
 	ImplicitDetachTimer  *time.Timer
-	PendingRemovalTimer  *time.Timer
+
+	// T3512SentSecs is the T3512 value (seconds) sent to the UE in its last
+	// REGISTRATION ACCEPT; 0 means unknown. Used so that, after an O&M
+	// lowering of T3512, the mobile reachable timer stays longer than the T3512
+	// the UE actually holds (TS 24.501 §5.3.7). Guarded by mu; use
+	// SetT3512SentSecs / T3512Sent.
+	T3512SentSecs int `json:"t3512_sent_secs,omitempty"`
+	// MobileReachableDur / ImplicitDetachDur record the duration used when the
+	// corresponding timer was last armed (observability and tests). Guarded by mu;
+	// use ArmedDurations.
+	MobileReachableDur  time.Duration `json:"-"`
+	ImplicitDetachDur   time.Duration `json:"-"`
+	PendingRemovalTimer *time.Timer
 
 	// Per-UE serial task queue used by the NGAP layer to process this UE's
 	// messages in arrival order without blocking the shared SCTP read loop
@@ -505,6 +517,29 @@ func kamfUsable(kamf []byte) bool {
 		}
 	}
 	return false
+}
+
+// SetT3512SentSecs records the T3512 sent to the UE in a Registration Accept.
+// It takes the UE lock; the caller must not hold it.
+func (u *UEContext) SetT3512SentSecs(secs int) {
+	u.mu.Lock()
+	u.T3512SentSecs = secs
+	u.mu.Unlock()
+}
+
+// T3512Sent returns the T3512 (seconds) last sent to the UE, 0 if unknown.
+func (u *UEContext) T3512Sent() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.T3512SentSecs
+}
+
+// ArmedDurations returns the durations used when the Mobile Reachable and
+// Implicit Detach timers were last armed (0 if never armed).
+func (u *UEContext) ArmedDurations() (mobileReachable, implicitDetach time.Duration) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.MobileReachableDur, u.ImplicitDetachDur
 }
 
 // Lock/Unlock expose the mutex for procedures that need to hold state across steps.
@@ -867,7 +902,9 @@ type UESnapshot struct {
 	CMState          string    `json:"cm_state"`
 	RegistrationTime time.Time `json:"registration_time"`
 	LastActivity     time.Time `json:"last_activity"`
-	PDUSessionIDs    []uint8   `json:"pdu_session_ids"`
+	// PDUSessionIDs is []int (not []uint8) so encoding/json emits a numeric array
+	// instead of a base64 string. Ascending order.
+	PDUSessionIDs []int `json:"pdu_session_ids"`
 }
 
 // Snapshot returns a JSON-safe view of the UE context. It takes the per-UE lock
@@ -890,11 +927,9 @@ func (u *UEContext) Snapshot() UESnapshot {
 		snap.GUTI = u.GUTI.String()
 	}
 	for psi := range u.PDUSessions {
-		snap.PDUSessionIDs = append(snap.PDUSessionIDs, psi)
+		snap.PDUSessionIDs = append(snap.PDUSessionIDs, int(psi))
 	}
-	sort.Slice(snap.PDUSessionIDs, func(i, j int) bool {
-		return snap.PDUSessionIDs[i] < snap.PDUSessionIDs[j]
-	})
+	sort.Ints(snap.PDUSessionIDs)
 	return snap
 }
 

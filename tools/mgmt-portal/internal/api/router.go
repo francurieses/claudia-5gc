@@ -171,9 +171,7 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 		r.Post("/policy-templates/{id}/apply", deps.handleApplyTemplate)
 
 		// Health
-		r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		})
+		r.Get("/health", deps.handleHealth)
 	})
 
 	// WebSocket log streaming

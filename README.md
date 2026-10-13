@@ -1,11 +1,16 @@
 <!-- tier: public -->
-# ClaudIA 5GC
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/logo-horizontal.svg">
+    <img src="brand/logo-horizontal-dark.svg" alt="ClaudIA 5GC" width="420">
+  </picture>
+</p>
 
 [![CI](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml/badge.svg)](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml)
 ![Go 1.26.2](https://img.shields.io/badge/Go-1.26.2-00ADD8?logo=go&logoColor=white)
 ![3GPP Rel-17](https://img.shields.io/badge/3GPP-Rel--17-blue)
 ![Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
 **A from-scratch, spec-faithful 5G Core (Standalone, 3GPP Rel-17) in Go — 13 network functions in Docker, Wireshark-clean N1/N2/N4/N3, validated with UERANSIM, PacketRusher, and a commercial gNB with COTS 5G handsets.**
 
@@ -280,7 +285,9 @@ Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Commits look like `feat(amf): impleme
 
 ## License
 
-[Apache-2.0](LICENSE). Original code © 2026 Francisco Curieses. No Open5GS (AGPL) code is used.
+Licensed under the [GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later). Original code © 2026 Francisco Curieses.
+
+Third-party components keep their own licenses and notices; they are listed below and are compatible with GPL-3.0.
 
 | Third-party | Use | License |
 |-------------|-----|---------|

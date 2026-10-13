@@ -5,6 +5,9 @@ package ngap
 
 import (
 	"testing"
+	"time"
+
+	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 
 	libngap "github.com/free5gc/ngap"
 	"github.com/free5gc/ngap/ngapType"
@@ -236,4 +239,56 @@ func buildSyntheticReleaseRequest(t *testing.T, amfID, ranID int64) []byte {
 		t.Fatalf("encode synthetic ReleaseRequest: %v", err)
 	}
 	return b
+}
+
+// TestBuildUEContextReleaseCommand_OmIntervention verifies the O&M AN release
+// command: cause misc/om-intervention (3) and IE order UE NGAP IDs then Cause.
+// Ref: TS 38.413 §9.2.2.5, §9.3.1.2.
+func TestBuildUEContextReleaseCommand_OmIntervention(t *testing.T) {
+	pdu := BuildUEContextReleaseCommand(42, 7,
+		ngapType.CausePresentMisc, int64(ngapType.CauseMiscPresentOmIntervention))
+	decoded, err := libngap.Decoder(pdu)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	list := decoded.InitiatingMessage.Value.UEContextReleaseCommand.ProtocolIEs.List
+	if len(list) != 2 {
+		t.Fatalf("want 2 IEs, got %d", len(list))
+	}
+	if list[0].Id.Value != ngapType.ProtocolIEIDUENGAPIDs || list[1].Id.Value != ngapType.ProtocolIEIDCause {
+		t.Fatalf("IE order = %d,%d; want UENGAPIDs then Cause", list[0].Id.Value, list[1].Id.Value)
+	}
+	if list[0].Value.UENGAPIDs.Present != ngapType.UENGAPIDsPresentUENGAPIDPair {
+		t.Error("UE NGAP IDs must be the pair")
+	}
+	c := list[1].Value.Cause
+	if c.Present != ngapType.CausePresentMisc || c.Misc == nil ||
+		int64(c.Misc.Value) != 3 {
+		t.Errorf("cause = %+v, want misc/om-intervention(3)", c)
+	}
+}
+
+// TestHasN2Association covers the 503 decision input of the O&M AN release.
+func TestHasN2Association(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	s := newRegistryServer(clk)
+	s.gnbs["10.0.0.1:1"] = newTestGNB(clk, "gnb-a", 1)
+
+	tests := []struct {
+		name string
+		addr string
+		want bool
+	}{
+		{"known gNB", "10.0.0.1:1", true},
+		{"unknown gNB", "10.0.0.9:9", false},
+		{"no GNBAddr", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ue := &amfctx.UEContext{GNBAddr: tc.addr}
+			if got := s.HasN2Association(ue); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
