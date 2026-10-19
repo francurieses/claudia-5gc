@@ -6,11 +6,17 @@
   </picture>
 </p>
 
-[![CI](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml/badge.svg)](https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml)
-![Go 1.26.2](https://img.shields.io/badge/Go-1.26.2-00ADD8?logo=go&logoColor=white)
-![3GPP Rel-17](https://img.shields.io/badge/3GPP-Rel--17-blue)
-![Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
-[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+<p align="center">
+  <a href="https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml"><img src="https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Go-1.26.2-00ADD8?logo=go&logoColor=white" alt="Go 1.26.2">
+  <img src="https://img.shields.io/badge/3GPP-Rel--17-blue" alt="3GPP Rel-17">
+  <img src="https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
+</p>
+
+<p align="center">
+  <a href="https://buymeacoffee.com/claudia5gc"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=claudia5gc&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="36"></a>
+</p>
 
 **A from-scratch, spec-faithful 5G Core (Standalone, 3GPP Rel-17) in Go — 13 network functions in Docker, Wireshark-clean N1/N2/N4/N3, validated with UERANSIM, PacketRusher, and a commercial gNB with COTS 5G handsets.**
 
@@ -282,6 +288,12 @@ scripts/             PKI, test suites, PCAP control
 ## Contributing
 
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md). Commits look like `feat(amf): implement X [TS 23.502 §4.2.2.2.2]`. Each new procedure follows the same flow: procedure doc → Cucumber feature → implementation → step definitions → integration test → PCAP validation → conformance update.
+
+## Support the project
+
+ClaudIA 5GC is free and open source. If it saves you time, you can help keep it going:
+
+[<img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=claudia5gc&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="40">](https://buymeacoffee.com/claudia5gc)
 
 ## License
 
