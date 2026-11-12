@@ -1,7 +1,7 @@
 ARG UERANSIM_VERSION=v3.2.8
 
 # ---- build -------------------------------------------------------------------
-FROM ubuntu:22.04 AS build
+FROM ubuntu:25.10 AS build
 
 ARG UERANSIM_VERSION
 ARG DEBIAN_FRONTEND=noninteractive
@@ -71,7 +71,7 @@ RUN cmake -DCMAKE_BUILD_TYPE=Release -G "CodeBlocks - Unix Makefiles" . -B cmake
     cp tools/nr-binder /out/
 
 # ---- runtime -----------------------------------------------------------------
-FROM ubuntu:22.04
+FROM ubuntu:25.10
 
 ARG DEBIAN_FRONTEND=noninteractive
 
