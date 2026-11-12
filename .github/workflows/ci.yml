@@ -149,7 +149,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # Verifies every tools/ueransim/patches/*.patch (including 0041's NRPPa
       # APER codec) still applies cleanly against the pinned v3.2.8 tarball and
       # the gNB/UE/CLI compile — the CI-path equivalent of `make ueransim-build-only`.
@@ -175,7 +175,7 @@ jobs:
         nf: [nrf, amf, ausf, bsf, lmf, nef, nssf, pcf, sepp, smf, smsf, udm, udr, upf]
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # The 14 matrix jobs start at once and each resolves the same Docker Hub
       # base images (golang:1.26.2-alpine, distroless). Anonymous-pull rate
       # limiting makes auth.docker.io reset connections intermittently
