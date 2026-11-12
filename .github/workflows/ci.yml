@@ -17,7 +17,7 @@ jobs:
         # lint omitted: golangci-lint binary doesn't support Go 1.26.2 yet.
         task: [test, build]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           # Lee la versión real del módulo (go 1.26.2). Fijar '1.22' aquí
@@ -32,7 +32,7 @@ jobs:
     name: Go build — all NFs (no workspace)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -51,7 +51,7 @@ jobs:
     # check by removing `continue-on-error` once it has been green for a few weeks.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -72,7 +72,7 @@ jobs:
     # Blocking on purpose: a missing tier marker or a public doc that links to / leaks
     # restricted or internal material must never merge (docs/DOC_MAP.md §4).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Tier rules (13-17)
         run: |
@@ -88,7 +88,7 @@ jobs:
     # import of private/) must never merge into the public tree (Rel-19 M0 exit evidence).
     # The leak scripts are path-internal and not shipped publicly, so the public repo skips.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -105,7 +105,7 @@ jobs:
     name: shared/nrppa — golden-byte + ProcedureCode regression
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -125,7 +125,7 @@ jobs:
     # 3GPP forge). Remove `continue-on-error` once it has been green for a few weeks.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -148,7 +148,7 @@ jobs:
     name: UERANSIM patch set — apply + compile
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       # Verifies every tools/ueransim/patches/*.patch (including 0041's NRPPa
       # APER codec) still applies cleanly against the pinned v3.2.8 tarball and
@@ -174,7 +174,7 @@ jobs:
       matrix:
         nf: [nrf, amf, ausf, bsf, lmf, nef, nssf, pcf, sepp, smf, smsf, udm, udr, upf]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       # The 14 matrix jobs start at once and each resolves the same Docker Hub
       # base images (golang:1.26.2-alpine, distroless). Anonymous-pull rate
@@ -199,7 +199,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: docker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: ./scripts/gen-pki.sh
       - name: Compose up (retry transient registry failures)
         run: |
