@@ -42,6 +42,8 @@ type Config struct {
 	BSFAddr string `yaml:"bsf_addr"`
 	// NEFAddr is the NEF Nnef_AFsessionWithQoS SBI (mTLS), used by af_qos_session_*.
 	NEFAddr string `yaml:"nef_addr"`
+	// SEPPAddr is the visited-PLMN SEPP SBI (mTLS), listed by mcp_info/core_health. Env: SEPP_ADDR.
+	SEPPAddr string `yaml:"sepp_addr"`
 	// SMSFAddr is the SMSF internal MT-SMS trigger (mTLS), used by sms_send_mt.
 	SMSFAddr       string `yaml:"smsf_addr"`
 	JaegerAddr     string `yaml:"jaeger_addr"`
@@ -192,6 +194,9 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv("NEF_ADDR"); v != "" {
 		c.NEFAddr = v
 	}
+	if v := os.Getenv("SEPP_ADDR"); v != "" {
+		c.SEPPAddr = v
+	}
 	if v := os.Getenv("SMSF_ADDR"); v != "" {
 		c.SMSFAddr = v
 	}
@@ -254,6 +259,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SMSFAddr == "" {
 		c.SMSFAddr = "https://smsf:8009"
+	}
+	if c.SEPPAddr == "" {
+		c.SEPPAddr = "https://vsepp:8014"
 	}
 	if c.JaegerAddr == "" {
 		c.JaegerAddr = "http://jaeger:16686"

@@ -749,6 +749,52 @@
         "x": 0,
         "y": 118
       }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "SBI FeatureNegotiation (supportedFeatures) by NF / Result",
+      "description": "TS 29.500 \u00a76.6.2 supportedFeatures negotiation, all 12 SBI NFs. OK = negotiated, REJECT = producer sent 400 INVALID_MSG_FORMAT (non-hex supportedFeatures), FAILURE = consumer received a malformed answer (procedure not failed).",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (nf, result) (rate(fivegc_procedure_total{procedure=\"FeatureNegotiation\"}[5m]))",
+          "legendFormat": "{{nf}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": {
+        "tooltip": { "mode": "multi" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 118 }
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "FeatureNegotiation REJECT + FAILURE (last 1h)",
+      "description": "Non-OK FeatureNegotiation outcomes per NF over the last hour (REJECT = producer 400, FAILURE = consumer saw malformed answer). TS 29.500 \u00a76.6.2.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (nf) (increase(fivegc_procedure_total{procedure=\"FeatureNegotiation\",result=~\"REJECT|FAILURE\"}[1h]))",
+          "legendFormat": "{{nf}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ]
+          }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 126 }
     }
   ]
 }

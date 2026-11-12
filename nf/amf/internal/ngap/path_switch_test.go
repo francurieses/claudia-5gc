@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 	"github.com/ishidawataru/sctp"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
@@ -694,7 +694,7 @@ func TestExtractPathSwitchRequest_Decodes(t *testing.T) {
 								}}}},
 					{Id: ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUESecurityCapabilities}, Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
 						Value: ngapType.PathSwitchRequestIEsValue{Present: ngapType.PathSwitchRequestIEsPresentUESecurityCapabilities,
-							UESecurityCapabilities: buildUESecurityCapabilities(0xE000, 0xC000)}},
+							UESecurityCapabilities: buildUESecurityCapabilities(UESecCapBitmaps{Enc: 0xE000, Int: 0xC000})}},
 					{Id: ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionResourceToBeSwitchedDLList}, Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 						Value: ngapType.PathSwitchRequestIEsValue{Present: ngapType.PathSwitchRequestIEsPresentPDUSessionResourceToBeSwitchedDLList,
 							PDUSessionResourceToBeSwitchedDLList: &ngapType.PDUSessionResourceToBeSwitchedDLList{List: []ngapType.PDUSessionResourceToBeSwitchedDLItem{

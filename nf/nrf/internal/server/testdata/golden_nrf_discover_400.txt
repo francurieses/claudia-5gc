@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"MANDATORY_QUERY_PARAM_INCORRECT","detail":"target-nf-type and requester-nf-type are mandatory","status":400}

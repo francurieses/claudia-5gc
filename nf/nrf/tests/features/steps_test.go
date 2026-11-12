@@ -27,12 +27,12 @@ import (
 
 // nrfCtx holds per-scenario state for NRF BDD tests.
 type nrfCtx struct {
-	srv        *server.Server
-	baseURL    string
-	profileID  string
-	profile    map[string]interface{}
-	lastResp   *http.Response
-	lastBody   map[string]interface{}
+	srv       *server.Server
+	baseURL   string
+	profileID string
+	profile   map[string]interface{}
+	lastResp  *http.Response
+	lastBody  map[string]interface{}
 }
 
 // startServer creates a fresh NRF with in-memory registry bound to a random port.

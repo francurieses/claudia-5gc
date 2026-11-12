@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"authType":"EAP_AKA_PRIME","supportedFeatures":"0","authenticationVector":{"avType":"EAP_AKA_PRIME","rand":"<HEX>","autn":"<HEX>","xres":"<HEX>","ckPrime":"<HEX>","ikPrime":"<HEX>"},"supi":"imsi-001010000000001"}

@@ -27,3 +27,28 @@ metrics:
 #   61cdb319f72eddfbac55c06c3ec38d15828880a259cbc11cc03ca92abb60fb5e
 # Ref: TS 33.501 §6.12, Annex C.3 — SUCI Profile A (protectionScheme: 1)
 hn_private_key_x25519: "c80949d0c3e4d73a54f8b49fbee7793c5c1de649d7e26ef8b05e0a1e0c8c12e9"
+
+# Home Network Public Key Identifiers (TS 33.501 Annex C.1). 0/unset = any id accepted.
+# hn_key_id_x25519: 1
+hn_key_id_p256: 2
+
+# Home network secp256r1 private scalar (hex, 32 bytes) for SUCI Profile B; unset = Profile B -> 501.
+# ⚠️  THIS IS THE TS 33.501 ANNEX C.4.4.1 PUBLISHED TEST VECTOR — NOT A PRODUCTION SECRET.
+#     It is intentionally included here so the dev stack works out of the box.
+#     For any real deployment, generate a fresh key and mount it as a secret file
+#     (HN_PRIVATE_KEY_P256_FILE or hn_private_key_p256_file, mode 0400):
+#       openssl ecparam -name prime256v1 -genkey -noout
+# Corresponding compressed public key (for UE SUCI generation):
+#   0272da71976234ce833a6907425867b82e074d44ef907dfb4b3e21c1c2256ebcd1
+# Ref: TS 33.501 §6.12, Annex C.3.4 / C.4.4 — SUCI Profile B (protectionScheme: 2)
+hn_private_key_p256: "f1ab1074477ebcc7f554ea1c5fc368b1616730155e0041ac447d6301975fecda"
+
+# Key files (hex, trailing newline ok). Precedence: env HN_PRIVATE_KEY_*_FILE > *_file yaml
+# > env HN_PRIVATE_KEY_* > inline yaml value. Keys are never logged.
+# hn_private_key_x25519_file: "/run/secrets/hn_key_x25519"
+# hn_private_key_p256_file: "/run/secrets/hn_key_p256"
+
+# Release profile (default rel19; rel17 = frozen legacy baseline). rel19 enables spec-literal
+# SBI supportedFeatures negotiation (TS 29.500 §6.6.2). NF_RELEASE_PROFILE overrides.
+# release:
+#   profile: rel17

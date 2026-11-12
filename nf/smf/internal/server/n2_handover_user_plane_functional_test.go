@@ -27,8 +27,8 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	"github.com/free5gc/ngap/ngapType"
 	pfcpie "github.com/wmnsk/go-pfcp/ie"
 	pfcpmsg "github.com/wmnsk/go-pfcp/message"
 )

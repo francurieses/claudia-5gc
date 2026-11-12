@@ -36,6 +36,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nia"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Sender is the interface to send NAS PDUs and NGAP messages to the UE via the gNB.
@@ -72,6 +73,9 @@ type Handler struct {
 	sender Sender
 	reg    *procedures.RegistrationHandler
 	logger *slog.Logger
+	// integrity selects strict (default) or relaxed uplink NAS integrity
+	// enforcement. Ref: TS 24.501 §4.4.4.3
+	integrity IntegrityEnforcement
 	// smsfClient forwards UL NAS Transport SMS containers to the SMSF.
 	// Nil = no SMSF configured (UL SMS is dropped with a warning; fail-open).
 	// Ref: TS 29.540 §5.2.4, TS 23.502 §4.13.3
@@ -111,6 +115,13 @@ type Handler struct {
 	// the UE confirms the release.
 	// Ref: TS 23.502 §4.3.4.3 steps 5-8.
 	pendingRelease sync.Map // map[string]*pendingReleaseState
+
+	// Supervision timers T3575 (NSSAA COMMAND, nssaa_timer.go) and T3522 (NW
+	// DEREGISTRATION REQUEST, dereg_timer.go), rel19 only: the timer state lives
+	// on the UEContext; this is only the injectable scheduler (nil =
+	// time.AfterFunc), set by SetTimerSchedulerForTest.
+	// Ref: TS 24.501 §5.4.7.2.3 a), §5.5.2.3.5 a)
+	timerAfter TimerScheduler
 }
 
 // pendingReleaseState tracks one in-flight NW-initiated PDU Session Release
@@ -206,20 +217,72 @@ func (h *Handler) WithNetworkName(full, short string) {
 // It decodes the PDU and dispatches to the appropriate procedure handler.
 func (h *Handler) HandleNASMessage(ctx context.Context, ue *amfctx.UEContext, pdu []byte) error {
 	// Unwrap NAS security for messages sent after security is active.
-	// Ref: TS 24.501 §9.1.1, TS 33.501 §D.3
-	if ue.SecurityCtx.Active && len(pdu) >= 2 && pdu[0] == nas.PDMobilityManagement {
+	// Ref: TS 24.501 §9.1.1, §4.4.4.3, TS 33.501 §D.3
+	wasProtected := false
+	verified := true
+	ue.Lock()
+	if ue.NASOnNewN2Connection {
+		// New N1 signalling connection: the secure exchange starts over.
+		ue.ResetSecureExchange()
+	}
+	ue.Unlock()
+	if len(pdu) >= 2 && pdu[0] == nas.PDMobilityManagement {
 		sht := nas.SecurityHeaderType(pdu[1] & 0x0F)
-		if sht != nas.SecurityHeaderPlainNAS {
-			var err error
-			pdu, err = h.unwrapNASSecurity(ue, pdu)
-			if err != nil {
-				return fmt.Errorf("nas security unwrap: %w", err)
+		switch {
+		case sht != nas.SecurityHeaderPlainNAS && ue.SecurityCtx.Active:
+			out, err := h.unwrapUplink(ue, pdu, sht)
+			switch {
+			case err == nil:
+				pdu = out
+				wasProtected = true
+				ue.MarkSecureExchange() // verified with the current context
+			case errors.Is(err, ErrNASIntegrity):
+				if !h.admitUnverified(ctx, ue, out, sht, true) {
+					return nil
+				}
+				pdu = out
+				verified = false
+			default:
+				return fmt.Errorf("amf: nas security unwrap: %w", err)
 			}
+		case sht == nas.SecurityHeaderPlainNAS && !h.relaxedIntegrity():
+			// Unprotected: only the TS 24.501 §4.4.4.3 list is processed.
+			if !h.admitUnverified(ctx, ue, pdu, sht, false) {
+				return nil
+			}
+			verified = false
+		case sht != nas.SecurityHeaderPlainNAS && !h.relaxedIntegrity():
+			// Security protected but no current 5G NAS security context: the MAC
+			// cannot be verified, so the message is unverified. Ciphered PDUs
+			// (SHT 2/4) cannot be read at all and are discarded.
+			// Ref: TS 24.501 §4.4.4.3
+			if sht == nas.SecurityHeaderIntegrityProtectedAndCiphered ||
+				sht == nas.SecurityHeaderIntegrityProtectedAndCipheredWithNewSC {
+				h.discardNAS(ctx, ue, 0, false, sht, "cannot_be_verified_no_security_context")
+				return nil
+			}
+			if !h.admitUnverified(ctx, ue, pdu, sht, true) {
+				return nil
+			}
+			verified = false
 		}
 	}
-
 	msg, err := nas.Decode(pdu)
 	if err != nil {
+		// A REGISTRATION REQUEST with a protocol error is answered with a
+		// REGISTRATION REJECT: syntactically incorrect mandatory IE -> #96.
+		// Ref: TS 24.501 §5.5.1.2.8 b), §5.5.1.3.8 b)
+		if mt, ok := nas.PeekMessageType(pdu); ok && mt == nas.MsgTypeRegistrationRequest {
+			h.logger.WarnContext(ctx, "REGISTRATION REQUEST decode failed", "nf", "AMF",
+				"procedure", "InitialRegistration", "interface", "N1", "direction", "IN",
+				"amf_ue_ngap_id", ue.AMFUENGAPId, "result", "REJECT", "error", err,
+				"spec_ref", "TS 24.501 §5.5.1.2.8 b)")
+			if rerr := h.rejectRegistration(ctx, ue, nas.CauseInvalidMandatoryInformation,
+				"TS 24.501 §5.5.1.2.8 b)", wasProtected); rerr != nil {
+				return rerr
+			}
+			return fmt.Errorf("nas decode: %w", err) // reported after the REGISTRATION REJECT went out
+		}
 		return fmt.Errorf("nas decode: %w", err)
 	}
 	log := h.logger.With(
@@ -231,9 +294,29 @@ func (h *Handler) HandleNASMessage(ctx context.Context, ue *amfctx.UEContext, pd
 	)
 	log.Info("NAS message received")
 
+	err = h.dispatch(ctx, ue, msg, pdu, verified, log)
+	// One place maps a terminal phase failure to REGISTRATION REJECT.
+	// Ref: TS 24.501 §5.5.1.2.5
+	var rc *procedures.ErrRejectCause
+	if errors.As(err, &rc) {
+		log.WarnContext(ctx, "registration phase failed - REGISTRATION REJECT", "nf", "AMF",
+			"procedure", "InitialRegistration", "interface", "N1", "direction", "IN",
+			"result", "REJECT", "cause", int(rc.Cause),
+			"error", rc.Err, "spec_ref", rc.SpecRef)
+		if rerr := h.rejectRegistration(ctx, ue, rc.Cause, rc.SpecRef, wasProtected); rerr != nil {
+			return rerr
+		}
+		return err // the cause is still reported to the caller's log
+	}
+	return err
+}
+
+// dispatch routes a decoded NAS message to its handler.
+func (h *Handler) dispatch(ctx context.Context, ue *amfctx.UEContext, msg *nas.Message,
+	pdu []byte, verified bool, log *slog.Logger) error {
 	switch msg.Header.MessageType {
 	case nas.MsgTypeRegistrationRequest:
-		return h.handleRegistrationRequest(ctx, ue, msg, pdu)
+		return h.handleRegistrationRequest(ctx, ue, msg, pdu, verified)
 	case nas.MsgTypeAuthenticationResponse:
 		return h.handleAuthenticationResponse(ctx, ue, msg)
 	case nas.MsgTypeAuthenticationFailure:
@@ -267,22 +350,98 @@ func (h *Handler) HandleNASMessage(ctx context.Context, ue *amfctx.UEContext, pd
 // ---- Registration Request -----------------------------------------------
 
 func (h *Handler) handleRegistrationRequest(
-	ctx context.Context, ue *amfctx.UEContext, msg *nas.Message, rawPDU []byte) error {
+	ctx context.Context, ue *amfctx.UEContext, msg *nas.Message, rawPDU []byte, verified bool) error {
 
 	regReq, ok := msg.Body.(*nas.RegistrationRequest)
 	if !ok {
 		return fmt.Errorf("nas: RegistrationRequest body decode failed")
 	}
 
+	// A REGISTRATION REQUEST during a network-initiated de-registration aborts it
+	// (initial registration; mobility/periodic update after cause #62 and the other
+	// listed causes) and the registration progresses: T3522 must not fire later on
+	// a UE that is registering again. No-op without a running T3522 (rel17).
+	// Ref: TS 24.501 §5.5.2.3.5 d), e)
+	ue.StopDeregTimer()
+
+	// A REGISTRATION REQUEST received while a registration procedure is pending.
+	// Identical retransmission: ignored while the procedure is still in progress,
+	// the REGISTRATION ACCEPT is resent (T3550 restarted) once it was sent. IEs
+	// differing: the previous procedure is aborted and the new request processed.
+	// Ref: TS 24.501 §5.5.1.2.8 d) 2), e) 2), §5.5.1.3.8 d) 2), §5.4.3.6 d)
+	if stage := ue.RegStage(); stage != amfctx.RegStageNone {
+		if ue.SameRegRequest(rawPDU) {
+			return h.handleDuplicateRegistrationRequest(ue, stage)
+		}
+		h.logger.InfoContext(ctx, "REGISTRATION REQUEST differs from the pending one - previous procedure aborted",
+			"nf", "AMF", "procedure", "InitialRegistration", "interface", "N1", "direction", "IN",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "stage", stage.String(),
+			"spec_ref", "TS 24.501 §5.5.1.2.8 d) 1), e) 1)")
+		// Always roll back: a no-op unless a new context is still unconfirmed.
+		h.rollbackSecurityCtx(ue, "superseded_by_registration_request")
+		ue.ClearRegProc()
+	}
+	ue.SetLastRegRequest(rawPDU, regReq.RegistrationType == nas.RegistrationTypePeriodic ||
+		regReq.RegistrationType == nas.RegistrationTypeMobility)
+
+	// Initial registration with an existing context: the outer message is integrity
+	// protected and its non-cleartext IEs are in the NAS message container
+	// (initial/emergency/update alike; the update path decodes it itself).
+	// Ref: TS 24.501 §4.4.6, §5.5.1.2.2
+	if regReq.RegistrationType != nas.RegistrationTypePeriodic &&
+		regReq.RegistrationType != nas.RegistrationTypeMobility && !verified {
+		// Integrity unverifiable: the container cannot be trusted. Authenticate
+		// + SMC with RINMR; the existing context stays until that succeeds.
+		// Ref: TS 24.501 §4.4.4.3 b)
+		return h.initiateRegistrationAuth(ctx, ue, regReq, rawPDU)
+	}
+	if regReq.RegistrationType != nas.RegistrationTypePeriodic &&
+		regReq.RegistrationType != nas.RegistrationTypeMobility {
+		outerReq := regReq
+		var cerr error
+		if regReq, cerr = h.registrationRequestFromContainer(ctx, ue, regReq, rawPDU); cerr != nil {
+			// Undecipherable container: fresh authentication + SMC with RINMR.
+			// Ref: TS 24.501 §4.4.6, §5.4.2.2
+			return h.initiateRegistrationAuth(ctx, ue, outerReq, rawPDU)
+		}
+	}
+
 	// Periodic and Mobility Registration Update: skip re-authentication when the
 	// UE already has an active NAS security context with this AMF.
 	// Ref: TS 23.502 §4.2.2.2.3 (Mobility), §4.2.2.2.4 (Periodic)
-	if ue.SecurityCtx.Active &&
-		(regReq.RegistrationType == nas.RegistrationTypePeriodic ||
-			regReq.RegistrationType == nas.RegistrationTypeMobility) {
-		return h.handleRegistrationUpdate(ctx, ue, regReq)
+	// Only for a request that passed the integrity check with the current 5G NAS
+	// security context (that proves the UE holds it); anything else (plain, MAC
+	// failure, no context) is authenticated (AKA + SMC with RINMR) on the existing
+	// context, which stays unchanged if that fails. An ngKSI differing from the
+	// stored one on a verified request is only logged (UERANSIM sends ngKSI 7 on
+	// its T3512 update).
+	// Ref: TS 24.501 §4.4.4.3 b), §5.5.1.3.2, §9.11.3.32
+	if regReq.RegistrationType == nas.RegistrationTypePeriodic ||
+		regReq.RegistrationType == nas.RegistrationTypeMobility {
+		if ue.SecurityCtx.Active && verified {
+			if regReq.NGKSI.KeySetIdentifier != ue.SecurityCtx.NGKSI {
+				h.logger.WarnContext(ctx, "registration update ngKSI differs from stored context, proceeding (MAC verified)",
+					"nf", "AMF", "procedure", "RegistrationUpdate", "interface", "N1", "direction", "IN",
+					"supi", ue.SUPI, "request_ngksi", regReq.NGKSI.KeySetIdentifier,
+					"stored_ngksi", ue.SecurityCtx.NGKSI, "spec_ref", "TS 24.501 §4.4.4.3, §9.11.3.32")
+			}
+			return h.handleRegistrationUpdate(ctx, ue, regReq, rawPDU)
+		}
+		h.logger.InfoContext(ctx, "registration update not verifiable - primary authentication + SMC (RINMR)",
+			"nf", "AMF", "procedure", "RegistrationUpdate", "interface", "N1", "direction", "IN",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI, "integrity_verified", verified,
+			"request_ngksi", regReq.NGKSI.KeySetIdentifier, "spec_ref", "TS 24.501 §4.4.4.3 b)")
 	}
 
+	return h.initiateRegistrationAuth(ctx, ue, regReq, rawPDU)
+}
+
+// initiateRegistrationAuth runs Phase 1 (authentication via AUSF) and sends the
+// AUTHENTICATION REQUEST; the SECURITY MODE COMMAND that follows carries RINMR so
+// the complete REGISTRATION REQUEST comes back in the SECURITY MODE COMPLETE.
+// Ref: TS 23.502 §4.2.2.2.2 steps 4-9; TS 24.501 §5.4.2.2
+func (h *Handler) initiateRegistrationAuth(
+	ctx context.Context, ue *amfctx.UEContext, regReq *nas.RegistrationRequest, rawPDU []byte) error {
 	// Phase 1: initiate authentication via AUSF
 	authReq, err := h.reg.Phase1_InitiateAuthentication(ctx, procedures.RegistrationInput{
 		UE:            ue,
@@ -293,6 +452,14 @@ func (h *Handler) handleRegistrationRequest(
 		// UE presented a GUTI that AMF cannot resolve. Request SUCI.
 		// Ref: TS 24.501 §5.5.1.2.2 step 1b
 		return h.sendIdentityRequest(ctx, ue)
+	}
+	if errors.Is(err, procedures.ErrUESecurityCapabilityUnacceptable) {
+		// Ref: TS 24.501 §5.5.1.2.8 i)
+		return h.rejectRegistrationPlain(ctx, ue, procedures.UESecCapRejectCause, "TS 24.501 §5.5.1.2.8 i)")
+	}
+	if errors.Is(err, procedures.ErrPEINotAccepted) {
+		// Ref: TS 24.501 §5.5.1.2.5, Annex A.2 (cause #5)
+		return h.rejectRegistrationPlain(ctx, ue, procedures.PEINotAcceptedCause, "TS 24.501 §5.5.1.2.5")
 	}
 	if err != nil {
 		return fmt.Errorf("registration phase1: %w", err)
@@ -312,7 +479,36 @@ func (h *Handler) handleRegistrationRequest(
 		return err
 	}
 	h.logNASOut(ue, nas.MsgTypeAuthenticationRequest)
-	return h.sender.SendDownlinkNASTransport(ue, pdu)
+	return h.sendRegProc(ue, amfctx.RegStageAuth, pdu) // T3560
+}
+
+// handleDuplicateRegistrationRequest answers a retransmitted, identical
+// REGISTRATION REQUEST. Ref: TS 24.501 §5.5.1.2.8 d) 2), e) 2)
+func (h *Handler) handleDuplicateRegistrationRequest(ue *amfctx.UEContext, stage amfctx.RegStage) error {
+	log := h.logger.With("nf", "AMF", "procedure", "InitialRegistration", "interface", "N1",
+		"direction", "IN", "amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI, "stage", stage.String(),
+		"message_type", "RegistrationRequest", "spec_ref", "TS 24.501 §5.5.1.2.8 d) 2), e) 2)")
+	if plain, _, ok := ue.PendingAccept(); ok {
+		pdu, err := h.cipherProtectNAS(ue, plain) // fresh NAS COUNT, TS 24.501 §4.4.3.1
+		if err != nil {
+			return fmt.Errorf("nas: protect RegistrationAccept: %w", err)
+		}
+		if err := h.sender.SendDownlinkNASTransport(ue, pdu); err != nil {
+			return fmt.Errorf("nas: resend RegistrationAccept: %w", err)
+		}
+		// T3550 restarted, the retransmission counter is not incremented nor reset
+		// (TS 24.501 §5.5.1.2.8 d) 2)).
+		expiries := 0
+		if cur, e, ok := ue.RegTimerState(); ok && cur.Stage == amfctx.RegStageAcceptSent {
+			expiries = e
+		}
+		h.armRegTimer(ue, &amfctx.RegRetx{Stage: amfctx.RegStageAcceptSent, Timer: regTimerT3550,
+			PDU: pdu, Plain: plain, SHT: byte(nas.SecurityHeaderIntegrityProtectedAndCiphered)}, expiries)
+		log.Info("retransmitted REGISTRATION REQUEST - REGISTRATION ACCEPT resent", "direction", "OUT")
+		return nil
+	}
+	log.Info("retransmitted REGISTRATION REQUEST ignored - procedure in progress")
+	return nil
 }
 
 // sendIdentityRequest sends a plain NAS Identity Request asking for SUCI.
@@ -334,7 +530,7 @@ func (h *Handler) sendIdentityRequest(ctx context.Context, ue *amfctx.UEContext)
 	if err != nil {
 		return err
 	}
-	return h.sender.SendDownlinkNASTransport(ue, pdu)
+	return h.sendRegProc(ue, amfctx.RegStageIdentity, pdu) // T3570, TS 24.501 §5.4.3.2
 }
 
 // handleIdentityResponse processes the UE's Identity Response (contains SUCI).
@@ -347,22 +543,26 @@ func (h *Handler) handleIdentityResponse(
 	if !ok {
 		return fmt.Errorf("nas: IdentityResponse body decode failed")
 	}
-
-	mi := idResp.MobileIdentity
-	if mi.Type != nas.MobileIdentitySUCI || mi.SUCI == nil {
-		h.logger.Warn("Identity Response did not contain SUCI — aborting registration",
-			"amf_ue_ngap_id", ue.AMFUENGAPId,
-			"identity_type", mi.Type,
-		)
+	// IDENTITY RESPONSE only when requested. Ref: TS 24.501 §4.4.4.3 b), §5.4.3.3
+	if !h.acceptSolicited(ue, amfctx.RegStageIdentity, "IdentityResponse", "TS 24.501 §5.4.3.3") {
 		return nil
 	}
+	ue.ClearRegProc() // T3570 stopped
 
-	suci := fmt.Sprintf("suci-%s%s-%s-0-%d-%s",
-		mi.SUCI.MCC, mi.SUCI.MNC,
-		mi.SUCI.RoutingIndicator,
-		mi.SUCI.ProtectionSchemeID,
-		hex.EncodeToString(mi.SUCI.SchemeOutput),
-	)
+	// A missing or unrepresentable SUCI leaves the UE unanswered until T3510:
+	// reject with #96 and release. Ref: TS 24.501 §5.5.1.2.8 b), §5.4.3.3
+	mi := idResp.MobileIdentity
+	var suci string
+	var err error
+	if mi.Type != nas.MobileIdentitySUCI || mi.SUCI == nil {
+		err = fmt.Errorf("nas: identity response carries identity type %d, not a SUCI", mi.Type)
+	} else {
+		suci, err = procedures.SUCIString(mi.SUCI)
+	}
+	if err != nil {
+		return &procedures.ErrRejectCause{Cause: procedures.UnusableSUCIRejectCause,
+			SpecRef: procedures.UnusableSUCISpecRef, Err: err}
+	}
 
 	authReq, err := h.reg.Phase1_AuthenticateWithSUCI(ctx, ue, suci)
 	if err != nil {
@@ -375,7 +575,7 @@ func (h *Handler) handleIdentityResponse(
 		return err
 	}
 	h.logNASOut(ue, nas.MsgTypeAuthenticationRequest)
-	return h.sender.SendDownlinkNASTransport(ue, pdu)
+	return h.sendRegProc(ue, amfctx.RegStageAuth, pdu) // T3560
 }
 
 // ---- Authentication Response --------------------------------------------
@@ -388,14 +588,29 @@ func (h *Handler) handleAuthenticationResponse(
 		return fmt.Errorf("nas: AuthenticationResponse body decode failed")
 	}
 
+	// AUTHENTICATION RESPONSE only when a challenge is outstanding.
+	// Ref: TS 24.501 §5.4.1.3.3, §4.4.4.3 b)
+	if !h.acceptSolicited(ue, amfctx.RegStageAuth, "AuthenticationResponse", "TS 24.501 §5.4.1.3.3") {
+		return nil
+	}
+	ue.ClearRegProc() // T3560 stopped
+
 	// Phase 2: verify RES* with AUSF, derive keys, build Security Mode Command.
 	// displaced is the prior UEContext for the same SUPI (non-nil when the UE
 	// reconnected without deregistering — e.g. Docker restart). Release it async
 	// so we don't block the new registration path.
 	smcReq, displaced, err := h.reg.Phase2_ProcessAuthResponse(ctx, ue, authResp)
+	if errors.Is(err, procedures.ErrAuthenticationRejected) {
+		// RES* rejected: 5G-GUTI-based challenge -> identification procedure; SUCI-based
+		// -> AUTHENTICATION REJECT. Ref: TS 24.501 §5.4.1.3.5
+		if ue.AuthViaGUTI {
+			ue.AuthViaGUTI = false
+			return h.sendIdentityRequest(ctx, ue)
+		}
+		return h.rejectAuthentication(ctx, ue, nas.CauseMACFailure, "TS 24.501 §5.4.1.3.5")
+	}
 	if err != nil {
-		// TODO: send Registration Reject
-		return fmt.Errorf("registration phase2: %w", err)
+		return fmt.Errorf("registration phase2: %w", err) // *ErrRejectCause -> REGISTRATION REJECT
 	}
 	if displaced != nil {
 		go h.releaseDisplacedContext(context.Background(), displaced)
@@ -405,14 +620,17 @@ func (h *Handler) handleAuthenticationResponse(
 	// TS 24.501 §4.4.4.3.1: when no prior current security context exists on the UE,
 	// the SMC MUST use SHT=0x03 so the UE processes it via the new-SC path.
 	// SHT=0x01 would fail because the UE has no active (current) security context yet.
-	pdu, err := h.sendNASIntegrityOnly(ue, nas.PDMobilityManagement,
-		nas.MsgTypeSecurityModeCommand, smcReq,
-		nas.SecurityHeaderIntegrityProtectedWithNewSC)
+	plain, err := h.sendNASPlain(ue, nas.PDMobilityManagement, nas.MsgTypeSecurityModeCommand, smcReq)
+	if err != nil {
+		return err
+	}
+	pdu, err := h.integrityProtectNAS(ue, plain, nas.SecurityHeaderIntegrityProtectedWithNewSC)
 	if err != nil {
 		return err
 	}
 	h.logNASOut(ue, nas.MsgTypeSecurityModeCommand)
-	return h.sender.SendDownlinkNASTransport(ue, pdu)
+	// T3560, TS 24.501 §5.4.2.2; retransmissions re-protect with a fresh NAS COUNT
+	return h.sendRegProcProtected(ue, amfctx.RegStageSMC, pdu, plain, nas.SecurityHeaderIntegrityProtectedWithNewSC)
 }
 
 // ---- Authentication Failure ---------------------------------------------
@@ -424,6 +642,7 @@ func (h *Handler) handleAuthenticationFailure(
 	if !ok {
 		return fmt.Errorf("nas: AuthenticationFailure body decode failed")
 	}
+	ue.StopRegTimer() // T3560 stopped by the UE's answer, TS 24.501 §5.4.1.3.5
 	h.logger.Warn("Authentication Failure from UE",
 		"procedure", "InitialRegistration",
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
@@ -431,10 +650,42 @@ func (h *Handler) handleAuthenticationFailure(
 		"spec_ref", "TS 24.501 §8.2.3",
 	)
 
-	// TS 23.502 §4.2.2.2.2 step 11: if cause=SynchFailure and AUTS present,
-	// restart authentication with resynchronisation info.
-	// Ref: TS 33.501 §6.1.3.2 step 11; TS 24.501 §8.2.3
-	if af.Cause5GMM == nas.CauseSynchFailure && len(af.AUTS) == 14 {
+	switch {
+	case af.Cause5GMM == nas.CausengKSIAlreadyInUse && ue.AuthNgKSIFailures < maxNgKSIInUseFailures:
+		// First #71: select a new ngKSI and send the same 5G authentication
+		// challenge. Ref: TS 24.501 §5.4.1.3.7 e)
+		ue.AuthNgKSIFailures++
+		authReq := h.reg.RepeatChallengeWithNewNGKSI(ue)
+		pdu, err := h.sendNASPlain(ue, nas.PDMobilityManagement, nas.MsgTypeAuthenticationRequest, authReq)
+		if err != nil {
+			return err
+		}
+		h.logger.Info("ngKSI already in use — re-sending the same challenge with a new ngKSI",
+			"procedure", "InitialRegistration",
+			"amf_ue_ngap_id", ue.AMFUENGAPId,
+			"interface", "N1",
+			"direction", "OUT",
+			"message_type", "AuthenticationRequest",
+			"ngksi", authReq.NGKSI.KeySetIdentifier,
+			"spec_ref", "TS 24.501 §5.4.1.3.7 e)",
+		)
+		return h.sendRegProc(ue, amfctx.RegStageAuth, pdu)
+
+	case (af.Cause5GMM == nas.CauseMACFailure || af.Cause5GMM == nas.CauseNon5GAuthenticationUnacceptable) &&
+		ue.AuthViaGUTI:
+		// The challenge ran on the SUPI mapped from a 5G-GUTI: identify the UE
+		// (SUCI) and restart authentication with it; a failure of the SUCI-based
+		// challenge then ends with AUTHENTICATION REJECT.
+		// Ref: TS 24.501 §5.4.1.3.7 c), d), §5.4.1.3.5
+		ue.AuthViaGUTI = false
+		return h.sendIdentityRequest(ctx, ue)
+
+	case af.Cause5GMM == nas.CauseSynchFailure && len(af.AUTS) == autsLen &&
+		ue.AuthSynchFailures < maxSynchFailures:
+		// TS 23.502 §4.2.2.2.2 step 11: re-synchronise with the AUTS and restart
+		// authentication; a second consecutive #21 ends with AUTHENTICATION REJECT.
+		// Ref: TS 33.501 §6.1.3.2 step 11; TS 24.501 §5.4.1.3.7 f) NOTE 4
+		ue.AuthSynchFailures++
 		h.logger.Info("SQN sync failure — initiating resync with AUSF",
 			"procedure", "InitialRegistration",
 			"amf_ue_ngap_id", ue.AMFUENGAPId,
@@ -446,9 +697,12 @@ func (h *Handler) handleAuthenticationFailure(
 		if err != nil {
 			h.logger.Error("resync authentication failed", "error", err,
 				"amf_ue_ngap_id", ue.AMFUENGAPId)
-			return fmt.Errorf("nas: resync auth: %w", err)
+			return h.rejectAuthentication(ctx, ue, af.Cause5GMM, "TS 24.501 §5.4.1.3.7 f)")
 		}
-		nasPDU, err := nas.EncodeAuthenticationRequest(authReq)
+		// Full plain NAS message (EPD, security header, message type + body):
+		// nas.EncodeAuthenticationRequest alone yields only the body, which the
+		// UE cannot parse. Ref: TS 24.501 §8.2.1.1
+		nasPDU, err := h.sendNASPlain(ue, nas.PDMobilityManagement, nas.MsgTypeAuthenticationRequest, authReq)
 		if err != nil {
 			return fmt.Errorf("nas: encode AuthenticationRequest: %w", err)
 		}
@@ -460,16 +714,196 @@ func (h *Handler) handleAuthenticationFailure(
 			"message_type", "AuthenticationRequest",
 			"spec_ref", "TS 23.502 §4.2.2.2.2 step 11",
 		)
-		return h.sender.SendDownlinkNASTransport(ue, nasPDU)
+		return h.sendRegProc(ue, amfctx.RegStageAuth, nasPDU)
 	}
 
-	// MAC failure or unhandled cause — abandon registration (TS 24.501 §5.5.1.2.7).
-	h.logger.Warn("authentication abandoned",
+	// #20 / #26 on a SUCI-based challenge, a repeated #71, a second consecutive
+	// #21, #21 without AUTS or any other cause: terminate the authentication with
+	// AUTHENTICATION REJECT instead of abandoning it silently (the UE's T3520
+	// would expire and it would bar the cell, §5.4.1.3.7 g)).
+	// Ref: TS 24.501 §5.4.1.3.5, §5.4.1.3.7 c)-f)
+	return h.rejectAuthentication(ctx, ue, af.Cause5GMM, "TS 24.501 §5.4.1.3.5, §5.4.1.3.7")
+}
+
+// rejectAuthentication sends a plain AUTHENTICATION REJECT, releases the N1 NAS
+// signalling connection and removes the UE context (the registration failed).
+// Ref: TS 24.501 §5.4.1.3.5, §8.2.5
+func (h *Handler) rejectAuthentication(ctx context.Context, ue *amfctx.UEContext,
+	ueCause nas.Cause5GMM, specRef string) error {
+	h.logger.WarnContext(ctx, "authentication not accepted — sending AUTHENTICATION REJECT",
 		"procedure", "InitialRegistration",
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
-		"cause", af.Cause5GMM,
+		"interface", "N1",
+		"direction", "OUT",
+		"message_type", "AuthenticationReject",
+		"result", "REJECT",
+		"cause", int(ueCause),
+		"spec_ref", specRef,
 	)
+	metrics.ProcedureTotal.WithLabelValues("AMF", "InitialRegistration", "REJECT").Inc()
+	// AUTHENTICATION REJECT without the optional EAP message IE: EPD, plain
+	// security header, message type (TS 24.501 §8.2.5.1).
+	pdu := []byte{nas.PDMobilityManagement, byte(nas.SecurityHeaderPlainNAS), byte(nas.MsgTypeAuthenticationReject)}
+	if err := h.sender.SendDownlinkNASTransport(ue, pdu); err != nil {
+		return fmt.Errorf("nas: send AuthenticationReject: %w", err)
+	}
+	h.releaseAfterReject(ctx, ue, ngapCauseNasAuthenticationFailure)
 	return nil
+}
+
+// rejectRegistrationPlain sends a plain REGISTRATION REJECT (no NAS security
+// context exists yet), releases the N1 NAS signalling connection and removes
+// the UE context. Ref: TS 24.501 §5.5.1.2.5, §5.5.1.2.8
+func (h *Handler) rejectRegistrationPlain(ctx context.Context, ue *amfctx.UEContext,
+	cause nas.Cause5GMM, specRef string) error {
+	return h.rejectRegistration(ctx, ue, cause, specRef, false)
+}
+
+// rejectRegistration sends a REGISTRATION REJECT with cause - integrity protected
+// and ciphered when protected (the UE's message came under the NAS security
+// context), plain otherwise - then releases the N1 NAS signalling connection and
+// removes the UE context. Ref: TS 24.501 §5.5.1.2.5, §5.5.1.2.8, §4.4.4.3
+func (h *Handler) rejectRegistration(ctx context.Context, ue *amfctx.UEContext,
+	cause nas.Cause5GMM, specRef string, protected bool) error {
+	ue.ClearRegProc()
+	var (
+		pdu []byte
+		err error
+	)
+	body := &nas.RegistrationReject{Cause5GMM: byte(cause)}
+	if cause == nas.CauseCongestion {
+		// #22: the AMF assigns a back-off timer T3346. Ref: TS 24.501 §5.5.1.2.5
+		backoff := procedures.CongestionBackoffT3346
+		body.T3346 = &backoff
+	}
+	if protected && ue.SecurityCtx.Active {
+		pdu, err = h.sendNASSecured(ue, nas.PDMobilityManagement, nas.MsgTypeRegistrationReject, body)
+	} else {
+		pdu, err = h.sendNASPlain(ue, nas.PDMobilityManagement, nas.MsgTypeRegistrationReject, body)
+	}
+	if err != nil {
+		return err
+	}
+	h.logger.WarnContext(ctx, "sending REGISTRATION REJECT",
+		"procedure", "InitialRegistration",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"interface", "N1",
+		"direction", "OUT",
+		"message_type", "RegistrationReject",
+		"result", "REJECT",
+		"cause", int(cause),
+		"spec_ref", specRef,
+	)
+	if err := h.sender.SendDownlinkNASTransport(ue, pdu); err != nil {
+		return fmt.Errorf("nas: send RegistrationReject: %w", err)
+	}
+	h.releaseAfterReject(ctx, ue, ngapCauseNasNormalRelease)
+	return nil
+}
+
+// rejectNoNetworkSlices sends a security-protected REGISTRATION REJECT #62
+// "No network slices available" listing every requested S-NSSAI, then releases
+// the N2 connection and the UE context. The rejected NSSAI goes in the Extended
+// rejected NSSAI IE when the UE set the ER-NSSAI capability (as the NSSAA
+// Configuration Update path does), else in the Rejected NSSAI IE.
+// Ref: TS 24.501 §5.5.1.2.5, §9.11.3.46, §9.11.3.75
+func (h *Handler) rejectNoNetworkSlices(ctx context.Context, ue *amfctx.UEContext,
+	rejected []nas.RejectedSNSSAI) error {
+	body := &nas.RegistrationReject{Cause5GMM: byte(nas.CauseNoNetworkSlicesAvailable)}
+	if ue.ERNSSAISupported {
+		body.ExtendedRejectedNSSAI = nas.ExtendedRejectedNSSAIFromList(rejected)
+	} else {
+		body.RejectedNSSAI = rejected
+	}
+	// The N2 and UE contexts are released even when the reject cannot be sent.
+	defer h.releaseAfterReject(ctx, ue, ngapCauseNasNormalRelease)
+	pdu, err := h.sendNASSecured(ue, nas.PDMobilityManagement, nas.MsgTypeRegistrationReject, body)
+	if err != nil {
+		return fmt.Errorf("nas: build RegistrationReject: %w", err)
+	}
+	h.logger.WarnContext(ctx, "sending REGISTRATION REJECT",
+		"nf", "AMF",
+		"procedure", "InitialRegistration",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"interface", "N1",
+		"direction", "OUT",
+		"message_type", "RegistrationReject",
+		"result", "REJECT",
+		"cause", int(nas.CauseNoNetworkSlicesAvailable),
+		"rejected_nssai_count", len(rejected),
+		"spec_ref", "TS 24.501 §5.5.1.2.5",
+	)
+	if err := h.sender.SendDownlinkNASTransport(ue, pdu); err != nil {
+		return fmt.Errorf("nas: send RegistrationReject: %w", err)
+	}
+	return nil
+}
+
+// releaseAfterReject releases the N2 UE context with NGAP cause NAS/causeValue
+// and removes the UE context: through the release completion when the command
+// was sent, locally otherwise. Ref: TS 38.413 §8.3.3
+func (h *Handler) releaseAfterReject(ctx context.Context, ue *amfctx.UEContext, causeValue int64) {
+	if !h.releaseN2(ue, ngapCausePresentNas, causeValue, true) {
+		h.reg.RemoveUEContext(ctx, ue)
+	}
+}
+
+// n2AssociationChecker is implemented by the NGAP server: it tells a sent UE
+// CONTEXT RELEASE COMMAND from the silent skip of SendUEContextReleaseCommandForUE.
+type n2AssociationChecker interface {
+	HasN2Association(ue *amfctx.UEContext) bool
+}
+
+// releaseN2 sends a UE CONTEXT RELEASE COMMAND for ue (remove=true marks the
+// context PendingRemoval first so the release completion removes it). It
+// returns false when nothing was sent (no N2 association or send error); the
+// PendingRemoval mark is then undone. Ref: TS 38.413 §8.3.3
+func (h *Handler) releaseN2(ue *amfctx.UEContext, causePresent int, causeValue int64, remove bool) bool {
+	if c, ok := h.sender.(n2AssociationChecker); ok && !c.HasN2Association(ue) {
+		return false
+	}
+	if remove {
+		ue.Lock()
+		ue.PendingRemoval = true
+		ue.Unlock()
+	}
+	if err := h.sender.SendUEContextReleaseCommandForUE(ue, causePresent, causeValue); err != nil {
+		h.logger.Warn("UE Context Release Command failed",
+			"procedure", "ANRelease", "interface", "N2", "direction", "OUT",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "result", "FAILURE", "error", err,
+			"spec_ref", "TS 38.413 §8.3.3")
+		if remove {
+			ue.Lock()
+			ue.PendingRemoval = false
+			ue.Unlock()
+		}
+		return false
+	}
+	return true
+}
+
+// ReleaseAfterPanic is the amfctx.PanicReleaser of the AMF (wired in cmd/amf):
+// after a recovered panic on a UE's serial queue it releases the UE's N2
+// context with cause misc/unspecified. remove=true (UE not 5GMM-REGISTERED)
+// also removes the context on the release completion; a registered UE keeps
+// its registration and goes CM-IDLE. Returns true when the command was sent.
+// Ref: TS 38.413 §8.3.3
+func (h *Handler) ReleaseAfterPanic(ctx context.Context, ue *amfctx.UEContext, remove bool) bool {
+	sent := h.releaseN2(ue, ngapCausePresentMisc, ngapCauseMiscUnspecified, remove)
+	h.logger.WarnContext(ctx, "UE released after a recovered panic",
+		"procedure", amfctx.PanicRecoveryProcedure,
+		"interface", "N2",
+		"direction", "OUT",
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"remove", remove,
+		"release_sent", sent,
+		"result", "FAILURE",
+		"cause", amfctx.PanicRecoveryCause,
+		"spec_ref", "TS 38.413 §8.3.3",
+	)
+	return sent
 }
 
 // ---- Security Mode Reject -----------------------------------------------
@@ -498,9 +932,28 @@ func (h *Handler) handleSecurityModeReject(
 		"spec_ref", "TS 24.501 §8.2.27 / §5.5.1.2.7",
 	)
 
-	// Reset the security context so a re-attempt starts clean.
-	ue.SecurityCtx = amfctx.SecurityContext{}
+	// The SECURITY MODE COMMAND is answered (T3560 stopped); the procedure is abandoned.
+	ue.ClearRegProc()
+	// Only the new, unconfirmed context is dropped; the context in use before the
+	// SECURITY MODE COMMAND keeps protecting this and every later message.
+	// Ref: TS 24.501 §5.4.2.5
+	h.rollbackSecurityCtx(ue, "SecurityModeReject")
 	return nil
+}
+
+// rollbackSecurityCtx drops the security context a pending SECURITY MODE COMMAND
+// was taking into use and re-applies the one in use before it.
+// Ref: TS 24.501 §5.4.2.5
+func (h *Handler) rollbackSecurityCtx(ue *amfctx.UEContext, reason string) {
+	pending, restored := ue.RollbackSecurityCtxChange()
+	if !pending {
+		return
+	}
+	h.logger.Info("new 5G NAS security context dropped",
+		"nf", "AMF", "procedure", "InitialRegistration", "interface", "N1", "direction", "IN",
+		"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI, "reason", reason,
+		"previous_context_restored", restored, "result", "REJECT",
+		"spec_ref", "TS 24.501 §5.4.2.5")
 }
 
 // ---- Security Mode Complete ---------------------------------------------
@@ -508,6 +961,18 @@ func (h *Handler) handleSecurityModeReject(
 func (h *Handler) handleSecurityModeComplete(
 	ctx context.Context, ue *amfctx.UEContext, msg *nas.Message) error {
 
+	// SECURITY MODE COMPLETE only answers an outstanding SECURITY MODE COMMAND: a
+	// duplicate or unsolicited one must not re-run Phase3 (second UECM PUT, PCF
+	// associations, 5G-GUTI, ICS). Ref: TS 24.501 §5.4.2.4, §4.4.4.3 b)
+	if !h.acceptSolicited(ue, amfctx.RegStageSMC, "SecurityModeComplete", "TS 24.501 §5.4.2.4") {
+		return nil
+	}
+	ue.ClearRegProc() // T3560 stopped
+	// SECURITY MODE COMPLETE verified with the new context: it is now the one in use.
+	// Ref: TS 24.501 §5.4.2.4
+	ue.CommitSecurityCtxChange()
+
+	var sessSync regSessionSync
 	// Process the Security Mode Complete payload before completing registration:
 	//   - IMEISV: requested in the SMC (IEI 0xE-); store as the UE's PEI.
 	//   - NAS message container: the retransmitted complete Registration Request.
@@ -527,25 +992,30 @@ func (h *Handler) handleSecurityModeComplete(
 			)
 		}
 		if len(smcComplete.NASMessageContainer) > 0 {
-			h.applyRetransmittedRegistrationRequest(ue, smcComplete.NASMessageContainer)
+			if inner := h.applyRetransmittedRegistrationRequest(ue, smcComplete.NASMessageContainer); inner != nil {
+				// PDU session status / Uplink data status of the complete request.
+				// Ref: TS 24.501 §5.5.1.2.2, §5.5.1.3.4
+				sessSync = h.syncPDUSessions(ctx, ue, inner, h.logger.With(
+					"nf", "AMF", "procedure", "InitialRegistration", "interface", "N1",
+					"direction", "IN", "amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI))
+			}
 		}
 	}
 
 	// Phase 3: fetch subscription data, assign GUTI, build RegistrationAccept
 	regAccept, err := h.reg.Phase3_ProcessSMCComplete(ctx, ue)
 	if err != nil {
-		// Service Area Restriction: PCF forbids this TA.
-		// Send Registration Reject (5GMM cause #73 = 0x49) and abort.
-		// Ref: TS 23.501 §5.3.4, TS 24.501 §8.2.8.2
-		if errors.Is(err, procedures.ErrServiceAreaRestricted) {
-			const cause73 = byte(0x49) // "Serving network not authorized"
-			_, _ = h.sendNASSecured(ue, nas.PDMobilityManagement,
-				nas.MsgTypeRegistrationReject,
-				&nas.RegistrationReject{Cause5GMM: cause73})
-			return nil // reject is a handled outcome, not a fatal error
+		// No allowed slice (and none pending NSSAA): REGISTRATION REJECT #62 with
+		// the Rejected NSSAI, then release the N2 connection.
+		// Ref: TS 24.501 §5.5.1.2.5; TS 23.502 §4.2.2.2.2 step 21
+		var noSlices *procedures.NoNetworkSlicesError
+		if errors.As(err, &noSlices) {
+			return h.rejectNoNetworkSlices(ctx, ue, noSlices.Rejected)
 		}
 		return fmt.Errorf("registration phase3: %w", err)
 	}
+
+	sessSync.applyTo(regAccept)
 
 	// RegistrationAccept must be integrity-protected (NAS security now active).
 	// Ref: TS 24.501 §5.5.1.2.4 step 14, TS 33.501 §6.7.2
@@ -553,6 +1023,29 @@ func (h *Handler) handleSecurityModeComplete(
 		nas.MsgTypeRegistrationAccept, regAccept)
 	if err != nil {
 		return err
+	}
+
+	// NSSAA-only: every requested slice awaits NSSAA, so there is no Allowed
+	// NSSAI and the mandatory Allowed NSSAI IE of the INITIAL CONTEXT SETUP
+	// REQUEST cannot be built (TS 38.413 §9.2.2.1): deliver the Accept (with the
+	// Pending NSSAI) in DOWNLINK NAS TRANSPORT, no ICS.
+	// Ref: TS 24.501 §5.5.1.2.4; TS 23.502 §4.2.9.2
+	if len(ue.AllowedNSSAI) == 0 {
+		h.logger.Info("Registration Accept without Allowed NSSAI — DL NAS TRANSPORT, no ICS",
+			"nf", "AMF",
+			"procedure", "InitialRegistration",
+			"amf_ue_ngap_id", ue.AMFUENGAPId,
+			"supi", ue.SUPI,
+			"interface", "N1",
+			"direction", "OUT",
+			"message_type", "RegistrationAccept",
+			"spec_ref", "TS 24.501 §5.5.1.2.4",
+		)
+		if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
+			return err
+		}
+		h.afterAcceptSent(ue, regAccept, nasPDU)
+		return nil
 	}
 
 	// KgNB is derived from KAMF and the NAS uplink COUNT of the message that
@@ -601,51 +1094,127 @@ func (h *Handler) handleSecurityModeComplete(
 		"message_type", "InitialContextSetupRequest",
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
+	ue.SetPendingICS(amfctx.ICSInitialRegistration) // failure -> rollback (AMF-034)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, secKey,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
-		encAlgs, intAlgs, nil); err != nil {
+		encAlgs, intAlgs, sessSync.Items); err != nil {
+		ue.TakePendingICS() // nothing in flight: a stale kind would mis-handle a later failure
 		return err
 	}
 	// N2 context now established — UE is CM-CONNECTED.
 	ue.CMState = amfctx.CMConnected
+	h.afterAcceptSent(ue, regAccept, nasPDU)
 	return nil
+}
+
+// afterAcceptSent runs once the REGISTRATION ACCEPT was sent. With a new 5G-GUTI
+// (always, today) T3550 is started and the UE enters
+// 5GMM-COMMON-PROCEDURE-INITIATED until the REGISTRATION COMPLETE; without one the
+// UE enters 5GMM-REGISTERED right away.
+// Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.4
+func (h *Handler) afterAcceptSent(ue *amfctx.UEContext, accept *nas.RegistrationAccept, pdu []byte) {
+	// A mobility / periodic update received while the UE is still in
+	// 5GMM-COMMON-PROCEDURE-INITIATED stays a registration update, not an initial
+	// registration. Ref: TS 24.501 §5.5.1.2.8 g), §5.5.1.3.8
+	updateReq := ue.LastRegIsUpdate()
+	ue.Lock()
+	prior := ue.State == amfctx.GMMRegistered ||
+		(ue.State == amfctx.GMMCommonProcedureInitiated && updateReq)
+	if accept.FiveGGUTI == nil {
+		ue.TransitionTo(amfctx.GMMRegistered)
+		ue.Unlock()
+		ue.ClearRegProc()
+		return
+	}
+	ue.TransitionTo(amfctx.GMMCommonProcedureInitiated)
+	ue.Unlock()
+	// The plain Accept is kept: every T3550 retransmission re-protects it with a
+	// fresh downlink NAS COUNT. Ref: TS 24.501 §4.4.3.1
+	plain, err := h.sendNASPlain(ue, nas.PDMobilityManagement, nas.MsgTypeRegistrationAccept, accept)
+	if err != nil {
+		h.logger.Warn("REGISTRATION ACCEPT re-encode failed - T3550 not started", "error", err,
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "spec_ref", "TS 24.501 §5.5.1.2.4")
+		return
+	}
+	ue.SetPendingAccept(plain, prior)
+	h.armRegTimer(ue, &amfctx.RegRetx{Stage: amfctx.RegStageAcceptSent, Timer: regTimerT3550,
+		PDU: pdu, Plain: plain, SHT: byte(nas.SecurityHeaderIntegrityProtectedAndCiphered)}, 0) // T3550
+}
+
+// acceptSolicited reports whether the UE's message answers the outstanding
+// procedure (want); an unsolicited or duplicate one is logged and must be ignored.
+// Ref: TS 24.501 §4.4.4.3 b), §5.5.1.2.8
+func (h *Handler) acceptSolicited(ue *amfctx.UEContext, want amfctx.RegStage, msgName, specRef string) bool {
+	if got := ue.RegStage(); got != want {
+		h.logger.Warn("unsolicited NAS message ignored",
+			"nf", "AMF", "procedure", "InitialRegistration", "interface", "N1", "direction", "IN",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI, "message_type", msgName,
+			"pending_stage", got.String(), "expected_stage", want.String(),
+			"result", "IGNORED", "spec_ref", specRef)
+		return false
+	}
+	return true
 }
 
 // applyRetransmittedRegistrationRequest decodes the complete Registration
 // Request the UE retransmitted in the Security Mode Complete's NAS message
 // container (in response to the RINMR bit in the Security Mode Command) and
-// applies the non-cleartext IEs to the UE context. Currently: Requested NSSAI
-// (drives the Allowed NSSAI intersection in Phase3). Decode failures are
+// applies the non-cleartext IEs to the UE context: Requested NSSAI (drives the
+// Allowed NSSAI intersection in Phase3), ER-NSSAI and 5GMM capability. It returns
+// the decoded request (nil when unusable) so the caller can also process its PDU
+// session IEs. Decode failures are
 // logged and ignored — the registration continues with the cleartext IEs.
 // Ref: TS 24.501 §4.4.6, §5.4.2.3; TS 23.502 §4.2.2.2.2
-func (h *Handler) applyRetransmittedRegistrationRequest(ue *amfctx.UEContext, container []byte) {
+func (h *Handler) applyRetransmittedRegistrationRequest(ue *amfctx.UEContext, container []byte) *nas.RegistrationRequest {
 	inner, err := nas.Decode(container)
 	if err != nil {
 		h.logger.Warn("SecurityModeComplete NAS message container decode failed",
 			"amf_ue_ngap_id", ue.AMFUENGAPId, "error", err,
 			"spec_ref", "TS 24.501 §5.4.2.3")
-		return
+		return nil
 	}
 	regReq, ok := inner.Body.(*nas.RegistrationRequest)
 	if !ok || inner.Header.MessageType != nas.MsgTypeRegistrationRequest {
-		return
+		return nil
 	}
 	if regReq.RequestedNSSAI != nil {
 		ue.RequestedNSSAI = nssaiToSubscribed(regReq.RequestedNSSAI)
 	}
+	ue.ERNSSAISupported = regReq.ERNSSAISupported() // complete IE set of the retransmitted request
+	// The 5GMM capability IE is a non-cleartext IE, so the cleartext initial
+	// message lacks it; the complete request is the first place it is visible.
+	// Ref: TS 24.501 §4.4.6, §9.11.3.1
+	if c := regReq.Capability5GMM(); c != nil {
+		ue.Capability5GMM = c
+	}
 	h.logger.Info("retransmitted Registration Request processed from SecurityModeComplete",
 		"procedure", "InitialRegistration",
+		"interface", "N1",
+		"direction", "IN",
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
 		"requested_nssai_count", len(ue.RequestedNSSAI),
+		"capability_5gmm", ue.Capability5GMM.RawHex(),
+		"capability_5gmm_bits", strings.Join(ue.Capability5GMM.SetBitNames(), ","),
 		"spec_ref", "TS 24.501 §4.4.6",
 	)
+	return regReq
 }
 
 // ---- Registration Complete ----------------------------------------------
 
 func (h *Handler) handleRegistrationComplete(
 	ctx context.Context, ue *amfctx.UEContext) error {
+
+	// REGISTRATION COMPLETE only answers a REGISTRATION ACCEPT awaiting it: T3550 is
+	// stopped and the UE enters 5GMM-REGISTERED. Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.4
+	if !h.acceptSolicited(ue, amfctx.RegStageAcceptSent, "RegistrationComplete", "TS 24.501 §5.5.1.2.4") {
+		return nil
+	}
+	ue.ClearRegProc() // T3550 stopped
+	ue.Lock()
+	ue.TransitionTo(amfctx.GMMRegistered)
+	ue.Unlock()
 
 	h.logger.Info("Registration Complete",
 		"procedure", "InitialRegistration",
@@ -667,6 +1236,10 @@ func (h *Handler) handleRegistrationComplete(
 	ue.Lock()
 	ue.RegistrationTime = time.Now()
 	ue.Unlock()
+
+	// The new 5G-GUTI is now in use: the previous 5G-TMSI stops resolving.
+	// Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.8 a) 1) i)
+	h.reg.ConfirmGUTI(ue)
 
 	// Persist the fully registered UE context so it survives AMF restarts.
 	h.reg.PersistUE(ctx, ue)
@@ -745,17 +1318,16 @@ func (h *Handler) sendNetworkNameConfigUpdate(ue *amfctx.UEContext) {
 // StartNSSAA sends the NETWORK SLICE-SPECIFIC AUTHENTICATION COMMAND for the first
 // slice withheld for NSSAA, if any. Safe to call when no slice is pending.
 // Ref: TS 23.502 §4.2.9.2, TS 24.501 §8.2.31.
+//
+// Must run on the UE's serial queue (like every NAS handler): it mutates the
+// NSSAA state of the UE. The COMMAND is supervised by T3575 under the rel19
+// profile.
 func (h *Handler) StartNSSAA(ctx context.Context, ue *amfctx.UEContext) {
 	cmd, started := h.reg.StartNSSAA(ctx, ue)
 	if !started {
 		return
 	}
-	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
-		nas.MsgTypeNetworkSliceSpecificAuthCommand, cmd); err != nil {
-		h.logger.Warn("NSSAA COMMAND send failed",
-			"procedure", "NSSAA", "supi", ue.SUPI, "error", err,
-			"spec_ref", "TS 24.501 §8.2.31")
-	}
+	h.sendNSSAACommand(ue, cmd, 0)
 }
 
 // handleNSSAAComplete processes a NETWORK SLICE-SPECIFIC AUTHENTICATION COMPLETE:
@@ -775,71 +1347,182 @@ func (h *Handler) handleNSSAAComplete(ctx context.Context, ue *amfctx.UEContext,
 		"spec_ref", "TS 24.501 §8.2.32",
 	)
 
+	// Runs on the UE's serial queue: the Nnssaaf call below holds the queue, not
+	// an NSSAA-only lock, so no other path mutates the same fields meanwhile and
+	// a T3575 expiry waits behind this task (then finds the timer stopped).
 	out, err := h.reg.ProcessNSSAAComplete(ctx, ue, complete)
 	if err != nil {
 		h.logger.Warn("NSSAA COMPLETE processing failed",
 			"procedure", "NSSAA", "supi", ue.SUPI, "error", err)
 		return nil
 	}
+	// COMPLETE accepted: T3575 stops (a following COMMAND restarts it).
+	// Ref: TS 24.501 §5.4.7.2.2
+	h.stopNSSAAT3575(ue)
 
-	// Send the RESULT (EAP-Success / EAP-Failure) for the resolved slice.
-	if sendErr := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
-		nas.MsgTypeNetworkSliceSpecificAuthResult, out.Result); sendErr != nil {
-		h.logger.Warn("NSSAA RESULT send failed",
-			"procedure", "NSSAA", "supi", ue.SUPI, "error", sendErr)
+	// Send the RESULT (EAP-Success / EAP-Failure) for the resolved slice. A nil
+	// Result means the slice was kept PENDING (no EAP result to relay).
+	if out.Result != nil {
+		if sendErr := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
+			nas.MsgTypeNetworkSliceSpecificAuthResult, out.Result); sendErr != nil {
+			h.logger.Warn("NSSAA RESULT send failed",
+				"procedure", "NSSAA", "supi", ue.SUPI, "error", sendErr)
+		}
 	}
 
 	// Start the next pending slice, if any.
 	if out.NextCommand != nil {
-		if sendErr := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
-			nas.MsgTypeNetworkSliceSpecificAuthCommand, out.NextCommand); sendErr != nil {
-			h.logger.Warn("NSSAA next COMMAND send failed",
-				"procedure", "NSSAA", "supi", ue.SUPI, "error", sendErr)
-		}
+		h.sendNSSAACommand(ue, out.NextCommand, 0)
 		return nil
 	}
 
-	// Queue drained. If the Allowed NSSAI changed and no more slices are pending,
-	// deliver the new Allowed NSSAI via a Configuration Update Command.
-	if out.AllowedChanged {
-		h.sendNSSAAConfigUpdate(ctx, ue)
-	}
+	// Queue drained: one Configuration Update Command with the new Allowed NSSAI
+	// (rel19: and the Rejected NSSAI of every failed slice, TS 23.502 §4.2.9.2
+	// step 19a). rel17: only when the last COMPLETE was authorized.
+	h.finishNSSAA(ctx, ue, out)
 	h.reg.PersistUE(ctx, ue)
 	return nil
 }
 
+// onUESerialQueue runs f on ue's serial queue and waits for it to finish, so a
+// caller outside the NGAP path (the O&M trigger endpoints) mutates the UE's
+// NSSAA state in the same order as its NAS handlers instead of racing them. It
+// must not be called from a task already on that queue.
+func onUESerialQueue(ue *amfctx.UEContext, f func()) {
+	done := make(chan struct{})
+	ue.EnqueueSerial(func() {
+		defer close(done)
+		f()
+	})
+	<-done
+}
+
 // RevokeNSSAASlice handles an AAA-initiated NSSAA revocation (TS 23.502 §4.2.9.4):
 // removes the slice from the Allowed NSSAI and delivers the updated Allowed NSSAI to
-// the UE via a Configuration Update Command. Returns true if the slice was allowed.
-func (h *Handler) RevokeNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) bool {
-	if !h.reg.RevokeNSSAA(ue, sst, sd) {
-		return false
-	}
-	h.sendNSSAAConfigUpdate(ctx, ue)
-	h.reg.PersistUE(ctx, ue)
-	return true
+// the UE via a Configuration Update Command (rel19: with the Rejected NSSAI too, or
+// the network-initiated de-registration when no S-NSSAI is left, TS 24.501
+// §4.6.2.4 c)). The UE's NSSAAs state is updated in any case; nothing is sent to a
+// UE that is not 5GMM-REGISTERED (e.g. already being de-registered). Returns true
+// if the slice was allowed. Runs on the UE's serial queue.
+func (h *Handler) RevokeNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) (revoked bool) {
+	onUESerialQueue(ue, func() {
+		var dereg, cuc bool
+		if revoked, dereg, cuc = h.reg.ApplyNSSAARevocation(ue, sst, sd); !revoked {
+			return
+		}
+		if !h.nssaaMayNotifyUE(ue, "revocation") {
+			return
+		}
+		if dereg {
+			h.deregisterForNSSAA(ctx, ue)
+		} else if cuc {
+			h.sendNSSAAConfigUpdate(ctx, ue)
+		}
+		h.reg.PersistUE(ctx, ue)
+	})
+	return revoked
 }
 
 // ReauthNSSAASlice handles an AAA-initiated NSSAA re-authentication (TS 23.502
 // §4.2.9.3): re-queues an allowed slice and starts a fresh EAP exchange. Returns true
-// if the slice was allowed and a COMMAND was emitted.
-func (h *Handler) ReauthNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) bool {
-	if !h.reg.ReauthNSSAA(ue, sst, sd) {
-		return false
-	}
-	h.StartNSSAA(ctx, ue)
-	return true
+// if the slice was allowed and a COMMAND was emitted. Runs on the UE's serial queue.
+func (h *Handler) ReauthNSSAASlice(ctx context.Context, ue *amfctx.UEContext, sst uint8, sd string) (queued bool) {
+	onUESerialQueue(ue, func() {
+		if !h.reg.ReauthNSSAA(ue, sst, sd) {
+			return
+		}
+		queued = true
+		h.StartNSSAA(ctx, ue)
+	})
+	return queued
 }
 
-// sendNSSAAConfigUpdate delivers the post-NSSAA Allowed NSSAI to the UE via a
-// Configuration Update Command (ACK requested). Ref: TS 23.502 §4.2.9.2 step 9,
-// TS 24.501 §8.2.19.
+// nssaaMayNotifyUE reports whether an NSSAA outcome may still be signalled to the
+// UE: only in 5GMM-REGISTERED. A UE already in 5GMM-DEREGISTERED-INITIATED (a
+// DEREGISTRATION REQUEST is in flight, e.g. an earlier NSSAA failure or an
+// O&M-triggered de-registration) or 5GMM-DEREGISTERED must not get a second
+// DEREGISTRATION REQUEST or a Configuration Update Command (TS 24.501 §5.5.2.3.1:
+// the UE is being de-registered; §5.4.4.1: generic UE configuration update is a
+// 5GMM-REGISTERED procedure). Runs on the UE's serial queue.
+func (h *Handler) nssaaMayNotifyUE(ue *amfctx.UEContext, what string) bool {
+	if ue.State == amfctx.GMMRegistered {
+		return true
+	}
+	h.logger.Debug("NSSAA outcome not signalled: UE is not 5GMM-REGISTERED",
+		"procedure", "NSSAA", "supi", ue.SUPI, "trigger", what, "gmm_state", ue.State.String(),
+		"spec_ref", "TS 24.501 §5.5.2.3.1, §5.4.4.1")
+	return false
+}
+
+// finishNSSAA acts on a drained NSSAA queue: the network-initiated
+// de-registration with the Rejected NSSAI (rel19, no S-NSSAI left) or the
+// Configuration Update Command; nothing for a UE that is not 5GMM-REGISTERED
+// (nssaaMayNotifyUE). Runs on the UE's serial queue.
+// Ref: TS 23.502 §4.2.9.2 steps 19a-19b, TS 24.501 §4.6.2.4 c)
+func (h *Handler) finishNSSAA(ctx context.Context, ue *amfctx.UEContext, out *procedures.NSSAACompleteOutcome) {
+	if !out.Deregister && !out.ConfigUpdate {
+		return
+	}
+	if !h.nssaaMayNotifyUE(ue, "queue drained") {
+		return
+	}
+	if out.Deregister {
+		h.deregisterForNSSAA(ctx, ue)
+	} else {
+		h.sendNSSAAConfigUpdate(ctx, ue)
+	}
+}
+
+// deregisterForNSSAA performs the network-initiated de-registration of a UE whose
+// NSSAA failed or was revoked for every S-NSSAI: DEREGISTRATION REQUEST (UE
+// terminated) built by procedures.NSSAADeregRequest (5GMM cause #62 "No network
+// slices available", "re-registration not required", 3GPP access, the rejected
+// NSSAI in the Extended rejected NSSAI IE for a UE that supports it, else in the
+// Rejected NSSAI IE). The UE's Deregistration Accept then runs the usual teardown
+// (PDU sessions via SMF, UDM, PCF, N2 release); T3522 supervises it (rel19).
+// A failed send falls back to the Configuration Update Command with the rejected
+// NSSAI so the UE is at least told; the REJECT metric counts a request that was
+// really sent. A UE that is not 5GMM-REGISTERED is left alone.
+// Ref: TS 24.501 §5.5.2.3.1, Table 8.2.14.1.1, §9.11.3.46, §9.11.3.75;
+// TS 23.502 §4.2.9.2 step 19b
+func (h *Handler) deregisterForNSSAA(ctx context.Context, ue *amfctx.UEContext) {
+	if !h.nssaaMayNotifyUE(ue, "de-registration") {
+		return
+	}
+	if len(ue.RejectedNSSAI) > nas.MaxRejectedSNSSAIs {
+		h.logger.Warn("Rejected NSSAI truncated to the IE maximum",
+			"procedure", "NSSAA", "supi", ue.SUPI, "max", nas.MaxRejectedSNSSAIs,
+			"spec_ref", "TS 24.501 §9.11.3.46")
+	}
+	req := procedures.NSSAADeregRequest(ue, h.reg.UseExtendedRejectedNSSAI(ue))
+	err := h.sendNetworkDeregistrationReq(ctx, ue, req,
+		"NSSAA", "TS 23.502 §4.2.9.2 step 19b, TS 24.501 §5.5.2.3.1")
+	if err != nil {
+		h.logger.Warn("NSSAA network-initiated de-registration failed - falling back to the Configuration Update Command with the rejected NSSAI",
+			"procedure", "NSSAA", "supi", ue.SUPI, "result", "FAILURE", "error", err,
+			"fallback", "ConfigurationUpdateCommand",
+			"spec_ref", "TS 24.501 §5.5.2.3.1, §5.4.4.2")
+		h.sendNSSAAConfigUpdate(ctx, ue)
+		return
+	}
+	metrics.ProcedureTotal.WithLabelValues("AMF", "NSSAA", "REJECT").Inc()
+}
+
+// sendNSSAAConfigUpdate delivers the post-NSSAA NSSAIs to the UE via a
+// Configuration Update Command (ACK requested), built by
+// procedures.NSSAAConfigUpdateCommand. Ref: TS 23.502 §4.2.9.2 step 9 / 19a,
+// TS 24.501 §8.2.19, §5.4.4.2.
+//
+// rel17 (frozen): Allowed NSSAI only. rel19: the new Allowed NSSAI (IE omitted
+// when empty) and the rejected NSSAI (cause "failed or revoked NSSAA", HPLMN
+// SST/SD, TS 24.501 §9.11.3.46 NOTEs 5/6) in the Extended rejected NSSAI IE for a
+// UE that supports it, else in the Rejected NSSAI IE (IEI 0x11).
 func (h *Handler) sendNSSAAConfigUpdate(_ context.Context, ue *amfctx.UEContext) {
-	allowed := procedures.NASAllowedNSSAI(ue.AllowedNSSAI)
-	ackBit := byte(0xD1) // IEI 0xD high nibble, ACKS bit set — request ConfigurationUpdateComplete
-	cmd := &nas.ConfigurationUpdateCommand{
-		ConfigUpdateIndication: &ackBit,
-		AllowedNSSAI:           &allowed,
+	cmd, truncated := h.reg.NSSAAConfigUpdateCommand(ue, h.reg.UseExtendedRejectedNSSAI(ue))
+	if truncated {
+		h.logger.Warn("Rejected NSSAI truncated to the IE maximum",
+			"procedure", "NSSAA", "supi", ue.SUPI, "max", nas.MaxRejectedSNSSAIs,
+			"spec_ref", "TS 24.501 §9.11.3.46")
 	}
 	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
 		nas.MsgTypeConfigurationUpdateCommand, cmd); err != nil {
@@ -849,7 +1532,8 @@ func (h *Handler) sendNSSAAConfigUpdate(_ context.Context, ue *amfctx.UEContext)
 	}
 	h.logger.Info("Configuration Update Command sent with post-NSSAA Allowed NSSAI",
 		"procedure", "NSSAA", "supi", ue.SUPI,
-		"allowed_count", len(ue.AllowedNSSAI),
+		"allowed_count", len(ue.AllowedNSSAI), "rejected_count", len(ue.RejectedNSSAI),
+		"extended_rejected_nssai", cmd.ExtendedRejectedNSSAI != nil,
 		"interface", "N1", "direction", "OUT",
 		"spec_ref", "TS 23.502 §4.2.9.2")
 }
@@ -875,21 +1559,11 @@ func (h *Handler) sendNASPlain(ue *amfctx.UEContext, epd byte, msgType nas.Messa
 	return pdu, nil
 }
 
-// sendNASIntegrityOnly wraps an inner NAS PDU with integrity-only protection.
-// sht selects 0x01 (integrity protected) or 0x03 (integrity protected with new SC).
-//
-// The Security Mode Command during initial registration MUST use SHT=0x03 so that
-// UERANSIM (and real UEs) process it via the "new security context" path
-// (TS 24.501 §4.4.4.3.1). SHT=0x01 is only valid when there is already an active
-// security context on the UE side.
-//
-// MAC input: COUNT=DownlinkCount, BEARER=1 (3GPP access), DIR=1 (DL), MESSAGE=SQN||innerPDU.
-func (h *Handler) sendNASIntegrityOnly(ue *amfctx.UEContext, epd byte, msgType nas.MessageType, body interface{}, sht nas.SecurityHeaderType) ([]byte, error) {
-	innerPDU, err := h.sendNASPlain(ue, epd, msgType, body)
-	if err != nil {
-		return nil, err
-	}
-
+// integrityProtectNAS wraps the plain NAS message innerPDU with the integrity
+// protection header sht using the next downlink NAS COUNT, which it increments.
+// Called once per new or retransmitted message. Ref: TS 24.501 §4.4.3.1
+func (h *Handler) integrityProtectNAS(ue *amfctx.UEContext, innerPDU []byte, sht nas.SecurityHeaderType) ([]byte, error) {
+	epd := innerPDU[0]
 	count := ue.SecurityCtx.DownlinkCount
 	sqn := byte(count & 0xFF)
 
@@ -923,7 +1597,14 @@ func (h *Handler) sendNASSecured(ue *amfctx.UEContext, epd byte, msgType nas.Mes
 	if err != nil {
 		return nil, err
 	}
+	return h.cipherProtectNAS(ue, innerPDU)
+}
 
+// cipherProtectNAS wraps the plain NAS message innerPDU as "integrity protected
+// and ciphered" with the next downlink NAS COUNT, which it increments. Called once
+// per new or retransmitted message. Ref: TS 24.501 §4.4.3.1
+func (h *Handler) cipherProtectNAS(ue *amfctx.UEContext, innerPDU []byte) ([]byte, error) {
+	epd := innerPDU[0]
 	count := ue.SecurityCtx.DownlinkCount
 	sqn := byte(count & 0xFF)
 
@@ -975,6 +1656,12 @@ func (h *Handler) sendNASSecured(ue *amfctx.UEContext, epd byte, msgType nas.Mes
 // Returns a reconstituted PDU (outer header preserved, inner now plaintext)
 // that nas.Decode can process normally.
 func (h *Handler) unwrapNASSecurity(ue *amfctx.UEContext, pdu []byte) ([]byte, error) {
+	return h.unwrapWithContext(&ue.SecurityCtx, pdu)
+}
+
+// unwrapWithContext is unwrapNASSecurity on an explicit security context value:
+// it verifies/deciphers with sc and advances sc.UplinkCount, touching nothing else.
+func (h *Handler) unwrapWithContext(sc *amfctx.SecurityContext, pdu []byte) ([]byte, error) {
 	if len(pdu) < 7 {
 		return nil, fmt.Errorf("nas: security PDU too short (%d bytes)", len(pdu))
 	}
@@ -983,8 +1670,13 @@ func (h *Handler) unwrapNASSecurity(ue *amfctx.UEContext, pdu []byte) ([]byte, e
 	receivedMAC := pdu[2:6]
 	sqn := pdu[6]
 	inner := pdu[7:]
+	ciphered := sht == nas.SecurityHeaderIntegrityProtectedAndCiphered ||
+		sht == nas.SecurityHeaderIntegrityProtectedAndCipheredWithNewSC
 
-	count := ue.SecurityCtx.UplinkCount
+	// Estimate the full NAS COUNT from the received 8-bit SQN. A replayed COUNT
+	// (already accepted) maps to the next overflow and fails the MAC.
+	// Ref: TS 24.501 §4.4.3.1; TS 33.501 §6.4.3.1
+	count := estimateUplinkCount(sc.UplinkCount, sqn)
 
 	// Per TS 33.501 §D.3.3: verify MAC over SQN || ciphertext first, then decipher.
 	// MAC is over the received bytes (ciphertext for ciphered messages).
@@ -992,41 +1684,77 @@ func (h *Handler) unwrapNASSecurity(ue *amfctx.UEContext, pdu []byte) ([]byte, e
 	macInput[0] = sqn
 	copy(macInput[1:], inner)
 
-	ok, err := nia.Verify(ue.SecurityCtx.KNASint, count, 0x01, 0x00, macInput, receivedMAC)
-	if err != nil {
-		h.logger.Warn("NAS MAC verification error", "error", err, "count", count)
-	} else if !ok {
-		h.logger.Warn("NAS MAC mismatch — continuing in dev mode",
-			"count", count, "sht", fmt.Sprintf("%02x", sht))
+	ok, err := nia.Verify(sc.KNASint, count, 0x01, 0x00, macInput, receivedMAC)
+	macBad := err != nil || !ok
+	if macBad {
+		if err != nil {
+			h.logger.Warn("NAS MAC verification error", "error", err, "count", count)
+		}
+		if !h.relaxedIntegrity() {
+			// Nothing is trusted or advanced. The caller gets the PDU with the
+			// untouched (still ciphered if SHT 2/4) body only to read the message
+			// type of an integrity-only message. Ref: TS 24.501 §4.4.4.3
+			// A ciphered body (NEA != 0) is never returned: its type is unreadable.
+			if ciphered && sc.CipheringAlgID != 0 {
+				return nil, fmt.Errorf("%w (count %d, sht %02x)", ErrNASIntegrity, count, byte(sht))
+			}
+			untrusted := make([]byte, len(pdu))
+			copy(untrusted, pdu)
+			return untrusted, fmt.Errorf("%w (count %d, sht %02x)", ErrNASIntegrity, count, byte(sht))
+		}
+		h.logger.Warn("NAS MAC mismatch - relaxed enforcement, processing anyway",
+			"count", count, "sht", fmt.Sprintf("%02x", byte(sht)),
+			"spec_ref", "TS 24.501 §4.4.4.3")
 	}
 
 	// Decipher if ciphered (SHT=0x02 or 0x04). Skip for NEA0 (null cipher — already plaintext).
 	var plainInner []byte
-	switch sht {
-	case nas.SecurityHeaderIntegrityProtectedAndCiphered,
-		nas.SecurityHeaderIntegrityProtectedAndCipheredWithNewSC:
-		if ue.SecurityCtx.CipheringAlgID == 0 {
-			plainInner = make([]byte, len(inner))
-			copy(plainInner, inner)
-		} else {
-			deciphered, err := nea.NEA2(ue.SecurityCtx.KNASenc, count, 0x01, 0x00, inner)
-			if err != nil {
-				return nil, fmt.Errorf("nas: NEA2 decipher: %w", err)
-			}
-			plainInner = deciphered
+	if ciphered && sc.CipheringAlgID != 0 {
+		deciphered, err := nea.NEA2(sc.KNASenc, count, 0x01, 0x00, inner)
+		if err != nil {
+			return nil, fmt.Errorf("nas: NEA2 decipher: %w", err)
 		}
-	default:
+		plainInner = deciphered
+	} else {
 		plainInner = make([]byte, len(inner))
 		copy(plainInner, inner)
 	}
 
-	ue.SecurityCtx.UplinkCount++
+	// Relaxed mode: a message with a bad MAC is processed but never advances the
+	// COUNT (a forged SQN must not desynchronise the real one).
+	if !macBad {
+		sc.UplinkCount = count + 1 // KgNB for a Service Request uses UplinkCount-1
+	}
 
 	// Return PDU with plaintext inner so nas.Decode can strip the header and parse it
 	result := make([]byte, 7+len(plainInner))
 	copy(result[:7], pdu[:7])
 	copy(result[7:], plainInner)
 	return result, nil
+}
+
+// unwrapUplink verifies/deciphers an uplink security protected PDU with the right
+// 5G NAS security context. While a SECURITY MODE COMMAND for a new context is
+// outstanding, only a message protected "with new security context" (SECURITY MODE
+// COMPLETE, SHT 3/4) uses the new context; anything else the UE protects (SECURITY
+// MODE REJECT) uses the context in use before the procedure.
+// Ref: TS 24.501 §5.4.2.3, §5.4.2.5
+func (h *Handler) unwrapUplink(ue *amfctx.UEContext, pdu []byte, sht nas.SecurityHeaderType) ([]byte, error) {
+	newSC := sht == nas.SecurityHeaderIntegrityProtectedWithNewSC ||
+		sht == nas.SecurityHeaderIntegrityProtectedAndCipheredWithNewSC
+	// The "new" context is chosen only while an SMC is really outstanding
+	// (RegStageSMC); otherwise ue.SecurityCtx is the context in use.
+	pending := ue.RegStage() == amfctx.RegStageSMC && ue.SecurityCtxChangePending()
+	if newSC || !pending {
+		return h.unwrapNASSecurity(ue, pdu)
+	}
+	prev := ue.PreviousSecurityCtx() // a copy: verified on an explicit value, ue.SecurityCtx is never swapped
+	if prev == nil || !prev.Active {
+		return h.unwrapNASSecurity(ue, pdu)
+	}
+	out, err := h.unwrapWithContext(prev, pdu)
+	ue.StorePreviousSecurityCtx(*prev)
+	return out, err
 }
 
 // sendNASSecuredViaDownlink encodes a security-protected NAS PDU and sends it
@@ -1055,6 +1783,82 @@ func gutiStr(ue *amfctx.UEContext) string {
 		return fmt.Sprintf("%s%s-%08x", ue.GUTI.MCC, ue.GUTI.MNC, ue.GUTI.TMSI)
 	}
 	return ""
+}
+
+// causeRestrictedServiceArea is 5GMM cause #28 "Restricted service area"
+// (TS 24.501 §9.11.3.2, Table 9.11.3.2.1).
+const causeRestrictedServiceArea = uint8(nas.CauseRestrictedServiceArea)
+
+// serviceTypeRestricted reports whether a Service Request of the given service
+// type is rejected with #28 in a Non-Allowed Area: "signalling" and "data"
+// only; mobile terminated services, emergency services, emergency services
+// fallback and elevated signalling continue, and high priority access is
+// exempt (the operator policy applying the restriction to it is not
+// implemented). Unused values map to signalling/data per Table 9.11.3.50.1.
+// Ref: TS 24.501 §5.6.1.5
+func serviceTypeRestricted(v byte) bool {
+	t, ok := nas.InterpretServiceType(v)
+	return ok && (t == nas.ServiceTypeSignalling || t == nas.ServiceTypeData)
+}
+
+// rejectServiceRestrictedArea sends an integrity protected and ciphered
+// SERVICE REJECT #28 (the UE keeps its 5GMM-REGISTERED state and security
+// context) and releases the N2 connection opened by the Service Request.
+// Ref: TS 24.501 §5.6.1.5, §8.2.17; TS 23.501 §5.3.4.1
+func (h *Handler) rejectServiceRestrictedArea(ctx context.Context, ue *amfctx.UEContext,
+	serviceType byte, log *slog.Logger) error {
+	log.WarnContext(ctx, "UE in a Non-Allowed Area - SERVICE REJECT #28",
+		"direction", "OUT", "service_type", serviceType, "tac", fmt.Sprintf("%06X", ue.TAI.TAC),
+		"result", "REJECT", "cause", causeRestrictedServiceArea,
+		"spec_ref", "TS 24.501 §5.6.1.5")
+	metrics.ProcedureTotal.WithLabelValues("AMF", "ServiceRequest", "REJECT").Inc()
+	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement, nas.MsgTypeServiceReject,
+		&nas.ServiceReject{Cause5GMM: causeRestrictedServiceArea}); err != nil {
+		return fmt.Errorf("service request: send Service Reject: %w", err)
+	}
+	h.releaseN2(ue, ngapCausePresentNas, ngapCauseNasNormalRelease, false)
+	return nil
+}
+
+// rejectRestrictedAreaSM answers a UL NAS TRANSPORT 5GSM request that cannot be
+// forwarded because the UE is in a Non-Allowed Area: DL NAS TRANSPORT with the
+// original payload container and 5GMM cause #28.
+// Ref: TS 24.501 §5.4.5.2.5 item 15, §5.4.5.3.1
+func (h *Handler) rejectRestrictedAreaSM(ue *amfctx.UEContext, pduSessionID uint8,
+	transport *nas.ULNASTransport, log *slog.Logger) error {
+	log.Warn("UE in a Non-Allowed Area - 5GSM request not forwarded, DL NAS TRANSPORT #28",
+		"pdu_session_id", pduSessionID, "direction", "OUT", "tac", fmt.Sprintf("%06X", ue.TAI.TAC),
+		"result", "REJECT", "cause", causeRestrictedServiceArea,
+		"spec_ref", "TS 24.501 §5.4.5.2.5, §5.4.5.3.1")
+	metrics.ProcedureTotal.WithLabelValues("AMF", "PDUSessionEstablishment", "REJECT").Inc()
+	return h.rejectULNASTransport(ue, pduSessionID,
+		transport.PayloadContainerType, transport.PayloadContainer, causeRestrictedServiceArea)
+}
+
+// Request type IE values (TS 24.501 §9.11.3.47, Table 9.11.3.47.1) that are
+// subject to the Non-Allowed Area / Service Area Restriction check.
+const (
+	requestTypeInitial      uint8 = 0x01 // initial request
+	requestTypeExistingPDU  uint8 = 0x02 // existing PDU session
+	requestTypeModification uint8 = 0x05 // modification request
+	requestTypeMAPDURequest uint8 = 0x06 // MA PDU request
+)
+
+// requestTypeExemptFromSAR reports whether a 5GSM message is forwarded to the
+// SMF even in a Non-Allowed Area. TS 24.501 §5.4.5.2.5 item 15 restricts only
+// messages whose Request type IE is present and set to "initial request",
+// "existing PDU session", "modification request" or "MA PDU request"; an absent
+// IE and every other value (emergency types included) is forwarded normally.
+// Ref: TS 24.501 §5.4.5.2.5 item 15, §9.11.3.47
+func requestTypeExemptFromSAR(rt *uint8) bool {
+	if rt == nil {
+		return true
+	}
+	switch *rt {
+	case requestTypeInitial, requestTypeExistingPDU, requestTypeModification, requestTypeMAPDURequest:
+		return false
+	}
+	return true
 }
 
 // ---- Service Request -------------------------------------------------------
@@ -1087,6 +1891,13 @@ func (h *Handler) handleServiceRequest(
 		"spec_ref", "TS 23.502 §4.2.3",
 	)
 	log.Info("Service Request received")
+
+	// UE in a Non-Allowed Area (or outside its Allowed Area): signalling/data
+	// service requests are rejected with #28; mobile terminated, emergency and
+	// elevated signalling services continue. Ref: TS 24.501 §5.6.1.5
+	if ue.InNonAllowedArea() && serviceTypeRestricted(svcReq.ServiceType) {
+		return h.rejectServiceRestrictedArea(ctx, ue, svcReq.ServiceType, log)
+	}
 
 	// Re-derive KgNB from the existing KAMF and the NAS UL COUNT of this message.
 	// unwrapNASSecurity already incremented UplinkCount; the SR's NAS COUNT is
@@ -1161,9 +1972,11 @@ func (h *Handler) handleServiceRequest(
 		"pdu_sessions_cxt_req", len(pduSessions),
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
+	ue.SetPendingICS(amfctx.ICSServiceRequest) // failure -> keep registration (AMF-034)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, kgnb,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
 		encAlgs, intAlgs, pduSessions); err != nil {
+		ue.TakePendingICS() // nothing in flight: a stale kind would mis-handle a later failure
 		return fmt.Errorf("service request: SendInitialContextSetupRequest: %w", err)
 	}
 
@@ -1177,6 +1990,9 @@ func (h *Handler) handleServiceRequest(
 		"result", "OK",
 		"spec_ref", "TS 23.502 §4.2.3",
 	)
+
+	// rel19: re-initiate NSSAA for slices left PENDING. Ref: TS 23.502 §4.2.9.2
+	h.retryPendingNSSAA(ctx, ue, "service_request")
 	return nil
 }
 
@@ -1486,7 +2302,7 @@ func (h *Handler) activatePDUSessions(
 //  3. Send Registration Accept inside InitialContextSetupRequest.
 //  4. UE replies with Registration Complete (handled by existing handler).
 func (h *Handler) handleRegistrationUpdate(
-	ctx context.Context, ue *amfctx.UEContext, regReq *nas.RegistrationRequest) error {
+	ctx context.Context, ue *amfctx.UEContext, regReq *nas.RegistrationRequest, rawPDU []byte) error {
 
 	procedureName := "PeriodicRegistrationUpdate"
 	specRef := "TS 23.502 §4.2.2.2.4"
@@ -1504,16 +2320,69 @@ func (h *Handler) handleRegistrationUpdate(
 		"spec_ref", specRef,
 	)
 	log.Info("Registration Update received — using existing security context")
+	// The non-cleartext IEs are in the NAS message container: decipher it and
+	// process the REGISTRATION REQUEST obtained from it. Ref: TS 24.501 §4.4.6
+	outerReq := regReq
+	var cerr error
+	if regReq, cerr = h.registrationRequestFromContainer(ctx, ue, regReq, rawPDU); cerr != nil {
+		// Undecipherable container: new authentication + SMC with RINMR instead of
+		// continuing with the cleartext IEs. Ref: TS 24.501 §4.4.6, §5.4.2.2
+		return h.initiateRegistrationAuth(ctx, ue, outerReq, rawPDU)
+	}
+	ue.ERNSSAISupported = regReq.ERNSSAISupported() // Ref: TS 24.501 §5.5.1.3.2
+	// Keep the previous capability when this update omits the IE (optional in a
+	// periodic update). Ref: TS 24.501 §5.5.1.3.2, §9.11.3.1
+	if c := regReq.Capability5GMM(); c != nil {
+		ue.Capability5GMM = c
+	}
+	log.Info("UE 5GMM capability",
+		"capability_5gmm", ue.Capability5GMM.RawHex(),
+		"capability_5gmm_bits", strings.Join(ue.Capability5GMM.SetBitNames(), ","),
+	)
+
+	// Requested NSSAI of the (container) request: re-evaluate the Allowed NSSAI.
+	// Ref: TS 24.501 §5.5.1.3.2, §5.5.1.3.4; TS 23.502 §4.2.2.2.3
+	if regReq.RequestedNSSAI != nil {
+		ue.RequestedNSSAI = nssaiToSubscribed(regReq.RequestedNSSAI)
+		h.reg.ReevaluateAllowedNSSAI(ctx, ue)
+	}
+	// PDU session status / Uplink data status IEs. Ref: TS 24.501 §5.5.1.3.4
+	sessSync := h.syncPDUSessions(ctx, ue, regReq, log)
 
 	regAccept, err := h.reg.BuildRegistrationUpdateAccept(ctx, ue)
 	if err != nil {
 		return fmt.Errorf("%s: build accept: %w", procedureName, err)
 	}
+	sessSync.applyTo(regAccept)
 
 	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement,
 		nas.MsgTypeRegistrationAccept, regAccept)
 	if err != nil {
 		return fmt.Errorf("%s: encode Registration Accept: %w", procedureName, err)
+	}
+
+	// CM-CONNECTED update (arrived over an existing N2 connection, UPLINK NAS
+	// TRANSPORT): no CM-IDLE to CM-CONNECTED transition, hence no new KgNB and
+	// no ICS; KgNB/NH/NCC are kept and the Accept goes in DOWNLINK NAS TRANSPORT.
+	// Ref: TS 33.501 §6.8.1.2.1; TS 24.501 §5.5.1.3.2
+	ue.Lock()
+	onNewN2 := ue.NASOnNewN2Connection
+	ue.Unlock()
+	if !onNewN2 {
+		log.Info("Registration Update over existing N2 connection — Accept in DL NAS TRANSPORT, KgNB kept",
+			"interface", "N2",
+			"direction", "OUT",
+			"message_type", "DownlinkNASTransport",
+			"spec_ref", "TS 33.501 §6.8.1.2.1",
+		)
+		if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
+			return fmt.Errorf("%s: send Registration Accept: %w", procedureName, err)
+		}
+		h.afterAcceptSent(ue, regAccept, nasPDU)
+		// Uplink data pending: re-establish the user plane over the existing N2
+		// connection, no ICS carries it. Ref: TS 24.501 §5.5.1.3.4
+		h.sendReactivatedSessions(ctx, ue, sessSync.Items, log)
+		return h.finishRegistrationUpdate(ctx, ue, log, specRef)
 	}
 
 	// Re-derive KgNB: use the NAS UL COUNT of this message (UplinkCount-1 since
@@ -1550,13 +2419,22 @@ func (h *Handler) handleRegistrationUpdate(
 		"message_type", "InitialContextSetupRequest",
 		"spec_ref", "TS 38.413 §8.3.1",
 	)
+	ue.SetPendingICS(amfctx.ICSRegistrationUpdate) // failure -> keep registration (AMF-034)
 	if err := h.sender.SendInitialContextSetupRequest(ue, nasPDU, kgnb,
 		ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.IntegrityAlgID,
-		encAlgs, intAlgs, nil); err != nil {
+		encAlgs, intAlgs, sessSync.Items); err != nil {
+		ue.TakePendingICS() // nothing in flight: a stale kind would mis-handle a later failure
 		return fmt.Errorf("%s: SendInitialContextSetupRequest: %w", procedureName, err)
 	}
 	ue.CMState = amfctx.CMConnected
+	h.afterAcceptSent(ue, regAccept, nasPDU)
+	return h.finishRegistrationUpdate(ctx, ue, log, specRef)
+}
 
+// finishRegistrationUpdate runs the post-Accept steps shared by the CM-IDLE
+// (ICS) and CM-CONNECTED (DL NAS TRANSPORT) Registration Update paths.
+func (h *Handler) finishRegistrationUpdate(ctx context.Context, ue *amfctx.UEContext,
+	log *slog.Logger, specRef string) error {
 	log.Info("Registration Update accepted",
 		"result", "OK",
 		"spec_ref", specRef,
@@ -1566,6 +2444,9 @@ func (h *Handler) handleRegistrationUpdate(
 	// CM-CONNECTED — cancel the CM-IDLE reachability watchdogs (re-armed on
 	// AN Release). Ref: TS 23.501 §5.3.2
 	h.notifyUEReachable(ue)
+
+	// rel19: re-initiate NSSAA for slices left PENDING. Ref: TS 23.502 §4.2.9.2
+	h.retryPendingNSSAA(ctx, ue, "registration_update")
 	return nil
 }
 
@@ -1576,6 +2457,26 @@ func (h *Handler) handleRegistrationUpdate(
 const (
 	ngapCausePresentNas    int   = 3 // ngapType.CausePresentNas
 	ngapCauseNasDeregister int64 = 2 // ngapType.CauseNasPresentDeregister
+	// ngapCauseNasNormalRelease is NAS cause normal-release.
+	ngapCauseNasNormalRelease int64 = 0 // ngapType.CauseNasPresentNormalRelease
+	// ngapCauseNasAuthenticationFailure is NAS cause authentication-failure.
+	ngapCauseNasAuthenticationFailure int64 = 1 // ngapType.CauseNasPresentAuthenticationFailure
+	// ngapCausePresentMisc / ngapCauseMiscUnspecified: Misc group, unspecified.
+	ngapCausePresentMisc     int   = 5 // ngapType.CausePresentMisc
+	ngapCauseMiscUnspecified int64 = 5 // ngapType.CauseMiscPresentUnspecified
+)
+
+// AUTHENTICATION FAILURE handling limits. Ref: TS 24.501 §5.4.1.3.7
+const (
+	// autsLen is the length of the AUTS parameter of the Authentication failure
+	// parameter IE (TS 24.501 §9.11.3.14; TS 33.102 §6.3.3).
+	autsLen = 14
+	// maxNgKSIInUseFailures: only the first #71 is answered with the same
+	// challenge and a new ngKSI (§5.4.1.3.7 e)); a repeated one is rejected.
+	maxNgKSIInUseFailures = 1
+	// maxSynchFailures: a second consecutive #21 ends with AUTHENTICATION
+	// REJECT (§5.4.1.3.7 f) NOTE 4).
+	maxSynchFailures = 1
 )
 
 // ---- Deregistration -------------------------------------------------------
@@ -1608,6 +2509,12 @@ func (h *Handler) handleDeregistration(
 	log.Info("Deregistration Request received")
 
 	ue.TransitionTo(amfctx.GMMDeregisteredInitiated)
+	// An NSSAA exchange (T3575) dies with the registration; a network-initiated
+	// de-registration in flight (T3522) is superseded by the UE's own: both
+	// procedures are completed (TS 24.501 §5.5.2.3.5 c)).
+	ue.StopNSSAATimer()
+	ue.StopDeregTimer()
+	ue.ClearRegProc() // a pending registration is superseded by the de-registration
 
 	// Step 1: if UE is not switching off, send Deregistration Accept (TS 24.501 §8.2.12.2).
 	if !deregReq.SwitchOff {
@@ -1650,7 +2557,7 @@ func (h *Handler) handleDeregistration(
 	}
 
 	// Step 3b: release AM policy association at PCF (Npcf_AMPolicyControl).
-	// Non-fatal. Ref: TS 29.507 §4.2.2.4, TS 23.502 §4.2.2.3.2 step 3
+	// Non-fatal. Ref: TS 29.507 §4.2.5, TS 23.502 §4.2.2.3.2 step 3
 	if ue.AMPolicyAssocID != "" {
 		if err := h.reg.ReleaseAMPolicy(ctx, ue.AMPolicyAssocID); err != nil {
 			log.Warn("PCF AM policy release failed (non-fatal)", "error", err,
@@ -1660,7 +2567,7 @@ func (h *Handler) handleDeregistration(
 	}
 
 	// Step 3c: release UE policy association at PCF (Npcf_UEPolicyControl / URSP).
-	// Non-fatal. Ref: TS 29.525 §4.2.2.3, TS 23.502 §4.2.2.3.2 step 3
+	// Non-fatal. Ref: TS 29.525 §4.2.5, TS 23.502 §4.2.2.3.2 step 3
 	if ue.PolicyAssociationID != "" {
 		if err := h.reg.ReleasePCFPolicy(ctx, ue.PolicyAssociationID); err != nil {
 			log.Warn("PCF UE policy release failed (non-fatal)", "error", err,
@@ -1714,41 +2621,57 @@ func (h *Handler) handleDeregistration(
 // Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §8.2.13.1
 func (h *Handler) SendNetworkDeregistration(ctx context.Context, ue *amfctx.UEContext, cause5GMM byte, accessType uint8, reregRequired bool) error {
 	if accessType == 0 {
-		accessType = 1 // default: 3GPP access
+		accessType = procedures.AccessType3GPP // default: 3GPP access
 	}
-
-	log := h.logger.With(
-		"procedure", "NetworkDeregistration",
-		"amf_ue_ngap_id", ue.AMFUENGAPId,
-		"supi", ue.SUPI,
-		"cause", cause5GMM,
-		"rereg_required", reregRequired,
-		"interface", "N1",
-		"direction", "OUT",
-		"spec_ref", "TS 23.502 §4.2.2.3.3",
-	)
-	log.Info("initiating NW-initiated Deregistration")
-
-	deregReq := &nas.DeregistrationRequestNW{
+	return h.sendNetworkDeregistrationReq(ctx, ue, &nas.DeregistrationRequestNW{
 		Cause5GMM:              cause5GMM,
 		AccessType:             accessType,
 		ReregistrationRequired: reregRequired,
+	}, "NetworkDeregistration", "TS 23.502 §4.2.2.3.3")
+}
+
+// sendNetworkDeregistrationReq sends deregReq (DEREGISTRATION REQUEST, UE
+// terminated) protected on the downlink, moves the UE to
+// 5GMM-DEREGISTERED-INITIATED, stops T3575 and, under rel19, starts T3522
+// (dereg_timer.go). procedure/specRef label the logs. rel19 also sets the spare
+// half octet to zero (rel17 keeps the frozen legacy 0x7 nibble). The state change
+// and the timer happen only after a successful send.
+// Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §5.5.2.3.1, §8.2.14, Table 8.2.14.1.1
+func (h *Handler) sendNetworkDeregistrationReq(_ context.Context, ue *amfctx.UEContext, deregReq *nas.DeregistrationRequestNW, procedure, specRef string) error {
+	if h.reg.NSSAASpecLiteral() {
+		deregReq.SpareHalfOctetZero = true
 	}
+	log := h.logger.With(
+		"procedure", procedure,
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"cause", deregReq.Cause5GMM,
+		"rereg_required", deregReq.ReregistrationRequired,
+		"rejected_nssai_count", len(deregReq.RejectedNSSAI),
+		"extended_rejected_nssai", deregReq.ExtendedRejectedNSSAI != nil,
+		"interface", "N1",
+		"direction", "OUT",
+		"spec_ref", specRef,
+	)
+	log.Info("initiating NW-initiated Deregistration")
+
 	if err := h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement,
 		nas.MsgTypeDeregistrationRequestNW, deregReq); err != nil {
 		return fmt.Errorf("network deregistration: send: %w", err)
 	}
 
 	ue.TransitionTo(amfctx.GMMDeregisteredInitiated)
+	ue.StopNSSAATimer() // an NSSAA exchange (T3575) dies with the registration
+	h.armDeregT3522(ue, deregReq, 0)
 	log.Info("Deregistration Request (NW) sent — awaiting UE accept")
 	return nil
 }
 
 // handleNWDeregistrationAccept processes the UE's Deregistration Accept sent in
-// response to a NW-initiated Deregistration Request. The AMF tears down PDU
-// sessions, deregisters from UDM, and releases the N2 context.
+// response to a NW-initiated Deregistration Request: T3522 is stopped and the AMF
+// tears the UE down (completeNWDeregistration).
 //
-// Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §8.2.13.2
+// Ref: TS 23.502 §4.2.2.3.3, TS 24.501 §8.2.13.2, §5.5.2.3.1
 func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.UEContext) error {
 	log := h.logger.With(
 		"procedure", "NetworkDeregistration",
@@ -1759,7 +2682,19 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 		"spec_ref", "TS 23.502 §4.2.2.3.3",
 	)
 	log.Info("Deregistration Accept (NW) received — tearing down UE context")
+	ue.StopNSSAATimer()
+	ue.StopDeregTimer() // "shall stop timer T3522 upon receipt of the DEREGISTRATION ACCEPT"
+	h.completeNWDeregistration(ctx, ue, log)
+	return nil
+}
 
+// completeNWDeregistration is the AMF-side teardown of a network-initiated
+// de-registration: the PDU sessions are released at the SMF, the AMF registration
+// at the UDM and the PCF policy associations are deleted, the UE enters
+// 5GMM-DEREGISTERED and the N2 context is released. Run on DEREGISTRATION ACCEPT
+// and, locally, when T3522 expires for the fifth time (TS 24.501 §5.5.2.3.5 a)).
+// Ref: TS 23.502 §4.2.2.3.3
+func (h *Handler) completeNWDeregistration(ctx context.Context, ue *amfctx.UEContext, log *slog.Logger) {
 	// Teardown PDU sessions
 	smfDel, canDel := h.sender.(interface {
 		DeleteSMContext(ctx context.Context, smContextRef string) error
@@ -1790,7 +2725,7 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 		}
 	}
 
-	// Release PCF AM policy association (Npcf_AMPolicyControl, TS 29.507 §4.2.2.4)
+	// Release PCF AM policy association (Npcf_AMPolicyControl, TS 29.507 §4.2.5)
 	if ue.AMPolicyAssocID != "" {
 		if err := h.reg.ReleaseAMPolicy(ctx, ue.AMPolicyAssocID); err != nil {
 			log.Warn("PCF AM policy release failed (non-fatal)", "error", err,
@@ -1799,7 +2734,7 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 		ue.AMPolicyAssocID = ""
 	}
 
-	// Release PCF UE policy association (Npcf_UEPolicyControl / URSP, TS 29.525 §4.2.2.3)
+	// Release PCF UE policy association (Npcf_UEPolicyControl / URSP, TS 29.525 §4.2.5)
 	if ue.PolicyAssociationID != "" {
 		if err := h.reg.ReleasePCFPolicy(ctx, ue.PolicyAssociationID); err != nil {
 			log.Warn("PCF UE policy release failed (non-fatal)", "error", err,
@@ -1822,7 +2757,6 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 		"result", "OK",
 		"spec_ref", "TS 23.502 §4.2.2.3.3",
 	)
-	return nil
 }
 
 // ---- PDU Session Establishment -----------------------------------------
@@ -1909,6 +2843,9 @@ func (h *Handler) handleULNASTransport(
 		h.completeNetworkPDUSessionRelease(ctx, ue, pduSessionID, "RELEASE_COMPLETE")
 		return nil
 	case nas.MsgTypePDUSessionModificationRequest:
+		if ue.InNonAllowedArea() && !requestTypeExemptFromSAR(transport.RequestType) {
+			return h.rejectRestrictedAreaSM(ue, pduSessionID, transport, log)
+		}
 		return h.handlePDUSessionModification(ctx, ue, pduSessionID, pti, transport.PayloadContainer, log)
 	case nas.MsgTypePDUSessionModificationComplete:
 		log.Info("PDU Session Modification Complete received",
@@ -1945,6 +2882,12 @@ func (h *Handler) handleULNASTransport(
 			"pdu_session_id", pduSessionID,
 		)
 		return nil
+	}
+
+	// Non-Allowed Area: initial/existing/MA PDU session requests are not forwarded
+	// to the SMF (emergency request types exempt). Ref: TS 24.501 §5.4.5.2.5 item 15
+	if pduSessionID != 0 && ue.InNonAllowedArea() && !requestTypeExemptFromSAR(transport.RequestType) {
+		return h.rejectRestrictedAreaSM(ue, pduSessionID, transport, log)
 	}
 
 	// PDU Session Establishment Request handler.
@@ -2046,7 +2989,7 @@ func (h *Handler) handleULNASTransport(
 
 	// Call SMF to create session context
 	smfClient, ok := h.sender.(interface {
-		CallSMF(context.Context, string, string, uint8, []byte, amfctx.SNSSAISubscribed) (smContextRef string, n1Resp []byte, n2Info []byte, err error)
+		CallSMF(context.Context, string, string, uint8, []byte, amfctx.SNSSAISubscribed) (smContextRef string, n1Resp []byte, n2Info []byte, negotiated features.Set, err error)
 	})
 
 	if !ok {
@@ -2054,7 +2997,7 @@ func (h *Handler) handleULNASTransport(
 		return nil
 	}
 
-	smContextRef, n1SmRespBody, n2SmInfo, err := smfClient.CallSMF(ctx, ue.SUPI, dnn, pduSessionID, transport.PayloadContainer, snssai)
+	smContextRef, n1SmRespBody, n2SmInfo, smfFeatures, err := smfClient.CallSMF(ctx, ue.SUPI, dnn, pduSessionID, transport.PayloadContainer, snssai)
 	if err != nil {
 		log.Error("SMF CreateSMContext failed", "error", err)
 		return nil
@@ -2093,6 +3036,7 @@ func (h *Handler) handleULNASTransport(
 		DNN:           dnn,
 		SNSSAI:        snssai,
 		N2SmTransfer:  n2SmInfo,
+		Features:      smfFeatures,
 	}
 	h.reg.PersistUE(ctx, ue)
 
@@ -2906,6 +3850,8 @@ func (h *Handler) SendUEPolicyContainer(
 // Called asynchronously from handleAuthenticationResponse.
 // Ref: TS 23.502 §4.2.2.2.2 — new registration supersedes an existing context
 func (h *Handler) releaseDisplacedContext(ctx context.Context, stale *amfctx.UEContext) {
+	stale.StopNSSAATimer()
+	stale.StopDeregTimer()
 	stale.Lock()
 	stale.StopAllTimers()
 	sessions := make(map[uint8]*amfctx.PDUSession, len(stale.PDUSessions))

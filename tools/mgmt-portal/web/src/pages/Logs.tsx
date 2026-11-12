@@ -16,29 +16,10 @@ import {
 import type { BadgeVariant } from '../components/ui'
 import { cn } from '../lib/cn'
 import { useStickToBottom } from '../lib/useStickToBottom'
+import { clearLogs, ensureStream, setLogsPaused, useLogStream } from '../lib/logStream'
+import type { ConnState } from '../lib/logStream'
 
 const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'lmf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf']
-
-/** Keep at most this many lines in memory (matches the pre-redesign cap). */
-const MAX_LINES = 2000
-const RECONNECT_MS = 3_000
-
-type LogLine = { raw: string; level: string; msg: string; ts: string }
-type ConnState = 'connecting' | 'open' | 'closed'
-
-function parseLogLine(raw: string): LogLine {
-  try {
-    const obj = JSON.parse(raw.trim())
-    return {
-      raw,
-      level: (obj.level ?? '').toLowerCase(),
-      msg: obj.msg ?? raw,
-      ts: obj.time ?? '',
-    }
-  } catch {
-    return { raw, level: 'info', msg: raw, ts: '' }
-  }
-}
 
 /**
  * Log level → semantic token. The level word itself is always printed next to
@@ -65,15 +46,15 @@ const CONN: Record<ConnState, { variant: BadgeVariant; icon: ReactNode; label: s
 
 export default function Logs() {
   const [container, setContainer] = useState('amf')
-  const [lines, setLines] = useState<LogLine[]>([])
   const [paused, setPaused] = useState(false)
   const [filter, setFilter] = useState('')
-  const [connState, setConnState] = useState<ConnState>('connecting')
-  const wsRef = useRef<WebSocket | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
-  const pausedRef = useRef(false)
 
-  pausedRef.current = paused
+  // Buffers live in lib/logStream (module scope): they survive navigation and
+  // container switches; only Clear or a container restart empties them.
+  const { lines, conn: connState } = useLogStream(container)
+  useEffect(() => { ensureStream(container) }, [container])
+  useEffect(() => { setLogsPaused(paused) }, [paused])
 
   const { data: services = [] } = useQuery({
     queryKey: ['services'],
@@ -84,48 +65,6 @@ export default function Logs() {
     .filter(s => NF_CONTAINERS.includes(s.name))
     .map(s => s.name)
     .sort()
-
-  useEffect(() => {
-    wsRef.current?.close()
-    setLines([])
-    setConnState('connecting')
-
-    let dead = false
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-
-    function connect() {
-      if (dead) return
-      setConnState('connecting')
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws/logs/${container}?tail=200`)
-      wsRef.current = ws
-
-      ws.onopen = () => {
-        if (!dead) setConnState('open')
-      }
-      ws.onmessage = (e) => {
-        if (pausedRef.current) return
-        const parsed = parseLogLine(e.data as string)
-        setLines(prev => {
-          const next = [...prev, parsed]
-          return next.length > MAX_LINES ? next.slice(-MAX_LINES) : next
-        })
-      }
-      ws.onclose = () => {
-        if (dead) return
-        setConnState('closed')
-        reconnectTimer = setTimeout(connect, RECONNECT_MS)
-      }
-    }
-
-    connect()
-    return () => {
-      dead = true
-      if (reconnectTimer) clearTimeout(reconnectTimer)
-      wsRef.current?.close()
-    }
-  }, [container])
 
   // Auto-scroll while streaming (suspended while paused so the operator can read).
   const { atBottom, jumpToLatest } = useStickToBottom(logRef, lines, paused)
@@ -162,7 +101,7 @@ export default function Logs() {
             <Button variant="secondary" size="sm" icon={<Download size={14} />} onClick={downloadLogs}>
               Export
             </Button>
-            <Button variant="secondary" size="sm" icon={<Trash2 size={14} />} onClick={() => setLines([])}>
+            <Button variant="secondary" size="sm" icon={<Trash2 size={14} />} onClick={() => clearLogs(container)}>
               Clear
             </Button>
             <Button
@@ -215,7 +154,7 @@ export default function Logs() {
         <DegradedState
           className="mb-4"
           title="Log stream disconnected"
-          description={`The WebSocket to the portal dropped. Reconnecting every ${RECONNECT_MS / 1000} s; buffered lines stay visible below.`}
+          description={`The WebSocket to the portal dropped. Reconnecting every 3 s; buffered lines stay visible below.`}
         />
       )}
 

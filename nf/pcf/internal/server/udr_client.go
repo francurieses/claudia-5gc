@@ -5,8 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 
+	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
@@ -28,6 +32,12 @@ type UDRClient interface {
 type HTTPUDRClient struct {
 	baseURL string
 	client  *http.Client
+
+	// profile and logger drive the supportedFeatures negotiation
+	// (udr_features.go); a nil profile is Rel-17 and sends nothing.
+	profile *capability.Profile
+	logger  *slog.Logger
+	cat     *features.Catalog
 }
 
 // NewHTTPUDRClient constructs a client pointing at the given UDR base URL.
@@ -36,9 +46,19 @@ func NewHTTPUDRClient(baseURL string, client *http.Client) *HTTPUDRClient {
 	return &HTTPUDRClient{baseURL: baseURL, client: client}
 }
 
+// suppFeatQuery renders the optional supp-feat query parameter ("" when the
+// profile offers nothing, so the legacy URL stays byte-identical).
+func suppFeatQuery(offer string) string {
+	if offer == "" {
+		return ""
+	}
+	return "?" + url.Values{udrQuerySuppFeat: {offer}}.Encode()
+}
+
 func (c *HTTPUDRClient) GetPolicySubscription(ctx context.Context, supi string) (*types.PolicySubscription, error) {
-	url := c.baseURL + "/nudr-dr/v2/policy-data/" + supi + "/ue-policy-set"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	offer := c.offer()
+	u := c.baseURL + "/nudr-dr/v2/policy-data/" + supi + "/ue-policy-set" + suppFeatQuery(offer)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pcf: udr client: new request: %w", err)
 	}
@@ -57,16 +77,22 @@ func (c *HTTPUDRClient) GetPolicySubscription(ctx context.Context, supi string) 
 		return nil, fmt.Errorf("pcf: udr client: unexpected status %d", resp.StatusCode)
 	}
 
-	var sub types.PolicySubscription
-	if err := json.NewDecoder(resp.Body).Decode(&sub); err != nil {
+	// UePolicySet.suppFeat is read next to the subscription (TS 29.519).
+	var body struct {
+		types.PolicySubscription
+		SuppFeat json.RawMessage `json:"suppFeat"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("pcf: udr client: decode policy: %w", err)
 	}
-	return &sub, nil
+	c.negotiate(ctx, supi, offer, body.SuppFeat)
+	return &body.PolicySubscription, nil
 }
 
 func (c *HTTPUDRClient) GetSmPolicyData(ctx context.Context, supi string) (*types.SmPolicyData, error) {
-	url := c.baseURL + "/nudr-dr/v2/policy-data/" + supi + "/sm-data"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	offer := c.offer()
+	u := c.baseURL + "/nudr-dr/v2/policy-data/" + supi + "/sm-data" + suppFeatQuery(offer)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("pcf: udr client: new request: %w", err)
 	}
@@ -85,20 +111,25 @@ func (c *HTTPUDRClient) GetSmPolicyData(ctx context.Context, supi string) (*type
 		return nil, fmt.Errorf("pcf: udr client: unexpected status %d", resp.StatusCode)
 	}
 
-	var data types.SmPolicyData
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	// SmPolicyData.suppFeat is read next to the data (TS 29.519).
+	var body struct {
+		types.SmPolicyData
+		SuppFeat json.RawMessage `json:"suppFeat"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("pcf: udr client: decode sm-data: %w", err)
 	}
-	return &data, nil
+	c.negotiate(ctx, supi, offer, body.SuppFeat)
+	return &body.SmPolicyData, nil
 }
 
 func (c *HTTPUDRClient) PutSmPolicyData(ctx context.Context, data *types.SmPolicyData) error {
-	url := c.baseURL + "/nudr-dr/v2/policy-data/" + data.SUPI + "/sm-data"
+	putURL := c.baseURL + "/nudr-dr/v2/policy-data/" + data.SUPI + "/sm-data"
 	body, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("pcf: udr client: marshal sm-data: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("pcf: udr client: new request: %w", err)
 	}

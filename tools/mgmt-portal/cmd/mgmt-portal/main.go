@@ -82,7 +82,7 @@ func main() {
 	}
 
 	// Docker client (gracefully degrade if socket not mounted)
-	docker, err := dockerclient.New()
+	docker, err := dockerclient.New(os.Getenv("COMPOSE_PROJECT_NAME"))
 	if err != nil {
 		slog.Warn("docker socket unavailable — services feature disabled", "err", err)
 	} else {
@@ -98,7 +98,13 @@ func main() {
 	}
 	detector := deployment.NewDetector(lister, ranTools)
 
+	var release *api.ReleaseResolver
+	if docker != nil {
+		release = api.NewReleaseResolver(docker)
+	}
+
 	deps := api.Deps{
+		Release:     release,
 		AMFMgmtURLs: amfMgmtURLs,
 		Deployment:  detector,
 		Store:       db,

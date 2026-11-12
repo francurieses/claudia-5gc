@@ -7,8 +7,10 @@ package ngap
 import (
 	"testing"
 
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/capability"
+
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 )
 
 var oneSession = []PDUSessionSetupItemCxtReq{
@@ -142,7 +144,7 @@ func TestPDUSessionResourceSetupRequest_UEAMBR(t *testing.T) {
 	sd := []byte{0, 0, 1}
 	t.Run("with UE-AMBR after list, criticality ignore", func(t *testing.T) {
 		ies := decodePSRSetup(t, BuildPDUSessionResourceSetupRequest(1, 2, 1, []byte{0x01}, []byte{0xBB}, 1, sd,
-			NewUEAMBRFromKbps(2_000_000, 4_000_000)))
+			NewUEAMBRFromKbps(2_000_000, 4_000_000), capability.PeerRAN{}))
 		want := []int64{ngapType.ProtocolIEIDAMFUENGAPID, ngapType.ProtocolIEIDRANUENGAPID,
 			ngapType.ProtocolIEIDPDUSessionResourceSetupListSUReq, ngapType.ProtocolIEIDUEAggregateMaximumBitRate}
 		if len(ies) != len(want) {
@@ -164,14 +166,14 @@ func TestPDUSessionResourceSetupRequest_UEAMBR(t *testing.T) {
 	})
 	t.Run("default 1 Gbps when subscription lacks UE-AMBR", func(t *testing.T) {
 		ies := decodePSRSetup(t, BuildPDUSessionResourceSetupRequest(1, 2, 1, []byte{0x01}, []byte{0xBB}, 1, sd,
-			NewUEAMBRFromKbps(0, 0)))
+			NewUEAMBRFromKbps(0, 0), capability.PeerRAN{}))
 		a := ies[3].Value.UEAggregateMaximumBitRate
 		if a.UEAggregateMaximumBitRateUL.Value != DefaultUEAMBRBps || a.UEAggregateMaximumBitRateDL.Value != DefaultUEAMBRBps {
 			t.Errorf("AMBR = %d/%d", a.UEAggregateMaximumBitRateUL.Value, a.UEAggregateMaximumBitRateDL.Value)
 		}
 	})
 	t.Run("omitted when nil (already delivered)", func(t *testing.T) {
-		ies := decodePSRSetup(t, BuildPDUSessionResourceSetupRequest(1, 2, 2, []byte{0x01}, []byte{0xBB}, 1, sd, nil))
+		ies := decodePSRSetup(t, BuildPDUSessionResourceSetupRequest(1, 2, 2, []byte{0x01}, []byte{0xBB}, 1, sd, nil, capability.PeerRAN{}))
 		if len(ies) != 3 {
 			t.Fatalf("got %d IEs, want 3", len(ies))
 		}

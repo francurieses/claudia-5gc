@@ -13,14 +13,17 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -32,35 +35,278 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
+	udmsbi "github.com/francurieses/claudia-5gc/nf/udm/internal/sbi"
 	"github.com/francurieses/claudia-5gc/shared/aka"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	suciPkg "github.com/francurieses/claudia-5gc/shared/crypto/suci"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
+	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
-// SdmSubscription is the request/response body for Nudm_SDM_Subscribe.
-// Ref: TS 29.503 §6.1.6.2.11
+// SdmSubscription is the spec-literal body of Nudm_SDM_Subscribe (Rel-19
+// profile response, and the normalised in-memory form of every subscription).
+// Ref: TS 29.503 §6.1.6.2.3 (Type: SdmSubscription)
+//
+// oapi: TS29503_Nudm_SDM.yaml#/components/schemas/SdmSubscription
 type SdmSubscription struct {
-	NfInstanceID    string `json:"nfInstanceId,omitempty"`
-	CallbackRef     string `json:"callbackReference"`
-	MonitoredResURI string `json:"monitoredResourceUri,omitempty"`
-	SubscriptionID  string `json:"subscriptionId,omitempty"`
-	ImplicitUnsub   bool   `json:"implicitUnsubscribe,omitempty"`
+	NfInstanceID          string   `json:"nfInstanceId,omitempty"`
+	CallbackRef           string   `json:"callbackReference"`
+	MonitoredResourceURIs []string `json:"monitoredResourceUris,omitempty"`
+	SubscriptionID        string   `json:"subscriptionId,omitempty"`
+	ImplicitUnsub         bool     `json:"implicitUnsubscribe,omitempty"`
+	// SupportedFeatures is the consumer's value on the request and the
+	// negotiated answer on the response. Ref: TS 29.503 §6.1.6.2.3.
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
+	// negotiated is the Nudm_SDM feature set negotiated for this subscription
+	// (TS 29.500 §6.6.2); kept on the resource context, never serialised.
+	negotiated features.Set
 }
 
-// ModificationNotification is the body POSTed to the callback URI.
-// Ref: TS 29.503 §6.1.6.2.13
+// sdmSubscriptionRequest decodes the POST body in either shape: the schema's
+// monitoredResourceUris array (embedded SdmSubscription) or the legacy
+// singular monitoredResourceUri string sent by Rel-17-profile consumers.
+//
+// oapi: none decode-only superset of SdmSubscription that also accepts the legacy Rel-17-profile attribute monitoredResourceUri
+type sdmSubscriptionRequest struct {
+	SdmSubscription
+	LegacyMonitoredResourceURI string `json:"monitoredResourceUri,omitempty"`
+}
+
+// sdmSubscriptionRel17 is the frozen Rel-17-profile subscription response
+// (singular monitoredResourceUri). Field order is part of the baseline bytes.
+//
+// oapi: none legacy Rel-17-profile wire shape of SdmSubscription, see SdmSubscription
+type sdmSubscriptionRel17 struct {
+	NfInstanceID      string `json:"nfInstanceId,omitempty"`
+	CallbackRef       string `json:"callbackReference"`
+	MonitoredResURI   string `json:"monitoredResourceUri,omitempty"`
+	SubscriptionID    string `json:"subscriptionId,omitempty"`
+	ImplicitUnsub     bool   `json:"implicitUnsubscribe,omitempty"`
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
+}
+
+// legacyView renders sub in the Rel-17-profile shape (first monitored URI).
+func (sub *SdmSubscription) legacyView() sdmSubscriptionRel17 {
+	v := sdmSubscriptionRel17{
+		NfInstanceID:      sub.NfInstanceID,
+		CallbackRef:       sub.CallbackRef,
+		SubscriptionID:    sub.SubscriptionID,
+		ImplicitUnsub:     sub.ImplicitUnsub,
+		SupportedFeatures: sub.SupportedFeatures,
+	}
+	if len(sub.MonitoredResourceURIs) > 0 {
+		v.MonitoredResURI = sub.MonitoredResourceURIs[0]
+	}
+	return v
+}
+
+// ModificationNotification is the spec-literal body POSTed to the callback URI
+// under the Rel-19 profile. Ref: TS 29.503 §6.1.6.2.21 (Type: ModificationNotification)
+//
+// oapi: TS29503_Nudm_SDM.yaml#/components/schemas/ModificationNotification
 type ModificationNotification struct {
-	ResourceChanges []ChangeItem `json:"resourceChanges"`
+	NotifyItems    []NotifyItem `json:"notifyItems"`
+	SubscriptionID string       `json:"subscriptionId,omitempty"`
 }
 
-// ChangeItem describes a single field change.
-// Ref: TS 29.503 §6.1.6.2.14
+// NotifyItem indicates the changes on one resource; resourceId is the absolute
+// URI of the changed resource. Ref: TS 29.571 §5.2.4.9 (Type NotifyItem)
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/NotifyItem
+type NotifyItem struct {
+	ResourceID string       `json:"resourceId"`
+	Changes    []ChangeItem `json:"changes"`
+}
+
+// ChangeItem describes a single change. Ref: TS 29.571 §5.2.4.8 (Type ChangeItem)
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/ChangeItem
 type ChangeItem struct {
+	Op        string `json:"op"`             // ADD | MOVE | REMOVE | REPLACE
+	Path      string `json:"path"`           // JSON Pointer (RFC 6901)
+	From      string `json:"from,omitempty"` // source pointer, MOVE only
+	OrigValue any    `json:"origValue,omitempty"`
+	NewValue  any    `json:"newValue,omitempty"`
+}
+
+// changeNewValueRequired is true for the ops whose newValue "shall be present"
+// (the null value being allowed). Ref: TS 29.571 §5.2.4.8.
+func changeNewValueRequired(op string) bool { return op == opAdd || op == opReplace }
+
+// MarshalJSON emits newValue as null when the op requires it but the value is
+// not known to the UDM (e.g. the whole resource was replaced).
+func (c ChangeItem) MarshalJSON() ([]byte, error) {
+	type withNull struct {
+		Op        string `json:"op"`
+		Path      string `json:"path"`
+		From      string `json:"from,omitempty"`
+		OrigValue any    `json:"origValue,omitempty"`
+		NewValue  any    `json:"newValue"`
+	}
+	type plain struct {
+		Op        string `json:"op"`
+		Path      string `json:"path"`
+		From      string `json:"from,omitempty"`
+		OrigValue any    `json:"origValue,omitempty"`
+		NewValue  any    `json:"newValue,omitempty"`
+	}
+	if changeNewValueRequired(c.Op) {
+		return json.Marshal(withNull(c))
+	}
+	return json.Marshal(plain(c))
+}
+
+// legacyModificationNotification is the frozen Rel-17-profile notification
+// body (resourceChanges); not a schema of TS29503_Nudm_SDM.yaml.
+//
+// oapi: none legacy Rel-17-profile wire shape of ModificationNotification, see ModificationNotification
+type legacyModificationNotification struct {
+	ResourceChanges []legacyChangeItem `json:"resourceChanges"`
+}
+
+// legacyChangeItem is the Rel-17-profile change entry and also the accepted
+// input element of the internal data-change trigger.
+//
+// oapi: none legacy Rel-17-profile wire shape of ChangeItem, see ChangeItem
+type legacyChangeItem struct {
 	ChangeType    string `json:"changeType"`              // ADD | REMOVE | REPLACE
 	ResourcePath  string `json:"resourcePath"`            // JSON Pointer
 	NewValue      any    `json:"newValue,omitempty"`      // value after change
 	OriginalValue any    `json:"originalValue,omitempty"` // value before change
+}
+
+// triggerChange is one element of the internal data-change trigger body: the
+// legacy change entry plus the optional MOVE source pointer, which only the
+// Rel-19 conversion uses (the Rel-17 body forwards the legacy fields verbatim).
+//
+// oapi: none internal (non-3GPP) data-change trigger input, see ChangeItem
+type triggerChange struct {
+	legacyChangeItem
+	From string `json:"from,omitempty"`
+}
+
+// ChangeItem op values. Ref: TS 29.571 §5.2.4.8 (ChangeType: ADD, MOVE, REMOVE, REPLACE).
+const (
+	opAdd     = "ADD"
+	opMove    = "MOVE"
+	opRemove  = "REMOVE"
+	opReplace = "REPLACE"
+)
+
+// normaliseOp maps a trigger changeType to a TS 29.571 ChangeType value: the
+// four op names (case-insensitive) and the legacy aliases CREATE, UPDATE and
+// DELETE. ok is false for any other value.
+func normaliseOp(changeType string) (op string, ok bool) {
+	switch strings.ToUpper(changeType) {
+	case opAdd, "CREATE":
+		return opAdd, true
+	case opMove:
+		return opMove, true
+	case opRemove, "DELETE":
+		return opRemove, true
+	case opReplace, "UPDATE":
+		return opReplace, true
+	}
+	return "", false
+}
+
+// sdmResourcePrefix marks a trigger resourcePath whose path component is a
+// Nudm_SDM resource URI (the trigger default) rather than a JSON pointer
+// inside the resource.
+const sdmResourcePrefix = "/nudm-sdm/"
+
+// resourcePathComponent returns the URI path of s when s is an absolute URI,
+// else s unchanged, with any trailing slash removed.
+func resourcePathComponent(s string) string {
+	if u, err := url.Parse(s); err == nil && u.Scheme != "" && u.Host != "" {
+		s = u.Path
+	}
+	if len(s) > 1 {
+		s = strings.TrimSuffix(s, "/")
+	}
+	return s
+}
+
+// toNotifyItems converts trigger changes to the TS 29.571 NotifyItem shape for
+// one subscription. A resourcePath whose path component is a Nudm_SDM resource
+// URI (relative or absolute) names the changed resource and yields path "";
+// any other value is a JSON pointer within the am-data resource of supi.
+// resourceId is the absolute URI the subscriber monitors: the entry of
+// sub.MonitoredResourceURIs whose path component equals the changed resource,
+// else apiRoot + the resource path. Items sharing a resourceId are grouped in
+// first-seen order. Ref: TS 29.571 §5.2.4.8-9, TS 29.503 §6.1.6.2.3.
+func toNotifyItems(supi, apiRoot string, monitored []string, in []triggerChange) ([]NotifyItem, error) {
+	var out []NotifyItem
+	idx := map[string]int{}
+	for _, c := range in {
+		op, ok := normaliseOp(c.ChangeType)
+		if !ok {
+			return nil, fmt.Errorf("udm: unknown changeType %q", c.ChangeType)
+		}
+		if op == opMove && c.From == "" {
+			return nil, fmt.Errorf("udm: changeType MOVE requires from")
+		}
+		resPath, path := "/nudm-sdm/v2/"+supi+"/am-data", c.ResourcePath
+		if rp := resourcePathComponent(c.ResourcePath); strings.HasPrefix(rp, sdmResourcePrefix) {
+			resPath, path = rp, ""
+		}
+		rid := apiRoot + resPath
+		for _, m := range monitored {
+			if resourcePathComponent(m) == resPath {
+				rid = m
+				break
+			}
+		}
+		i, ok := idx[rid]
+		if !ok {
+			i = len(out)
+			idx[rid] = i
+			out = append(out, NotifyItem{ResourceID: rid})
+		}
+		out[i].Changes = append(out[i].Changes, ChangeItem{
+			Op: op, Path: path, From: c.From, OrigValue: c.OriginalValue, NewValue: c.NewValue,
+		})
+	}
+	return out, nil
+}
+
+// AuthType / AvType wire values. Ref: TS 29.503 §6.3.6.3.3 (Enumeration: AuthType),
+// §6.3.6.3.4 (Enumeration: AvType).
+const (
+	authType5GAKA       = "5G_AKA"
+	authTypeEAPAKAPrime = "EAP_AKA_PRIME"
+	avType5GHEAKA       = "5G_HE_AKA"
+	avTypeEAPAKAPrime   = "EAP_AKA_PRIME"
+)
+
+// AuthenticationInfoResult is the spec-literal generate-auth-data answer
+// (Rel-19 profile). Ref: TS 29.503 §6.3.6.2.3 (Type: AuthenticationInfoResult)
+//
+// oapi: TS29503_Nudm_UEAU.yaml#/components/schemas/AuthenticationInfoResult
+type AuthenticationInfoResult struct {
+	AuthType             string                `json:"authType"`
+	SupportedFeatures    string                `json:"supportedFeatures,omitempty"`
+	AuthenticationVector *AuthenticationVector `json:"authenticationVector,omitempty"`
+	Supi                 string                `json:"supi,omitempty"`
+}
+
+// AuthenticationVector carries either an Av5GHeAka (avType 5G_HE_AKA) or an
+// AvEapAkaPrime (avType EAP_AKA_PRIME); the unused member attributes are
+// omitted. Ref: TS 29.503 §6.3.6.2.4 (AvEapAkaPrime), §6.3.6.2.5 (Av5GHeAka); oneOf discriminated by avType.
+//
+// oapi: TS29503_Nudm_UEAU.yaml#/components/schemas/AuthenticationVector
+type AuthenticationVector struct {
+	AvType   string `json:"avType"`
+	Rand     string `json:"rand"`
+	Autn     string `json:"autn"`
+	XresStar string `json:"xresStar,omitempty"` // 5G_HE_AKA
+	Kausf    string `json:"kausf,omitempty"`    // 5G_HE_AKA
+	Xres     string `json:"xres,omitempty"`     // EAP_AKA_PRIME
+	CkPrime  string `json:"ckPrime,omitempty"`  // EAP_AKA_PRIME
+	IkPrime  string `json:"ikPrime,omitempty"`  // EAP_AKA_PRIME
 }
 
 // UDRClient calls the UDR for subscription data.
@@ -84,9 +330,16 @@ type UDRAuthSub struct {
 }
 
 // UDRAMData holds AM subscription data from the UDR.
+//
+// oapi: none internal normalised view of the Nudr am-data answer (not a wire body)
 type UDRAMData struct {
 	SNSSAIs                  []SNSSAIEntry
 	AMBRUplink, AMBRDownlink uint64
+	// GPSIs are the subscriber's Gpsi values decoded from the UDR answer
+	// (AccessAndMobilitySubscriptionData.gpsis, TS 29.503 §6.1.6.2.4). Only
+	// well-formed entries (TS 29.571 §5.3.2 pattern) are kept. The omitempty
+	// keeps the marshalled form of a record without GPSIs unchanged.
+	GPSIs []string `json:",omitempty"`
 }
 
 type SNSSAIEntry struct {
@@ -118,6 +371,14 @@ type Server struct {
 	// Ref: TS 33.501 §6.12, Annex C.3
 	homeNetPrivKeyA    [32]byte
 	homeNetPrivKeyASet bool
+	// homeNetPrivKeyB is the Home Network secp256r1 private scalar for SUCI
+	// Profile B; nil = Profile B not enabled (501).
+	// Ref: TS 33.501 §6.12, Annex C.3.4
+	homeNetPrivKeyB []byte
+	// hnKeyIDA / hnKeyIDB are the Home Network Public Key Identifiers of the
+	// X25519 / P-256 key pairs; 0 = any identifier accepted.
+	// Ref: TS 23.003 §2.2B, TS 33.501 Annex C.1
+	hnKeyIDA, hnKeyIDB uint8
 
 	// SDM subscription store — keyed by SUPI.
 	// Value type: []*SdmSubscription.
@@ -125,6 +386,46 @@ type Server struct {
 	subscriptions   sync.Map
 	subscriptionIdx sync.Map // subscriptionId → supi
 	notifyClient    *http.Client
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// ueauCat is the Nudm_UEAU producer catalog.
+	ueauCat *features.Catalog
+	// sdmCat / uecmCat are the Nudm_SDM and Nudm_UECM producer catalogs.
+	sdmCat  *features.Catalog
+	uecmCat *features.Catalog
+}
+
+// SetProfile wires the release profile used for supportedFeatures negotiation.
+// Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetUEAUCatalog replaces the Nudm_UEAU catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetUEAUCatalog(c *features.Catalog) {
+	if c == nil {
+		c = udmsbi.NudmUEAUCatalog()
+	}
+	s.ueauCat = c
+}
+
+// SetSDMCatalog replaces the Nudm_SDM catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetSDMCatalog(c *features.Catalog) {
+	if c == nil {
+		c = udmsbi.NudmSDMCatalog()
+	}
+	s.sdmCat = c
+}
+
+// SetUECMCatalog replaces the Nudm_UECM catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetUECMCatalog(c *features.Catalog) {
+	if c == nil {
+		c = udmsbi.NudmUECMCatalog()
+	}
+	s.uecmCat = c
 }
 
 func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
@@ -151,6 +452,9 @@ func New(addr, snName string, tlsCfg TLSConfig, udr UDRClient, logger *slog.Logg
 		addr:         addr,
 		snName:       snName,
 		notifyClient: &http.Client{Timeout: 5 * time.Second},
+		ueauCat:      udmsbi.NudmUEAUCatalog(),
+		sdmCat:       udmsbi.NudmSDMCatalog(),
+		uecmCat:      udmsbi.NudmUECMCatalog(),
 	}
 	return newWithServer(s, tlsCfg)
 }
@@ -181,6 +485,229 @@ func (s *Server) WithHomeNetPrivKeyA(hexKey string) error {
 	s.logger.Info("UDM: SUCI Profile A (X25519) enabled",
 		"spec_ref", "TS 33.501 §6.12 Annex C.3")
 	return nil
+}
+
+// WithHomeNetPrivKeyB loads the Home Network secp256r1 private scalar
+// (hex-encoded, 32 bytes) for SUCI Profile B de-concealment. Empty = disabled
+// (Profile B SUCI is answered 501).
+// Ref: TS 33.501 §6.12, Annex C.3.4
+func (s *Server) WithHomeNetPrivKeyB(hexKey string) error {
+	if hexKey == "" {
+		return nil
+	}
+	b, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf("udm: invalid hn_private_key_p256: %w", err)
+	}
+	if len(b) != 32 {
+		return fmt.Errorf("udm: hn_private_key_p256 must be 32 bytes, got %d", len(b))
+	}
+	// Reject a zero scalar or a scalar >= the curve order n at load time.
+	if _, err := ecdh.P256().NewPrivateKey(b); err != nil {
+		return fmt.Errorf("udm: hn_private_key_p256 is not a valid P-256 scalar: %w", err)
+	}
+	s.homeNetPrivKeyB = b
+	s.logger.Info("UDM: SUCI Profile B (secp256r1) enabled",
+		"spec_ref", "TS 33.501 §6.12 Annex C.3.4")
+	return nil
+}
+
+// WithHNKeyIDs sets the Home Network Public Key Identifiers of the Profile A
+// (X25519) and Profile B (P-256) key pairs. 0 accepts any identifier.
+// Ref: TS 33.501 Annex C.1
+func (s *Server) WithHNKeyIDs(x25519, p256 uint8) *Server {
+	s.hnKeyIDA, s.hnKeyIDB = x25519, p256
+	if s.homeNetPrivKeyASet && x25519 == 0 {
+		s.logger.Warn("UDM: hn_private_key_x25519 set but hn_key_id_x25519 is 0; any SUCI key identifier is accepted",
+			"spec_ref", "TS 23.003 §2.2B")
+	}
+	if s.homeNetPrivKeyB != nil && p256 == 0 {
+		s.logger.Warn("UDM: hn_private_key_p256 set but hn_key_id_p256 is 0; any SUCI key identifier is accepted",
+			"spec_ref", "TS 23.003 §2.2B")
+	}
+	return s
+}
+
+// ProblemDetails causes of the SIDF (SUCI de-concealment) failures.
+// Ref: TS 29.503 §6.3.7.3 Table 6.3.7.3-1 (Nudm_UEAuthentication application
+// errors), TS 29.500 §5.2.7.2 Table 5.2.7.2-1 (generic causes).
+const (
+	// causeMandatoryIEIncorrect: malformed SUCI path parameter (400).
+	causeMandatoryIEIncorrect = "MANDATORY_IE_INCORRECT"
+	// causeUnsupportedProtectionScheme: unknown or unconfigured protection
+	// scheme (501, TS 29.503 Table 6.3.7.3-1).
+	causeUnsupportedProtectionScheme = "UNSUPPORTED_PROTECTION_SCHEME"
+	// causeInvalidHNPublicKeyID: unknown Home Network Public Key Identifier
+	// (403, TS 29.503 Table 6.3.7.3-1).
+	causeInvalidHNPublicKeyID = "INVALID_HN_PUBLIC_KEY_IDENTIFIER"
+	// causeInvalidSchemeOutput: scheme output cannot be de-concealed (403,
+	// TS 29.503 Table 6.3.7.3-1).
+	causeInvalidSchemeOutput = "INVALID_SCHEME_OUTPUT"
+	// causeUnsupportedSUPIType: SUCI of a SUPI type other than IMSI. TS 29.503
+	// Table 6.3.7.3-1 defines no cause for it, so the 501 carries no "cause"
+	// attribute (a project-invented cause string is not allowed).
+	causeUnsupportedSUPIType = ""
+)
+
+// Fixed ProblemDetails details: never echo the SUCI or a crypto error.
+const (
+	detailInvalidSUCI         = "supiOrSuci is not a valid SUCI"
+	detailInvalidSchemeOutput = "SUCI scheme output could not be de-concealed"
+	detailUnsupportedSUPIType = "SUPI type of the SUCI is not supported"
+	detailInvalidHNKeyID      = "unknown home network public key identifier"
+	detailSchemeNotConfigured = "SUCI protection scheme not configured"
+	detailSchemeUnsupported   = "SUCI protection scheme not supported"
+)
+
+// invalidParamSUCI is the invalidParams entry of a malformed SUCI: it is the
+// URI path variable supiOrSuci of GenerateAuthData (TS 29.503 §6.3.3.2), so
+// the plain variable name is the param (TS 29.500 §5.2.7.2 Table 5.2.7.2-1
+// NOTE 1: invalidParams is mandatory for MANDATORY_IE_INCORRECT).
+var invalidParamSUCI = []map[string]string{{"param": "supiOrSuci"}}
+
+// maskSUCI renders a SUCI for logs: scheme output of Profile A/B is replaced
+// (keeping the scheme, key id and routing indicator); the null scheme and
+// unparsable input never reveal the MSIN either.
+func maskSUCI(p types.SUCI) string {
+	p.SchemeOutput = "<concealed>"
+	return p.String()
+}
+
+// shownSupiOrSuci returns the identifier as it may appear in logs and spans:
+// a SUPI unchanged, a parsable SUCI with the scheme output masked, an
+// unparsable SUCI-prefixed value as a fixed placeholder.
+func shownSupiOrSuci(id string) string {
+	if !types.IsSUCI(id) {
+		return id
+	}
+	p, err := types.ParseSUCI(id)
+	if err != nil {
+		return "suci-<malformed>"
+	}
+	return maskSUCI(p)
+}
+
+// sidfProblem writes a SIDF ProblemDetails. invalidParams is set only for 400.
+func (s *Server) sidfProblem(w http.ResponseWriter, status int, cause, detail string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	body := map[string]any{"status": status, "detail": detail}
+	if cause != "" {
+		body["cause"] = cause
+	}
+	if status == http.StatusBadRequest {
+		body["invalidParams"] = invalidParamSUCI
+	}
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// deconceal resolves a standard-format SUCI (TS 29.571 §5.3.2) to a SUPI
+// (SIDF, TS 33.501 §6.12). On failure it writes the ProblemDetails response
+// and returns ok=false. Error causes follow TS 29.503 Table 6.3.7.3-1.
+func (s *Server) deconceal(w http.ResponseWriter, log *slog.Logger, supi string) (string, bool) {
+	parsed, err := types.ParseSUCI(supi)
+	if err != nil {
+		log.Error("SUCI parse failed", "error", err, "result", "REJECT")
+		s.sidfProblem(w, http.StatusBadRequest, causeMandatoryIEIncorrect, detailInvalidSUCI)
+		return "", false
+	}
+	masked := maskSUCI(parsed)
+	log = log.With("scheme", parsed.ProtectionScheme, "hn_key_id", parsed.HNPublicKeyID,
+		"routing_indicator", parsed.RoutingIndicator)
+	if parsed.SUPIType != types.SUPITypeIMSI {
+		log.Error("SUCI SUPI type not supported", "supi_type", parsed.SUPIType)
+		s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedSUPIType, detailUnsupportedSUPIType)
+		return "", false
+	}
+
+	switch parsed.ProtectionScheme {
+	case types.SUCISchemeNull:
+		actual, err := parsed.SUPI()
+		if err != nil {
+			return s.invalidOutput(w, log, err)
+		}
+		log.Info("SUCI deconcealed (null scheme)", "suci", masked, "supi", actual,
+			"spec_ref", "TS 33.501 §6.12")
+		return actual, true
+	case types.SUCISchemeProfileA:
+		if !s.homeNetPrivKeyASet {
+			log.Error("SUCI Profile A received but hn_private_key_x25519 not configured")
+			s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedProtectionScheme, detailSchemeNotConfigured)
+			return "", false
+		}
+		if !s.checkHNKeyID(w, log, parsed, s.hnKeyIDA) {
+			return "", false
+		}
+		ls, err := toLegacySUCI(parsed)
+		if err != nil {
+			return s.invalidOutput(w, log, err)
+		}
+		res, err := suciPkg.DeconceaProfileA(ls, s.homeNetPrivKeyA)
+		if err != nil {
+			return s.invalidOutput(w, log, err)
+		}
+		log.Info("SUCI deconcealed (Profile A / X25519)", "suci", masked, "supi", res.SUPI,
+			"spec_ref", "TS 33.501 §6.12 Annex C.3")
+		return res.SUPI, true
+	case types.SUCISchemeProfileB:
+		if s.homeNetPrivKeyB == nil {
+			log.Error("SUCI Profile B received but hn_private_key_p256 not configured")
+			s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedProtectionScheme, detailSchemeNotConfigured)
+			return "", false
+		}
+		if !s.checkHNKeyID(w, log, parsed, s.hnKeyIDB) {
+			return "", false
+		}
+		ls, err := toLegacySUCI(parsed)
+		if err != nil {
+			return s.invalidOutput(w, log, err)
+		}
+		res, err := suciPkg.DeconceaProfileB(ls, s.homeNetPrivKeyB)
+		if err != nil {
+			return s.invalidOutput(w, log, err)
+		}
+		log.Info("SUCI deconcealed (Profile B / secp256r1)", "suci", masked, "supi", res.SUPI,
+			"spec_ref", "TS 33.501 §6.12 Annex C.3.4")
+		return res.SUPI, true
+	default:
+		log.Error("SUCI protection scheme not supported")
+		s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedProtectionScheme, detailSchemeUnsupported)
+		return "", false
+	}
+}
+
+// checkHNKeyID verifies the SUCI's Home Network Public Key Identifier against
+// the configured one (0 = any accepted). It writes the 403 answer on mismatch.
+func (s *Server) checkHNKeyID(w http.ResponseWriter, log *slog.Logger, p types.SUCI, want uint8) bool {
+	if want != 0 && p.HNPublicKeyID != want {
+		log.Error("SUCI home network public key id mismatch", "configured_key_id", want)
+		s.sidfProblem(w, http.StatusForbidden, causeInvalidHNPublicKeyID, detailInvalidHNKeyID)
+		return false
+	}
+	return true
+}
+
+// invalidOutput answers 403 INVALID_SCHEME_OUTPUT with a fixed detail; the
+// real (crypto) error only goes to the log.
+func (s *Server) invalidOutput(w http.ResponseWriter, log *slog.Logger, err error) (string, bool) {
+	log.Error("SUCI de-concealment failed", "error", err, "result", "REJECT")
+	s.sidfProblem(w, http.StatusForbidden, causeInvalidSchemeOutput, detailInvalidSchemeOutput)
+	return "", false
+}
+
+// toLegacySUCI converts the parsed SUCI to the shared/crypto/suci input form.
+func toLegacySUCI(p types.SUCI) (suciPkg.SUCI, error) {
+	out, err := p.SchemeOutputBytes()
+	if err != nil {
+		return suciPkg.SUCI{}, err
+	}
+	return suciPkg.SUCI{
+		SUPIFormat: 0, MCC: p.MCC, MNC: p.MNC,
+		RoutingIndicator:       p.RoutingIndicator,
+		ProtectionScheme:       suciPkg.Profile(p.ProtectionScheme),
+		HomeNetworkPublicKeyID: p.HNPublicKeyID,
+		SchemeOutput:           out,
+	}, nil
 }
 
 func newWithServer(s *Server, tlsCfg TLSConfig) (*Server, error) {
@@ -274,7 +801,8 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 	supi := r.PathValue("supi") // may be SUPI or SUCI (UDM resolves)
 
 	spanCtx, span := tracing.Tracer("UDM", "procedures").Start(r.Context(), "Nudm_UEAuthentication_Get")
-	span.SetAttributes(attribute.String("supi_or_suci", supi))
+	shown := shownSupiOrSuci(supi)
+	span.SetAttributes(attribute.String("supi_or_suci", shown))
 	defer span.End()
 	r = r.WithContext(spanCtx)
 
@@ -282,7 +810,7 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 		"procedure", "GenerateAuthData",
 		"interface", "Nudm",
 		"direction", "IN",
-		"supi_or_suci", supi,
+		"supi_or_suci", shown,
 		"correlation_id", r.Header.Get("X-Correlation-Id"),
 		"spec_ref", "TS 29.503 §5.2.2.2",
 	)
@@ -294,11 +822,46 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 			RAND string `json:"rand"`
 			AUTS string `json:"auts"`
 		} `json:"resynchronizationInfo,omitempty"`
+		// SupportedFeatures: TS 29.503 §6.1.6.2.2 (AuthenticationInfoRequest).
+		SupportedFeatures string `json:"supportedFeatures,omitempty"`
 	}
+	// The middleware sets the correlation id on the response header when the
+	// request had none.
+	corrID := r.Header.Get("X-Correlation-Id")
+	if corrID == "" {
+		corrID = w.Header().Get("X-Correlation-Id")
+	}
+	fctx := logging.WithCorrelationID(r.Context(), corrID)
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if features.IsTypeError(err) {
+			s.rejectSupportedFeatures(fctx, w, "AUSF", s.ueauCat, "<non-string>", err)
+			return
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(w)
+			return
+		}
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", err.Error())
 		return
 	}
+	// supportedFeatures must be schema-valid before any state is touched.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	if err := features.Validate(req.SupportedFeatures); err != nil {
+		s.rejectSupportedFeatures(fctx, w, "AUSF", s.ueauCat, req.SupportedFeatures, err)
+		return
+	}
+	// Producer side (decision D1): the intersection, absent under rel17 when
+	// the request had none, "0" under rel19.
+	sfAnswer, sfSet := features.Answer(s.ueauCat, s.profile, req.SupportedFeatures)
+	features.LogNegotiation(fctx, s.logger, features.Negotiation{
+		NF:        "UDM",
+		Interface: "Nudm", Direction: "IN", PeerNF: "AUSF",
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.ueauCat.Supported(s.profile), Peer: req.SupportedFeatures,
+		PeerPresent: req.SupportedFeatures != "", Negotiated: sfSet,
+	})
 	log = log.With("serving_net", req.ServingNetworkName)
 	if req.ResynchronizationInfo != nil {
 		log.Info("GenerateAuthData re-sync request received",
@@ -310,60 +873,18 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 	// SUCI deconcealment — TS 33.501 §6.12
 	// The AMF passes the SUCI as received from the UE. UDM resolves it to a SUPI.
 	actualSUPI := supi
-	if strings.HasPrefix(supi, "suci-") {
-		parsed, err := suciPkg.ParseSUCIString(supi)
-		if err != nil {
-			log.Error("SUCI parse failed", "error", err)
-			s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT",
-				fmt.Sprintf("invalid SUCI: %v", err))
+	if types.IsSUCI(supi) {
+		resolved, ok := s.deconceal(w, log, supi)
+		if !ok {
 			return
 		}
-		switch parsed.ProtectionScheme {
-		case suciPkg.ProfileNull:
-			result, err := suciPkg.DeconceaNull(parsed)
-			if err != nil {
-				log.Error("null-scheme SUCI deconcealment failed", "error", err)
-				s.problem(w, http.StatusInternalServerError, "NF_FAILURE", err.Error())
-				return
-			}
-			actualSUPI = result.SUPI
-			log.Info("SUCI deconcealed (null scheme)",
-				"suci", supi, "supi", actualSUPI,
-				"spec_ref", "TS 33.501 §6.12")
-		case suciPkg.ProfileA:
-			// Profile A: X25519 ECIES — requires home-network private key
-			// Ref: TS 33.501 §6.12, Annex C.3
-			if !s.homeNetPrivKeyASet {
-				log.Error("SUCI Profile A received but hn_private_key_x25519 not configured")
-				s.problem(w, http.StatusNotImplemented, "NF_FAILURE",
-					"SUCI Profile A not configured: set hn_private_key_x25519 in UDM config")
-				return
-			}
-			result, err := suciPkg.DeconceaProfileA(parsed, s.homeNetPrivKeyA)
-			if err != nil {
-				log.Error("SUCI Profile A deconcealment failed", "error", err)
-				s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT",
-					fmt.Sprintf("SUCI Profile A deconcealment: %v", err))
-				return
-			}
-			actualSUPI = result.SUPI
-			log.Info("SUCI deconcealed (Profile A / X25519)",
-				"suci", supi, "supi", actualSUPI,
-				"spec_ref", "TS 33.501 §6.12 Annex C.3")
-		default:
-			// Profile B requires secp256r1 key — not yet configured
-			log.Error("SUCI protection scheme not implemented",
-				"scheme", parsed.ProtectionScheme)
-			s.problem(w, http.StatusNotImplemented, "NF_FAILURE",
-				fmt.Sprintf("SUCI protection scheme %d not yet supported", parsed.ProtectionScheme))
-			return
-		}
+		actualSUPI = resolved
 	}
 
 	span.SetAttributes(attribute.String("supi", actualSUPI))
 
 	// Fetch authentication subscription from UDR
-	authSub, err := s.udr.GetAuthSubscription(r.Context(), actualSUPI)
+	authSub, err := s.udr.GetAuthSubscription(fctx, actualSUPI)
 	if err != nil {
 		log.Error("UDR auth subscription fetch failed", "error", err)
 		span.RecordError(err)
@@ -454,7 +975,28 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 			"spec_ref", "TS 33.501 §6.1.3.1")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]any{
+		if features.SpecLiteral(s.profile) {
+			// Rel-19 profile: spec-literal AuthenticationInfoResult with the
+			// nested AvEapAkaPrime. Ref: TS 29.503 §6.3.6.2.3, §6.3.6.2.4.
+			err := json.NewEncoder(w).Encode(AuthenticationInfoResult{
+				AuthType:          authTypeEAPAKAPrime,
+				SupportedFeatures: sfAnswer,
+				AuthenticationVector: &AuthenticationVector{
+					AvType:  avTypeEAPAKAPrime,
+					Rand:    hex.EncodeToString(eapAV.RAND[:]),
+					Autn:    hex.EncodeToString(eapAV.AUTN[:]),
+					Xres:    hex.EncodeToString(eapAV.XRES[:]),
+					CkPrime: hex.EncodeToString(eapAV.CKPrime[:]),
+					IkPrime: hex.EncodeToString(eapAV.IKPrime[:]),
+				},
+				Supi: actualSUPI,
+			})
+			if err != nil {
+				log.Error("generate-auth-data: encode response", "error", err, "spec_ref", "TS 29.503 §6.3.6.2.3")
+			}
+			return
+		}
+		eapRsp := map[string]any{
 			"authType": "EAP_AKA_PRIME",
 			"rand":     hex.EncodeToString(eapAV.RAND[:]),
 			"autn":     hex.EncodeToString(eapAV.AUTN[:]),
@@ -462,7 +1004,11 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 			"ckPrime":  hex.EncodeToString(eapAV.CKPrime[:]),
 			"ikPrime":  hex.EncodeToString(eapAV.IKPrime[:]),
 			"supi":     actualSUPI,
-		})
+		}
+		if sfAnswer != "" {
+			eapRsp["supportedFeatures"] = sfAnswer
+		}
+		_ = json.NewEncoder(w).Encode(eapRsp)
 		return
 	}
 
@@ -495,7 +1041,28 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	if features.SpecLiteral(s.profile) {
+		// Rel-19 profile: spec-literal AuthenticationInfoResult with the
+		// nested Av5GHeAka. HXRES* is not a UDM output; the AUSF derives it
+		// from RAND and XRES* (TS 33.501 Annex A.5). Ref: TS 29.503 §6.3.6.2.3.
+		err := json.NewEncoder(w).Encode(AuthenticationInfoResult{
+			AuthType:          authType5GAKA,
+			SupportedFeatures: sfAnswer,
+			AuthenticationVector: &AuthenticationVector{
+				AvType:   avType5GHEAKA,
+				Rand:     hex.EncodeToString(heav.RAND[:]),
+				Autn:     hex.EncodeToString(heav.AUTN[:]),
+				XresStar: hex.EncodeToString(heav.XRESStar),
+				Kausf:    hex.EncodeToString(heav.KAUSF),
+			},
+			Supi: actualSUPI,
+		})
+		if err != nil {
+			log.Error("generate-auth-data: encode response", "error", err, "spec_ref", "TS 29.503 §6.3.6.2.3")
+		}
+		return
+	}
+	rsp := map[string]any{
 		"authType":  "5G_AKA",
 		"rand":      hex.EncodeToString(heav.RAND[:]),
 		"autn":      hex.EncodeToString(heav.AUTN[:]),
@@ -503,7 +1070,89 @@ func (s *Server) handleGenerateAuthData(w http.ResponseWriter, r *http.Request) 
 		"hxresStar": hex.EncodeToString(heav.HRESStar),
 		"kausf":     hex.EncodeToString(heav.KAUSF),
 		"supi":      actualSUPI,
+	}
+	if sfAnswer != "" {
+		rsp["supportedFeatures"] = sfAnswer
+	}
+	_ = json.NewEncoder(w).Encode(rsp)
+}
+
+// rejectSupportedFeatures answers a schema-invalid supportedFeatures body
+// attribute with 400 INVALID_MSG_FORMAT and invalidParams[{param:
+// /supportedFeatures}] and logs the REJECT negotiation record for the API
+// owning cat. Ref: TS 29.500 §5.2.7.2; TS 29.571 §5.2.4.6.
+func (s *Server) rejectSupportedFeatures(ctx context.Context, w http.ResponseWriter, peerNF string,
+	cat *features.Catalog, shown string, cause error) {
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "UDM",
+		Interface: "Nudm", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseInvalidMsgFormat,
+		Local: cat.Supported(s.profile), Peer: shown, PeerPresent: true,
+	}, "error", cause)
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusBadRequest,
+		"cause":  features.CauseInvalidMsgFormat,
+		"detail": "supportedFeatures is not a valid hexadecimal string",
+		"invalidParams": []map[string]string{
+			{"param": features.ParamSupportedFeatures},
+		},
 	})
+}
+
+// querySupportedFeatures is the optional "supported-features" query parameter
+// of the Nudm_SDM Get operations. Ref: TS 29.503 §6.1.3 (resource tables).
+const querySupportedFeatures = "supported-features"
+
+// correlationCtx returns a context carrying the request's correlation id; the
+// middleware sets it on the response header when the request had none.
+func correlationCtx(w http.ResponseWriter, r *http.Request) context.Context {
+	corrID := r.Header.Get("X-Correlation-Id")
+	if corrID == "" {
+		corrID = w.Header().Get("X-Correlation-Id")
+	}
+	return logging.WithCorrelationID(r.Context(), corrID)
+}
+
+// negotiateQuery runs the producer side of TS 29.500 §6.6.2 for a Nudm_SDM Get
+// whose consumer offers its features in the optional "supported-features"
+// query parameter. A non-hex value is answered 400
+// OPTIONAL_QUERY_PARAM_INCORRECT (TS 29.500 Table 5.2.7.2-1) and ok is false.
+// answer is "" when the attribute must be omitted (decision D1).
+func (s *Server) negotiateQuery(w http.ResponseWriter, r *http.Request, cat *features.Catalog) (answer string, ok bool) {
+	ctx := correlationCtx(w, r)
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "UNKNOWN")
+	q := r.URL.Query()
+	peer := q.Get(querySupportedFeatures)
+	if err := features.Validate(peer); err != nil {
+		features.LogNegotiation(ctx, s.logger, features.Negotiation{
+			NF:        "UDM",
+			Interface: "Nudm", Direction: "IN", PeerNF: peerNF,
+			SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseOptionalQueryParamIncorrect,
+			Local: cat.Supported(s.profile), Peer: peer, PeerPresent: true,
+		}, "error", err)
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": http.StatusBadRequest,
+			"cause":  features.CauseOptionalQueryParamIncorrect,
+			"detail": "supported-features is not a valid hexadecimal string",
+			"invalidParams": []map[string]string{
+				{"param": features.ParamQuerySupportedFeatures},
+			},
+		})
+		return "", false
+	}
+	answer, set := features.Answer(cat, s.profile, peer)
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "UDM",
+		Interface: "Nudm", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: cat.Supported(s.profile), Peer: peer,
+		PeerPresent: peer != "", Negotiated: set,
+	})
+	return answer, true
 }
 
 // ---- Nudm_SDM Get (TS 29.503 §5.2.2.2) ----------------------------------
@@ -512,7 +1161,14 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 	log := s.logger.With("procedure", "GetAMData", "supi", supi)
 	log.Info("GetAMData request", "direction", "IN")
 
-	amData, err := s.udr.GetAMData(r.Context(), supi)
+	// Optional supported-features query (TS 29.500 §6.6.2); answered in
+	// AccessAndMobilitySubscriptionData.supportedFeatures (TS 29.503 §6.1.6.2.4).
+	sfAnswer, ok := s.negotiateQuery(w, r, s.sdmCat)
+	if !ok {
+		return
+	}
+
+	amData, err := s.udr.GetAMData(correlationCtx(w, r), supi)
 	if err != nil {
 		s.problem(w, http.StatusNotFound, "RESOURCE_URI_STRUCTURE_NOT_FOUND", err.Error())
 		return
@@ -534,7 +1190,7 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 		snssais = append(snssais, entry)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	rsp := map[string]any{
 		"nssai": map[string]any{
 			"defaultSingleNssais": snssais,
 		},
@@ -542,7 +1198,16 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 			"uplink":   fmt.Sprintf("%d Kbps", amData.AMBRUplink),
 			"downlink": fmt.Sprintf("%d Kbps", amData.AMBRDownlink),
 		},
-	})
+	}
+	// gpsis (TS 29.503 §6.1.6.2.4): spec-literal Rel-19 profile only (AMF-020);
+	// the legacy profile never emits it, whatever the UDR answered.
+	if features.SpecLiteral(s.profile) && len(amData.GPSIs) > 0 {
+		rsp["gpsis"] = amData.GPSIs
+	}
+	if sfAnswer != "" {
+		rsp["supportedFeatures"] = sfAnswer
+	}
+	_ = json.NewEncoder(w).Encode(rsp)
 }
 
 // handleGetSMData serves Nudm_SDM Get for sm-data: the per-slice session
@@ -558,7 +1223,15 @@ func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 	log := s.logger.With("procedure", "GetSMData", "supi", supi, "interface", "Nudm")
 	log.Info("GetSMData request", "direction", "IN")
 
-	raw, err := s.udr.GetSMData(r.Context(), supi)
+	// Optional supported-features query (TS 29.500 §6.6.2); answered in
+	// SessionManagementSubscriptionData.supportedFeatures of every returned
+	// element (TS 29.503 §6.1.6.2.7).
+	sfAnswer, ok := s.negotiateQuery(w, r, s.sdmCat)
+	if !ok {
+		return
+	}
+
+	raw, err := s.udr.GetSMData(correlationCtx(w, r), supi)
 	if err != nil {
 		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
 		return
@@ -607,6 +1280,9 @@ func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
+		if sfAnswer != "" {
+			e["supportedFeatures"] = sfAnswer
+		}
 		filtered = append(filtered, e)
 	}
 
@@ -641,13 +1317,124 @@ func (s *Server) handleGetLcsPrivacyData(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleAMFRegistration(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
+
+	// Amf3GppAccessRegistration.supportedFeatures (TS 29.503 §6.2.6.2.2). The
+	// handler has always accepted any body, so a body that does not parse as a
+	// JSON object stays accepted (no supportedFeatures offered); only a
+	// supportedFeatures that violates its schema is rejected (TS 29.500
+	// §5.2.7.2).
+	ctx := correlationCtx(w, r)
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "UNKNOWN")
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes))
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(w)
+			return
+		}
+		s.problem(w, http.StatusBadRequest, "INVALID_MSG_FORMAT", "request body: "+err.Error())
+		return
+	}
+	var reg struct {
+		SupportedFeatures string `json:"supportedFeatures"`
+	}
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		if features.IsTypeError(err) {
+			s.rejectSupportedFeatures(ctx, w, peerNF, s.uecmCat, "<non-string>", err)
+			return
+		}
+		if features.Request(s.uecmCat, s.profile) != "" {
+			// Rel-19 profile: the body is an Amf3GppAccessRegistration object
+			// (TS 29.503 §5.3.2.2.2); anything else is malformed.
+			// Ref: TS 29.500 §5.2.7.2.
+			s.logger.Warn("AMF registration body is not a JSON object",
+				"procedure", "UECMRegistration", "interface", "Nudm", "direction", "IN",
+				"supi", supi, "result", "REJECT", "cause", "INVALID_MSG_FORMAT",
+				"spec_ref", "TS 29.500 §5.2.7.2", "error", err)
+			s.problem(w, http.StatusBadRequest, "INVALID_MSG_FORMAT", "request body is not a JSON object")
+			return
+		}
+		// Rel-17 profile: legacy behaviour, any body is accepted and no
+		// supportedFeatures is offered. Leave a trace of the malformed body.
+		s.logger.Warn("AMF registration body is not valid JSON; accepted (legacy)",
+			"procedure", "UECMRegistration", "interface", "Nudm", "direction", "IN",
+			"supi", supi, "result", "OK",
+			"spec_ref", "TS 29.500 §5.2.7.2", "error", err)
+		reg.SupportedFeatures = ""
+	}
+	if err := features.Validate(reg.SupportedFeatures); err != nil {
+		s.rejectSupportedFeatures(ctx, w, peerNF, s.uecmCat, reg.SupportedFeatures, err)
+		return
+	}
+	// Producer side (decision D1): the intersection, absent under rel17 when
+	// the request had none, "0" under rel19. The UDM keeps no Nudm_UECM
+	// registration resource context yet (the registration is only logged), so
+	// the negotiated set has nowhere to be stored: a known gap.
+	sfAnswer, sfSet := features.Answer(s.uecmCat, s.profile, reg.SupportedFeatures)
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "UDM",
+		Interface: "Nudm", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.uecmCat.Supported(s.profile), Peer: reg.SupportedFeatures,
+		PeerPresent: reg.SupportedFeatures != "", Negotiated: sfSet,
+	}, "supi", supi)
+
 	s.logger.Info("AMF registered at UDM",
 		"procedure", "UECMRegistration",
 		"direction", "IN",
 		"supi", supi,
 		"spec_ref", "TS 29.503 §5.3.2.2",
 	)
+	if sfAnswer == "" {
+		// Legacy answer: 201 without a body.
+		w.WriteHeader(http.StatusCreated)
+		return
+	}
+	// 201 carries the Amf3GppAccessRegistration representation with the
+	// negotiated supportedFeatures (TS 29.503 §5.3.2.2.2, TS 29.500 §6.6.2).
+	rsp := map[string]json.RawMessage{}
+	if err := json.Unmarshal(raw, &rsp); err != nil || rsp == nil {
+		rsp = map[string]json.RawMessage{}
+	}
+	sf, _ := json.Marshal(sfAnswer)
+	rsp["supportedFeatures"] = sf
+	w.Header().Set("Location", s.apiRoot(r)+"/nudm-uecm/v1/"+url.PathEscape(supi)+"/registrations/amf-3gpp-access")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(rsp)
+}
+
+// apiRoot returns the {apiRoot} of this UDM's SBI for absolute Location
+// headers: "https://" + authority (SBA is always https). The UDM config has no
+// fqdn, so the authority is, in order: the request Host (the peer is
+// mTLS-authenticated: it is the name it used to reach this UDM); the TLS SNI
+// server name (with the port of the listen address); the host of the listen
+// address when it is a specified address; otherwise "" and the Location is the
+// bare path. It never emits an unspecified host (0.0.0.0, ::, empty).
+// Ref: TS 29.501 §4.4.1.
+func (s *Server) apiRoot(r *http.Request) string {
+	host, port, err := net.SplitHostPort(s.addr)
+	if err != nil {
+		host, port = s.addr, ""
+	}
+	authority := func(h string) string {
+		if port == "" {
+			return h
+		}
+		return net.JoinHostPort(h, port)
+	}
+	if r.Host != "" {
+		return "https://" + r.Host
+	}
+	if r.TLS != nil && r.TLS.ServerName != "" {
+		return "https://" + authority(r.TLS.ServerName)
+	}
+	if host != "" {
+		if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+			return "https://" + authority(host)
+		}
+	}
+	return ""
 }
 
 // handleAMFDeregistration handles Nudm_UECM_Deregistration from the AMF.
@@ -694,21 +1481,84 @@ func (s *Server) handleSDMSubscribe(w http.ResponseWriter, r *http.Request) {
 		"spec_ref", "TS 29.503 §5.3.2.2",
 	)
 
-	var sub SdmSubscription
-	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+	ctx := correlationCtx(w, r)
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "UNKNOWN")
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	var subReq sdmSubscriptionRequest
+	if err := json.NewDecoder(r.Body).Decode(&subReq); err != nil {
+		if features.IsTypeError(err) {
+			s.rejectSupportedFeatures(ctx, w, peerNF, s.sdmCat, "<non-string>", err)
+			return
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(w)
+			return
+		}
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "request body: "+err.Error())
+		return
+	}
+	// Both shapes are accepted whatever the profile (mixed-release
+	// deployments): the legacy singular attribute is normalised into the
+	// schema's monitoredResourceUris array.
+	sub := subReq.SdmSubscription
+	if len(sub.MonitoredResourceURIs) == 0 && subReq.LegacyMonitoredResourceURI != "" {
+		sub.MonitoredResourceURIs = []string{subReq.LegacyMonitoredResourceURI}
+	}
+	// supportedFeatures must be schema-valid before any state is touched.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	peerSF := sub.SupportedFeatures
+	if err := features.Validate(peerSF); err != nil {
+		s.rejectSupportedFeatures(ctx, w, peerNF, s.sdmCat, peerSF, err)
 		return
 	}
 	if sub.CallbackRef == "" {
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "callbackReference is mandatory")
 		return
 	}
+	// Rel-19 profile: nfInstanceId and monitoredResourceUris are mandatory
+	// (M, 1 / 1..N), and the 201 body must echo them. Rel-17 profile keeps
+	// accepting their absence. Ref: TS 29.503 §6.1.6.2.3.
+	if features.SpecLiteral(s.profile) {
+		var missing []map[string]string
+		if sub.NfInstanceID == "" {
+			missing = append(missing, map[string]string{"param": "/nfInstanceId"})
+		}
+		if len(sub.MonitoredResourceURIs) == 0 {
+			missing = append(missing, map[string]string{"param": "/monitoredResourceUris"})
+		}
+		if len(missing) > 0 {
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": http.StatusBadRequest, "cause": "MANDATORY_IE_MISSING",
+				"detail":        "nfInstanceId and monitoredResourceUris are mandatory",
+				"invalidParams": missing,
+			})
+			return
+		}
+	}
+
+	// Producer side (decision D1): SdmSubscription.supportedFeatures carries
+	// the intersection (absent under rel17 when the request had none, "0"
+	// under rel19) and the negotiated set is kept on the subscription.
+	sfAnswer, sfSet := features.Answer(s.sdmCat, s.profile, peerSF)
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "UDM",
+		Interface: "Nudm", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.sdmCat.Supported(s.profile), Peer: peerSF,
+		PeerPresent: peerSF != "", Negotiated: sfSet,
+	}, "supi", supi)
+	sub.SupportedFeatures = sfAnswer
+	sub.negotiated = sfSet
 
 	sub.SubscriptionID = ulid.Make().String()
 	log.Info("SDM subscription created",
 		"subscription_id", sub.SubscriptionID,
 		"callback_ref", sub.CallbackRef,
-		"monitored_resource", sub.MonitoredResURI,
+		"monitored_resources", sub.MonitoredResourceURIs,
+		"wire_shape", sdmWireShape(features.SpecLiteral(s.profile)),
 	)
 
 	s.addSubscription(supi, &sub)
@@ -718,7 +1568,30 @@ func (s *Server) handleSDMSubscribe(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", location)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(sub)
+	// Rel-17 profile (and no profile): frozen singular-attribute bytes.
+	// Rel-19 profile: schema attribute names. Ref: TS 29.503 §6.1.6.2.3.
+	if features.SpecLiteral(s.profile) {
+		if err := json.NewEncoder(w).Encode(sub); err != nil {
+			log.Error("SDM subscription: encode response", "error", err, "spec_ref", "TS 29.503 §6.1.6.2.3")
+		}
+		return
+	}
+	if len(sub.MonitoredResourceURIs) > 1 {
+		log.Warn("SDM subscription: Rel-17 profile response carries only the first monitored resource URI",
+			"monitored_resources", len(sub.MonitoredResourceURIs),
+			"spec_ref", "TS 29.503 §6.1.6.2.3")
+	}
+	if err := json.NewEncoder(w).Encode(sub.legacyView()); err != nil {
+		log.Error("SDM subscription: encode response", "error", err, "spec_ref", "TS 29.503 §6.1.6.2.3")
+	}
+}
+
+// sdmWireShape names the body shape selected by the release profile, for logs.
+func sdmWireShape(specLiteral bool) string {
+	if specLiteral {
+		return "spec"
+	}
+	return "legacy"
 }
 
 // handleSDMUnsubscribe processes DELETE /nudm-sdm/v2/{supi}/sdm-subscriptions/{subscriptionId}.
@@ -751,13 +1624,30 @@ func (s *Server) handleSDMUnsubscribe(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDataChangeTrigger(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 
-	var changes []ChangeItem
-	if err := json.NewDecoder(r.Body).Decode(&changes); err != nil || len(changes) == 0 {
+	var trig []triggerChange
+	if err := json.NewDecoder(r.Body).Decode(&trig); err != nil || len(trig) == 0 {
 		// default: generic AM data change
-		changes = []ChangeItem{{
+		trig = []triggerChange{{legacyChangeItem: legacyChangeItem{
 			ChangeType:   "REPLACE",
 			ResourcePath: "/nudm-sdm/v2/" + supi + "/am-data",
-		}}
+		}}}
+	}
+	changes := make([]legacyChangeItem, len(trig))
+	for i, c := range trig {
+		changes[i] = c.legacyChangeItem
+	}
+
+	specLiteral := features.SpecLiteral(s.profile)
+	// Rel-19: reject an invalid trigger before any fan-out. Ref: TS 29.571 §5.2.4.8.
+	if specLiteral {
+		if _, err := toNotifyItems(supi, "", nil, trig); err != nil {
+			s.logger.Warn("SDM notify: invalid data-change trigger",
+				"procedure", "SDMNotify", "interface", "Nudm", "direction", "IN",
+				"supi", supi, "result", "REJECT", "error", err,
+				"spec_ref", "TS 29.571 §5.2.4.8")
+			s.problem(w, http.StatusBadRequest, "INVALID_MSG_FORMAT", err.Error())
+			return
+		}
 	}
 
 	subs := s.listSubscriptions(supi)
@@ -766,11 +1656,40 @@ func (s *Server) handleDataChangeTrigger(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	notif := ModificationNotification{ResourceChanges: changes}
-	body, _ := json.Marshal(notif)
+	// Body shape follows the release profile: Rel-17 / no profile keeps the
+	// frozen resourceChanges bytes; Rel-19 emits notifyItems.
+	// Ref: TS 29.503 §6.1.6.2.21, TS 29.571 §5.2.4.8-9.
+	var legacyBody []byte
+	if !specLiteral {
+		var err error
+		legacyBody, err = json.Marshal(legacyModificationNotification{ResourceChanges: changes})
+		if err != nil {
+			s.logger.Error("SDM notify: marshal notification",
+				"procedure", "SDMNotify", "interface", "Nudm", "direction", "OUT",
+				"supi", supi, "result", "FAILURE", "error", err,
+				"spec_ref", "TS 29.503 §5.2.2.5.2")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	for _, sub := range subs {
 		sub := sub
+		body := legacyBody
+		if specLiteral {
+			items, err := toNotifyItems(supi, "https://"+s.addr, sub.MonitoredResourceURIs, trig)
+			if err == nil {
+				body, err = json.Marshal(ModificationNotification{NotifyItems: items, SubscriptionID: sub.SubscriptionID})
+			}
+			if err != nil {
+				s.logger.Error("SDM notify: build notification, subscriber skipped",
+					"procedure", "SDMNotify", "interface", "Nudm", "direction", "OUT",
+					"supi", supi, "subscription_id", sub.SubscriptionID,
+					"result", "FAILURE", "error", err,
+					"spec_ref", "TS 29.503 §5.2.2.5.2")
+				continue
+			}
+		}
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -798,7 +1717,7 @@ func (s *Server) handleDataChangeTrigger(w http.ResponseWriter, r *http.Request)
 				"supi", supi,
 				"subscription_id", sub.SubscriptionID,
 				"callback_status", resp.StatusCode,
-				"spec_ref", "TS 29.503 §5.3.3.2",
+				"spec_ref", "TS 29.503 §5.2.2.5.2",
 			)
 		}()
 	}
@@ -880,6 +1799,13 @@ func (s *Server) problem(w http.ResponseWriter, status int, cause, detail string
 type HTTPUDRClient struct {
 	address string
 	client  *http.Client
+	// profile gates supportedFeatures on the wire (decision D2): nil or rel17
+	// sends none. cat overrides the default Nudr_DataRepository catalog and
+	// logger is the base logger of the FeatureNegotiation record (nil =
+	// slog.Default()). See udr_features.go.
+	profile *capability.Profile
+	cat     *features.Catalog
+	logger  *slog.Logger
 }
 
 func NewHTTPUDRClient(address string, client *http.Client) *HTTPUDRClient {
@@ -888,6 +1814,7 @@ func NewHTTPUDRClient(address string, client *http.Client) *HTTPUDRClient {
 
 func (c *HTTPUDRClient) GetAuthSubscription(ctx context.Context, supi string) (*UDRAuthSub, error) {
 	url := fmt.Sprintf("https://%s/nudr-dr/v2/subscription-data/%s/authentication-data/authentication-subscription", c.address, supi)
+	url, offer := c.withOffer(url)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -907,9 +1834,11 @@ func (c *HTTPUDRClient) GetAuthSubscription(ctx context.Context, supi string) (*
 			SQN string `json:"sqn"`
 		} `json:"sequenceNumber"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxUDRResponseBytes)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("udr: decode auth sub: %w", err)
 	}
+	// AuthenticationSubscription has no supportedFeatures attribute: no answer.
+	c.negotiate(ctx, supi, offer, nil)
 	return &UDRAuthSub{
 		AuthMethod: result.AuthMethod,
 		K:          result.EncK,
@@ -925,6 +1854,7 @@ func (c *HTTPUDRClient) UpdateSQN(ctx context.Context, supi, newSQN string) erro
 		"sequenceNumber": map[string]string{"sqn": newSQN},
 	})
 	url := fmt.Sprintf("https://%s/nudr-dr/v2/subscription-data/%s/authentication-data/authentication-subscription", c.address, supi)
+	url, _ = c.withOffer(url) // no answer to negotiate on a PATCH
 	req, _ := http.NewRequestWithContext(ctx, "PATCH", url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/merge-patch+json")
 	resp, err := c.client.Do(req)
@@ -937,6 +1867,7 @@ func (c *HTTPUDRClient) UpdateSQN(ctx context.Context, supi, newSQN string) erro
 
 func (c *HTTPUDRClient) GetSMData(ctx context.Context, supi string) (json.RawMessage, error) {
 	url := fmt.Sprintf("https://%s/nudr-dr/v2/subscription-data/%s/001/provisioned-data/sm-data", c.address, supi)
+	url, offer := c.withOffer(url)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -950,14 +1881,17 @@ func (c *HTTPUDRClient) GetSMData(ctx context.Context, supi string) (json.RawMes
 		return nil, fmt.Errorf("udr: get sm data: status %d", resp.StatusCode)
 	}
 	var raw json.RawMessage
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxUDRResponseBytes)).Decode(&raw); err != nil {
 		return nil, fmt.Errorf("udr: decode sm data: %w", err)
 	}
+	// The sm-data body has no top-level supportedFeatures attribute: no answer.
+	c.negotiate(ctx, supi, offer, nil)
 	return raw, nil
 }
 
 func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData, error) {
 	url := fmt.Sprintf("https://%s/nudr-dr/v2/subscription-data/%s/001/provisioned-data/am-data", c.address, supi)
+	url, offer := c.withOffer(url)
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -965,6 +1899,13 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 	}
 	defer resp.Body.Close()
 	var result struct {
+		// SupportedFeatures: AccessAndMobilitySubscriptionData.supportedFeatures
+		// (TS 29.505), the UDR's answer to the supported-features query.
+		// Read as raw JSON so a non-string answer is a negotiation failure
+		// (R13) and not a decode failure of the whole response.
+		SupportedFeatures json.RawMessage `json:"supportedFeatures"`
+		// GPSIs: AccessAndMobilitySubscriptionData.gpsis (TS 29.503 §6.1.6.2.4).
+		GPSIs []string `json:"gpsis"`
 		NSSAI struct {
 			DefaultSingleNssais []struct {
 				SST            int    `json:"sst"`
@@ -974,15 +1915,52 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 			} `json:"defaultSingleNssais"`
 		} `json:"nssai"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxUDRResponseBytes)).Decode(&result); err != nil {
+		return nil, fmt.Errorf("udr: decode am data: %w", err)
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		c.negotiate(ctx, supi, offer, result.SupportedFeatures)
 	}
 	amData := &UDRAMData{AMBRUplink: 100000, AMBRDownlink: 100000}
+	// gpsis are only emitted under the spec-literal profile (AMF-020): filter
+	// and log only then; the answer is decoded either way (raw under rel17,
+	// where nothing is emitted).
+	amData.GPSIs = result.GPSIs
+	if features.SpecLiteral(c.profile) {
+		var rejected []string
+		amData.GPSIs, rejected = types.FilterGpsis(result.GPSIs)
+		gl := c.logger
+		if gl == nil {
+			gl = slog.Default()
+		}
+		for _, g := range rejected {
+			gl.Warn("UDR am-data gpsis entry does not match the Gpsi pattern, skipped",
+				"nf", "UDM", "procedure", "GetAMData", "interface", "Nudr", "direction", "IN",
+				"supi", supi, "result", "REJECT", "cause", "INVALID_GPSI", "gpsi", g,
+				"spec_ref", "TS 29.571 §5.3.2")
+		}
+	}
 	for _, s := range result.NSSAI.DefaultSingleNssais {
 		amData.SNSSAIs = append(amData.SNSSAIs, SNSSAIEntry{SST: s.SST, SD: s.SD, DNN: s.DNN, SubjectToNSSAA: s.SubjectToNSSAA})
 	}
 	return amData, nil
 }
 
+// maxUDRResponseBytes bounds the UDR response bodies decoded by the Nudr
+// client (same 1 MiB cap as features.MaxRequestBodyBytes).
+const maxUDRResponseBytes = features.MaxRequestBodyBytes
+
 // bitRateKbpsPattern is the TS 29.571 §5.5.2 BitRate regex (space mandatory).
 const bitRateKbpsPattern = `^\d+(\.\d+)? (bps|Kbps|Mbps|Gbps|Tbps)$`
+
+// payloadTooLarge answers a body over features.MaxRequestBodyBytes with 413 and
+// a ProblemDetails without a cause (no 413 cause is defined).
+// Ref: TS 29.500 §5.2.7.1; TS 29.571 §5.2.4.1.
+func payloadTooLarge(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusRequestEntityTooLarge,
+		"detail": "request body too large",
+	})
+}

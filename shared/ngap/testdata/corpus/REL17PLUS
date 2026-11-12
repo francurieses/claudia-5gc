@@ -1,0 +1,4 @@
+# Vectors free5gc/ngap v1.1.3 (pre-Rel-17 ASN.1) cannot decode; excluded from the free5gc equivalence test.
+# Format: <vector-name without .hex> <reason>
+pcap-PDUSessionResourceSetup-so-cceefc91 carries User Location Information (IE 121) in PDU SESSION RESOURCE SETUP RESPONSE, unknown to free5gc/ngap v1.1.3 (decodes as Present 0, re-encode fails)
+pcap-PDUSessionResourceSetup-so-f13c9763 carries User Location Information (IE 121) in PDU SESSION RESOURCE SETUP RESPONSE, unknown to free5gc/ngap v1.1.3 (decodes as Present 0, re-encode fails)

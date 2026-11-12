@@ -21,6 +21,10 @@ type PDUSessionEstablishmentRequest struct {
 	// inside the (E)PCO container 0x8021, or nil if that container is absent
 	// or is not a Configure-Request. See ParseIPCPFromEPCO.
 	IPCPRequest *IPCPConfigureRequest
+	// Capability5GSM is the decoded 5GSM capability IE (optional TLV, IEI
+	// 0x28), nil when absent, empty or syntactically incorrect (treated as
+	// not present, TS 24.501 §7.7.1). Ref: §9.11.4.1
+	Capability5GSM *FiveGSMCapability
 	// RequestedPCOContainerIDs lists every (E)PCO container ID the UE sent,
 	// IN THE EXACT ORDER IT SENT THEM. The Accept must answer the containers
 	// it can answer in this same order: Open5GS builds its reply with a
@@ -167,16 +171,29 @@ func DecodePDUSessionEstablishmentRequest(b []byte) (*PDUSessionEstablishmentReq
 			for _, c := range parseEPCOContainerList(msg.ExtendedProtocolConfigOptions) {
 				msg.RequestedPCOContainerIDs = append(msg.RequestedPCOContainerIDs, c.ID)
 			}
+		case IEIPDUSessionEstReq5GSMCapability: // 5GSM capability — TLV (TS 24.501 §9.11.4.1)
+			l, err := r.ReadByte()
+			if err != nil {
+				return msg, nil // §7.7.1: truncated optional IE = not present
+			}
+			v, err := r.ReadBytes(int(l))
+			if err != nil {
+				return msg, nil // §7.7.1
+			}
+			if c, derr := Decode5GSMCapability(v); derr == nil {
+				msg.Capability5GSM = c
+			}
 		case 0x55: // Maximum number of supported packet filters — TV, 3 octets total
 			_, _ = r.ReadBytes(2)
 		default:
-			// Remaining optional IEs (0x28 5GSM capability, 0x39 SM PDU DN
-			// request container, ...) are TLV with a 1-byte length.
-			l, err := r.ReadByte()
-			if err != nil {
-				break
+			// Remaining optional IEs (0x39 SM PDU DN
+			// request container, ...) and unknown ones: skip per the IE table or
+			// the TS 24.007 §11.2.4 rule. Ref: TS 24.501 §7.6.1
+			if err := r.skipIE(IEMsgPDUSessionEstablishmentRequest); err != nil {
+				// Syntactically incorrect optional IE: treat as not present and
+				// stop optional-IE parsing. Ref: TS 24.501 §7.7.1
+				return msg, nil
 			}
-			_, _ = r.ReadBytes(int(l))
 		}
 	}
 
@@ -1076,9 +1093,8 @@ func buildSessionAMBR(dlMbps, ulMbps int) []byte {
 
 // 5GSM cause values (TS 24.501 §9.11.4.2)
 const (
-	Cause5GSMRegularDeactivation   uint8 = 0x24 // 36
-	Cause5GSMReactivationRequested uint8 = 0x1D // 29
-	Cause5GSMNetworkFailure        uint8 = 0x26 // 38
+	Cause5GSMRegularDeactivation uint8 = 0x24 // 36
+	Cause5GSMNetworkFailure      uint8 = 0x26 // 38
 )
 
 // WrapPDUSessionReleaseCommandBody builds a complete 5GSM PDU Session Release Command.

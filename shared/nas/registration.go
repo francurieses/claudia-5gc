@@ -2,6 +2,7 @@ package nas
 
 import (
 	"fmt"
+	"time"
 )
 
 // ---- Registration Request (TS 24.501 §8.2.6.1) ---------------------------
@@ -38,6 +39,11 @@ type RegistrationRequest struct {
 	UEStatus *byte
 	// IEI 0x77 — Additional GUTI
 	AdditionalGUTI *MobileIdentity
+	// IEI 0x53 — 5GS update type value octets (TS 24.501 §9.11.3.9A)
+	FiveGSUpdateType []byte
+	// IEI 0x71 — NAS message container (TLV-E, TS 24.501 §9.11.3.33): raw value
+	// part (the ciphered/plain inner NAS message), without IEI and length.
+	NASMessageContainer []byte
 }
 
 // IEI codes for RegistrationRequest optional IEs (TS 24.501 §8.2.6.1 Table 8.2.6.1.1)
@@ -59,6 +65,7 @@ const (
 	IEIPayloadContainerReg   = 0x7B
 	IEI5GSUpdateType         = 0x53
 	IEINASMessageContainer   = 0x71
+	IEIMICOIndication        = 0xB0 // type 1 half-octet IEI 0xB (TS 24.501 §9.11.3.31)
 )
 
 // DecodeRegistrationRequest parses the body bytes after the message type.
@@ -103,81 +110,118 @@ func DecodeRegistrationRequest(b []byte) (*RegistrationRequest, error) {
 	}
 	r.MobileIdentity = *mi
 
-	// Optional IEs (TLV format)
+	// Optional IEs. Two non-imperative error rules apply to every IE below:
+	//   - TS 24.501 §7.6.3: a repeated IE whose repetition is not specified is
+	//     handled only on its first occurrence; later repetitions are skipped.
+	//   - TS 24.501 §7.7.1: a syntactically incorrect optional IE is treated as
+	//     not present. When its length octet is intact the IE is skipped and
+	//     decoding continues; when the length overruns the message the parser
+	//     cannot resynchronise, so optional-IE parsing stops (same rule as the
+	//     generic Reader.skipIE path).
+	seen := make(map[byte]bool, 4)
 	for rdr.Len() > 0 {
 		iei, err := rdr.ReadByte()
 		if err != nil {
 			break
 		}
-		switch iei {
-		case IEI5GMMCapability:
-			l, err := rdr.ReadByte()
-			if err != nil {
-				return nil, err
+		repeated := seen[iei]
+		seen[iei] = true
+		switch {
+		case repeated:
+			if err := rdr.skipIE(IEMsgRegistrationRequest); err != nil {
+				return r, nil
 			}
-			r.FiveGMMCapability, err = rdr.ReadBytes(int(l))
-			if err != nil {
-				return nil, err
+		case iei == IEI5GMMCapability:
+			v, ok := readOptionalTLVValue(rdr)
+			if !ok {
+				return r, nil
 			}
-		case IEIUESecurityCapability:
-			l, err := rdr.ReadByte()
-			if err != nil {
-				return nil, err
+			r.FiveGMMCapability = v
+		case iei == IEIUESecurityCapability:
+			v, ok := readOptionalTLVValue(rdr)
+			if !ok {
+				return r, nil
 			}
-			capBytes, err := rdr.ReadBytes(int(l))
-			if err != nil {
-				return nil, err
+			if cap, err := DecodeUESecurityCapability(v); err == nil {
+				r.UESecurityCapability = &cap
 			}
-			cap, err := DecodeUESecurityCapability(capBytes)
-			if err != nil {
-				return nil, err
+		case iei == IEIRequestedNSSAI:
+			v, ok := readOptionalTLVValue(rdr)
+			if !ok {
+				return r, nil
 			}
-			r.UESecurityCapability = &cap
-		case IEIRequestedNSSAI:
-			l, err := rdr.ReadByte()
-			if err != nil {
-				return nil, err
+			if nssai, err := DecodeNSSAI(v); err == nil {
+				r.RequestedNSSAI = &nssai
 			}
-			nssaiBytes, err := rdr.ReadBytes(int(l))
-			if err != nil {
-				return nil, err
+		case iei == IEIUplinkDataStatus, iei == IEIPDUSessionStatus, iei == IEI5GSUpdateType, iei == IEIUEStatus:
+			// TS 24.501 §9.11.3.57, §9.11.3.44, §9.11.3.9A, §9.11.3.56 (all TLV).
+			v, ok := readOptionalTLVValue(rdr)
+			if !ok {
+				return r, nil
 			}
-			nssai, err := DecodeNSSAI(nssaiBytes)
-			if err != nil {
-				return nil, err
-			}
-			r.RequestedNSSAI = &nssai
-		case IEINASMessageContainer, IEIEPSNASMsgContainer, IEIAdditionalGUTI,
-			IEIPayloadContainerReg, IEILADNIndication, 0x7E:
-			// TLV-E IEs (2-byte big-endian length): NAS message container (0x71),
-			// EPS NAS message container (0x70), Additional GUTI (0x77), Payload
-			// container (0x7B), LADN indication (0x74 per spec; 0x7E in the
-			// UERANSIM fork). Skipping these with a 1-byte length would shift
-			// the parser and corrupt every subsequent IE.
-			// Ref: TS 24.501 Table 8.2.6.1.1, TS 24.007 §11.2.1.1.4
-			hi, err := rdr.ReadByte()
-			if err != nil {
-				break
-			}
-			lo, err := rdr.ReadByte()
-			if err != nil {
-				break
-			}
-			_, _ = rdr.ReadBytes(int(hi)<<8 | int(lo))
-		default:
-			// Unknown optional IE: skip (TV/TLV)
-			// Try TLV format (IEI >= 0x80 are TV with value in low nibble)
-			if iei < 0x80 {
-				l, err := rdr.ReadByte()
-				if err != nil {
-					break
+			switch iei {
+			case IEIUplinkDataStatus:
+				r.UplinkDataStatus = v
+			case IEIPDUSessionStatus:
+				r.PDUSessionStatus = v
+			case IEI5GSUpdateType:
+				r.FiveGSUpdateType = v
+			case IEIUEStatus:
+				if len(v) == 1 {
+					b := v[0]
+					r.UEStatus = &b
 				}
-				_, _ = rdr.ReadBytes(int(l))
 			}
-			// TV (1-byte value, IEI >= 0x80): already consumed IEI byte
+		case iei&0xF0 == IEIMICOIndication:
+			// Type 1 TV: IEI in the high nibble, value in the low nibble
+			// (TS 24.501 §9.11.3.31).
+			b := iei & 0x0F
+			r.MICOIndication = &b
+		case iei == IEINASMessageContainer:
+			// TLV-E: 2-byte length (TS 24.501 §9.11.3.33). Overrun = syntactically
+			// incorrect: treated as absent, parsing stops (§7.7.1).
+			hi, err1 := rdr.ReadByte()
+			lo, err2 := rdr.ReadByte()
+			if err1 != nil || err2 != nil {
+				return r, nil
+			}
+			v, err := rdr.ReadBytes(int(hi)<<8 | int(lo))
+			if err != nil {
+				return r, nil
+			}
+			r.NASMessageContainer = append([]byte(nil), v...)
+		default:
+			// IEs without a dedicated case (including the TLV-E ones: NAS message
+			// container 0x71, EPS NAS message container 0x70, Additional GUTI 0x77,
+			// Payload container 0x7B, LADN indication 0x74, and 0x7E emitted by the
+			// UERANSIM fork) are skipped by the IE table / TS 24.007 §11.2.4 rule.
+			// A 1-byte length for a TLV-E IE would shift every later IE.
+			// Ref: TS 24.501 §7.6.1, Table 8.2.6.1.1
+			if err := rdr.skipIE(IEMsgRegistrationRequest); err != nil {
+				// Syntactically incorrect optional IE: treat as not present and
+				// stop optional-IE parsing. Ref: TS 24.501 §7.7.1
+				return r, nil
+			}
 		}
 	}
 	return r, nil
+}
+
+// readOptionalTLVValue reads the length octet and value of a type 4 (TLV)
+// optional IE whose IEI the reader has just consumed. ok is false when the
+// length octet is missing or overruns the message: the IE is then syntactically
+// incorrect and the remaining octets cannot be parsed (TS 24.501 §7.7.1,
+// TS 24.007 §11.2.4). The returned slice aliases the message buffer.
+func readOptionalTLVValue(rdr *Reader) ([]byte, bool) {
+	l, err := rdr.ReadByte()
+	if err != nil {
+		return nil, false
+	}
+	v, err := rdr.ReadBytes(int(l))
+	if err != nil {
+		return nil, false
+	}
+	return v, true
 }
 
 // ---- Registration Accept (TS 24.501 §8.2.7.1) ---------------------------
@@ -196,7 +240,8 @@ type RegistrationAccept struct {
 	TAIList []byte
 	// IEI 0x15 — Allowed NSSAI (UERANSIM uses 0x15; TS 24.501 §8.2.7.1 uses 0x15 too)
 	AllowedNSSAI *NSSAI
-	// IEI 0x11 — Rejected NSSAI
+	// IEI 0x11 — Rejected NSSAI value (TLV, TS 24.501 §9.11.3.46). Raw value
+	// octets; build with RejectedNSSAIValue. nil/empty = IE absent.
 	RejectedNSSAI []byte
 	// IEI 0x31 — Configured NSSAI
 	ConfiguredNSSAI *NSSAI
@@ -208,14 +253,25 @@ type RegistrationAccept struct {
 	PDUSessionStatus []byte
 	// IEI 0x26 — PDU session reactivation result
 	PDUSessionReactivationResult []byte
+	// IEI 0x72 — PDU session reactivation result error cause (TLV-E, TS 24.501
+	// §9.11.3.43). Encoded right after IEI 0x26. nil/empty = IE absent.
+	PDUSessionReactivationResultErrorCause []PDUSessionErrorCause
 	// IEI 0x79 — LADN information (TS 24.501 §9.11.3.30; was wrongly commented
 	// 0x72 — that IEI is unassigned in Table 8.2.7.1.1). Not yet encoded.
 	LADNInformation []byte
 	// IEI 0x27 — Service area list (TS 24.501 §9.11.3.49; was wrongly commented
-	// 0x2C — that IEI is "Disaster return wait range" in Rel-17+). Not yet encoded.
-	ServiceAreaList []byte
+	// 0x2C — that IEI is "Disaster return wait range" in Rel-17+).
+	// nil = IE absent; encoded between PDU session reactivation result and T3512.
+	ServiceAreaList *ServiceAreaList
 	// T3512 timer value
 	T3512Value *byte
+	// IEI 0x39 — Pending NSSAI (TLV, 1-byte length; TS 24.501 Table 8.2.7.1.1,
+	// §9.11.3.37). nil/empty = IE absent. Sent while NSSAA is still pending.
+	PendingNSSAI *NSSAI
+	// IEI 0x68 — Extended rejected NSSAI (TLV, TS 24.501 §9.11.3.75, Table
+	// 8.2.7.1.1: after Pending NSSAI 0x39 and the NB-N1 mode DRX IE). Only for
+	// UEs with the ER-NSSAI bit set (RegistrationRequest.ERNSSAISupported). nil = absent.
+	ExtendedRejectedNSSAI *ExtendedRejectedNSSAI
 	// IEI 0x5D — Non-3GPP deregistration timer (TS 24.501 §9.11.2.9; was wrongly
 	// commented 0x6A — that IEI is T3324 in Table 8.2.7.1.1). Not yet encoded.
 	Non3GPPDeregTimer *byte
@@ -282,11 +338,7 @@ func EncodeGPRSTimer3(seconds int) byte {
 // implement those features.
 // Ref: TS 24.501 §9.11.3.5, §8.2.7.1 Table 8.2.7.1.1 (IEI 0x21)
 func NewNetworkFeatureSupport(imsVoPS3GPP bool) []byte {
-	var octet1 byte
-	if imsVoPS3GPP {
-		octet1 |= 0x01 // bit 1: IMS VoPS-3GPP-access indicator
-	}
-	return []byte{octet1, 0x00}
+	return NetworkFeatureSupport{IMSVoPS3GPP: imsVoPS3GPP}.Encode(NFSLegacyOctets)
 }
 
 // EncodeTAIList encodes a 5GS tracking area identity list containing a single
@@ -347,6 +399,13 @@ func EncodeRegistrationAccept(ra *RegistrationAccept) ([]byte, error) {
 		out = append(out, nssaiBytes...)
 	}
 
+	// IEI 0x11 — Rejected NSSAI (TLV, 1-byte length), between Allowed and Configured
+	// NSSAI per TS 24.501 Table 8.2.7.1.1.
+	if len(ra.RejectedNSSAI) > 0 {
+		out = append(out, 0x11, byte(len(ra.RejectedNSSAI)))
+		out = append(out, ra.RejectedNSSAI...)
+	}
+
 	// IEI 0x31 — Configured NSSAI (IE4 = 1-byte length)
 	if ra.ConfiguredNSSAI != nil {
 		nssaiBytes := EncodeNSSAI(*ra.ConfiguredNSSAI)
@@ -354,11 +413,35 @@ func EncodeRegistrationAccept(ra *RegistrationAccept) ([]byte, error) {
 		out = append(out, nssaiBytes...)
 	}
 
-	// IEI 0x21 — 5GS network feature support (TLV, 1-3 content octets).
+	// IEI 0x21 — 5GS network feature support (TLV, 1-4 content octets, TS 24.501 V19.8.0).
 	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
 	if len(ra.NetworkFeatureSupport) > 0 {
 		out = append(out, 0x21, byte(len(ra.NetworkFeatureSupport)))
 		out = append(out, ra.NetworkFeatureSupport...)
+	}
+
+	// IEI 0x50 — PDU session status, IEI 0x26 — PDU session reactivation result
+	// (TLV), after 5GS network feature support and before T3512 value per
+	// TS 24.501 Table 8.2.7.1.1; §9.11.3.44, §9.11.3.42.
+	if len(ra.PDUSessionStatus) > 0 {
+		out = append(out, IEIPDUSessionStatus, byte(len(ra.PDUSessionStatus)))
+		out = append(out, ra.PDUSessionStatus...)
+	}
+	if len(ra.PDUSessionReactivationResult) > 0 {
+		out = append(out, IEIPDUSessionReactivationResult, byte(len(ra.PDUSessionReactivationResult)))
+		out = append(out, ra.PDUSessionReactivationResult...)
+	}
+	out = append(out, EncodePDUSessionReactivationResultErrorCause(ra.PDUSessionReactivationResultErrorCause)...)
+
+	// IEI 0x27 — Service area list (TLV), after PDU session reactivation result
+	// (and LADN info / MICO / NSSAI inclusion mode) and before T3512 value
+	// per TS 24.501 Table 8.2.7.1.1; §9.11.3.49.
+	if ra.ServiceAreaList != nil {
+		tlv, err := EncodeServiceAreaList(ra.ServiceAreaList)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tlv...)
 	}
 
 	// IEI 0x5E — T3512 value (TLV: IEI + 1-byte length + 1-byte GPRS Timer 3 value)
@@ -366,6 +449,24 @@ func EncodeRegistrationAccept(ra *RegistrationAccept) ([]byte, error) {
 	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.48
 	if ra.T3512Value != nil {
 		out = append(out, 0x5E, 0x01, *ra.T3512Value)
+	}
+
+	// IEI 0x39 — Pending NSSAI (TLV, 1-byte length). Last in Table 8.2.7.1.1 among the
+	// IEs this encoder emits (follows T3512 value).
+	if ra.PendingNSSAI != nil {
+		if nssaiBytes := EncodeNSSAI(*ra.PendingNSSAI); len(nssaiBytes) > 0 {
+			out = append(out, 0x39, byte(len(nssaiBytes)))
+			out = append(out, nssaiBytes...)
+		}
+	}
+
+	// IEI 0x68 — Extended rejected NSSAI (TLV), Table 8.2.7.1.1: after Pending NSSAI.
+	if ra.ExtendedRejectedNSSAI != nil {
+		tlv, err := encodeExtendedRejectedNSSAITLV(ra.ExtendedRejectedNSSAI)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tlv...)
 	}
 
 	// NOTE: URSP / UE policies are NOT carried in Registration Accept. They are
@@ -417,7 +518,45 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
 			nssai, _ := DecodeNSSAI(nssaiBytes)
 			ra.ConfiguredNSSAI = &nssai
-		case 0x21: // 5GS network feature support — TLV (1-byte length, 1-3 content octets)
+		case 0x11: // Rejected NSSAI — TLV (1-byte length), raw value kept
+			l, _ := rdr.ReadByte()
+			ra.RejectedNSSAI, _ = rdr.ReadBytes(int(l))
+		case IEIExtendedRejectedNSSAI: // Extended rejected NSSAI — TLV (1-byte length)
+			l, err := rdr.ReadByte()
+			if err != nil {
+				return nil, fmt.Errorf("nas: registration accept: extended rejected NSSAI length: %w", err)
+			}
+			v, err := rdr.ReadBytes(int(l))
+			if err != nil {
+				return nil, fmt.Errorf("nas: registration accept: extended rejected NSSAI: %w", err)
+			}
+			if ra.ExtendedRejectedNSSAI, err = DecodeExtendedRejectedNSSAI(v); err != nil {
+				return nil, fmt.Errorf("nas: registration accept: %w", err)
+			}
+		case 0x39: // Pending NSSAI — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			nssaiBytes, _ := rdr.ReadBytes(int(l))
+			nssai, _ := DecodeNSSAI(nssaiBytes)
+			ra.PendingNSSAI = &nssai
+		case IEIPDUSessionReactivationResultErrorCause: // TLV-E (2-byte length)
+			lb, err := rdr.ReadBytes(2)
+			if err != nil {
+				return ra, nil
+			}
+			v, err := rdr.ReadBytes(int(lb[0])<<8 | int(lb[1]))
+			if err != nil {
+				return ra, nil
+			}
+			if list, err := DecodePDUSessionReactivationResultErrorCause(v); err == nil {
+				ra.PDUSessionReactivationResultErrorCause = list
+			}
+		case 0x27: // Service area list — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			v, _ := rdr.ReadBytes(int(l))
+			if sal, err := DecodeServiceAreaListValue(v); err == nil {
+				ra.ServiceAreaList = sal
+			}
+		case 0x21: // 5GS network feature support — TLV (1-byte length, 1-4 content octets, TS 24.501 V19.8.0)
 			l, _ := rdr.ReadByte()
 			nfsBytes, _ := rdr.ReadBytes(int(l))
 			ra.NetworkFeatureSupport = nfsBytes
@@ -429,13 +568,12 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 				ra.T3512Value = &v
 			}
 		default:
-			// Skip unknown optional TLV IEs; TV IEs (IEI >= 0x80) have no length byte
-			if iei < 0x80 {
-				l, err := rdr.ReadByte()
-				if err != nil {
-					break
-				}
-				_, _ = rdr.ReadBytes(int(l))
+			// Unknown / unhandled optional IE: skip per the IE table or the
+			// TS 24.007 §11.2.4 rule (TS 24.501 §7.6.1).
+			if err := rdr.skipIE(IEMsgRegistrationAccept); err != nil {
+				// Syntactically incorrect optional IE: treat as not present and
+				// stop optional-IE parsing. Ref: TS 24.501 §7.7.1
+				return ra, nil
 			}
 		}
 	}
@@ -446,16 +584,109 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 type RegistrationComplete struct{}
 
 // RegistrationReject is the body of a 5GMM Registration Reject (0x44).
-// Contains a mandatory 5GMM Cause IE. Ref: TS 24.501 §8.2.8.2
+// Contains a mandatory 5GMM Cause IE. Ref: TS 24.501 §8.2.9
 type RegistrationReject struct {
 	// Cause5GMM — TS 24.501 §9.11.3.2.
 	// 0x49 = cause 73 = "Serving network not authorized" (Service Area Restriction).
 	Cause5GMM byte
+
+	// RejectedNSSAI is the optional Rejected NSSAI IE (IEI 0x69, TLV,
+	// TS 24.501 §9.11.3.46), sent with cause #62. Empty = IE absent.
+	RejectedNSSAI []RejectedSNSSAI
+
+	// ExtendedRejectedNSSAI is the optional Extended rejected NSSAI IE
+	// (IEI 0x68, TLV, TS 24.501 §9.11.3.75). nil = IE absent.
+	ExtendedRejectedNSSAI *ExtendedRejectedNSSAI
+
+	// T3346 is the optional T3346 value IE (IEI 0x5F, GPRS timer 2,
+	// TS 24.501 §9.11.2.4). nil = IE absent; a zero duration encodes as
+	// 0 x 2 s (not "deactivated"). Ref: TS 24.501 §8.2.9.1.
+	T3346 *time.Duration
 }
 
-// EncodeRegistrationReject encodes a Registration Reject body (1 byte: cause).
+// IEIRegistrationRejectT3346 is the T3346 value IEI in REGISTRATION REJECT
+// (TS 24.501 §8.2.9.1, Table 8.2.9.1.1).
+const IEIRegistrationRejectT3346 = 0x5F
+
+// GPRSTimer2Deactivated is the GPRS timer 2 octet meaning "timer deactivated"
+// (unit bits 111). Ref: TS 24.008 §10.5.7.4, TS 24.501 §9.11.2.4.
+const GPRSTimer2Deactivated byte = 0xE0
+
+// EncodeGPRSTimer2 encodes d as a GPRS timer 2 value octet (unit in bits 8-6:
+// 000 = 2 s, 001 = 1 min, 010 = decihours (6 min); value in bits 5-1).
+// It picks the finest unit whose value fits in 5 bits, rounding up to the unit;
+// durations above 31 decihours (3 h 6 min) or negative are rejected.
+// Ref: TS 24.008 §10.5.7.4, TS 24.501 §9.11.2.4.
+func EncodeGPRSTimer2(d time.Duration) (byte, error) {
+	if d < 0 {
+		return 0, fmt.Errorf("nas: GPRS timer 2: negative duration %s", d)
+	}
+	units := []struct {
+		unit byte
+		step time.Duration
+	}{{0x00, 2 * time.Second}, {0x20, time.Minute}, {0x40, 6 * time.Minute}}
+	for _, u := range units {
+		v := (d + u.step - 1) / u.step
+		if v <= 31 {
+			return u.unit | byte(v), nil
+		}
+	}
+	return 0, fmt.Errorf("nas: GPRS timer 2: duration %s exceeds 31 decihours", d)
+}
+
+// IEIRegistrationRejectRejectedNSSAI is the Rejected NSSAI IEI in REGISTRATION
+// REJECT (TS 24.501 §8.2.9.1, Table 8.2.9.1.1).
+const IEIRegistrationRejectRejectedNSSAI = 0x69
+
+// EncodeRegistrationReject encodes a Registration Reject body: cause, then
+// optional IEs in Table 8.2.9.1.1 order (Rejected NSSAI 0x69 precedes Extended
+// rejected NSSAI 0x68). With no optional IEs the output is exactly {cause}.
 // The common header (EPD + SHT + MsgType) is prepended by the NAS encoder.
-// Ref: TS 24.501 §8.2.8.2
+// Ref: TS 24.501 §8.2.9
 func EncodeRegistrationReject(r *RegistrationReject) ([]byte, error) {
-	return []byte{r.Cause5GMM}, nil
+	out := []byte{r.Cause5GMM}
+	if r.T3346 != nil {
+		t, err := EncodeGPRSTimer2(*r.T3346)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, IEIRegistrationRejectT3346, 0x01, t)
+	}
+	if len(r.RejectedNSSAI) > 0 {
+		rej, err := EncodeRejectedNSSAI(r.RejectedNSSAI)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, IEIRegistrationRejectRejectedNSSAI, byte(len(rej)))
+		out = append(out, rej...)
+	}
+	if r.ExtendedRejectedNSSAI != nil {
+		tlv, err := encodeExtendedRejectedNSSAITLV(r.ExtendedRejectedNSSAI)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tlv...)
+	}
+	return out, nil
+}
+
+// RejectedNSSAIValue builds the RegistrationAccept.RejectedNSSAI value octets
+// (TS 24.501 §9.11.3.46) from a typed list.
+func RejectedNSSAIValue(list []RejectedSNSSAI) ([]byte, error) {
+	return EncodeRejectedNSSAI(list)
+}
+
+// Capability5GMM returns the decoded 5GMM capability IE of this REGISTRATION
+// REQUEST, or nil when the IE is absent or empty (treated as not present,
+// TS 24.501 §7.7.1). FiveGMMCapability keeps the raw value octets.
+// Ref: TS 24.501 §9.11.3.1
+func (r *RegistrationRequest) Capability5GMM() *FiveGMMCapability {
+	if r == nil {
+		return nil
+	}
+	c, err := Decode5GMMCapability(r.FiveGMMCapability)
+	if err != nil {
+		return nil
+	}
+	return c
 }

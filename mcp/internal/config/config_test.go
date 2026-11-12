@@ -141,3 +141,21 @@ func TestNEFAndSMSFAddrDefaultAndEnv(t *testing.T) {
 		t.Errorf("env: nef=%q smsf=%q", cfg.NEFAddr, cfg.SMSFAddr)
 	}
 }
+
+func TestSEPPAddrDefaultAndEnv(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "transport: sse\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SEPPAddr != "https://vsepp:8014" {
+		t.Errorf("default sepp=%q", cfg.SEPPAddr)
+	}
+	t.Setenv("SEPP_ADDR", "https://localhost:8014")
+	cfg, err = Load(writeConfig(t, "transport: sse\n"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.SEPPAddr != "https://localhost:8014" {
+		t.Errorf("env sepp=%q", cfg.SEPPAddr)
+	}
+}

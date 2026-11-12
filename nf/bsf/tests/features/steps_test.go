@@ -266,7 +266,7 @@ func (c *bsfCtx) consumerSendsDiscoveryBySupi(supi string) error {
 	return c.doJSON(http.MethodGet, "/nbsf-management/v1/pcfBindings?supi="+supi, nil)
 }
 
-// ---- Scenario 8: no query param → 400 MANDATORY_IE_MISSING ------------------
+// ---- Scenario 8: no query param → 400 MANDATORY_QUERY_PARAM_MISSING ------------------
 
 func (c *bsfCtx) consumerSendsDiscoveryNoParams() error {
 	return c.doJSON(http.MethodGet, "/nbsf-management/v1/pcfBindings", nil)
@@ -370,7 +370,8 @@ func (m *mockBSFServer) lastDEL() string {
 // handleCreateSmPolicy and handleDeleteSmPolicy here. The synthetic PCF:
 //   - On POST /npcf-smpolicycontrol/v1/sm-policies: registers a PCF binding
 //     with the mock BSF in a detached goroutine (exactly as the real PCF does).
-//   - On DELETE /npcf-smpolicycontrol/v1/sm-policies/{id}: deregisters the
+//   - On POST /npcf-smpolicycontrol/v1/sm-policies/{id}/delete (TS 29.512
+//     §4.2.5 custom delete operation): deregisters the
 //     stored BSF binding synchronously.
 //
 // See the BLOCKER note in the file header: once the PCF server exposes a
@@ -402,7 +403,7 @@ func syntheticPCFHandler(mockBSFURL string, bsfHTTPClient *http.Client, pts *pcf
 		// Respond 201 immediately (before BSF registration, as the real PCF does).
 		resp := map[string]any{"smPolicyId": smPolicyID}
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Location", "/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyID)
+		w.Header().Set("Location", "http://"+r.Host+"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyID) // absolute {apiRoot} per TS 29.501 §4.4.1
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(resp)
 
@@ -470,7 +471,7 @@ func syntheticPCFHandler(mockBSFURL string, bsfHTTPClient *http.Client, pts *pcf
 		}()
 	})
 
-	mux.HandleFunc("DELETE /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /npcf-smpolicycontrol/v1/sm-policies/{smPolicyId}/delete", func(w http.ResponseWriter, r *http.Request) {
 		smPolicyID := r.PathValue("smPolicyId")
 
 		pts.mu.Lock()
@@ -549,13 +550,14 @@ func (p *pcfTestServer) postSmPolicy(supi, dnn string, sst int, sd, ipv4Addr str
 	return out, nil
 }
 
-// deleteSmPolicy sends DELETE /npcf-smpolicycontrol/v1/sm-policies/{id} to the (synthetic) PCF.
+// deleteSmPolicy sends POST /npcf-smpolicycontrol/v1/sm-policies/{id}/delete to the (synthetic) PCF.
 func (p *pcfTestServer) deleteSmPolicy(smPolicyID string) error {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete,
-		p.url+"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyID, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		p.url+"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyID+"/delete", strings.NewReader("{}"))
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -714,7 +716,7 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the consumer sends a Discovery request with query ipv4Addr "([^"]+)"$`, c.consumerSendsDiscoveryByIPv4)
 	sc.Step(`^the BSF responds with status 200 OK$`, func() error { return c.bsfRespondsWithStatus(http.StatusOK) })
 
-	// Scenario 3 — Discovery 404
+	// Scenario 3 — Discovery no match (204; 404 step kept for Deregister unknown id)
 	sc.Step(`^no PcfBinding is registered for ipv4Addr "([^"]+)"$`, c.noPcfBindingRegisteredForIPv4)
 	sc.Step(`^the BSF responds with status 404$`, func() error { return c.bsfRespondsWithStatus(http.StatusNotFound) })
 

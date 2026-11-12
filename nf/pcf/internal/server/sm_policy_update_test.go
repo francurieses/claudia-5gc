@@ -1,7 +1,7 @@
 package server
 
 // sm_policy_update_test.go — SM Policy Association Update authorization tests
-// (TS 29.512 §5.2.2.3). Mirrors the scenarios in features/sm_policy_update.feature.
+// (TS 29.512 §5.2.2.3). Mirrors the scenarios in tests/features/sm_policy_update.feature.
 
 import (
 	"encoding/json"
@@ -14,10 +14,9 @@ import (
 // createPolicyID creates an SM policy via the create handler and returns its smPolicyId.
 func createPolicyID(t *testing.T, s *Server, supi, dnn string) string {
 	t.Helper()
-	resp := createSmPolicy(t, s, `{"supi":"`+supi+`","dnn":"`+dnn+`"}`)
-	id, _ := resp["smPolicyId"].(string)
+	_, id := createSmPolicyWithID(t, s, `{"supi":"`+supi+`","dnn":"`+dnn+`"}`)
 	if id == "" {
-		t.Fatal("create did not return an smPolicyId")
+		t.Fatal("create did not return a Location smPolicyId")
 	}
 	return id
 }
@@ -133,7 +132,7 @@ func TestSmPolicyUpdateUnknownPolicy(t *testing.T) {
 	}
 	var resp map[string]any
 	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["cause"] != "CONTEXT_NOT_FOUND" {
-		t.Errorf("cause: got %v want CONTEXT_NOT_FOUND", resp["cause"])
+	if resp["cause"] != "POLICY_ASSOCIATION_NOT_FOUND" {
+		t.Errorf("cause: got %v want POLICY_ASSOCIATION_NOT_FOUND", resp["cause"])
 	}
 }

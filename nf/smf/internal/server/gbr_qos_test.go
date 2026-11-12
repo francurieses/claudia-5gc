@@ -8,8 +8,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	"github.com/free5gc/ngap/ngapType"
 )
 
 // TestBuildQosFlowSetupRequestList_GBR verifies GBRQosInformation is present

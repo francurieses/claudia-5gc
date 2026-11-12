@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,11 +24,22 @@ import (
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
+// maxNgKsi is the largest ngKSI value NgKsi.ksi can carry (maximum 6; 7 means
+// "no key is available"). Ref: TS 29.518 (NgKsi), TS 24.501 §9.11.3.32.
+const maxNgKsi = 6
+
 const nfName = "AMF"
+
+// ratTypeNR is the TS 29.571 §5.4.3.2 RatType value for NR, reported in the
+// rel19 ProvideLocInfo answer.
+const ratTypeNR = "NR"
 
 // Config configures the inbound SBI server.
 type Config struct {
@@ -121,6 +133,37 @@ type Server struct {
 	// when the UE returns to CM-CONNECTED via a Service Request.
 	// Ref: TS 23.273 §7.2 steps E2–E7.
 	pendingLocPage sync.Map
+	// profile is the release profile gating supportedFeatures behaviour
+	// (decision D1, dev/REL19_PROGRAM.md §2). nil behaves as rel17: a request
+	// without supportedFeatures gets a response without it.
+	profile *capability.Profile
+	// namfCat is the Namf_Communication catalog used to answer
+	// supportedFeatures; defaults to NamfCommunicationCatalog().
+	namfCat *features.Catalog
+	// onUDMDereg performs the local deregistration of a UE the UDM asked to
+	// deregister (DeregistrationNotification); wired by SetDeregistrationHandler.
+	onUDMDereg func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error
+}
+
+// SetDeregistrationHandler wires the local deregistration run when the UDM sends
+// a DeregistrationNotification (same path as the implicit detach). Must be
+// called before Start(). Ref: TS 29.503 §5.3.2.2; TS 23.502 §4.2.2.3.3.
+func (s *Server) SetDeregistrationHandler(fn func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error) {
+	s.onUDMDereg = fn
+}
+
+// SetProfile wires the release profile used for supportedFeatures
+// negotiation. Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetCatalog replaces the Namf_Communication catalog (tests inject catalogs
+// with Implemented entries). Must be called before Start(). nil restores the
+// default.
+func (s *Server) SetCatalog(c *features.Catalog) {
+	if c == nil {
+		c = NamfCommunicationCatalog()
+	}
+	s.namfCat = c
 }
 
 // NotifyUEReachable is called by the NAS onUEReachable callback whenever a UE
@@ -158,13 +201,13 @@ func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, mgr: mgr, logger: logger}
+	s := &Server{cfg: cfg, mgr: mgr, logger: logger, namfCat: NamfCommunicationCatalog()}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer", s.handleUEContextTransfer)
 	mux.HandleFunc("POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages", s.handleN1N2MessageTransfer)
 	// Namf_Location_ProvideLocationInfo — Cell-ID positioning relay.
-	// Ref: TS 29.518 §5.2.2.6; TS 23.273 §7.2.
+	// Ref: TS 29.518 §5.5.2.4; TS 23.273 §7.2.
 	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info", s.handleProvideLocInfo)
 	// Namf_Location dl-nrppa-info: LMF sends DL NRPPa PDU; AMF relays to gNB and waits for UL NRPPa.
 	// Ref: TS 29.518 §5.2.2.6 (NRPPa relay extension); TS 38.413 §8.17.3.
@@ -173,6 +216,9 @@ func New(cfg Config, mgr *amfctx.Manager, logger *slog.Logger) (*Server, error) 
 	// over N1 (DL NAS Transport, payload container type 0x03) and waits for
 	// the matching UL LPP PDU. Ref: TS 29.518 §5.2.2.6; TS 24.501 §8.7.4; LMF-005.
 	mux.HandleFunc("POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-lpp-info", s.handleDLLPPInfo)
+	// UDM callbacks (deregCallbackUri / SDM callbackReference), AUD-registration-17.
+	mux.HandleFunc("POST "+UDMDeregCallbackPath+"/{supi}", s.handleUDMDeregNotify)
+	mux.HandleFunc("POST "+UDMSDMCallbackPath, s.handleUDMSDMNotify)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -248,19 +294,32 @@ func (s *Server) handleUEContextTransfer(w http.ResponseWriter, r *http.Request)
 	)
 
 	var req UeContextTransferReqData
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Warn("malformed UEContextTransfer body", "result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
-		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
-		metrics.ProcedureTotal.WithLabelValues(nfName, "UEContextTransfer", "REJECT").Inc()
+	if err := s.decodeBody(r, true, &req); err != nil {
+		if s.rejectSupportedFeaturesType(ctx, w, err, "AMF", "UEContextTransfer") {
+			return
+		}
+		s.rejectBody(w, log, err, "UEContextTransfer", "UEContextTransfer")
 		return
 	}
 
-	// reason is a mandatory IE. Ref: TS 29.518 §6.1.6.2.2.
-	if req.Reason == "" {
-		log.Warn("UEContextTransfer missing reason", "result", "REJECT", "cause", "MANDATORY_IE_MISSING")
-		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "reason is mandatory")
-		metrics.ProcedureTotal.WithLabelValues(nfName, "UEContextTransfer", "REJECT").Inc()
+	// supportedFeatures must be schema-valid before any state is touched.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	sfAnswer, sfSet, sfOK := s.negotiateRequest(ctx, w, "AMF", req.SupportedFeatures, "UEContextTransfer")
+	if !sfOK {
 		return
+	}
+
+	// reason and accessType are mandatory IEs; accessType is validated under
+	// rel19 only (rel17 frozen). Ref: TS 29.518 Table 6.1.6.2.23-1.
+	if req.Reason == "" {
+		s.rejectIE(w, log, CauseMandatoryIEMissing, "reason is mandatory", paramReason, "UEContextTransfer")
+		return
+	}
+	if s.specLiteral() {
+		if cause, detail, ok := accessTypeProblem(req.AccessType); !ok {
+			s.rejectIE(w, log, cause, detail, paramAccessType, "UEContextTransfer")
+			return
+		}
 	}
 
 	ue, found := s.lookupUE(ueContextID)
@@ -273,7 +332,9 @@ func (s *Server) handleUEContextTransfer(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	rsp := s.buildTransferRsp(ue)
+	rsp := s.buildTransferRsp(ue, req)
+	rsp.SupportedFeatures = sfAnswer
+	s.logNegotiated(ctx, "AMF", req.SupportedFeatures, sfSet, "ue_context_id", ueContextID)
 
 	// Mark the context transferred but keep it until RegistrationStatusUpdate or
 	// implicit detach. Ref: TS 23.502 §4.2.2.2.3.
@@ -308,10 +369,18 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 	)
 
 	var req N1N2MessageTransferReqData
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Warn("malformed N1N2MessageTransfer body", "result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
-		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
-		metrics.ProcedureTotal.WithLabelValues(nfName, "NetworkTriggeredServiceRequest", "REJECT").Inc()
+	if err := s.decodeBody(r, true, &req); err != nil {
+		if s.rejectSupportedFeaturesType(ctx, w, err, "SMF", "NetworkTriggeredServiceRequest") {
+			return
+		}
+		s.rejectBody(w, log, err, "N1N2MessageTransfer", "NetworkTriggeredServiceRequest")
+		return
+	}
+
+	// supportedFeatures must be schema-valid before paging or any state change.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	sfAnswer, sfSet, sfOK := s.negotiateRequest(ctx, w, "SMF", req.SupportedFeatures, "NetworkTriggeredServiceRequest")
+	if !sfOK {
 		return
 	}
 
@@ -329,17 +398,18 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 	supi := ue.SUPI
 	ue.Unlock()
 
-	var psi int = -1
+	psi := -1
 	if req.PduSessionID != nil {
 		psi = int(*req.PduSessionID)
 	}
+	s.logNegotiated(ctx, "SMF", req.SupportedFeatures, sfSet, "supi", supi, "ue_context_id", ueContextID)
 
 	if connected {
 		// UE is reachable — the N1/N2 payload is delivered over the existing N2
 		// connection (PDU session resource setup / DL NAS). Ref: TS 23.502 §4.2.3.3 (UE in CM-CONNECTED).
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(N1N2MessageTransferRspData{Cause: CauseN1N2TransferInitiated})
+		_ = json.NewEncoder(w).Encode(N1N2MessageTransferRspData{Cause: CauseN1N2TransferInitiated, SupportedFeatures: sfAnswer})
 		log.Info("N1N2 message delivered to CM-CONNECTED UE",
 			"supi", supi, "pdu_session_id", psi, "result", "OK", "cause", CauseN1N2TransferInitiated)
 		metrics.ProcedureTotal.WithLabelValues(nfName, "NetworkTriggeredServiceRequest", "OK").Inc()
@@ -372,8 +442,13 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	if s.specLiteral() {
+		// Location is mandatory in the 202 (rel19; rel17 frozen without it).
+		// Ref: TS 29.518 §5.2.2.3.1.2, Table 6.1.3.5.3.1-3
+		w.Header().Set("Location", n1n2MessageLocation(r, ueContextID))
+	}
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(N1N2MessageTransferRspData{Cause: CauseAttemptingToReachUE})
+	_ = json.NewEncoder(w).Encode(N1N2MessageTransferRspData{Cause: CauseAttemptingToReachUE, SupportedFeatures: sfAnswer})
 	log.Info("CM-IDLE UE paged for network-triggered service request",
 		"supi", supi, "pdu_session_id", psi, "result", "OK", "cause", CauseAttemptingToReachUE)
 	metrics.ProcedureTotal.WithLabelValues(nfName, "NetworkTriggeredServiceRequest", "OK").Inc()
@@ -384,7 +459,7 @@ func (s *Server) handleN1N2MessageTransfer(w http.ResponseWriter, r *http.Reques
 // to the serving gNB, blocks until the LocationReport arrives (or times out),
 // then returns LocationData with the NRCGI and TAI.
 //
-// Ref: TS 29.518 §5.2.2.6; TS 38.413 §8.17.1; TS 23.273 §7.2.
+// Ref: TS 29.518 §5.5.2.4; TS 38.413 §8.17.1; TS 23.273 §7.2.
 func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 	ueContextID := r.PathValue("ueContextId")
 	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
@@ -392,21 +467,21 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 	log := logging.NewProcedureLogger(ctx, s.logger, "ProvideLocationInfo").With(
 		"interface", "Namf",
 		"direction", "IN",
-		"spec_ref", "TS 29.518 §5.2.2.6",
+		"spec_ref", "TS 29.518 §5.5.2.4",
 		"correlation_id", corrID,
 		"ue_context_id", ueContextID,
 	)
 
 	var req RequestLocInfo
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Warn("malformed ProvideLocationInfo body",
-			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
-		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
-		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "REJECT").Inc()
+	if err := s.decodeBody(r, false, &req); err != nil {
+		s.rejectBody(w, log, err, "ProvideLocationInfo", "ProvideLocationInfo")
 		return
 	}
 
-	if !req.Req5gsLoc {
+	// req5gsLoc is conditional (absent/false = location not requested, TS 29.518
+	// Table 6.4.6.2.5-1). rel17 (frozen) rejects such a request; rel19 answers
+	// the requested NPLI without a location once the UE is known.
+	if !req.Req5gsLoc && !s.specLiteral() {
 		log.Warn("req5gsLoc not set — mandatory for Cell-ID MVP",
 			"result", "REJECT", "cause", "MANDATORY_IE_MISSING")
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "req5gsLoc must be true for Cell-ID positioning")
@@ -423,6 +498,11 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !req.Req5gsLoc {
+		s.provideNPLIWithoutLocation(w, log, req)
+		return
+	}
+
 	ue.Lock()
 	connected := ue.CMState == amfctx.CMConnected
 	supi := ue.SUPI
@@ -436,10 +516,11 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 		// trigger NGAP Paging, block until the UE returns to CM-CONNECTED via a
 		// Service Request, then fall through to the NGAP location exchange below.
 		if s.pager == nil {
+			status, cause := s.locStatus(http.StatusServiceUnavailable, CauseLocationFailure,
+				http.StatusInternalServerError, CauseSystemFailure)
 			log.Error("ProvideLocationInfo: no Pager wired — cannot page CM-IDLE UE",
-				"result", "FAILURE", "cause", CauseLocationFailure)
-			s.problem(w, http.StatusServiceUnavailable, CauseLocationFailure,
-				"internal: Pager not configured")
+				"result", "FAILURE", "cause", cause)
+			s.problem(w, status, cause, "internal: Pager not configured")
 			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 			return
 		}
@@ -450,10 +531,11 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 			"spec_ref", "TS 23.273 §7.2 steps E2-E7")
 		if err := s.pager.SendPaging(ue); err != nil {
 			s.pendingLocPage.Delete(amfID)
+			status, cause := s.locStatus(http.StatusGatewayTimeout, CauseLocationFailure,
+				http.StatusGatewayTimeout, CauseUnreachableUser)
 			log.Error("ProvideLocationInfo: paging failed", "error", err,
-				"result", "FAILURE", "cause", CauseLocationFailure)
-			s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure,
-				"paging failed: "+err.Error())
+				"result", "FAILURE", "cause", cause)
+			s.problem(w, status, cause, "paging failed: "+err.Error())
 			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 			return
 		}
@@ -465,10 +547,14 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 				"supi", supi, "spec_ref", "TS 23.273 §7.2 step E7")
 		case <-pageCtx.Done():
 			s.pendingLocPage.Delete(amfID)
+			// TS 29.518 §5.5.2.4.1 step 2a would return the last known location
+			// (currentLoc false) here; the AMF stores no last known cell, so the
+			// failure is reported (rel19: UNREACHABLE_USER, Table 6.4.7.3-1).
+			status, cause := s.locStatus(http.StatusGatewayTimeout, CauseUENotReachable,
+				http.StatusGatewayTimeout, CauseUnreachableUser)
 			log.Warn("ProvideLocationInfo: UE did not respond to paging within T-positioning",
-				"timeout_s", pageTimeout.Seconds(), "result", "FAILURE", "cause", CauseUENotReachable)
-			s.problem(w, http.StatusGatewayTimeout, CauseUENotReachable,
-				"UE did not respond to paging within T-positioning (15 s)")
+				"timeout_s", pageTimeout.Seconds(), "result", "FAILURE", "cause", cause)
+			s.problem(w, status, cause, "UE did not respond to paging within T-positioning (15 s)")
 			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 			return
 		}
@@ -476,10 +562,11 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.locator == nil {
+		status, cause := s.locStatus(http.StatusServiceUnavailable, CauseLocationFailure,
+			http.StatusInternalServerError, CauseSystemFailure)
 		log.Error("ProvideLocationInfo: no Locator wired — cannot send NGAP LocationReportingControl",
-			"result", "FAILURE", "cause", CauseLocationFailure)
-		s.problem(w, http.StatusServiceUnavailable, CauseLocationFailure,
-			"internal: Locator not configured")
+			"result", "FAILURE", "cause", cause)
+		s.problem(w, status, cause, "internal: Locator not configured")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 		return
 	}
@@ -492,10 +579,11 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 
 	ch, err := s.locator.SendLocationReportingControl(ue)
 	if err != nil {
+		status, cause := s.locStatus(http.StatusGatewayTimeout, CauseLocationFailure,
+			http.StatusGatewayTimeout, CauseUnreachableUser)
 		log.Error("SendLocationReportingControl failed",
-			"result", "FAILURE", "cause", CauseLocationFailure, "error", err)
-		s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure,
-			fmt.Sprintf("NGAP LocationReportingControl failed: %v", err))
+			"result", "FAILURE", "cause", cause, "error", err)
+		s.problem(w, status, cause, fmt.Sprintf("NGAP LocationReportingControl failed: %v", err))
 		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 		return
 	}
@@ -517,15 +605,54 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if result.Err != nil {
+		// The only error is the guard timeout: the NG-RAN sent no LocationReport.
+		status, cause := s.locStatus(http.StatusGatewayTimeout, CauseLocationFailure,
+			http.StatusGatewayTimeout, CausePeerNotResponding)
 		log.Warn("ProvideLocationInfo: NGAP location exchange failed",
-			"result", "FAILURE", "cause", CauseLocationFailure, "error", result.Err)
-		s.problem(w, http.StatusGatewayTimeout, CauseLocationFailure, result.Err.Error())
+			"result", "FAILURE", "cause", cause, "error", result.Err)
+		s.problem(w, status, cause, result.Err.Error())
 		metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
 		return
 	}
 
-	// Build the response. TAI is optional in the ngap.LocationResult if the gNB
-	// did not include UserLocationInformation; we include it when available.
+	// Rel-19 profile: answer with the TS 29.518 ProvideLocInfo data type.
+	// Rel-17 / no profile: frozen legacy LocationData bytes (decision D1).
+	var rsp any
+	if features.SpecLiteral(s.profile) {
+		pli, perr := buildProvideLocInfo(result)
+		if perr != nil {
+			// NrLocation requires both tai and ncgi (TS 29.571 NrLocation
+			// schema): without them the answer would carry no usable data.
+			log.Warn("ProvideLocationInfo: NG-RAN report lacks TAI/NCGI — cannot build ProvideLocInfo",
+				"nr_cell_id", result.NRCellID, "tai_known", result.TAI != nil,
+				"result", "FAILURE", "cause", CauseSystemFailure, "error", perr,
+				"spec_ref", "TS 29.518 §6.4.3.2.4.3.2 table 6.4.3.2.4.3.2-2; TS 29.500 §5.2.7.2")
+			s.problem(w, http.StatusInternalServerError, CauseSystemFailure, perr.Error())
+			metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "FAILURE").Inc()
+			return
+		}
+		rsp = pli
+	} else {
+		rsp = buildLegacyLocationData(result)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(rsp)
+
+	log.Info("ProvideLocationInfo complete",
+		"nr_cell_id", result.NRCellID,
+		"wire_shape", locWireShape(s.profile),
+		"result", "OK",
+		"spec_ref", "TS 29.518 §5.5.2.4",
+	)
+	metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "OK").Inc()
+}
+
+// buildLegacyLocationData builds the Rel-17-profile (frozen) answer. TAI is
+// optional in the ngap.LocationResult if the gNB did not include
+// UserLocationInformation; it is included when available.
+func buildLegacyLocationData(result ngap.LocationResult) LocationData {
 	rsp := LocationData{
 		LocationEstimate: &GeographicArea{
 			Shape: "POINT",
@@ -540,17 +667,43 @@ func (s *Server) handleProvideLocInfo(w http.ResponseWriter, r *http.Request) {
 			Tac:    fmt.Sprintf("%06x", result.TAI.TAC),
 		}
 	}
+	return rsp
+}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(rsp)
+// buildProvideLocInfo builds the rel19 ProvideLocInfo answer: the serving
+// NRCGI and TAI go to location.nrLocation (both mandatory there), the age to
+// locationAge / ageOfLocationInformation, and the RAT is NR. No geoInfo is
+// produced: the AMF has no point estimate (the legacy 0,0 was a placeholder).
+// It returns an error when the gNB reported no TAI or no cell id, because
+// NrLocation cannot then be built and an empty 200 would be useless.
+//
+// Limitation: the Ncgi PLMN is the TAI PLMN. NGAP UserLocationInformationNR
+// carries the cell PLMN in the NR-CGI, but ngap.LocationResult (outside this
+// package) stores only the TAI, so in a MOCN deployment the NCGI PLMN may be
+// wrong; carrying it needs a new ngap.LocationResult field.
+//
+// Ref: TS 29.518 §6.4.6.2.6 (ProvideLocInfo); TS 29.571 NrLocation schema.
+func buildProvideLocInfo(result ngap.LocationResult) (ProvideLocInfo, error) {
+	rsp := ProvideLocInfo{CurrentLoc: ptr(true), LocationAge: ptr(0), RatType: ratTypeNR}
+	if result.TAI == nil || result.NRCellID == "" {
+		return rsp, fmt.Errorf("amf: build ProvideLocInfo: incomplete NG-RAN location (tai known: %t, nr cell id known: %t)",
+			result.TAI != nil, result.NRCellID != "")
+	}
+	plmn := PlmnID{MCC: result.TAI.MCC, MNC: result.TAI.MNC}
+	rsp.Location = &UserLocation{NrLocation: &NrLocation{
+		Tai:                      TaiLoc{PlmnId: plmn, Tac: fmt.Sprintf("%06x", result.TAI.TAC)},
+		Ncgi:                     Ncgi{PlmnId: plmn, NrCellId: result.NRCellID},
+		AgeOfLocationInformation: 0,
+	}}
+	return rsp, nil
+}
 
-	log.Info("ProvideLocationInfo complete",
-		"nr_cell_id", result.NRCellID,
-		"result", "OK",
-		"spec_ref", "TS 29.518 §5.2.2.6",
-	)
-	metrics.ProcedureTotal.WithLabelValues(nfName, "ProvideLocationInfo", "OK").Inc()
+// locWireShape names the ProvideLocationInfo wire shape for logs.
+func locWireShape(p *capability.Profile) string {
+	if features.SpecLiteral(p) {
+		return "ProvideLocInfo"
+	}
+	return "LocationData"
 }
 
 // handleDLNRPPaInfo serves Namf_Location dl-nrppa-info (producer side).
@@ -911,50 +1064,115 @@ func (s *Server) handleDLLPPInfo(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildTransferRsp assembles the UeContextTransferRspData from the UE context.
-func (s *Server) buildTransferRsp(ue *amfctx.UEContext) UeContextTransferRspData {
+// rel17 / no profile is the frozen legacy shape. rel19 follows TS 29.518
+// §5.2.2.2.1 and Table 6.1.6.2.25-1: supiUnauthInd with the SUPI, NAS counts
+// even when 0, NAS IEs from octet 1, no PDU session contexts of the requested
+// access type for INIT_REG, no seafData for MOBI_REG_UE_VALIDATED, and no
+// identifiers the AMF does not hold (hsmfId, pcfId).
+func (s *Server) buildTransferRsp(ue *amfctx.UEContext, req UeContextTransferReqData) UeContextTransferRspData {
 	ue.Lock()
 	defer ue.Unlock()
+	spec := s.specLiteral()
 
 	uc := UeContext{
 		Supi: ue.SUPI,
 		Pei:  ue.PEI,
 	}
+	if spec && ue.SUPI != "" {
+		// "shall be present if SUPI is present": the AMF binds a SUPI only after
+		// a successful primary authentication (Manager.SetSUPI after the AUSF
+		// confirmation), so it is never unauthenticated here.
+		// Ref: TS 29.518 Table 6.1.6.2.25-1 (supiUnauthInd)
+		uc.SupiUnauthInd = ptr(false)
+	}
+	if spec && ue.Capability5GMM != nil {
+		// Present when the UE sent the IE at registration. Ref: TS 29.518 Table
+		// 6.1.6.2.25-1 (5gMmCapability), §6.1.6.3.2
+		if v, err := nas.Encode5GMMCapability(ue.Capability5GMM); err == nil {
+			if ie, ok := nasIEFromOctet1(iei5GMMCapability, v); ok {
+				uc.FiveGMmCapability = base64.StdEncoding.EncodeToString(ie)
+			}
+		}
+	}
 
 	if sc := ue.SecurityCtx; sc.Active {
 		mm := MmContext{
-			AccessType: "3GPP_ACCESS",
+			AccessType: AccessType3GPP,
 			NasSecurityMode: &NasSecurityMode{
 				IntegrityAlgorithm: nasIntegName(sc.IntegrityAlgID),
 				CipheringAlgorithm: nasCipherName(sc.CipheringAlgID),
 			},
-			NasDownlinkCount: sc.DownlinkCount,
-			NasUplinkCount:   sc.UplinkCount,
+			NasDownlinkCount: nasCount(sc.DownlinkCount, spec),
+			NasUplinkCount:   nasCount(sc.UplinkCount, spec),
 		}
 		if len(sc.KAMF) > 0 {
-			mm.KAmf = base64.StdEncoding.EncodeToString(sc.KAMF)
+			if spec {
+				// rel19: spec shape UeContext.seafData.keyAmf (hex key value).
+				// ngKSI is NATIVE with the AMF-assigned value; a value above
+				// the schema maximum 6 (no KSI) cannot be expressed, so the
+				// key is then not transferred. MOBI_REG_UE_VALIDATED excludes
+				// SeafData (§5.2.2.2.1.2 step 2).
+				// Ref: TS 29.518 §6.1.6.2.35 (SeafData), §6.1.6.2.50 (KeyAmf)
+				if sc.NGKSI <= maxNgKsi && req.Reason != ReasonMobiRegUEValidated {
+					uc.SeafData = &SeafData{
+						NgKsi:  NgKsi{Tsc: "NATIVE", Ksi: int(sc.NGKSI)},
+						KeyAmf: KeyAmf{KeyType: "KAMF", KeyVal: hex.EncodeToString(sc.KAMF)},
+					}
+				}
+			} else {
+				mm.KAmf = base64.StdEncoding.EncodeToString(sc.KAMF)
+			}
 		}
 		if len(ue.RawUESecCap) > 0 {
-			mm.UeSecurityCapability = base64.StdEncoding.EncodeToString(ue.RawUESecCap)
+			capIE := ue.RawUESecCap
+			if spec {
+				// From octet 1 (IEI, length, value). Ref: TS 29.518 §6.1.6.3.2
+				capIE, _ = nasIEFromOctet1(ieiUESecurityCapability, ue.RawUESecCap)
+			}
+			if len(capIE) > 0 {
+				mm.UeSecurityCapability = base64.StdEncoding.EncodeToString(capIE)
+			}
 		}
 		uc.MmContextList = append(uc.MmContextList, mm)
 	}
 
+	// rel19 INIT_REG: "without PDU Session Contexts associated to the access type
+	// indicated in the request"; every session here is a 3GPP access one.
+	// Ref: TS 29.518 §5.2.2.2.1.1 step 2a case a)
+	sessionsExcluded := spec && req.Reason == ReasonInitReg && req.AccessType == AccessType3GPP
 	for psi, sess := range ue.PDUSessions {
+		if sessionsExcluded {
+			break
+		}
+		if spec && (sess.SMFInstanceID == "" || sess.DNN == "") {
+			// smContextRef and dnn are mandatory (Table 6.1.6.2.37-1): a session
+			// without them is not a transferable PDU session context.
+			continue
+		}
 		pc := PduSessionContext{
-			PduSessionID:  psi,
-			SmContextRef:  sess.SMFInstanceID,
-			Dnn:           sess.DNN,
-			AccessType:    "3GPP_ACCESS",
-			SmfInstanceID: sess.SMFInstanceID,
+			PduSessionID: psi,
+			SmContextRef: sess.SMFInstanceID,
+			Dnn:          sess.DNN,
+			AccessType:   AccessType3GPP,
 			SNssai: &Snssai{
 				Sst: sess.SNSSAI.SST,
 				Sd:  sess.SNSSAI.SD,
 			},
 		}
+		// rel19 sends no hsmfId: PDUSession.SMFInstanceID holds the SM context
+		// reference returned by the SMF (stored as smContextRef at PDU session
+		// establishment), not the SMF NF instance id that hsmfId names, and the
+		// AMF does not keep that id. Ref: TS 29.518 Table 6.1.6.2.37-1 (hsmfId)
+		if !spec {
+			pc.SmfInstanceID = sess.SMFInstanceID
+		}
 		uc.SessionContextList = append(uc.SessionContextList, pc)
 	}
 
-	if ue.PolicyAssociationID != "" {
+	// pcfId is the NfInstanceId of the PCF; the AMF keeps only the UE policy
+	// association id, so rel19 sends no pcfId (rel17 frozen: the legacy value).
+	// Ref: TS 29.518 Table 6.1.6.2.25-1 (pcfId)
+	if !spec && ue.PolicyAssociationID != "" {
 		uc.PcfID = ue.PolicyAssociationID
 	}
 
@@ -1000,6 +1218,74 @@ func (s *Server) problem(w http.ResponseWriter, status int, cause, detail string
 		Cause:  cause,
 		Detail: detail,
 		Title:  http.StatusText(status),
+	})
+}
+
+// negotiateRequest validates the consumer's supportedFeatures and answers it
+// (TS 29.500 §6.6.2; decision D1). An invalid value (non-hex, TS 29.571
+// §5.2.2 pattern) is answered here with 400 INVALID_MSG_FORMAT and
+// invalidParams [{"param":"/supportedFeatures"}] (TS 29.500 §5.2.7.2) and ok
+// is false; the caller must return without side effects. The success log is
+// emitted later by logNegotiated, once the resource is known to exist.
+func (s *Server) negotiateRequest(ctx context.Context, w http.ResponseWriter, peerNF, value, procedure string) (answer string, neg features.Set, ok bool) {
+	if err := features.Validate(value); err != nil {
+		LogNegotiation(ctx, s.logger, Negotiation{
+			Interface: "Namf", Direction: "IN", PeerNF: peerNF,
+			SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: CauseInvalidMsgFormat,
+			Local: s.namfCat.Supported(s.profile), Peer: value, PeerPresent: true,
+		}, "error", err)
+		s.problemParams(w, http.StatusBadRequest, CauseInvalidMsgFormat,
+			"supportedFeatures is not a valid hexadecimal string",
+			[]InvalidParam{{Param: paramSupportedFeatures, Reason: "must match ^[A-Fa-f0-9]*$"}})
+		metrics.ProcedureTotal.WithLabelValues(nfName, procedure, "REJECT").Inc()
+		return "", features.Set{}, false
+	}
+	answer, neg = features.Answer(s.namfCat, s.profile, value)
+	return answer, neg, true
+}
+
+// rejectSupportedFeaturesType maps a JSON type error on the supportedFeatures
+// field (e.g. a number instead of a string) to 400 INVALID_MSG_FORMAT with
+// invalidParams[{param:"/supportedFeatures"}] (TS 29.500 §5.2.7.2, TS 29.571
+// §5.2.2, §5.2.4.6) and logs it REJECT. It returns false, writing nothing, for
+// any other decode error so the caller's generic handling is unchanged.
+func (s *Server) rejectSupportedFeaturesType(ctx context.Context, w http.ResponseWriter, err error, peerNF, procedure string) bool {
+	var ute *json.UnmarshalTypeError
+	if !errors.As(err, &ute) || ute.Field != "supportedFeatures" {
+		return false
+	}
+	LogNegotiation(ctx, s.logger, Negotiation{
+		Interface: "Namf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: CauseInvalidMsgFormat,
+		Local: s.namfCat.Supported(s.profile), Peer: "<non-string>", PeerPresent: true,
+	}, "error", err)
+	s.problemParams(w, http.StatusBadRequest, CauseInvalidMsgFormat,
+		"supportedFeatures is not a valid hexadecimal string",
+		[]InvalidParam{{Param: paramSupportedFeatures, Reason: "must be a string matching ^[A-Fa-f0-9]*$"}})
+	metrics.ProcedureTotal.WithLabelValues(nfName, procedure, "REJECT").Inc()
+	return true
+}
+
+// logNegotiated logs the producer-side FeatureNegotiation record.
+func (s *Server) logNegotiated(ctx context.Context, peerNF, value string, neg features.Set, extra ...any) {
+	LogNegotiation(ctx, s.logger, Negotiation{
+		Interface: "Namf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.namfCat.Supported(s.profile), Peer: value, PeerPresent: value != "", Negotiated: neg,
+	}, extra...)
+}
+
+// problemParams writes a ProblemDetails response with invalidParams.
+// Ref: TS 29.571 §5.2.4.1 (ProblemDetails), §5.2.4.6 (InvalidParam).
+func (s *Server) problemParams(w http.ResponseWriter, status int, cause, detail string, params []InvalidParam) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(ProblemDetails{
+		Status:        status,
+		Cause:         cause,
+		Detail:        detail,
+		Title:         http.StatusText(status),
+		InvalidParams: params,
 	})
 }
 

@@ -24,7 +24,9 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/lmf/internal/config"
+	lmfsbi "github.com/francurieses/claudia-5gc/nf/lmf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/lmf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -54,6 +56,18 @@ func main() {
 	}
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
+
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	// ---- Tracing (OTel → Jaeger) ----------------------------------------------
 	// Ref: TS 29.500 §4.4 — SBA observability (OTel / Jaeger)
@@ -120,6 +134,7 @@ func main() {
 
 	// ---- SBI server -----------------------------------------------------------
 	srv := server.NewWithNotifClient(cfg, logger, amfClient, udmClient, notifClient)
+	srv.SetProfile(relProfile)
 
 	// ---- Wire NRPPa relay client (E-CID positioning, LMF-004) ----------------
 	// HTTPAMFLocationClient implements both AMFLocationClient (Cell-ID) and
@@ -146,21 +161,7 @@ func main() {
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
-		profile := &nrf.NFProfile{
-			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "LMF",
-			NFStatus:     "REGISTERED",
-			FQDN:         cfg.SBI.FQDN,
-			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-nlmf-loc",
-				ServiceName:       "nlmf-loc",
-				Scheme:            "https",
-				NFServiceStatus:   "REGISTERED",
-				Versions: []nrf.NFServiceVersion{
-					{APIVersionInURI: "v1", APIFullVersion: "1.0.0"},
-				},
-			}},
-		}
+		profile := lmfsbi.BuildNFProfile(cfg.NFInstanceID, cfg.SBI.FQDN, relProfile, lmfsbi.NlmfLocationCatalog())
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr,

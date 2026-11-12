@@ -76,12 +76,16 @@ type gnbHistoryEntry struct {
 // ---- JSON snapshot types (contract: docs/procedures/ng-setup-gnb-registry.md)
 
 // PLMNJSON is a PLMN in the management API.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type PLMNJSON struct {
 	MCC string `json:"mcc"`
 	MNC string `json:"mnc"`
 }
 
 // RANNodeJSON is the Global RAN Node ID in the management API.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type RANNodeJSON struct {
 	Type        string   `json:"type"`
 	PLMN        PLMNJSON `json:"plmn"`
@@ -91,18 +95,24 @@ type RANNodeJSON struct {
 }
 
 // SCTPJSON is the SCTP peer of a gNB in the management API.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type SCTPJSON struct {
 	RemoteAddrs []string `json:"remote_addrs"`
 	RemotePort  int      `json:"remote_port"`
 }
 
 // SliceJSON is an S-NSSAI in the management API.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type SliceJSON struct {
 	SST uint8  `json:"sst"`
 	SD  string `json:"sd"`
 }
 
 // BroadcastPLMNJSON is a broadcast PLMN with its slices.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type BroadcastPLMNJSON struct {
 	MCC    string      `json:"mcc"`
 	MNC    string      `json:"mnc"`
@@ -110,12 +120,16 @@ type BroadcastPLMNJSON struct {
 }
 
 // SupportedTAJSON is a supported tracking area of a gNB.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type SupportedTAJSON struct {
 	TAC            uint32              `json:"tac"`
 	BroadcastPLMNs []BroadcastPLMNJSON `json:"broadcast_plmns"`
 }
 
 // UECountsJSON counts the UEs associated with a gNB.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type UECountsJSON struct {
 	Connected int `json:"connected"`
 	Idle      int `json:"idle"`
@@ -123,6 +137,8 @@ type UECountsJSON struct {
 
 // GNBSnapshot is the read-only view of one gNB served by
 // GET /amf/v1/ran/gnbs.
+//
+// oapi: none mgmt API snapshot (GET /amf/v1/ran/gnbs on :9002), not SBI
 type GNBSnapshot struct {
 	ID               string            `json:"id"`
 	AMFName          string            `json:"amf_name"`
@@ -138,6 +154,13 @@ type GNBSnapshot struct {
 	UEs              UECountsJSON      `json:"ues"`
 	LastNGResetAt    *time.Time        `json:"last_ng_reset_at,omitempty"`
 	NGResetCount     int               `json:"ng_reset_count"`
+	// Release is the effective release capability ("Rel-17".."Rel-19") recorded at
+	// NG Setup; InferredRelease is the pre-override inference and ReleaseOverride
+	// is true when an ngap.ran_profiles entry capped it (REL19-4.8). Omitted
+	// before NG Setup.
+	Release         string `json:"release,omitempty"`
+	InferredRelease string `json:"inferred_release,omitempty"`
+	ReleaseOverride bool   `json:"release_override,omitempty"`
 }
 
 // clock returns the registry time, tolerating Server literals built in tests.
@@ -271,6 +294,11 @@ func (s *Server) snapshotLocked(gnb *GNBContext, id string) GNBSnapshot {
 		SupportedTAs: make([]SupportedTAJSON, 0, len(gnb.SupportedTAs)),
 		UEs:          UECountsJSON{Connected: len(gnb.UEs), Idle: len(gnb.IdleUEs)},
 		NGResetCount: gnb.NGResetCount,
+	}
+	if gnb.release != 0 {
+		snap.Release = gnb.release.String()
+		snap.InferredRelease = gnb.inferredRelease.String()
+		snap.ReleaseOverride = gnb.releaseOverride
 	}
 	if snap.State == "" {
 		snap.State = GNBStateSCTPUp

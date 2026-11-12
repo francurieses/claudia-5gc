@@ -6,12 +6,15 @@ package ngap
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+
+	"github.com/francurieses/claudia-5gc/shared/capability"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 )
@@ -147,7 +150,7 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 // ---- Extractors ----------------------------------------------------------
 
 func extractNGSetupRequest(req *ngapType.NGSetupRequest) *NGSetupRequest {
-	out := &NGSetupRequest{}
+	out := &NGSetupRequest{InferredRelease: InferRANRelease(req)}
 	for _, ie := range req.ProtocolIEs.List {
 		switch ie.Id.Value {
 		case ngapType.ProtocolIEIDGlobalRANNodeID: // 27
@@ -158,7 +161,7 @@ func extractNGSetupRequest(req *ngapType.NGSetupRequest) *NGSetupRequest {
 			}
 		case ngapType.ProtocolIEIDRANNodeName: // 82
 			if ie.Value.RANNodeName != nil {
-				out.RANNodeName = string(ie.Value.RANNodeName.Value)
+				out.RANNodeName = ie.Value.RANNodeName.Value
 			}
 		case ngapType.ProtocolIEIDSupportedTAList: // 102
 			if ie.Value.SupportedTAList != nil {
@@ -169,19 +172,22 @@ func extractNGSetupRequest(req *ngapType.NGSetupRequest) *NGSetupRequest {
 	return out
 }
 
+// extractGlobalRANNodeIDBytes returns PLMN Identity ‖ gNB ID octets of a Global gNB ID, the key
+// gNBs are matched by (findGNBByGlobalID). nil when the node is not a gNB or its GNB-ID is the
+// choice-Extensions alternative (TS 38.413 §9.3.1.6), which has no gNB-ID BIT STRING: that
+// alternative made the AMF dereference a nil *BitString on an NG SETUP REQUEST or
+// HANDOVER REQUIRED carrying it.
 func extractGlobalRANNodeIDBytes(id *ngapType.GlobalRANNodeID) []byte {
-	switch id.Present {
-	case ngapType.GlobalRANNodeIDPresentGlobalGNBID:
-		if id.GlobalGNBID != nil {
-			plmn := id.GlobalGNBID.PLMNIdentity.Value
-			gnbID := id.GlobalGNBID.GNBID.GNBID.Bytes
-			result := make([]byte, 0, len(plmn)+len(gnbID))
-			result = append(result, plmn...)
-			result = append(result, gnbID...)
-			return result
-		}
+	if id.Present != ngapType.GlobalRANNodeIDPresentGlobalGNBID || id.GlobalGNBID == nil ||
+		id.GlobalGNBID.GNBID.GNBID == nil {
+		return nil
 	}
-	return nil
+	plmn := id.GlobalGNBID.PLMNIdentity.Value
+	gnbID := id.GlobalGNBID.GNBID.GNBID.Bytes
+	result := make([]byte, 0, len(plmn)+len(gnbID))
+	result = append(result, plmn...)
+	result = append(result, gnbID...)
+	return result
 }
 
 // extractGlobalRANNode decodes the Global RAN Node ID into its structured form,
@@ -382,6 +388,12 @@ type InitialContextSetupFailureMsg struct {
 	// CausePresent: 1=RadioNetwork 2=Transport 3=NAS 4=Protocol 5=Misc; 0=absent
 	CausePresent int
 	CauseValue   int64
+	// FailedPSIs lists the PDU sessions of the PDU Session Resource Failed to
+	// Setup List (id-PDUSessionResourceFailedToSetupListCxtFail, 132);
+	// FailedTransfers[i] is the PDU Session Resource Setup Unsuccessful Transfer
+	// of FailedPSIs[i], relayed transparently to the SMF (TS 38.413 §8.3.1.3).
+	FailedPSIs      []uint8
+	FailedTransfers [][]byte
 }
 
 func extractInitialContextSetupFailure(msg *ngapType.InitialContextSetupFailure) *InitialContextSetupFailureMsg {
@@ -395,6 +407,14 @@ func extractInitialContextSetupFailure(msg *ngapType.InitialContextSetupFailure)
 		case ngapType.ProtocolIEIDRANUENGAPID:
 			if ie.Value.RANUENGAPID != nil {
 				out.RANUENGAPId = ie.Value.RANUENGAPID.Value
+			}
+		case ngapType.ProtocolIEIDPDUSessionResourceFailedToSetupListCxtFail:
+			if ie.Value.PDUSessionResourceFailedToSetupListCxtFail != nil {
+				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListCxtFail.List {
+					out.FailedPSIs = append(out.FailedPSIs, uint8(item.PDUSessionID.Value))
+					out.FailedTransfers = append(out.FailedTransfers,
+						[]byte(item.PDUSessionResourceSetupUnsuccessfulTransfer))
+				}
 			}
 		case ngapType.ProtocolIEIDCause:
 			if ie.Value.Cause != nil {
@@ -432,6 +452,14 @@ func extractInitialContextSetupFailure(msg *ngapType.InitialContextSetupFailure)
 // BuildNGSetupResponse builds a real NG Setup Response PDU (ASN.1 PER).
 // snssais is the list of slices this AMF/PLMN serves; uses SST=1/SD=000001 if empty.
 func BuildNGSetupResponse(amfName, mcc, mnc string, regionID byte, setID uint16, amfID byte, snssais []amfctx.SNSSAISubscribed) []byte {
+	return BuildNGSetupResponseWithDiagnostics(amfName, mcc, mnc, regionID, setID, amfID, snssais, nil)
+}
+
+// BuildNGSetupResponseWithDiagnostics is BuildNGSetupResponse plus the optional Criticality
+// Diagnostics IE (19, ignore), appended after the PLMN Support List (spec order, TS 38.413
+// §9.2.6.2) to report ignored not-comprehended IEs of the NG SETUP REQUEST (§10.3.4.2).
+// cd == nil yields bytes identical to BuildNGSetupResponse.
+func BuildNGSetupResponseWithDiagnostics(amfName, mcc, mnc string, regionID byte, setID uint16, amfID byte, snssais []amfctx.SNSSAISubscribed, cd *ngapType.CriticalityDiagnostics) []byte {
 	plmn := plmnFromMCCMNC(mcc, mnc)
 
 	pdu := ngapType.NGAPPDU{
@@ -486,10 +514,70 @@ func BuildNGSetupResponse(amfName, mcc, mnc string, regionID byte, setID uint16,
 			},
 		},
 	}
+	if cd != nil {
+		l := &pdu.SuccessfulOutcome.Value.NGSetupResponse.ProtocolIEs.List
+		*l = append(*l, ngapType.NGSetupResponseIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDCriticalityDiagnostics},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.NGSetupResponseIEsValue{
+				Present:                ngapType.NGSetupResponseIEsPresentCriticalityDiagnostics,
+				CriticalityDiagnostics: cd,
+			},
+		})
+	}
 
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
 		// Should never happen with valid structs; log and return empty
+		return nil
+	}
+	return b
+}
+
+// BuildNGSetupFailure builds an NG SETUP FAILURE (UnsuccessfulOutcome, procedure code 21):
+// Cause (15), [Time to Wait], [Criticality Diagnostics]. Time to Wait is never sent.
+// Ref: TS 38.413 §8.7.1.3, §9.2.6.3.
+func BuildNGSetupFailure(causePresent int, causeValue int64) []byte {
+	return BuildNGSetupFailureWithDiagnostics(causePresent, causeValue, nil)
+}
+
+// BuildNGSetupFailureWithDiagnostics is BuildNGSetupFailure plus the optional Criticality
+// Diagnostics IE (19, ignore) after Cause (spec order of §9.2.6.3; Time to Wait, between
+// them, is omitted). Ref: TS 38.413 §9.2.6.3, §10.3.4.2.
+func BuildNGSetupFailureWithDiagnostics(causePresent int, causeValue int64, cd *ngapType.CriticalityDiagnostics) []byte {
+	cause := buildCause(causePresent, causeValue)
+	fail := &ngapType.NGSetupFailure{}
+	fail.ProtocolIEs.List = append(fail.ProtocolIEs.List, ngapType.NGSetupFailureIEs{
+		Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDCause},
+		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+		Value: ngapType.NGSetupFailureIEsValue{
+			Present: ngapType.NGSetupFailureIEsPresentCause,
+			Cause:   &cause,
+		},
+	})
+	if cd != nil {
+		fail.ProtocolIEs.List = append(fail.ProtocolIEs.List, ngapType.NGSetupFailureIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDCriticalityDiagnostics},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.NGSetupFailureIEsValue{
+				Present:                ngapType.NGSetupFailureIEsPresentCriticalityDiagnostics,
+				CriticalityDiagnostics: cd,
+			},
+		})
+	}
+	pdu := ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentUnsuccessfulOutcome,
+		UnsuccessfulOutcome: &ngapType.UnsuccessfulOutcome{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeNGSetup},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+			Value: ngapType.UnsuccessfulOutcomeValue{
+				Present:        ngapType.UnsuccessfulOutcomePresentNGSetupFailure,
+				NGSetupFailure: fail,
+			},
+		},
+	}
+	b, err := libngap.Encoder(pdu)
+	if err != nil {
 		return nil
 	}
 	return b
@@ -592,6 +680,8 @@ func buildUEAMBR(ulBps, dlBps int64) *ngapType.UEAggregateMaximumBitRate {
 	}
 }
 
+// ranCap is the target gNB's release capability (REL19-4.8, capability.PeerRAN);
+// Rel-18+ IEs are appended only when capability.Gate allows them for that gNB.
 // BuildInitialContextSetupRequest builds an Initial Context Setup Request PDU.
 // encAlgsBitmap and intAlgsBitmap are the UE's advertised capability bitmasks
 // (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3) per TS 38.413 §9.3.1.86.
@@ -615,7 +705,42 @@ func BuildInitialContextSetupRequest(
 	ambrULBps, ambrDLBps int64,
 	rfsp int,
 	pduSessions []PDUSessionSetupItemCxtReq,
+	ranCap capability.PeerRAN,
 ) []byte {
+	// An encode failure yields nil (documented contract of this exported form);
+	// SendInitialContextSetupRequest uses the error-returning builder.
+	b, _ := buildInitialContextSetupRequest(amfUEID, ranUEID, nasPDU, secKey,
+		UESecCapBitmaps{Enc: encAlgsBitmap, Int: intAlgsBitmap},
+		mcc, mnc, regionID, setID, amfIDByte, allowedNSSAI, ambrULBps, ambrDLBps,
+		rfsp, pduSessions, ranCap, nil)
+	return b
+}
+
+// buildInitialContextSetupRequest is BuildInitialContextSetupRequest with the
+// complete UE Security Capabilities (NR and E-UTRA bitmaps, TS 38.413
+// §9.3.1.86) and the stored UE Radio Capability (IE 117, TS 38.413 §9.3.1.74;
+// nil omits it). TS 23.501 §5.4.4.1: the AMF sends its most up to date UE Radio
+// Capability information to the RAN in the INITIAL CONTEXT SETUP REQUEST.
+func buildInitialContextSetupRequest(
+	amfUEID, ranUEID int64,
+	nasPDU []byte,
+	secKey [32]byte,
+	secCap UESecCapBitmaps,
+	mcc, mnc string,
+	regionID byte, setID uint16, amfIDByte byte,
+	allowedNSSAI []amfctx.SNSSAISubscribed,
+	ambrULBps, ambrDLBps int64,
+	rfsp int,
+	pduSessions []PDUSessionSetupItemCxtReq,
+	ranCap capability.PeerRAN,
+	ueRadioCap []byte,
+) ([]byte, error) {
+	// Allowed NSSAI is mandatory (criticality reject, SIZE(1..maxnoofAllowedS-NSSAIs));
+	// an INITIAL CONTEXT SETUP REQUEST without it must never be emitted.
+	// Ref: TS 38.413 §9.2.2.1, §9.3.1.31
+	if len(allowedNSSAI) == 0 {
+		return nil, errors.New("ngap: initial context setup request: empty Allowed NSSAI (mandatory IE, TS 38.413 §9.2.2.1)")
+	}
 	plmn := plmnFromMCCMNC(mcc, mnc)
 
 	// IEs in the exact order specified by TS 38.413 Table 9.2.2.1-1.
@@ -696,7 +821,7 @@ func BuildInitialContextSetupRequest(
 	// (8) AllowedNSSAI (id=0) — position 8 in the spec table, before UESecurityCapabilities.
 	// Informs gNB which slices are permitted for this UE.
 	// Ref: TS 38.413 §9.2.2.1, §9.3.1.52
-	if len(allowedNSSAI) > 0 {
+	{
 		var items []ngapType.AllowedNSSAIItem
 		for _, s := range allowedNSSAI {
 			items = append(items, ngapType.AllowedNSSAIItem{
@@ -720,7 +845,7 @@ func BuildInitialContextSetupRequest(
 		Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 		Value: ngapType.InitialContextSetupRequestIEsValue{
 			Present:                ngapType.InitialContextSetupRequestIEsPresentUESecurityCapabilities,
-			UESecurityCapabilities: buildUESecurityCapabilities(encAlgsBitmap, intAlgsBitmap),
+			UESecurityCapabilities: buildUESecurityCapabilities(secCap),
 		},
 	})
 
@@ -739,6 +864,23 @@ func BuildInitialContextSetupRequest(
 		},
 	})
 
+	// (14) UE Radio Capability (id=117) — Optional, criticality ignore. Position:
+	// after Security Key / Trace Activation / Mobility Restriction List, before
+	// Index to RAT/Frequency Selection Priority (TS 38.413 Table 9.2.2.1-1).
+	// Sent when the AMF has a stored capability so the gNB can skip the UE
+	// capability enquiry. Ref: TS 23.501 §5.4.4.1, TS 38.413 §9.3.1.74.
+	if len(ueRadioCap) > 0 {
+		rc := ngapType.UERadioCapability{Value: aper.OctetString(ueRadioCap)}
+		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDUERadioCapability},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitialContextSetupRequestIEsValue{
+				Present:           ngapType.InitialContextSetupRequestIEsPresentUERadioCapability,
+				UERadioCapability: &rc,
+			},
+		})
+	}
+
 	// (15) IndexToRFSP (id=31) — Optional, position 15 in the spec table.
 	// Must precede NAS-PDU (id=38, position 17): TS 38.413 Table 9.2.2.1-1 lists
 	// Index to RAT/Frequency Selection Priority before NAS-PDU. A strict decoder
@@ -746,7 +888,7 @@ func BuildInitialContextSetupRequest(
 	// these are out of tabular order.
 	// Radio Frequency Selection Priority index: 1=lowest priority, 256=highest.
 	// Operator default (1) guarantees this IE is always on the wire.
-	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2, TS 29.507 §4.2.2.2
+	// Ref: TS 38.413 §9.3.1.27, TS 23.501 §5.3.4.2, TS 29.507 §4.2.2
 	if rfsp > 0 {
 		rfspVal := ngapType.IndexToRFSP{Value: int64(rfsp)}
 		ieList = append(ieList, ngapType.InitialContextSetupRequestIEs{
@@ -772,6 +914,8 @@ func BuildInitialContextSetupRequest(
 		})
 	}
 
+	ieList = appendICSRel18PlusIEs(ieList, ranCap)
+
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentInitiatingMessage,
 		InitiatingMessage: &ngapType.InitiatingMessage{
@@ -790,9 +934,9 @@ func BuildInitialContextSetupRequest(
 
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ngap: encode initial context setup request: %w", err)
 	}
-	return b
+	return b, nil
 }
 
 // ---- Builder helpers -----------------------------------------------------
@@ -876,27 +1020,45 @@ func buildNGAPSNSSAI(sst uint8, sdBytes []byte) ngapType.SNSSAI {
 }
 
 // buildUESecurityCapabilities builds the NGAP UESecurityCapabilities IE from
-// the UE's advertised bitmasks (bit 15=NEA1/NIA1, 14=NEA2/NIA2, 13=NEA3/NIA3).
-// These must reflect what the UE supports, not the selected algorithm.
+// the UE's advertised bitmaps (bit 15 = first bit = NEA1/NIA1 or EEA1/EIA1,
+// bit 14 = second bit, ... bit 9 = seventh bit). These must reflect what the UE
+// supports, not the selected algorithm. Shared by INITIAL CONTEXT SETUP REQUEST,
+// HANDOVER REQUEST and PATH SWITCH REQUEST ACKNOWLEDGE.
 // Ref: TS 38.413 §9.3.1.86
-func buildUESecurityCapabilities(encAlgsBitmap, intAlgsBitmap uint16) *ngapType.UESecurityCapabilities {
-	encBytes := []byte{byte(encAlgsBitmap >> 8), byte(encAlgsBitmap)}
-	intBytes := []byte{byte(intAlgsBitmap >> 8), byte(intAlgsBitmap)}
-
-	return &ngapType.UESecurityCapabilities{
-		NRencryptionAlgorithms: ngapType.NRencryptionAlgorithms{
-			Value: aper.BitString{Bytes: encBytes, BitLength: 16},
-		},
-		NRintegrityProtectionAlgorithms: ngapType.NRintegrityProtectionAlgorithms{
-			Value: aper.BitString{Bytes: intBytes, BitLength: 16},
-		},
-		EUTRAencryptionAlgorithms: ngapType.EUTRAencryptionAlgorithms{
-			Value: aper.BitString{Bytes: []byte{0x00, 0x00}, BitLength: 16},
-		},
-		EUTRAintegrityProtectionAlgorithms: ngapType.EUTRAintegrityProtectionAlgorithms{
-			Value: aper.BitString{Bytes: []byte{0x00, 0x00}, BitLength: 16},
-		},
+func buildUESecurityCapabilities(c UESecCapBitmaps) *ngapType.UESecurityCapabilities {
+	bits := func(v uint16) aper.BitString {
+		return aper.BitString{Bytes: []byte{byte(v >> 8), byte(v)}, BitLength: 16}
 	}
+	return &ngapType.UESecurityCapabilities{
+		NRencryptionAlgorithms:             ngapType.NRencryptionAlgorithms{Value: bits(c.Enc)},
+		NRintegrityProtectionAlgorithms:    ngapType.NRintegrityProtectionAlgorithms{Value: bits(c.Int)},
+		EUTRAencryptionAlgorithms:          ngapType.EUTRAencryptionAlgorithms{Value: bits(c.EUTRAEnc)},
+		EUTRAintegrityProtectionAlgorithms: ngapType.EUTRAintegrityProtectionAlgorithms{Value: bits(c.EUTRAInt)},
+	}
+}
+
+// nasAlgOctetToNGAP maps one octet of the NAS UE security capability IE (bit 8 =
+// algorithm 0, bit 7 = algorithm 1 ... bit 1 = algorithm 7) onto an NGAP 16-bit
+// algorithm bitmap: algorithm 0 is implicit (mandated), the first NGAP bit is
+// algorithm 1, and the "fourth to seventh bit" are bits 4 to 1 of the octet.
+// Ref: TS 38.413 §9.3.1.86, TS 24.501 §9.11.3.54
+func nasAlgOctetToNGAP(o byte) uint16 {
+	return uint16(o&0x7F) << 9
+}
+
+// ueSecCapFromNAS converts the value part of the NAS UE security capability IE
+// (octet 3 = 5G-EA, octet 4 = 5G-IA, optional octet 5 = EEA, octet 6 = EIA) into
+// the NGAP bitmaps without truncation. ok is false when raw is shorter than the
+// two mandatory octets. Ref: TS 38.413 §9.3.1.86, TS 24.501 §9.11.3.54
+func ueSecCapFromNAS(raw []byte) (c UESecCapBitmaps, ok bool) {
+	if len(raw) < 2 {
+		return UESecCapBitmaps{}, false
+	}
+	c.Enc, c.Int = nasAlgOctetToNGAP(raw[0]), nasAlgOctetToNGAP(raw[1])
+	if len(raw) >= 4 {
+		c.EUTRAEnc, c.EUTRAInt = nasAlgOctetToNGAP(raw[2]), nasAlgOctetToNGAP(raw[3])
+	}
+	return c, true
 }
 
 // ---- PLMN/TAC helpers ---------------------------------------------------
@@ -974,11 +1136,13 @@ func zeroPad(s string, n int) string {
 // (id=110, criticality ignore) AFTER the PDU Session Resource Setup Request List,
 // as in the Rel-17 PDUSessionResourceSetupRequestIEs order; nil omits it. The AMF
 // passes it when the gNB has not yet received a UE-AMBR for the current N2 context.
+// ranCap gates Rel-18+ IEs per gNB (REL19-4.8).
 // Ref: TS 38.413 §8.2.1, §9.2.1.1, §9.3.1.58
 func BuildPDUSessionResourceSetupRequest(
 	amfUEID, ranUEID int64, pduSessionID uint8, nasPDU []byte, n2SmInfo []byte,
 	sst uint8, sdBytes []byte,
 	ueAMBR *UEAMBR,
+	ranCap capability.PeerRAN,
 ) []byte {
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentInitiatingMessage,
@@ -1044,6 +1208,8 @@ func BuildPDUSessionResourceSetupRequest(
 		})
 	}
 
+	appendPSRRel18PlusIEs(&pdu.InitiatingMessage.Value.PDUSessionResourceSetupRequest.ProtocolIEs, ranCap)
+
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
 		return nil
@@ -1106,13 +1272,16 @@ func extractPDUSessionResourceSetupResponse(resp *ngapType.PDUSessionResourceSet
 // InitialContextSetupResponseMsg is the decoded Initial Context Setup Response.
 // Setups carries the gNB's PDUSessionResourceSetupResponseTransfer per PDU
 // session re-established via PDUSessionResourceSetupListCxtReq (Service Request
-// UP re-activation). FailedPSIs lists sessions the gNB could not set up.
+// UP re-activation). FailedPSIs lists sessions the gNB could not set up;
+// FailedTransfers[i] is the PDU Session Resource Setup Unsuccessful Transfer of
+// FailedPSIs[i] (kept for the SMF, TS 38.413 §8.3.1.2).
 // Ref: TS 38.413 §8.3.1, §9.2.2.2
 type InitialContextSetupResponseMsg struct {
-	AMFUENGAPId int64
-	RANUENGAPId int64
-	Setups      []PDUSessionSetupResult
-	FailedPSIs  []uint8
+	AMFUENGAPId     int64
+	RANUENGAPId     int64
+	Setups          []PDUSessionSetupResult
+	FailedPSIs      []uint8
+	FailedTransfers [][]byte
 }
 
 func extractInitialContextSetupResponse(resp *ngapType.InitialContextSetupResponse) *InitialContextSetupResponseMsg {
@@ -1140,6 +1309,8 @@ func extractInitialContextSetupResponse(resp *ngapType.InitialContextSetupRespon
 			if ie.Value.PDUSessionResourceFailedToSetupListCxtRes != nil {
 				for _, item := range ie.Value.PDUSessionResourceFailedToSetupListCxtRes.List {
 					out.FailedPSIs = append(out.FailedPSIs, uint8(item.PDUSessionID.Value))
+					out.FailedTransfers = append(out.FailedTransfers,
+						[]byte(item.PDUSessionResourceSetupUnsuccessfulTransfer))
 				}
 			}
 		}
@@ -1750,6 +1921,9 @@ func extractHOTargetID(t *ngapType.TargetID) HOTargetID {
 
 // HandoverRequiredMsg holds decoded fields from an NGAP HandoverRequired.
 type HandoverRequiredMsg struct {
+	// NotifyCD carries the Criticality Diagnostics of not-comprehended "ignore and notify"
+	// IEs; it goes into the response (HANDOVER COMMAND / FAILURE), TS 38.413 §10.3.4.2.
+	NotifyCD                           *ngapType.CriticalityDiagnostics
 	AMFUENGAPId                        int64
 	RANUENGAPId                        int64
 	HandoverType                       int // 0=intra5GS, 1=5GS→EPS, 2=EPS→5GS
@@ -1956,6 +2130,26 @@ func BuildHandoverRequest(
 	mcc, mnc string,
 	regionID byte, setID uint16, amfIDByte byte,
 ) []byte {
+	return buildHandoverRequest(amfUEID, handoverType, causePresent, causeValue, ueAMBR,
+		nhNCC, nh, UESecCapBitmaps{Enc: encAlgsBitmap, Int: intAlgsBitmap},
+		sessions, allowedNSSAI, srcToTgtContainer, mcc, mnc, regionID, setID, amfIDByte)
+}
+
+// buildHandoverRequest is BuildHandoverRequest with the complete UE Security
+// Capabilities (NR and E-UTRA bitmaps). Ref: TS 38.413 §9.2.3.4, §9.3.1.86
+func buildHandoverRequest(
+	amfUEID int64,
+	handoverType int,
+	causePresent int, causeValue int64,
+	ueAMBR *UEAMBR,
+	nhNCC uint8, nh [32]byte,
+	secCap UESecCapBitmaps,
+	sessions []PDUSessionHOReqItem,
+	allowedNSSAI []amfctx.SNSSAISubscribed,
+	srcToTgtContainer []byte,
+	mcc, mnc string,
+	regionID byte, setID uint16, amfIDByte byte,
+) []byte {
 	if len(sessions) == 0 || len(allowedNSSAI) == 0 || len(srcToTgtContainer) == 0 {
 		return nil
 	}
@@ -2022,7 +2216,7 @@ func BuildHandoverRequest(
 			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverRequestIEsValue{
 				Present:                ngapType.HandoverRequestIEsPresentUESecurityCapabilities,
-				UESecurityCapabilities: buildUESecurityCapabilities(encAlgsBitmap, intAlgsBitmap),
+				UESecurityCapabilities: buildUESecurityCapabilities(secCap),
 			},
 		},
 		// SecurityContext (NH + NCC) — TS 38.413 §9.3.1.18
@@ -2115,6 +2309,14 @@ func BuildHandoverRequest(
 // (UnsuccessfulOutcome of HandoverPreparation, AMF → source gNB): AMF UE NGAP ID,
 // RAN UE NGAP ID, Cause. Ref: TS 38.413 §8.4.1.3, §9.2.3.3.
 func BuildHandoverPreparationFailure(amfUEID, ranUEID int64, causePresent int, causeValue int64) []byte {
+	return BuildHandoverPreparationFailureWithDiagnostics(amfUEID, ranUEID, causePresent, causeValue, nil)
+}
+
+// BuildHandoverPreparationFailureWithDiagnostics is BuildHandoverPreparationFailure plus the
+// optional Criticality Diagnostics IE (19, ignore), appended after the Cause (spec order of
+// HandoverPreparationFailureIEs). cd == nil yields bytes identical to
+// BuildHandoverPreparationFailure. Ref: TS 38.413 §9.2.3.3, §10.3.4.2.
+func BuildHandoverPreparationFailureWithDiagnostics(amfUEID, ranUEID int64, causePresent int, causeValue int64, cd *ngapType.CriticalityDiagnostics) []byte {
 	cause := buildCause(causePresent, causeValue)
 	fail := &ngapType.HandoverPreparationFailure{}
 	add := func(id int64, crit aper.Enumerated, v ngapType.HandoverPreparationFailureIEsValue) {
@@ -2136,6 +2338,12 @@ func BuildHandoverPreparationFailure(amfUEID, ranUEID int64, causePresent int, c
 		Present: ngapType.HandoverPreparationFailureIEsPresentCause,
 		Cause:   &cause,
 	})
+	if cd != nil {
+		add(ngapType.ProtocolIEIDCriticalityDiagnostics, ngapType.CriticalityPresentIgnore, ngapType.HandoverPreparationFailureIEsValue{
+			Present:                ngapType.HandoverPreparationFailureIEsPresentCriticalityDiagnostics,
+			CriticalityDiagnostics: cd,
+		})
+	}
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentUnsuccessfulOutcome,
 		UnsuccessfulOutcome: &ngapType.UnsuccessfulOutcome{
@@ -2194,6 +2402,21 @@ func BuildHandoverCommand(
 	toRelease []PDUSessionHOReleaseItem,
 	tgtToSrcContainer []byte,
 ) []byte {
+	return BuildHandoverCommandWithDiagnostics(amfUEID, ranUEID, handoverType, handled, toRelease, tgtToSrcContainer, nil)
+}
+
+// BuildHandoverCommandWithDiagnostics is BuildHandoverCommand plus the optional Criticality
+// Diagnostics IE (19, ignore) after the Target to Source Transparent Container (Table
+// 9.2.3.2-1 order), reporting ignored not-comprehended IEs of the HANDOVER REQUIRED
+// (§10.3.4.2). cd == nil yields bytes identical to BuildHandoverCommand.
+func BuildHandoverCommandWithDiagnostics(
+	amfUEID, ranUEID int64,
+	handoverType int,
+	handled []PDUSessionHOCmdItem,
+	toRelease []PDUSessionHOReleaseItem,
+	tgtToSrcContainer []byte,
+	cd *ngapType.CriticalityDiagnostics,
+) []byte {
 	var sessionList []ngapType.PDUSessionResourceHandoverItem
 	for _, s := range handled {
 		cmdTransfer := s.HandoverCommandTransfer
@@ -2231,7 +2454,7 @@ func BuildHandoverCommand(
 		// AMF-UE-NGAP-ID
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDAMFUENGAPID},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverCommandIEsValue{
 				Present:     ngapType.HandoverCommandIEsPresentAMFUENGAPID,
 				AMFUENGAPID: &ngapType.AMFUENGAPID{Value: amfUEID},
@@ -2240,7 +2463,7 @@ func BuildHandoverCommand(
 		// RAN-UE-NGAP-ID
 		{
 			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDRANUENGAPID},
-			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 			Value: ngapType.HandoverCommandIEsValue{
 				Present:     ngapType.HandoverCommandIEsPresentRANUENGAPID,
 				RANUENGAPID: &ngapType.RANUENGAPID{Value: ranUEID},
@@ -2293,6 +2516,16 @@ func BuildHandoverCommand(
 			},
 		},
 	})
+	if cd != nil {
+		ieList = append(ieList, ngapType.HandoverCommandIEs{
+			Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDCriticalityDiagnostics},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.HandoverCommandIEsValue{
+				Present:                ngapType.HandoverCommandIEsPresentCriticalityDiagnostics,
+				CriticalityDiagnostics: cd,
+			},
+		})
+	}
 
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentSuccessfulOutcome,
@@ -2436,16 +2669,20 @@ type PDUSessionFailedSetupItem struct {
 	PathSwitchRequestSetupFailedTransfer []byte
 }
 
-// UESecCapBitmaps are the NR encryption / integrity algorithm bitmaps of a UE
-// Security Capabilities IE (bit 15 = NEA1/NIA1 ... bit 13 = NEA3/NIA3).
+// UESecCapBitmaps are the algorithm bitmaps of a UE Security Capabilities IE
+// (bit 15 = first bit = NEA1/NIA1 resp. EEA1/EIA1 ... bit 9 = seventh bit).
+// Enc/Int are the NR bitmaps, EUTRAEnc/EUTRAInt the E-UTRA ones.
 // Ref: TS 38.413 §9.3.1.86.
 type UESecCapBitmaps struct {
-	Enc, Int uint16
+	Enc, Int           uint16
+	EUTRAEnc, EUTRAInt uint16
 }
 
 // PathSwitchRequestMsg is the decoded form of an NGAP PathSwitchRequest
 // (TS 38.413 Table 9.2.3.8-1).
 type PathSwitchRequestMsg struct {
+	// NotifyCD: see HandoverRequiredMsg.NotifyCD (PATH SWITCH REQUEST ACKNOWLEDGE / FAILURE).
+	NotifyCD          *ngapType.CriticalityDiagnostics
 	SourceAMFUENGAPId int64 // AMF UE NGAP ID assigned by source AMF
 	RANUENGAPId       int64 // new RAN UE NGAP ID assigned by target gNB
 	PDUSessions       []PDUSessionSwitchItem
@@ -2476,8 +2713,10 @@ func extractPathSwitchRequest(req *ngapType.PathSwitchRequest) *PathSwitchReques
 		case ngapType.PathSwitchRequestIEsPresentUESecurityCapabilities:
 			if c := ie.Value.UESecurityCapabilities; c != nil {
 				out.UESecCap = &UESecCapBitmaps{
-					Enc: bitmap16(c.NRencryptionAlgorithms.Value.Bytes),
-					Int: bitmap16(c.NRintegrityProtectionAlgorithms.Value.Bytes),
+					Enc:      bitmap16(c.NRencryptionAlgorithms.Value.Bytes),
+					Int:      bitmap16(c.NRintegrityProtectionAlgorithms.Value.Bytes),
+					EUTRAEnc: bitmap16(c.EUTRAencryptionAlgorithms.Value.Bytes),
+					EUTRAInt: bitmap16(c.EUTRAintegrityProtectionAlgorithms.Value.Bytes),
 				}
 			}
 		case ngapType.PathSwitchRequestIEsPresentPDUSessionResourceToBeSwitchedDLList:
@@ -2574,6 +2813,9 @@ func releasedTransfer(r PDUSessionReleasedItem) ([]byte, error) {
 
 // PathSwitchAckParams are the inputs of BuildPathSwitchRequestAcknowledge.
 type PathSwitchAckParams struct {
+	// CD, when non-nil, is added as the Criticality Diagnostics IE (19, ignore) after the
+	// Allowed NSSAI (§9.2.3.9) to report ignored not-comprehended IEs (§10.3.4.2).
+	CD                       *ngapType.CriticalityDiagnostics
 	AMFUENGAPId, RANUENGAPId int64
 	// UESecCap, when non-nil, is echoed as UE Security Capabilities (IE 119): only
 	// set when the capabilities received from the target differ from the stored ones.
@@ -2633,7 +2875,7 @@ func BuildPathSwitchRequestAcknowledge(p PathSwitchAckParams) []byte {
 		add(ngapType.ProtocolIEIDUESecurityCapabilities, ngapType.CriticalityPresentReject,
 			ngapType.PathSwitchRequestAcknowledgeIEsValue{
 				Present:                ngapType.PathSwitchRequestAcknowledgeIEsPresentUESecurityCapabilities,
-				UESecurityCapabilities: buildUESecurityCapabilities(p.UESecCap.Enc, p.UESecCap.Int),
+				UESecurityCapabilities: buildUESecurityCapabilities(*p.UESecCap),
 			})
 	}
 	// (4) Security Context {NCC, NH} — M, reject (TS 38.413 §9.3.1.18)
@@ -2697,6 +2939,14 @@ func BuildPathSwitchRequestAcknowledge(p PathSwitchAckParams) []byte {
 			Present:      ngapType.PathSwitchRequestAcknowledgeIEsPresentAllowedNSSAI,
 			AllowedNSSAI: &ngapType.AllowedNSSAI{List: nssaiItems},
 		})
+	// (13) Criticality Diagnostics — O, ignore
+	if p.CD != nil {
+		add(ngapType.ProtocolIEIDCriticalityDiagnostics, ngapType.CriticalityPresentIgnore,
+			ngapType.PathSwitchRequestAcknowledgeIEsValue{
+				Present:                ngapType.PathSwitchRequestAcknowledgeIEsPresentCriticalityDiagnostics,
+				CriticalityDiagnostics: p.CD,
+			})
+	}
 
 	b, err := libngap.Encoder(pdu)
 	if err != nil {
@@ -2711,6 +2961,13 @@ func BuildPathSwitchRequestAcknowledge(p PathSwitchAckParams) []byte {
 // session in PathSwitchRequestUnsuccessfulTransfer — there is no message-level Cause.
 // Returns nil when released is empty. Ref: TS 38.413 §8.4.4.3, §9.2.3.10.
 func BuildPathSwitchRequestFailure(amfUENGAPId, ranUENGAPId int64, released []PDUSessionReleasedItem) []byte {
+	return BuildPathSwitchRequestFailureWithDiagnostics(amfUENGAPId, ranUENGAPId, released, nil)
+}
+
+// BuildPathSwitchRequestFailureWithDiagnostics is BuildPathSwitchRequestFailure plus the
+// optional Criticality Diagnostics IE (19, ignore) after the Released List. cd == nil yields
+// bytes identical to BuildPathSwitchRequestFailure. Ref: TS 38.413 §9.2.3.10, §10.3.4.2.
+func BuildPathSwitchRequestFailureWithDiagnostics(amfUENGAPId, ranUENGAPId int64, released []PDUSessionReleasedItem, cd *ngapType.CriticalityDiagnostics) []byte {
 	if len(released) == 0 {
 		return nil
 	}
@@ -2745,6 +3002,12 @@ func BuildPathSwitchRequestFailure(amfUENGAPId, ranUENGAPId int64, released []PD
 		Present:                              ngapType.PathSwitchRequestFailureIEsPresentPDUSessionResourceReleasedListPSFail,
 		PDUSessionResourceReleasedListPSFail: list,
 	})
+	if cd != nil {
+		add(ngapType.ProtocolIEIDCriticalityDiagnostics, ngapType.PathSwitchRequestFailureIEsValue{
+			Present:                ngapType.PathSwitchRequestFailureIEsPresentCriticalityDiagnostics,
+			CriticalityDiagnostics: cd,
+		})
+	}
 
 	pdu := ngapType.NGAPPDU{
 		Present: ngapType.NGAPPDUPresentUnsuccessfulOutcome,
@@ -2963,4 +3226,128 @@ func BuildDownlinkNonUEAssociatedNRPPaTransport(nrppaPDU []byte, routingID []byt
 		return nil
 	}
 	return encodedNonUE
+}
+
+// ---- Error Indication (AMF → gNB, InitiatingMessage, ProcCode=9) -------------
+// Ref: TS 38.413 §8.7.5, §9.2.6.13
+
+// maxCriticalityDiagnosticsIEs is maxnoofErrors, the upper bound of the Criticality
+// Diagnostics IE list. Ref: TS 38.413 §9.3.1.3, §9.4 (maxnoofErrors = 256).
+const maxCriticalityDiagnosticsIEs = 256
+
+// CriticalityDiagnosticsParams are the inputs of BuildCriticalityDiagnostics. Nil
+// pointers leave the optional member out.
+type CriticalityDiagnosticsParams struct {
+	ProcedureCode        *int64           // 0..255; only within an ERROR INDICATION
+	TriggeringMessage    *aper.Enumerated // ngapType.TriggeringMessagePresent*; only within an ERROR INDICATION
+	ProcedureCriticality *aper.Enumerated // ngapType.CriticalityPresent*
+	IEs                  []CDIEItem       // reported IEs, capped at 256
+}
+
+// CDIEItem is one IE of the Criticality Diagnostics IE list (TS 38.413 §9.3.1.3).
+type CDIEItem struct {
+	IECriticality aper.Enumerated // ngapType.CriticalityPresent*; "ignore" is not applicable
+	IEID          int64           // 0..65535
+	TypeOfError   aper.Enumerated // ngapType.TypeOfErrorPresent*
+}
+
+// BuildCriticalityDiagnostics builds the Criticality Diagnostics IE value (TS 38.413
+// §9.3.1.3). The IE list is truncated to maxnoofErrors (256) items.
+func BuildCriticalityDiagnostics(p CriticalityDiagnosticsParams) ngapType.CriticalityDiagnostics {
+	cd := ngapType.CriticalityDiagnostics{}
+	if p.ProcedureCode != nil {
+		cd.ProcedureCode = &ngapType.ProcedureCode{Value: *p.ProcedureCode}
+	}
+	if p.TriggeringMessage != nil {
+		cd.TriggeringMessage = &ngapType.TriggeringMessage{Value: *p.TriggeringMessage}
+	}
+	if p.ProcedureCriticality != nil {
+		cd.ProcedureCriticality = &ngapType.Criticality{Value: *p.ProcedureCriticality}
+	}
+	ies := p.IEs
+	if len(ies) > maxCriticalityDiagnosticsIEs {
+		ies = ies[:maxCriticalityDiagnosticsIEs]
+	}
+	if len(ies) > 0 {
+		cd.IEsCriticalityDiagnostics = &ngapType.CriticalityDiagnosticsIEList{}
+		for _, it := range ies {
+			cd.IEsCriticalityDiagnostics.List = append(cd.IEsCriticalityDiagnostics.List, ngapType.CriticalityDiagnosticsIEItem{
+				IECriticality: ngapType.Criticality{Value: it.IECriticality},
+				IEID:          ngapType.ProtocolIEID{Value: it.IEID},
+				TypeOfError:   ngapType.TypeOfError{Value: it.TypeOfError},
+			})
+		}
+	}
+	return cd
+}
+
+// ErrorIndicationParams are the inputs of BuildErrorIndication (TS 38.413 §9.2.6.13).
+type ErrorIndicationParams struct {
+	// AMFUENGAPID / RANUENGAPID must be both set or both nil (§8.7.5.2: a UE-associated
+	// ERROR INDICATION carries both).
+	AMFUENGAPID, RANUENGAPID *int64
+	// Cause is the optional Cause IE; CausePresent == 0 omits it.
+	CausePresent int
+	CauseValue   int64
+	// CD is the optional Criticality Diagnostics IE.
+	CD *ngapType.CriticalityDiagnostics
+}
+
+// BuildErrorIndication builds an NGAP ERROR INDICATION (InitiatingMessage, procedure code 9,
+// criticality ignore) with IEs in the spec order of §9.2.6.13: AMF UE NGAP ID, RAN UE NGAP
+// ID, Cause, Criticality Diagnostics. It fails when only one of the two UE NGAP IDs is
+// given or when neither Cause nor Criticality Diagnostics is given (§8.7.5.2).
+func BuildErrorIndication(p ErrorIndicationParams) ([]byte, error) {
+	if (p.AMFUENGAPID == nil) != (p.RANUENGAPID == nil) {
+		return nil, errors.New("amf: build error indication: AMF and RAN UE NGAP ID must be both present or both absent")
+	}
+	if p.CausePresent == 0 && p.CD == nil {
+		return nil, errors.New("amf: build error indication: neither Cause nor Criticality Diagnostics given")
+	}
+	msg := &ngapType.ErrorIndication{}
+	add := func(id int64, v ngapType.ErrorIndicationIEsValue) {
+		msg.ProtocolIEs.List = append(msg.ProtocolIEs.List, ngapType.ErrorIndicationIEs{
+			Id:          ngapType.ProtocolIEID{Value: id},
+			Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value:       v,
+		})
+	}
+	if p.AMFUENGAPID != nil {
+		add(ngapType.ProtocolIEIDAMFUENGAPID, ngapType.ErrorIndicationIEsValue{
+			Present:     ngapType.ErrorIndicationIEsPresentAMFUENGAPID,
+			AMFUENGAPID: &ngapType.AMFUENGAPID{Value: *p.AMFUENGAPID},
+		})
+		add(ngapType.ProtocolIEIDRANUENGAPID, ngapType.ErrorIndicationIEsValue{
+			Present:     ngapType.ErrorIndicationIEsPresentRANUENGAPID,
+			RANUENGAPID: &ngapType.RANUENGAPID{Value: *p.RANUENGAPID},
+		})
+	}
+	if p.CausePresent != 0 {
+		cause := buildCause(p.CausePresent, p.CauseValue)
+		add(ngapType.ProtocolIEIDCause, ngapType.ErrorIndicationIEsValue{
+			Present: ngapType.ErrorIndicationIEsPresentCause,
+			Cause:   &cause,
+		})
+	}
+	if p.CD != nil {
+		add(ngapType.ProtocolIEIDCriticalityDiagnostics, ngapType.ErrorIndicationIEsValue{
+			Present:                ngapType.ErrorIndicationIEsPresentCriticalityDiagnostics,
+			CriticalityDiagnostics: p.CD,
+		})
+	}
+	b, err := libngap.Encoder(ngapType.NGAPPDU{
+		Present: ngapType.NGAPPDUPresentInitiatingMessage,
+		InitiatingMessage: &ngapType.InitiatingMessage{
+			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeErrorIndication},
+			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+			Value: ngapType.InitiatingMessageValue{
+				Present:         ngapType.InitiatingMessagePresentErrorIndication,
+				ErrorIndication: msg,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("amf: build error indication: %w", err)
+	}
+	return b, nil
 }

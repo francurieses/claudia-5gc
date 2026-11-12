@@ -3,9 +3,12 @@
 #   core            → Implemented NFs
 #   observability   → Loki + Promtail + Grafana + Prometheus + Jaeger
 #   integration-ueransim → UERANSIM gNB + UE for E2E tests
+#   roaming         → hSEPP + hNRF (home PLMN 001/02); use with core: --profile core --profile roaming
 #   handover        → PacketRusher dual-gNB Xn handover test (make handover-test)
 
-name: 5gc-rel17
+# Compose project name (REL19-0.4). Renaming it orphans the previous project's
+# named volumes (<project>_postgres-data, ...): run `make down` first; UDR reseeds.
+name: claudia-5gc
 
 networks:
   sbi-net:
@@ -59,6 +62,13 @@ networks:
         - subnet: 172.30.7.0/24
         - subnet: fd00:7::/64
           gateway: fd00:7::1
+  # N32 (inter-PLMN, vSEPP <-> hSEPP) + home-PLMN SBI for the roaming profile (TS 29.573).
+  n32-net:
+    name: 5gc-n32
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
   obs-net:
     name: 5gc-obs
     driver: bridge
@@ -99,6 +109,8 @@ services:
       - ./pki/nrf.key:/etc/5gc/pki/nrf.key:ro
       - ./nf/nrf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       REDIS_URL: "redis:6379"
@@ -140,6 +152,8 @@ services:
       - ./pki/amf.key:/etc/5gc/pki/amf.key:ro
       - ./nf/amf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       METRICS_ADDRESS: "0.0.0.0:9101"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
@@ -196,6 +210,8 @@ services:
       - ./pki/ausf.key:/etc/5gc/pki/ausf.key:ro
       - ./nf/ausf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       REDIS_URL: "redis:6379"
@@ -243,6 +259,8 @@ services:
       - ./pki/udm.key:/etc/5gc/pki/udm.key:ro
       - ./nf/udm/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -288,6 +306,8 @@ services:
       - ./pki/udr.key:/etc/5gc/pki/udr.key:ro
       - ./nf/udr/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       UE_COUNT: ${UE_COUNT:-1}
@@ -336,6 +356,8 @@ services:
       - ./pki/smf.key:/etc/5gc/pki/smf.key:ro
       - ./nf/smf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
@@ -387,6 +409,8 @@ services:
       - ./pki/pcf.key:/etc/5gc/pki/pcf.key:ro
       - ./nf/pcf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -539,6 +563,152 @@ services:
       - ./pcaps/nrf:/pcaps
     command: sleep infinity
 
+  # ============================================================
+  # ROAMING — vSEPP (profile core) / hSEPP + hNRF (profile roaming), TS 29.573
+  # ============================================================
+
+  vsepp:
+    image: 5gc/sepp:dev
+    profiles: [core]
+    build:
+      context: .
+      dockerfile: nf/sepp/Dockerfile
+    container_name: vsepp
+    hostname: vsepp.local
+    restart: unless-stopped
+    networks:
+      sbi-net:
+        aliases: [vsepp, sepp.5gc.local]
+      n32-net:
+        aliases: [vsepp.n32, sepp.5gc.mnc001.mcc001.3gppnetwork.org]
+      obs-net: {}
+    ports:
+      - "8014:8014"   # SBI HTTPS
+      - "8443:8443"   # N32 (mTLS)
+      - "9115:9115"   # Prometheus metrics
+    volumes:
+      - ./pcaps/sepp-keys:/keylog
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/vsepp.crt:/etc/5gc/pki/sepp.crt:ro
+      - ./pki/vsepp.key:/etc/5gc/pki/sepp.key:ro
+      - ./nf/sepp/config/dev.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      # Release profile of the run (rel17|rel19); empty = the config file value. make sepp-e2e PROFILE=...
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      # Opt-in TLS key log for pcap decryption (set SEPP_KEYLOG_DIR=1; written under ./pcaps/sepp-keys).
+      SSLKEYLOGFILE: "${SEPP_KEYLOG_DIR:+/keylog/vsepp.keys}"
+    depends_on: [nrf]
+    healthcheck:
+      test: ["CMD", "/bin/sepp", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      logging.5gc/nf: "SEPP"
+
+  hsepp:
+    image: 5gc/sepp:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/sepp/Dockerfile
+    container_name: hsepp
+    hostname: hsepp.local
+    restart: unless-stopped
+    networks:
+      n32-net:
+        aliases: [hsepp, hsepp.n32, sepp.5gc.mnc002.mcc001.3gppnetwork.org]
+      obs-net: {}
+    ports:
+      - "8114:8014"   # SBI HTTPS
+      - "8543:8443"   # N32 (mTLS)
+      - "9215:9115"   # Prometheus metrics
+    volumes:
+      - ./pcaps/sepp-keys:/keylog
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hsepp.crt:/etc/5gc/pki/sepp.crt:ro
+      - ./pki/hsepp.key:/etc/5gc/pki/sepp.key:ro
+      - ./nf/sepp/config/hsepp.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      # Release profile of the run (rel17|rel19); empty = the config file value. make sepp-e2e PROFILE=...
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      # Opt-in TLS key log for pcap decryption (set SEPP_KEYLOG_DIR=1; written under ./pcaps/sepp-keys).
+      SSLKEYLOGFILE: "${SEPP_KEYLOG_DIR:+/keylog/hsepp.keys}"
+    depends_on: [hnrf]
+    healthcheck:
+      test: ["CMD", "/bin/sepp", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      logging.5gc/nf: "SEPP"
+
+  # hNRF — home-PLMN NRF (001/02) for the roaming profile; in-memory registry (no Redis).
+  hnrf:
+    image: 5gc/nrf:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/nrf/Dockerfile
+    container_name: hnrf
+    hostname: hnrf.local
+    restart: unless-stopped
+    networks:
+      n32-net:
+        aliases: [hnrf, hnrf.5gc.local, nrf.5gc.mnc002.mcc001.3gppnetwork.org]
+      obs-net: {}
+    ports:
+      - "8100:8000"   # SBI HTTPS
+      - "9200:9100"   # Prometheus metrics
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hnrf.crt:/etc/5gc/pki/nrf.crt:ro
+      - ./pki/hnrf.key:/etc/5gc/pki/nrf.key:ro
+      - ./nf/nrf/config/hnrf.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    healthcheck:
+      test: ["CMD", "/bin/nrf", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      logging.5gc/nf: "NRF"
+
+  vsepp-pcap:
+    image: nicolaka/netshoot
+    profiles: [core]
+    container_name: vsepp-pcap
+    network_mode: "service:vsepp"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [vsepp]
+    volumes:
+      - ./pcaps/vsepp:/pcaps
+    command: sleep infinity
+
+  hsepp-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hsepp-pcap
+    network_mode: "service:hsepp"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hsepp]
+    volumes:
+      - ./pcaps/hsepp:/pcaps
+    command: sleep infinity
+
   # AMF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
   amf-pcap:
     image: nicolaka/netshoot
@@ -576,6 +746,8 @@ services:
       - ./pki/nssf.key:/etc/5gc/pki/nssf.key:ro
       - ./nf/nssf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -619,6 +791,8 @@ services:
       - ./pki/smsf.key:/etc/5gc/pki/smsf.key:ro
       - ./nf/smsf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -662,6 +836,8 @@ services:
       - ./pki/bsf.key:/etc/5gc/pki/bsf.key:ro
       - ./nf/bsf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -705,6 +881,8 @@ services:
       - ./pki/nef.key:/etc/5gc/pki/nef.key:ro
       - ./nf/nef/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -752,6 +930,8 @@ services:
       - ./pki/lmf.key:/etc/5gc/pki/lmf.key:ro
       - ./nf/lmf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
+      # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
     labels:
@@ -940,6 +1120,9 @@ services:
       LISTEN_ADDR: ":8080"
       PORTAL_CERT_FILE: "/etc/5gc/pki/portal.crt"
       PORTAL_KEY_FILE: "/etc/5gc/pki/portal.key"
+      # Compose project label the portal filters containers on; must equal the
+      # top-level `name:` above (REL19-0.4).
+      COMPOSE_PROJECT_NAME: "${COMPOSE_PROJECT_NAME:-claudia-5gc}"
     depends_on:
       postgres:
         condition: service_healthy

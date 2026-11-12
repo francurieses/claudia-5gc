@@ -16,7 +16,7 @@ func TestCreateAMPolicy_HappyPath(t *testing.T) {
 	s := newTestPCF(t)
 
 	body := `{"supi":"imsi-001010000000001","accessType":"3GPP_ACCESS","plmnId":{"mcc":"001","mnc":"01"}}`
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -34,9 +34,17 @@ func TestCreateAMPolicy_HappyPath(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	polAssoID, ok := resp["polAssoId"].(string)
-	if !ok || polAssoID == "" {
-		t.Fatal("polAssoId missing from response")
+	// PolicyAssociation (TS 29.507 §5.6.2.2) has no polAssoId attribute; the id
+	// is conveyed by the (absolute) Location header only (TS 29.501 §4.4.1).
+	if _, present := resp["polAssoId"]; present {
+		t.Fatal("polAssoId is not a PolicyAssociation attribute")
+	}
+	polAssoID := lastSegment(loc)
+	if polAssoID == "" {
+		t.Fatal("polAssoId missing from Location")
+	}
+	if !strings.HasPrefix(loc, "https://") {
+		t.Fatalf("Location %q is not absolute", loc)
 	}
 	if rfsp, ok := resp["rfsp"].(float64); !ok || rfsp < 1 {
 		t.Fatalf("rfsp not present or zero: %v", resp["rfsp"])
@@ -49,7 +57,7 @@ func TestCreateAMPolicy_HappyPath(t *testing.T) {
 func TestCreateAMPolicy_MissingSUPI(t *testing.T) {
 	s := newTestPCF(t)
 
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(`{"accessType":"3GPP_ACCESS"}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -68,7 +76,7 @@ func TestCreateAMPolicy_MissingSUPI(t *testing.T) {
 func TestCreateAMPolicy_MissingAccessType(t *testing.T) {
 	s := newTestPCF(t)
 
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(`{"supi":"imsi-001010000000001"}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -83,19 +91,17 @@ func TestDeleteAMPolicy_HappyPath(t *testing.T) {
 	s := newTestPCF(t)
 
 	// Create first
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(`{"supi":"imsi-001010000000001","accessType":"3GPP_ACCESS"}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.handleCreateAMPolicy(w, r)
 
-	var resp map[string]any
-	_ = json.NewDecoder(w.Body).Decode(&resp)
-	polAssoID := resp["polAssoId"].(string)
+	polAssoID := lastSegment(w.Header().Get("Location"))
 
 	// Delete
 	r2 := httptest.NewRequest(http.MethodDelete,
-		"/npcf-ampolicycontrol/v1/policies/"+polAssoID, nil)
+		"/npcf-am-policy-control/v1/policies/"+polAssoID, nil)
 	r2.SetPathValue("polAssoId", polAssoID)
 	w2 := httptest.NewRecorder()
 	s.handleDeleteAMPolicy(w2, r2)
@@ -106,7 +112,7 @@ func TestDeleteAMPolicy_HappyPath(t *testing.T) {
 
 	// Deleting again gives 404
 	r3 := httptest.NewRequest(http.MethodDelete,
-		"/npcf-ampolicycontrol/v1/policies/"+polAssoID, nil)
+		"/npcf-am-policy-control/v1/policies/"+polAssoID, nil)
 	r3.SetPathValue("polAssoId", polAssoID)
 	w3 := httptest.NewRecorder()
 	s.handleDeleteAMPolicy(w3, r3)
@@ -140,7 +146,7 @@ func TestSetRFSPOverride_AppliesToAMPolicy(t *testing.T) {
 	setRFSPOverride(t, s, supi, 42)
 
 	// A subsequent AM policy creation for that SUPI must return rfsp=42.
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(`{"supi":"`+supi+`","accessType":"3GPP_ACCESS"}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -157,7 +163,7 @@ func TestSetRFSPOverride_AppliesToAMPolicy(t *testing.T) {
 
 func TestCreateAMPolicy_DefaultWhenNoOverride(t *testing.T) {
 	s := newTestPCF(t)
-	r := httptest.NewRequest(http.MethodPost, "/npcf-ampolicycontrol/v1/policies",
+	r := httptest.NewRequest(http.MethodPost, "/npcf-am-policy-control/v1/policies",
 		strings.NewReader(`{"supi":"imsi-001010000000099","accessType":"3GPP_ACCESS"}`))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

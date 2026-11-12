@@ -35,9 +35,11 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/registry"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Server is the NRF HTTP/2 SBI server.
@@ -51,6 +53,13 @@ type Server struct {
 	oauth2Secret []byte
 	// httpClient is used for sending NFStatusNotify callbacks to subscribers.
 	httpClient *http.Client
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// mgmtCat / discCat override the Nnrf_NFManagement / Nnrf_NFDiscovery
+	// catalogs (tests inject Implemented entries); nil = the NRF defaults.
+	mgmtCat, discCat *features.Catalog
 }
 
 // New constructs a Server.
@@ -216,16 +225,6 @@ func (w *responseWriter) WriteHeader(c int) { w.status = c; w.ResponseWriter.Wri
 
 // ---- Handlers ----------------------------------------------------------
 
-// handleListAll implements GET /nnrf-nfm/v1/nf-instances (TS 29.510 §5.2.2.6 NFListRetrieval).
-// Returns all registered NF profiles in SearchResult format for portal/tooling use.
-func (s *Server) handleListAll(w http.ResponseWriter, r *http.Request) {
-	profiles := s.reg.ListAll()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"nfInstances": profiles,
-	})
-}
-
 // handleRegister implements PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId}
 // (TS 29.510 §5.2.2.2.2 — NFRegister).
 // The response always carries heartBeatTimer so NFs know the expected interval.
@@ -253,7 +252,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", fmt.Sprintf("/nnrf-nfm/v1/nf-instances/%s", id))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated) // TS 29.510: 201 on create, 200 on update
-	_ = json.NewEncoder(w).Encode(p)
+	_ = json.NewEncoder(w).Encode(&p)
 }
 
 // handleUpdate — TS 29.510 §5.2.2.3 (PATCH).
@@ -309,10 +308,27 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // handleGet — TS 29.510 §5.2.2.5.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("nfInstanceId")
+	// requester-features (Table 6.1.3.3.3.1-1): the NFProfile response has no
+	// supportedFeatures attribute to answer in, so a value is only validated
+	// and the negotiation logged. An absent or empty value is not negotiated.
+	var neg negotiation
+	rf := r.URL.Query().Get(queryRequesterFeatures)
+	peerNF := peerNFType(r, "")
+	if rf != "" {
+		if err := features.Validate(rf); err != nil {
+			s.rejectBadFeatures(w, r, "Nnrf", peerNF, s.mgmtCatalog(), rf,
+				features.CauseOptionalQueryParamIncorrect, paramQueryRequesterFeatures, err)
+			return
+		}
+		neg = s.negotiate(s.mgmtCatalog(), rf)
+	}
 	p, ok := s.reg.Get(id)
 	if !ok {
 		problem(w, http.StatusNotFound, "RESOURCE_URI_STRUCTURE_NOT_FOUND", "unknown nfInstanceId")
 		return
+	}
+	if rf != "" {
+		s.logOK(r, "Nnrf", peerNF, neg)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(p)
@@ -344,19 +360,65 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	if dnn := q.Get("dnn"); dnn != "" {
 		filter.DNN = dnn
 	}
+	// supported-features (TS 29.510 §6.2.3.2.3.1): only meaningful with a single
+	// service-name, ignored otherwise. Rel-19 "required-features" is not implemented.
+	if sf := q.Get("supported-features"); sf != "" {
+		if len(filter.ServiceNames) == 1 {
+			// Schema check only (TS 29.571 §5.2.2 pattern, no length limit); an
+			// optional parameter with an incorrect value is
+			// OPTIONAL_QUERY_PARAM_INCORRECT (TS 29.500 Table 5.2.7.2-1) and the
+			// InvalidParam name is "query <name>" (TS 29.571 §5.2.4.2).
+			if err := features.Validate(sf); err != nil {
+				problemParam(w, http.StatusBadRequest, "OPTIONAL_QUERY_PARAM_INCORRECT",
+					"supported-features is not a valid SupportedFeatures hex string",
+					"query supported-features", err.Error())
+				return
+			}
+			filter.SupportedFeatures = sf
+			s.logger.Debug("supported-features discovery filter applied",
+				"procedure", "NFDiscover", "interface", "Nnrf", "direction", "IN",
+				"correlation_id", r.Header.Get("X-Correlation-Id"),
+				"service_name", filter.ServiceNames[0], "supported_features", sf,
+				"spec_ref", "TS 29.510 §6.2.3.2.3.1")
+		} else {
+			s.logger.Debug("supported-features discovery filter ignored (needs exactly one service-name)",
+				"procedure", "NFDiscover", "interface", "Nnrf", "direction", "IN",
+				"correlation_id", r.Header.Get("X-Correlation-Id"),
+				"service_names", len(filter.ServiceNames),
+				"spec_ref", "TS 29.510 §6.2.3.2.3.1")
+		}
+	}
+	// requester-features (TS 29.510 Table 6.2.3.2.3.1-1): the consumer's
+	// Nnrf_NFDiscovery features. A non-hex value is
+	// OPTIONAL_QUERY_PARAM_INCORRECT (TS 29.500 Table 5.2.7.2-1). Answered in
+	// SearchResult.nrfSupportedFeatures (decision D1).
+	rf := q.Get(queryRequesterFeatures)
+	peerNF := peerNFType(r, requester)
+	if err := features.Validate(rf); err != nil {
+		s.rejectBadFeatures(w, r, "Nnrf", peerNF, s.discCatalog(), rf,
+			features.CauseOptionalQueryParamIncorrect, paramQueryRequesterFeatures, err)
+		return
+	}
+	neg := s.negotiate(s.discCatalog(), rf)
+	s.logOK(r, "Nnrf", peerNF, neg)
+
 	results := s.reg.Discover(filter)
 	discResult := "EMPTY"
 	if len(results) > 0 {
 		discResult = "OK"
 	}
 	metrics.NFDiscoveryTotal.WithLabelValues(target, discResult).Inc()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"validityPeriod":    3600,
 		"nfInstances":       results,
 		"searchId":          ulid.Make().String(),
 		"numNfInstComplete": len(results),
-	})
+	}
+	if neg.answer != "" {
+		resp["nrfSupportedFeatures"] = neg.answer
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleList implements NFListRetrieval (TS 29.510 §5.2.2.6): returns the set of
@@ -442,6 +504,18 @@ func problem(w http.ResponseWriter, status int, cause, detail string) {
 	})
 }
 
+// problemParam is problem() plus a single InvalidParam entry (TS 29.571 §5.2.4.2).
+func problemParam(w http.ResponseWriter, status int, cause, detail, param, reason string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":        status,
+		"cause":         cause,
+		"detail":        detail,
+		"invalidParams": []map[string]string{{"param": param, "reason": reason}},
+	})
+}
+
 func splitNonEmpty(s string) []string {
 	if s == "" {
 		return nil
@@ -506,8 +580,23 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		NotificationURI string `json:"nfStatusNotificationUri"`
 		ReqNFType       string `json:"reqNfType,omitempty"`
 		ReqNFInstanceID string `json:"reqNfInstanceId,omitempty"`
+		// RequesterFeatures is SubscriptionData.requesterFeatures (writeOnly,
+		// TS 29.510 §6.1.6.2.16): the consumer's Nnrf_NFManagement features.
+		RequesterFeatures string `json:"requesterFeatures,omitempty"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	cat := s.mgmtCatalog()
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.payloadTooLarge(w, r, "NFStatusSubscribe")
+			return
+		}
+		if features.IsTypeErrorOn(err, bodyRequesterFeatures) {
+			s.rejectBadFeatures(w, r, "Nnrf", peerNFType(r, ""), cat, "",
+				features.CauseInvalidMsgFormat, paramRequesterFeatures, err)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -515,13 +604,25 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nfStatusNotificationUri required", http.StatusBadRequest)
 		return
 	}
+	peerNF := peerNFType(r, req.ReqNFType)
+	if err := features.Validate(req.RequesterFeatures); err != nil {
+		s.rejectBadFeatures(w, r, "Nnrf", peerNF, cat, req.RequesterFeatures,
+			features.CauseInvalidMsgFormat, paramRequesterFeatures, err)
+		return
+	}
+	// Producer side: nrfSupportedFeatures is the NRF's own Nnrf_NFManagement set
+	// (TS 29.510 §6.1.6.2.16); per D1 it is absent under rel17 when the request
+	// had none. The intersection is kept on the subscription and in the log.
+	neg := s.negotiate(cat, req.RequesterFeatures)
 
 	sub := &registry.Subscription{
 		NotificationURI: req.NotificationURI,
 		ReqNFType:       registry.NFType(req.ReqNFType),
 		ReqNFInstanceID: req.ReqNFInstanceID,
+		Features:        neg.set,
 	}
 	subID := s.subs.Add(sub)
+	s.logOK(r, "Nnrf", peerNF, neg)
 
 	log.Info("NFStatusSubscription created",
 		"subscriptionId", subID,
@@ -530,10 +631,14 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		"direction", "OUT", "result", "OK",
 	)
 
+	resp := map[string]string{"subscriptionId": subID}
+	if neg.answer != "" {
+		resp["nrfSupportedFeatures"] = neg.answer
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Location", "/nnrf-nfm/v1/subscriptions/"+subID)
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{"subscriptionId": subID})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleUnsubscribe handles DELETE /nnrf-nfm/v1/subscriptions/{subscriptionId}.
@@ -614,7 +719,7 @@ func (s *Server) notifySubscribers(event registry.NFEvent, profile *registry.NFP
 func newH2CClient() *http.Client {
 	transport := &http2.Transport{
 		AllowHTTP: true,
-		DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+		DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) { //nolint:staticcheck // SA1019: h2c dial without TLS; DialTLSContext is not a drop-in with AllowHTTP
 			return net.Dial(network, addr)
 		},
 	}

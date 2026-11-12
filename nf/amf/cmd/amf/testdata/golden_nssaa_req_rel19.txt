@@ -1,0 +1,4 @@
+POST /nnssaaf-nssaa/v1/slice-authentications
+Content-Type: application/json
+
+{"gpsi":"msisdn-12025550100","snssai":{"sst":1,"sd":"000003"},"eapIdRsp":"AgcACQFhQGJj"}

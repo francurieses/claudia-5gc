@@ -39,6 +39,11 @@ const (
 	minImplicitDetachSecs = 60
 	maxImplicitDetachSecs = 86400
 
+	// minNASTimerSecs / maxNASTimerSecs bound T3550, T3560 and T3570 (TS 24.501
+	// §10.2 Table 10.2.2 default 6 s; the range is a lab limit).
+	minNASTimerSecs = timercfg.MinNASTimerSecs
+	maxNASTimerSecs = timercfg.MaxNASTimerSecs
+
 	// timerConfigMaxBody is the PUT body size limit in bytes.
 	timerConfigMaxBody = 4096
 
@@ -64,6 +69,12 @@ const (
 	causeMalformedRequest    = "MALFORMED_REQUEST"
 	causeResetExclusive      = "RESET_EXCLUSIVE"
 	causeNoChange            = "NO_CHANGE"
+	causeT3550OutOfRange     = "T3550_OUT_OF_RANGE"
+	causeT3560OutOfRange     = "T3560_OUT_OF_RANGE"
+	causeT3570OutOfRange     = "T3570_OUT_OF_RANGE"
+	timerFieldT3550          = "t3550_secs"
+	timerFieldT3560          = "t3560_secs"
+	timerFieldT3570          = "t3570_secs"
 	timerFieldT3512          = "t3512_secs"
 	timerFieldGuard          = "mobile_reachable_guard_secs"
 	timerFieldImplicitDetach = "implicit_detach_secs"
@@ -72,14 +83,23 @@ const (
 )
 
 // TimerValues is the JSON shape of one set of timer values.
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI
 type TimerValues struct {
 	T3512Secs            int `json:"t3512_secs"`
 	MobileReachableGuard int `json:"mobile_reachable_guard_secs"`
 	MobileReachableSecs  int `json:"mobile_reachable_secs"`
 	ImplicitDetachSecs   int `json:"implicit_detach_secs"`
+	// T3550Secs, T3560Secs and T3570Secs are the NAS common-procedure
+	// supervision timers (TS 24.501 §10.2 Table 10.2.2, default 6 s).
+	T3550Secs int `json:"t3550_secs"`
+	T3560Secs int `json:"t3560_secs"`
+	T3570Secs int `json:"t3570_secs"`
 }
 
 // TimerConfigResponse is the 200 body of GET and PUT /amf/v1/config/timers.
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI
 type TimerConfigResponse struct {
 	Effective TimerValues `json:"effective"`
 	Base      TimerValues `json:"base"`
@@ -88,6 +108,8 @@ type TimerConfigResponse struct {
 }
 
 // TimerProblem is the 400 body (ProblemDetails-like).
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI (stable O&M causes)
 type TimerProblem struct {
 	Status int    `json:"status"`
 	Title  string `json:"title"`
@@ -101,6 +123,9 @@ func toTimerValues(v timercfg.Values) TimerValues {
 		MobileReachableGuard: v.GuardSecs,
 		MobileReachableSecs:  v.MobileReachableSecs(),
 		ImplicitDetachSecs:   v.ImplicitDetachSecs,
+		T3550Secs:            int(v.T3550().Seconds()),
+		T3560Secs:            int(v.T3560().Seconds()),
+		T3570Secs:            int(v.T3570().Seconds()),
 	}
 }
 
@@ -158,6 +183,7 @@ func nearestRepresentable(secs int) (lower, higher int) {
 
 type timerRequest struct {
 	t3512, guard, implicit *int
+	t3550, t3560, t3570    *int
 	reset                  bool
 }
 
@@ -188,7 +214,8 @@ func parseTimerRequest(body []byte) (*timerRequest, *timerReject) {
 	sort.Strings(keys)
 	for _, k := range keys {
 		switch k {
-		case timerFieldT3512, timerFieldGuard, timerFieldImplicitDetach:
+		case timerFieldT3512, timerFieldGuard, timerFieldImplicitDetach,
+			timerFieldT3550, timerFieldT3560, timerFieldT3570:
 			var n int
 			if err := json.Unmarshal(raw[k], &n); err != nil || bytes.Equal(bytes.TrimSpace(raw[k]), []byte("null")) {
 				return nil, &timerReject{causeMalformedRequest, k + " must be an integer"}
@@ -198,6 +225,12 @@ func parseTimerRequest(body []byte) (*timerRequest, *timerReject) {
 				req.t3512 = &n
 			case timerFieldGuard:
 				req.guard = &n
+			case timerFieldT3550:
+				req.t3550 = &n
+			case timerFieldT3560:
+				req.t3560 = &n
+			case timerFieldT3570:
+				req.t3570 = &n
 			default:
 				req.implicit = &n
 			}
@@ -211,7 +244,8 @@ func parseTimerRequest(body []byte) (*timerRequest, *timerReject) {
 			return nil, &timerReject{causeUnknownField, fmt.Sprintf("unknown field %q", k)}
 		}
 	}
-	hasValue := req.t3512 != nil || req.guard != nil || req.implicit != nil
+	hasValue := req.t3512 != nil || req.guard != nil || req.implicit != nil ||
+		req.t3550 != nil || req.t3560 != nil || req.t3570 != nil
 	if req.reset && hasValue {
 		return nil, &timerReject{causeResetExclusive, "reset:true cannot be combined with value fields"}
 	}
@@ -233,6 +267,19 @@ func parseTimerRequest(body []byte) (*timerRequest, *timerReject) {
 	}
 	if v := req.implicit; v != nil && (*v < minImplicitDetachSecs || *v > maxImplicitDetachSecs) {
 		return nil, &timerReject{causeImplicitOutOfRange, fmt.Sprintf("implicit_detach_secs must be within %d..%d", minImplicitDetachSecs, maxImplicitDetachSecs)}
+	}
+	for _, c := range []struct {
+		v     *int
+		field string
+		cause string
+	}{
+		{req.t3550, timerFieldT3550, causeT3550OutOfRange},
+		{req.t3560, timerFieldT3560, causeT3560OutOfRange},
+		{req.t3570, timerFieldT3570, causeT3570OutOfRange},
+	} {
+		if c.v != nil && (*c.v < minNASTimerSecs || *c.v > maxNASTimerSecs) {
+			return nil, &timerReject{c.cause, fmt.Sprintf("%s must be within %d..%d", c.field, minNASTimerSecs, maxNASTimerSecs)}
+		}
 	}
 	return req, nil
 }
@@ -301,6 +348,15 @@ func TimerConfigHandler(store *timercfg.Store, logger *slog.Logger) http.Handler
 				if req.implicit != nil {
 					cur.ImplicitDetachSecs = *req.implicit
 				}
+				if req.t3550 != nil {
+					cur.T3550Secs = *req.t3550
+				}
+				if req.t3560 != nil {
+					cur.T3560Secs = *req.t3560
+				}
+				if req.t3570 != nil {
+					cur.T3570Secs = *req.t3570
+				}
 				store.Set(cur)
 			}
 			mu.Unlock()
@@ -310,7 +366,10 @@ func TimerConfigHandler(store *timercfg.Store, logger *slog.Logger) http.Handler
 				"reset", req.reset,
 				"t3512_secs_old", old.T3512Secs, "t3512_secs_new", cur.T3512Secs,
 				"mobile_reachable_secs_old", old.MobileReachableSecs(), "mobile_reachable_secs_new", cur.MobileReachableSecs(),
-				"implicit_detach_secs_old", old.ImplicitDetachSecs, "implicit_detach_secs_new", cur.ImplicitDetachSecs)
+				"implicit_detach_secs_old", old.ImplicitDetachSecs, "implicit_detach_secs_new", cur.ImplicitDetachSecs,
+				"t3550_secs_new", int(cur.T3550().Seconds()),
+				"t3560_secs_new", int(cur.T3560().Seconds()),
+				"t3570_secs_new", int(cur.T3570().Seconds()))
 			respond(w)
 		default:
 			w.Header().Set("Allow", "GET, PUT")

@@ -165,6 +165,10 @@ type Store interface {
 	// Access and mobility subscription
 	GetAMSubscription(supi string) (*AccessAndMobilitySubscriptionData, error)
 	PutAMSubscription(sub *AccessAndMobilitySubscriptionData) error
+	// SetGPSIsIfEmpty atomically sets only the gpsis column of the AM row to
+	// gpsis when the row exists and currently holds no GPSI. It reports whether
+	// it wrote; a missing row or a non-empty list is (false, nil).
+	SetGPSIsIfEmpty(supi string, gpsis []string) (bool, error)
 
 	// SMF selection subscription
 	GetSMFSelectionSubscription(supi string) (*SMFSelectionSubscriptionData, error)
@@ -283,6 +287,20 @@ func (s *InMemory) PutAMSubscription(sub *AccessAndMobilitySubscriptionData) err
 	defer s.mu.Unlock()
 	s.amSubs[sub.SUPI] = sub
 	return nil
+}
+
+// SetGPSIsIfEmpty implements Store under the store lock; only GPSIS changes.
+func (s *InMemory) SetGPSIsIfEmpty(supi string, gpsis []string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.amSubs[supi]
+	if !ok || len(sub.GPSIS) > 0 {
+		return false, nil
+	}
+	cp := *sub
+	cp.GPSIS = append([]string(nil), gpsis...)
+	s.amSubs[supi] = &cp
+	return true, nil
 }
 
 func (s *InMemory) GetSMFSelectionSubscription(supi string) (*SMFSelectionSubscriptionData, error) {

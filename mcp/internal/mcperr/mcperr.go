@@ -4,7 +4,10 @@
 // offset of a malformed TLV, the offending IE, and the governing 3GPP clause).
 package mcperr
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // JSON-RPC 2.0 reserved error codes (https://www.jsonrpc.org/specification §5.1).
 const (
@@ -59,7 +62,8 @@ func From(err error) *Error {
 	if err == nil {
 		return nil
 	}
-	if e, ok := err.(*Error); ok {
+	var e *Error
+	if ok := errors.As(err, &e); ok {
 		return e
 	}
 	return &Error{Code: CodeInternal, Message: err.Error()}

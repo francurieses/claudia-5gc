@@ -1,7 +1,7 @@
 package server
 
 // sm_policy_update.go — Npcf_SMPolicyControl SM Policy Association Update
-// (TS 29.512 §5.2.2.3). The SMF consults the PCF when a PDU session's QoS is
+// (TS 29.512 §4.2.3). The SMF consults the PCF when a PDU session's QoS is
 // modified; the PCF authorises the requested 5QI / Session-AMBR or rejects it.
 //
 // This is the custom "update" operation on the individual SM Policy resource:
@@ -11,21 +11,30 @@ package server
 //	  200 resp: SmPolicyDecision (qosDecs + sessRules + x5gcQosSource)
 //	  403 resp: ProblemDetails{cause: REQUESTED_QOS_NOT_AUTHORIZED}
 //
-// Ref: TS 29.512 §5.2.2.3, §5.6.2.5 (SmPolicyUpdateContextData), §5.6.2.6 (SmPolicyDecision).
+// Ref: TS 29.512 §4.2.3, §5.6.2.5 (SmPolicyUpdateContextData), §5.6.2.6 (SmPolicyDecision).
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
+// smPolicyUpdateSpecRef is the clause of the SM Policy Association modification
+// initiated by the SMF (Npcf_SMPolicyControl_Update).
+const smPolicyUpdateSpecRef = "TS 29.512 §4.2.3"
+
 // smPolicyUpdateRequest is the subset of SmPolicyUpdateContextData this PCF consumes.
 // ReqQos is an additive convenience object carrying the requested QoS change; TS 29.512
 // conveys a UE-requested change via repPolicyCtrlReqTriggers=[RES_MO_RE] plus the rule.
+//
+// oapi: TS29512_Npcf_SMPolicyControl.yaml#/components/schemas/SmPolicyUpdateContextData
 type smPolicyUpdateRequest struct {
 	RepPolicyCtrlReqTriggers []string `json:"repPolicyCtrlReqTriggers,omitempty"`
-	ReqQos                   *struct {
+	// ReqQos is sent by this project's SMF only (receiver-only here).
+	// oapi-ext: SmPolicyUpdateContextData has no reqQos; a UE-requested change is ueInitResReq.reqQos (RequestedQos: 5qi, gbrUl, gbrDl) and the session AMBR is subsSessAmbr, so the project object {5qi, ambr} has no spec home (docs/procedures/sm-policy-control-update.md records it as a modelling simplification). A third-party PCF would ignore it (TS 29.500 §6.6.2) and not apply the change.
+	ReqQos *struct {
 		FiveQI int `json:"5qi,omitempty"`
 		AMBR   *struct {
 			Uplink   string `json:"uplink,omitempty"`
@@ -33,34 +42,33 @@ type smPolicyUpdateRequest struct {
 		} `json:"ambr,omitempty"`
 	} `json:"reqQos,omitempty"`
 	// Optional fallbacks if the stored policy lacks supi/dnn (defensive).
+	// oapi-ext: the SUPI and DNN of an SM policy association are fixed at creation (SmPolicyContextData) and the update URI names the association, so SmPolicyUpdateContextData has no supi; dnn is not an update attribute either (only ueReqDnn, a different meaning).
 	SUPI string `json:"supi,omitempty"`
-	DNN  string `json:"dnn,omitempty"`
+	// oapi-ext: see SUPI.
+	DNN string `json:"dnn,omitempty"`
 }
 
 // handleUpdateSmPolicy authorises a QoS modification for an existing SM policy.
 func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	smPolicyId := r.PathValue("smPolicyId")
-	log := s.logger.With(
-		"procedure", "SmPolicyUpdate",
-		"interface", "Npcf",
-		"direction", "IN",
-		"correlation_id", r.Header.Get("X-Correlation-Id"),
-		"smPolicyId", smPolicyId,
-		"spec_ref", "TS 29.512 §5.2.2.3",
-	)
+	base := s.procLog(r, "SmPolicyUpdate").With("smPolicyId", smPolicyId)
+	in := dirLog(base, ifaceNpcf, dirIn, smPolicyUpdateSpecRef)
+	log := dirLog(base, ifaceNpcf, dirOut, smPolicyUpdateSpecRef) // outcome lines
+	in.Info("SmPolicyControl_Update received")
 
 	// Resolve the stored policy created at establishment (TS 29.512 §5.2.2.2).
 	s.policiesMu.Lock()
 	stored, found := s.policies[smPolicyId]
 	s.policiesMu.Unlock()
-	if !found {
-		log.Info("SmPolicyUpdate: unknown smPolicyId", "result", "REJECT", "cause", "CONTEXT_NOT_FOUND")
-		problem(w, http.StatusNotFound, "CONTEXT_NOT_FOUND", "no SM policy with id "+smPolicyId)
+	if !found || !isRecordType(stored, recordTypeSMPolicy) {
+		log.Warn("SmPolicyUpdate: unknown smPolicyId", "result", "REJECT", "cause", "POLICY_ASSOCIATION_NOT_FOUND")
+		problem(w, http.StatusNotFound, "POLICY_ASSOCIATION_NOT_FOUND", "no SM policy with id "+smPolicyId)
 		return
 	}
 
 	var req smPolicyUpdateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Warn("SmPolicyUpdate: invalid body", "error", err, "result", "REJECT", "cause", "INVALID_BODY")
 		problem(w, http.StatusBadRequest, "INVALID_BODY", err.Error())
 		return
 	}
@@ -117,14 +125,14 @@ func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Info("SmPolicyUpdate: per-subscriber override applied — request superseded",
 			"supi", supi, "dnn", dnn, "requested_5qi", reqFiveQI, "granted_5qi", grantedFiveQI,
-			"direction", "OUT", "result", "OK")
-		writeSmPolicyDecision(w, grantedFiveQI, arpPriority, grantedUL, grantedDL, QoSSourcePCFOverride)
+			"result", "OK")
+		writeSmPolicyDecision(log, w, grantedFiveQI, arpPriority, grantedUL, grantedDL, QoSSourcePCFOverride)
 		return
 	}
 
 	// Authorisation against the operator policy.
 	if !s.is5QIAuthorized(reqFiveQI) {
-		log.Info("SmPolicyUpdate: requested 5QI not authorised",
+		log.Warn("SmPolicyUpdate: requested 5QI not authorised",
 			"supi", supi, "requested_5qi", reqFiveQI, "result", "REJECT",
 			"cause", "REQUESTED_QOS_NOT_AUTHORIZED")
 		problem(w, http.StatusForbidden, "REQUESTED_QOS_NOT_AUTHORIZED",
@@ -133,7 +141,7 @@ func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	if max := s.cfg.DefaultSMPolicy.MaxSessionAMBRMbps; max > 0 {
 		if ambrMbps(reqUL) > max || ambrMbps(reqDL) > max {
-			log.Info("SmPolicyUpdate: requested Session-AMBR over ceiling",
+			log.Warn("SmPolicyUpdate: requested Session-AMBR over ceiling",
 				"supi", supi, "requested_ul", reqUL, "requested_dl", reqDL,
 				"max_mbps", max, "result", "REJECT", "cause", "REQUESTED_QOS_NOT_AUTHORIZED")
 			problem(w, http.StatusForbidden, "REQUESTED_QOS_NOT_AUTHORIZED",
@@ -145,8 +153,8 @@ func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	log.Info("SmPolicyUpdate: change authorised",
 		"supi", supi, "dnn", dnn, "granted_5qi", reqFiveQI,
 		"granted_ul", reqUL, "granted_dl", reqDL,
-		"direction", "OUT", "result", "OK")
-	writeSmPolicyDecision(w, reqFiveQI, arpPriority, reqUL, reqDL, "PCF_AUTHORIZED")
+		"result", "OK")
+	writeSmPolicyDecision(log, w, reqFiveQI, arpPriority, reqUL, reqDL, "PCF_AUTHORIZED")
 }
 
 // is5QIAuthorized reports whether the PCF policy permits the given 5QI on an update.
@@ -168,7 +176,7 @@ func (s *Server) is5QIAuthorized(fiveQI int) bool {
 const QoSSourcePCFOverride = "PCF_OVERRIDE"
 
 // writeSmPolicyDecision emits a 200 SmPolicyDecision with the granted QoS.
-func writeSmPolicyDecision(w http.ResponseWriter, fiveQI, arpPriority int, ambrUL, ambrDL, qosSource string) {
+func writeSmPolicyDecision(out *slog.Logger, w http.ResponseWriter, fiveQI, arpPriority int, ambrUL, ambrDL, qosSource string) {
 	resp := map[string]interface{}{
 		"x5gcQosSource": qosSource,
 		"sessRules": map[string]interface{}{
@@ -190,7 +198,7 @@ func writeSmPolicyDecision(w http.ResponseWriter, fiveQI, arpPriority int, ambrU
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(resp)
+	encodeBody(out, w, resp)
 }
 
 // ambrMbps extracts the integer Mbps value from an AMBR string like "100 Mbps".

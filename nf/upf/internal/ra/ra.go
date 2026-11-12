@@ -37,8 +37,8 @@ const (
 // Router Advertisement flags octet (RFC 4861 §4.2): M (Managed) and O
 // (Other config) bits. SLAAC-only prefix delegation keeps both clear.
 const (
-	raFlagManaged     uint8 = 0x80
-	raFlagOtherConfig uint8 = 0x40
+	raFlagManaged     uint8 = 0x80 //nolint:unused // RFC 4861 §4.2 M flag, documented for completeness
+	raFlagOtherConfig uint8 = 0x40 //nolint:unused // RFC 4861 §4.2 O flag, documented for completeness
 )
 
 // Prefix Information option (RFC 4861 §4.6.2).

@@ -1,6 +1,7 @@
 package nas
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -8,12 +9,12 @@ import (
 
 // UL NAS Transport message (TS 24.501 §8.7.1)
 type ULNASTransport struct {
-	PayloadContainerType uint8   // Payload Container Type
-	PayloadContainer     []byte  // N1 SM container (5GSM PDU)
-	PDUSessionID         *uint8  // Optional
-	RequestType          *uint8  // Optional
+	PayloadContainerType uint8            // Payload Container Type
+	PayloadContainer     []byte           // N1 SM container (5GSM PDU)
+	PDUSessionID         *uint8           // Optional
+	RequestType          *uint8           // Optional
 	SNSSAI               *SNSSAITransport // Optional
-	DNN                  *string // Optional
+	DNN                  *string          // Optional
 }
 
 // DL NAS Transport message (TS 24.501 §8.7.2)
@@ -81,7 +82,7 @@ func DecodeULNASTransport(b []byte) (*ULNASTransport, error) {
 	// Parse optional IEs
 	for r.Len() > 0 {
 		iei, err := r.PeekByte()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -91,7 +92,7 @@ func DecodeULNASTransport(b []byte) (*ULNASTransport, error) {
 		// Handle Request Type (nibble IEI 0x8-: TV format, 1 byte)
 		// TS 24.501 Table 8.7.1.2-2: IEI nibble high = 0x8, value = nibble low
 		if iei&0xF0 == 0x80 {
-			r.ReadByte() // consume the byte
+			_, _ = r.ReadByte() // consume the byte
 			rtVal := iei & 0x0F
 			msg.RequestType = &rtVal
 			continue
@@ -101,12 +102,12 @@ func DecodeULNASTransport(b []byte) (*ULNASTransport, error) {
 		case IEIPDUSessionID:
 			// TV format (2 bytes: IEI + value)
 			// TS 24.501 Table 8.7.1.2-2: IEI 0x12, TV format
-			r.ReadByte() // skip IEI
+			_, _ = r.ReadByte() // skip IEI
 			psi, _ := r.ReadByte()
 			msg.PDUSessionID = &psi
 
 		case IEISNSSAITransport:
-			r.ReadByte() // skip IEI
+			_, _ = r.ReadByte() // skip IEI
 			lenByte, _ := r.ReadByte()
 			// Valid S-NSSAI value lengths per TS 24.501 §9.11.2.8: 1 (SST),
 			// 2 (SST+mapped SST), 4 (SST+SD), 5 (SST+SD+mapped SST), 8 (+mapped SD).
@@ -127,7 +128,7 @@ func DecodeULNASTransport(b []byte) (*ULNASTransport, error) {
 			msg.SNSSAI = &SNSSAITransport{SST: sst, SD: sd}
 
 		case IEIDNN:
-			r.ReadByte() // skip IEI
+			_, _ = r.ReadByte() // skip IEI
 			lenByte, _ := r.ReadByte()
 			dnnBytes, _ := r.ReadBytes(int(lenByte))
 			// Decode APN label format (TS 23.003 §9.1): each label is length-prefixed.
@@ -137,13 +138,12 @@ func DecodeULNASTransport(b []byte) (*ULNASTransport, error) {
 			msg.DNN = &dnnStr
 
 		default:
-			// Unknown IEI, skip it
-			r.ReadByte()
-			if r.Len() > 0 {
-				lenByte, _ := r.ReadByte()
-				if lenByte > 0 && r.Len() >= int(lenByte) {
-					r.ReadBytes(int(lenByte))
-				}
+			// Unknown or unhandled IEI: skip by table / TS 24.007 §11.2.4.
+			// A syntactically incorrect IE is treated as not present.
+			// Ref: TS 24.501 §7.6.1, §7.7.1
+			_, _ = r.ReadByte() // consume the IEI so skipIE can look back at it
+			if err := r.skipIE(IEMsgULNASTransport); err != nil {
+				return msg, nil
 			}
 		}
 	}

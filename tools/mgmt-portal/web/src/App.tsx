@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { BrowserRouter, NavLink, Route, Routes, useLocation } from 'react-router-dom'
-import { ChevronDown, Layers, Menu, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
+import { ChevronDown, Info, Layers, Menu, PanelLeftClose, PanelLeftOpen, X } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import Subscribers from './pages/Subscribers'
 import Slices from './pages/Slices'
@@ -27,6 +27,7 @@ import {
   visibleNavGroups,
 } from './lib/navigation'
 import { modeLabel, useDeployment } from './lib/deployment'
+import { releaseLabel, useRelease } from './lib/release'
 import { usePersistentState } from './lib/usePersistentState'
 
 /**
@@ -81,6 +82,7 @@ function AppShell() {
   const menuButtonRef = useRef<HTMLButtonElement>(null)
 
   const deployment = useDeployment()
+  const release = releaseLabel(useRelease().data)
   const navGroups = useMemo(
     () => visibleNavGroups(NAV_GROUPS, deployment.caps, deployment.failed),
     [deployment.caps, deployment.failed],
@@ -220,7 +222,13 @@ function AppShell() {
             collapsed ? 'lg:justify-center lg:p-2' : ''
           }`}
         >
-          <p className={`text-xs text-muted-fg ${collapsed ? 'lg:hidden' : ''}`}>Rel-17 · dev</p>
+          <p
+            className={`flex items-center gap-1.5 text-xs text-muted-fg ${collapsed ? 'lg:hidden' : ''}`}
+            title={release.tooltip}
+          >
+            <Info size={12} aria-hidden="true" className="flex-shrink-0" />
+            <span>{release.text}</span>
+          </p>
           <IconButton
             label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
             variant="ghost"

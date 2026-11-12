@@ -33,6 +33,14 @@ func newTestPCF(t *testing.T) *Server {
 
 func createSmPolicy(t *testing.T, s *Server, body string) map[string]any {
 	t.Helper()
+	resp, _ := createSmPolicyWithID(t, s, body)
+	return resp
+}
+
+// createSmPolicyWithID creates an SM policy and returns the 201 body and the
+// smPolicyId taken from the Location header (the body has no id attribute).
+func createSmPolicyWithID(t *testing.T, s *Server, body string) (map[string]any, string) {
+	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "/npcf-smpolicycontrol/v1/sm-policies",
 		strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
@@ -45,7 +53,10 @@ func createSmPolicy(t *testing.T, s *Server, body string) map[string]any {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	return resp
+	if _, has := resp["smPolicyId"]; has {
+		t.Error("SmPolicyDecision carries non-schema attribute smPolicyId")
+	}
+	return resp, lastSegment(w.Header().Get("Location"))
 }
 
 func extract5QI(t *testing.T, resp map[string]any) int {

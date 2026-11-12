@@ -11,6 +11,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/francurieses/claudia-5gc/shared/capability"
 )
 
 // CellCoord is a WGS84 coordinate pair mapped to a serving NR cell.
@@ -90,6 +92,11 @@ type Config struct {
 
 	// LocationSubscription controls the EventSubscription service (TS 29.572 §5.2.3).
 	LocationSubscription LocationSubscriptionConfig `yaml:"location_subscription"`
+
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	// Ref: TS 29.500 §6.6.2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 // LocationSubscriptionConfig holds parameters for the Nlmf_Location EventSubscription service.

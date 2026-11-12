@@ -44,11 +44,14 @@ back to the operator-default QoS. Details on slices: [`getting-started.md`](gett
 | `LOKI_ADDR` | URL | MCP | Loki query API for `log_query` and `procedure_timeline` (default `http://loki:3100`). |
 | `BSF_ADDR` | URL | MCP | BSF Nbsf_Management endpoint for `pcf_binding_list` and `core_consistency_check`, over mTLS (default `https://bsf:8010`; `https://localhost:8010` in host mode). Config key `bsf_addr`. |
 | `NEF_ADDR` | URL | MCP | NEF endpoint for `af_qos_session_*`, over mTLS (default `https://nef:8011`; `https://localhost:8011` in host mode). Config key `nef_addr`. |
+| `SEPP_ADDR` | URL | MCP | vSEPP SBI listed by `mcp_info`/`core_health` upstreams, over mTLS (default `https://vsepp:8014`; `https://localhost:8014` in host mode). Config key `sepp_addr`. |
+| `COMPOSE_PROJECT_NAME` | string (compose sets `claudia-5gc`) | mgmt-portal | Compose project label the portal filters containers on; must equal the project the stack runs under. |
 | `SMSF_ADDR` | URL | MCP | SMSF endpoint for `sms_send_mt`, over mTLS (default `https://smsf:8009`; `https://localhost:8009` in host mode). Config key `smsf_addr`. |
 | `LMF_URL` | URL | portal | LMF endpoint for the UE Location page (Nlmf_Location; default `https://lmf:8012`) |
 | `DATABASE_URL` | DSN | AMF, SMF, UDR | PostgreSQL connection |
 | `REDIS_URL` | URL | NRF, AMF, AUSF | Redis connection |
 | `OPERATOR_CONFIG_PATH` / `NF_CONFIGS_PATH` | path | NFs, portal | Path to `config/operator.yaml` / per-NF configs |
+| `NF_RELEASE_PROFILE` | enum `rel17`\|`rel19` (default `rel19`) | AMF, SMF, AUSF, UDM, NEF, BSF, SMSF, LMF, NSSF, PCF, NRF, UDR | Release profile; overrides the YAML `release.profile`. docker-compose forwards it to every core NF (`NF_RELEASE_PROFILE=rel17 make up` switches the stack; empty = YAML/`rel19`). `rel19` enables spec-literal SBI `supportedFeatures` negotiation (TS 29.500 §6.6.2); `rel17` keeps the frozen wire baseline. Unknown value = startup error. Also read by BSF, SMSF, LMF, NSSF, PCF, NRF and UDR. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `JAEGER_ADDR` | URL | all NFs | OTLP→Jaeger exporter |
 | `PROMETHEUS_ADDR` / `PROMETHEUS_URL` | URL | MCP, portal | Prometheus query endpoint |
 | `URSP_ENABLED` | bool | PCF/AMF | Toggle URSP delivery |
@@ -57,9 +60,12 @@ back to the operator-default QoS. Details on slices: [`getting-started.md`](gett
 | `PR_SCENARIO` | enum `xn`\|`n2`\|`none` (default `xn`) | root Makefile | PacketRusher scenario started by `RAN=packetrusher\|both` (`none` = create only) |
 | `MCP` | `on`\|`off` (default `off`) | root Makefile | Deploy the MCP server container (profile `tools`, SSE `:9300`) with `make up\|up-obs\|5gcsa` |
 | `SEED_EXTRA_SUPIS` | comma list of `imsi-<15 digits>` (default `imsi-001010000000101,imsi-001010000000201,…202,…203,…204,imsi-001010000000301,imsi-001010000000401`) | UDR | Extra dev subscribers seeded outside the `UE_COUNT` range: 101 PacketRusher, 201–204 multi-slice UEs, 301 SUCI Profile A UE, 401 `ue-unauth` (test-slices T8). Each gets the cyclic multi-slice profile by MSIN (`(msin-1) % number_of_profiles`); invalid entries are skipped with a warning. UDR skips SUPIs already provisioned in Postgres |
+| `SEED_GPSI_PREFIX` | digits (default `490`; `off` disables) | UDR, mgmt-portal | GPSI given to every seeded subscriber: `msisdn-<prefix><last 10 IMSI digits>`; backfilled at UDR start; the portal uses it as the default `gpsis` on create. am-data carries it only under `release.profile: rel19`. Not passed by compose |
 | `PORTAL_RAN_TOOLS` | enum `auto`\|`none`\|`ueransim`\|`packetrusher`\|`both` (default `auto`) | mgmt-portal | Force the detected RAN-tool deployment mode; `auto` probes Docker |
 | `AMF_MGMT_URLS` | comma list of URLs (default = `AMF_URL`) | mgmt-portal | AMF management endpoints aggregated by the gNBs page (`GET /api/v1/ran/gnbs`) |
 | `HN_PRIVATE_KEY_X25519` | hex | UDM | Home network private key for SUCI Profile A |
+| `HN_PRIVATE_KEY_P256` | hex | UDM | Home network secp256r1 private scalar for SUCI Profile B (dev.yaml ships the TS 33.501 Annex C.4.4.1 vector, key id 2) |
+| `HN_PRIVATE_KEY_X25519_FILE` / `HN_PRIVATE_KEY_P256_FILE` | file path | UDM | Hex key read from a file (secret mount, mode 0400, <=4 KiB). Precedence: env `*_FILE` > yaml `hn_private_key_*_file` > env `HN_PRIVATE_KEY_*` > yaml value. Invalid or missing key: UDM exits 1 |
 | `MCP_TRANSPORT` | enum (stdio/sse/both) | MCP | Transport selection |
 | `PORTAL_CERT_FILE` / `PORTAL_KEY_FILE` | path | mgmt-portal | TLS cert/key |
 | `POSTGRES_USER/PASSWORD/DB` | string | postgres | DB bootstrap |
@@ -73,12 +79,15 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`.
 | Key | File | Description |
 |---|---|---|
 | `served_tacs` (list of ints, default `[1]`) | `nf/amf/config/dev.yaml` | Registration area advertised as the TAI list (IEI 0x54) in every Registration Accept. Must cover every TAC the connected gNBs broadcast; the UE's current TAC is always appended if missing. Ref: TS 24.501 §9.11.3.9 |
+| `release.profile` (`rel17`\|`rel19`, default `rel19`), `release.features` (optional per-feature enable map) | `nf/amf/config/dev.yaml`, `nf/smf/config/dev.yaml`, `nf/ausf/config/dev.yaml`, `nf/udm/config/dev.yaml`, `nf/nef/config/dev.yaml`, `nf/bsf/config/dev.yaml`, `nf/smsf/config/dev.yaml`, `nf/lmf/config/dev.yaml`, `nf/nssf/config/dev.yaml`, `nf/pcf/config/dev.yaml`, `nf/nrf/config/dev.yaml`, `nf/udr/config/dev.yaml` | Release profile of the NF; `NF_RELEASE_PROFILE` overrides it. `rel19` turns on SBI `supportedFeatures` negotiation on the wire; the SMF, AUSF, UDM, NEF, BSF, SMSF, LMF, NSSF, PCF, NRF and UDR dev configs carry a commented example. No Rel-19 feature is implemented yet, so a rel19 NF offers `"0"` |
+| `sbi.authority` (host[:port], optional, AUSF) | `nf/ausf/config/dev.yaml` | Authority peers use to reach the AUSF; builds the absolute `Location` header of `POST /nnssaaf-nssaa/v1/slice-authentications` (201). When unset the AUSF uses a routable `sbi.address`, else the request `Host` if it is a valid authority. Not set in the dev config. |
 | `n4.report_listen` (default `0.0.0.0:8805`) | `nf/smf/config/dev.yaml` | Bind address of the SMF persistent PFCP receiver that consumes UPF Session Report Requests (URR usage reports). Intra-Docker-network UDP — no published port needed. Ref: TS 29.244 §6.2.1 |
 | `n4.volume_threshold_bytes` (default `1000000`) | `nf/smf/config/dev.yaml` | Volume Threshold installed in the URR — UPF emits a VOLTH Usage Report once cumulative session volume crosses this many bytes (re-arms after each report). Ref: TS 29.244 §8.2.13 |
 | `n4.heartbeat_interval_seconds` (default `2`) | `nf/smf/config/dev.yaml` | PFCP Heartbeat period towards the UPF. Zero = default |
 | `n4.t1_seconds` (default `3`), `n4.n1_retransmissions` (default `3`) | `nf/smf/config/dev.yaml` | PFCP T1 response timeout and N1 retransmission count for Association Setup / Heartbeat (TS 29.244 §6.4); N1 loss = peer failure |
 | `n4.association_retry_initial_seconds` (default `1`), `n4.association_retry_max_seconds` (default `5`) | `nf/smf/config/dev.yaml` | Association Setup retry back-off bounds. The 30 s release guard is a constant, not configurable |
 | `PFCP_TIMEOUT` (default `20`), `PFCP_SETTLE` (default `3`) | env of `scripts/services-restart-check.sh` | After an smf/upf restart: max wait for the UPF log `PFCP AssociationSetup accepted`, then settle time before the E2E check |
+| `PREV` (default: latest git tag), `BUILD_CURRENT` (default `0`), `UE_TIMEOUT` (default `90`, registration only), `SESSION_TIMEOUT` (default `90`), `SWAP_TIMEOUT` (default `60`), `GNB_GRACE` (default `10`) | env of `scripts/rolling-upgrade-check.sh` (`make rolling-upgrade-check`) | Release tag whose AMF/SMF are swapped in and out; `1` rebuilds the current amf/smf images first; max seconds for the UE to register, for a PDU session that pings (own deadline), for the post-swap state gate and a gNB restart; seconds the UERANSIM gNB gets to reach `NG_READY` by itself before it is restarted once. Needs `make ueransim UE_COUNT=1` |
 | `n4.measurement_period_seconds` (default `60`) | `nf/smf/config/dev.yaml` | Measurement Period installed in the URR — UPF emits a PERIO Usage Report every N seconds. Ref: TS 29.244 §8.2.42 |
 | `UPF_PPROF_ADDR` (default empty = off, e.g. `0.0.0.0:6060`) | env of `upf` | Optional pprof HTTP listener (`/debug/pprof/`), not published to the host: fetch from inside the UPF netns. `LOG_LEVEL` is also honoured by the UPF. |
 | `GOGC` (optional, read by the Go runtime) | env of `upf` | Go GC target; only reported in the `UPF runtime` startup log |
@@ -91,12 +100,14 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`.
 | `dnns[].secondary_auth` (bool, default `false`) | `nf/smf/config/dev.yaml` | When true, the SMF triggers DN-AAA secondary authentication (EAP round-trip) during PDU Session Establishment for that DNN; false (all shipped DNNs) = normal establishment, no EAP. Ref: TS 23.501 §5.6.6, TS 23.502 §4.3.2.3 |
 | `dnns[].dn_aaa_unreachable` (bool, default `false`) | `nf/smf/config/dev.yaml` | Dev/test knob: simulates the DN-AAA being unreachable so establishment is rejected with 5GSM cause #29. For local testing of the failure path only. Ref: TS 24.501 §9.11.4.2 |
 | `dnns[].ue_ipv6_prefix` (e.g. `2001:db8:60::/56`) | `nf/smf/config/dev.yaml`, `config/operator.yaml` | Base IPv6 prefix (CIDR, length `/8`-`/64`, multiple of 8) the SMF's `IPv6Pool` delegates per-session `/64`s from for IPv6/IPv4v6 PDU sessions. Empty/absent = the DNN is IPv4-only and v6 requests are downgraded. All four seeded DNNs (`internet`=`2001:db8:60::/56`, `ims`=`2001:db8:61::/56`, `gaming`=`2001:db8:62::/56`, `gold`=`2001:db8:63::/56`) now have one configured. Manageable from the portal `/slices` DNN edit form (`PUT /api/v1/dnns/{name}`) — writes `operator.yaml`+SMF+UPF in one call; SMF/UPF only read config at startup, so check "Restart SMF and UPF" to apply. Ref: TS 23.501 §5.8.2.2 |
+| `ngap.ran_profiles` (list; each entry has `global_ran_node_id` or a `gnb_name` glob, plus `max_release`: `Rel-17` or `Rel-18`) |Rel-18}`) | `nf/amf/config/dev.yaml` | Optional per-gNB release cap. The gNB release is inferred from the NG Setup Request (default Rel-17); `max_release` only lowers it. A `global_ran_node_id` match beats a `gnb_name` match. |
 
 ## Build and security switches
 
 - **URSP delivery** is a build-time switch — see [`getting-started.md`](getting-started.md) → *Compile with / without URSP policy delivery*.
 - **AMF `null_ciphering`** (NEA0) is a development switch for simulators that require it — see
   [`getting-started.md`](getting-started.md) → *Security debug flags (AMF)*. Never enable it outside a lab.
+- **AMF uplink NAS integrity enforcement**: `nas_security.integrity_enforcement: strict|relaxed` in `nf/amf/config/dev.yaml` (default `strict`), overridden by env `AMF_NAS_INTEGRITY_ENFORCEMENT`. `strict` discards unprotected or integrity-failing uplink NAS after the first verified message (TS 24.501 §4.4.4.3); `relaxed` only logs and processes them (debug only, startup Warn). Any other value stops the AMF at start-up.
 
 ## TLS / PKI
 

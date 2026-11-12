@@ -30,8 +30,8 @@ import (
 	"time"
 
 	"github.com/cucumber/godog"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/ishidawataru/sctp"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
@@ -201,6 +201,9 @@ func (w *anWorld) registrationComplete() error {
 	if err != nil {
 		return err
 	}
+	// A REGISTRATION ACCEPT is awaiting its COMPLETE (the AMF ignores an unsolicited
+	// one, TS 24.501 §5.5.1.2.4).
+	ue.SetRegStage(amfctx.RegStageAcceptSent)
 	if err := h.HandleNASMessage(context.Background(), ue, pdu); err != nil {
 		return fmt.Errorf("Registration Complete handling failed: %w", err)
 	}

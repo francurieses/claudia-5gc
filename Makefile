@@ -1,9 +1,9 @@
-# 5GC Rel-17 — Root Makefile
+# 5GC Rel-19 — Root Makefile
 # Conventions in CLAUDE.md §7
 
-.PHONY: help all build test lint docker-nfs docker-ran ran-up ran-down mcp-start mcp-e2e up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs
+.PHONY: help all build test lint docker-nfs docker-ran ran-up packetrusher-vendor ran-down mcp-start mcp-e2e up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs release-leak-test rolling-upgrade-check mixed-release-e2e
 
-NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef lmf
+NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef lmf sepp
 COMPOSE := docker compose
 PKI_DIR := pki
 
@@ -102,6 +102,9 @@ mcp-test: ## Unit + functional tests for the MCP server
 mcp-e2e: ## Live smoke test of every MCP tool, with a coverage guard (MUTATE=1 state changes, DISRUPT=1 confirmed N1/N2 tools, LAB_URL=<lab mcp> ADMIN tools + roles; each reverted)
 	./scripts/mcp-smoke.sh
 
+sepp-e2e: ## vSEPP<->hSEPP roaming E2E: N32-c, NFDiscover via N32-f (header + telescopic), pcap+keylog (PROFILE=rel17|rel19; needs make up + make pki)
+	PROFILE=$(or $(PROFILE),rel17) ./scripts/sepp-e2e.sh
+
 mcp-docker: ## Build the MCP server Docker image
 	$(MAKE) -C mcp docker
 
@@ -122,6 +125,9 @@ up-obs: docker-nfs ## Start core + observability (RAN=none|ueransim|packetrusher
 up-test: ## Start core + observability + UERANSIM (alias of: make up-obs RAN=ueransim)
 	@$(MAKE) --no-print-directory up-obs RAN=ueransim
 
+packetrusher-vendor: ## Stage shared/{ngap,nas,capability} for the PacketRusher image (docker/packetrusher/claudia-vendor, gitignored)
+	./scripts/packetrusher-vendor.sh
+
 ran-up: ## Start the RAN simulators selected by RAN= (no-op for RAN=none)
 ifneq ($(RAN_UERANSIM),)
 	@$(MAKE) --no-print-directory docker-ran
@@ -129,6 +135,7 @@ ifneq ($(RAN_UERANSIM),)
 	@echo "UERANSIM started with $(UE_COUNT) UE(s). Monitor: make logs-ueransim"
 endif
 ifneq ($(RAN_PACKETRUSHER),)
+	@$(MAKE) --no-print-directory packetrusher-vendor
 	$(COMPOSE) --profile handover --profile handover-n2 up --no-start --build
 ifeq ($(PR_SCENARIO),xn)
 	$(COMPOSE) --profile handover --profile handover-n2 start packetrusher
@@ -174,8 +181,8 @@ release-docs:
 pki: ## Generate development PKI (CA + cert per NF)
 	./scripts/gen-pki.sh
 
-sync-openapi: ## Download latest OpenAPI YAML from 3GPP forge
-	./scripts/sync-openapi.sh
+sync-openapi: ## Fetch 3GPP OpenAPI YAMLs into specs/3gpp-openapi/<REL>/ [REL=Rel-19|Rel-17]
+	./scripts/sync-openapi.sh $(REL)
 
 clean: ## Clean binaries and artifacts
 	@for nf in $(NFS); do \
@@ -198,9 +205,12 @@ ueransim-no-ursp: docker ## Build + start full core + obs + UERANSIM WITHOUT URS
 	@echo "Core started WITHOUT URSP delivery (URSP_ENABLED=false), $(UE_COUNT) UE(s)."
 	@echo "Verify: docker logs amf | grep 'URSP delivery disabled'"
 
-ueransim-only: ueransim-build-only ## Start only UERANSIM (gNB + N UEs) without touching core. Use UE_COUNT=N
-	$(COMPOSE) --profile integration-ueransim up -d
-	@echo "UERANSIM started with $(UE_COUNT) UE(s). Monitor: make logs-ueransim"
+ueransim-only: ueransim-build-only ## Restart only UERANSIM (gNB + N UEs), core untouched, no UDR reseed. Use UE_COUNT=N
+	# --force-recreate: a plain `up -d` is a no-op for running containers, so UEs would keep their old sessions.
+	# --no-deps: never recreate core services. Starts the gNB first, then the UEs (fresh PDU sessions).
+	$(COMPOSE) --profile integration-ueransim up -d --force-recreate --no-deps ueransim-gnb
+	$(COMPOSE) --profile integration-ueransim up -d --force-recreate --no-deps ueransim-ue
+	@echo "UERANSIM (gNB + $(UE_COUNT) UE(s)) recreated; core and UDR untouched. Monitor: make logs-ueransim"
 
 ueransim-build-only: ## Compile only UERANSIM image
 	docker build -f tools/ueransim/Dockerfile -t 5gc/ueransim:dev .
@@ -311,6 +321,12 @@ test-slices: ## Run slice validation tests (requires: make ueransim-slices or ma
 services-restart-check: ## PORTAL-001: restart every service via the portal API and verify recovery (up, NRF, /metrics|health, E2E); vars [SERVICES="amf smf"] [E2E=0|1]
 	@SERVICES="$(SERVICES)" E2E="$(or $(E2E),1)" ./scripts/services-restart-check.sh
 
+mixed-release-e2e: ## REL19-10.2: Rel-19 AMF vs Rel-17 SMF/PCF and the reverse: FeatureNegotiation logs, NRF apiFullVersion, decrypted supportedFeatures pcap (needs make ueransim UE_COUNT=1; recreates amf/smf/pcf, restores defaults)
+	@./scripts/mixed-release-e2e.sh
+
+rolling-upgrade-check: ## REL19-7.3: upgrade+downgrade AMF/SMF vs PREV tag: state gate, gNB re-attach, Service Request, PDU session (needs make ueransim UE_COUNT=1); vars [PREV=<git tag>] [BUILD_CURRENT=1] [GNB_GRACE=10] [SESSION_TIMEOUT=90] [UE_TIMEOUT=90] [SWAP_TIMEOUT=60]
+	@PREV="$(PREV)" BUILD_CURRENT="$(BUILD_CURRENT)" ./scripts/rolling-upgrade-check.sh
+
 validate-ursp: ## Validate URSP policy delivery (requires: make ueransim or make ueransim-all)
 	./scripts/validate-ursp.sh
 
@@ -404,7 +420,17 @@ full: ## Build + start NFs + obs + portal + UERANSIM multi-slice + PacketRusher 
 full-down: ## Stop and clean volumes from complete stack
 	$(COMPOSE) $(ALL_PROFILES) down -v
 
+## token-audit: estimate context-token cost of instructions, agents, skills, big docs/code (scripts/token-audit.sh); fails if a budget is exceeded
+.PHONY: token-audit
+token-audit:
+	@./scripts/token-audit.sh --budget CLAUDE.md=4500 --budget AGENTS.md=3000 --budget nf/amf/CLAUDE.md=8500 --budget .claude/agents/orchestrator.md=3600
+
 ## docs-check: docs drift linter (code vs docs; rules in docs/DOC_MAP.md). STRICT=1 fails on warnings, BASE=<ref> adds a changed-code-without-docs check
 .PHONY: docs-check
 docs-check:
 	@if [ -x ./scripts/docs-lint.sh ]; then ./scripts/docs-lint.sh $(if $(STRICT),--strict) $(if $(BASE),--diff $(BASE)); else echo "docs-check: linter not available in this repo (maintained internally) — skipping"; fi
+
+## release-leak-test: assert no private-edition artefact is in the public release tree (dry-run, no push)
+.PHONY: release-leak-test
+release-leak-test:
+	./scripts/test-release-leak.sh

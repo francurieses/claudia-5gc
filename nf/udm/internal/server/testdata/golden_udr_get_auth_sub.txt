@@ -1,0 +1,8 @@
+GET /nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription
+Content-Type: 
+Accept: 
+
+
+
+--- result
+{"AuthMethod":"5G_AKA","K":"00112233445566778899aabbccddeeff","OPc":"ffeeddccbbaa99887766554433221100","AMF":"8000","SQN":"000000000020","AlgID":"milenage"}

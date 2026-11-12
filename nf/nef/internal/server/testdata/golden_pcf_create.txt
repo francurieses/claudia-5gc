@@ -1,0 +1,6 @@
+POST /npcf-policyauthorization/v1/app-sessions
+Content-Type: application/json
+Accept: application/json
+Content-Length: 230
+
+{"ascReqData":{"aspId":"af-1","afAppId":"app-1","ueIpv4":"10.60.0.1","qosReference":"qos-1","dnn":"internet","sliceInfo":{"sst":1,"sd":"000001"},"medComponents":{"1":{"medType":"DATA","fDescs":["permit out ip from any to any"]}}}}

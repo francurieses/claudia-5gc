@@ -122,7 +122,7 @@ type ntsrWorld struct {
 	released []string            // smContextRefs released (DELETE sm-contexts/{ref})
 	relCh    chan string         // signalled on every SM context release
 
-	logs *bytes.Buffer
+	logs *tcLockedBuf // goroutine-safe: written by slog handler goroutines, read by requireSR
 
 	srErr    error
 	icsCount int
@@ -143,7 +143,7 @@ func (w *ntsrWorld) reset() {
 	w.requests = map[string][]string{}
 	w.released = nil
 	w.relCh = make(chan string, 16)
-	w.logs = &bytes.Buffer{}
+	w.logs = &tcLockedBuf{}
 	w.srErr, w.icsCount, w.icsNAS, w.icsItems, w.preDL = nil, 0, nil, nil, 0
 	w.smf = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		// /nsmf-pdusession/v1/sm-contexts/{ref}/modify
@@ -305,8 +305,8 @@ func (w *ntsrWorld) requireSR() error {
 	if w.srErr != nil {
 		return fmt.Errorf("Service Request handling failed: %w", w.srErr)
 	}
-	if bytes.Contains(w.logs.Bytes(), []byte("NAS MAC mismatch")) ||
-		bytes.Contains(w.logs.Bytes(), []byte("NAS MAC verification error")) {
+	if strings.Contains(w.logs.String(), "NAS MAC mismatch") ||
+		strings.Contains(w.logs.String(), "NAS MAC verification error") {
 		return fmt.Errorf("uplink Service Request failed NIA2 verification: %s", w.logs.String())
 	}
 	return nil

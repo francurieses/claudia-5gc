@@ -319,3 +319,87 @@ func TestProvideLocInfo_MissingReq5gsLoc(t *testing.T) {
 		t.Errorf("cause = %q, want MANDATORY_IE_MISSING", pd.Cause)
 	}
 }
+
+// TestProvideLocInfo_Rel19_Shape verifies the rel19 answer is the TS 29.518
+// ProvideLocInfo data type: nrLocation with tai+ncgi, locationAge, currentLoc,
+// and none of the legacy LocationData attributes.
+// Ref: TS 29.518 §6.4.6.2.6; TS 29.571 NrLocation schema.
+func TestProvideLocInfo_Rel19_Shape(t *testing.T) {
+	raw := provideLocInfoBody(t, profileNamed(t, "rel19"))
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, legacy := range []string{"locationEstimate", "nrCellId", "tai", "ageOfLocationEstimate"} {
+		if _, ok := m[legacy]; ok {
+			t.Errorf("rel19 body carries legacy attribute %q: %s", legacy, raw)
+		}
+	}
+	var p ProvideLocInfo
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.CurrentLoc == nil || !*p.CurrentLoc || p.RatType != "NR" || p.Location == nil || p.Location.NrLocation == nil {
+		t.Fatalf("unexpected ProvideLocInfo: %s", raw)
+	}
+	nr := p.Location.NrLocation
+	if nr.Ncgi.NrCellId != "000000042" || nr.Tai.Tac != "000001" || nr.Tai.PlmnId.MCC != "001" || nr.Ncgi.PlmnId.MNC != "01" {
+		t.Errorf("nrLocation = %+v", nr)
+	}
+}
+
+// TestProvideLocInfo_Rel19_IncompleteLocation: NrLocation requires tai and
+// ncgi, so under rel19 a gNB report lacking either yields a 500 SYSTEM_FAILURE
+// ProblemDetails instead of an empty 200. Rel17 stays on the legacy answer.
+func TestProvideLocInfo_Rel19_IncompleteLocation(t *testing.T) {
+	tests := []struct {
+		name   string
+		result ngap.LocationResult
+	}{
+		{"cell without TAI", ngap.LocationResult{NRCellID: "000000042"}},
+		{"TAI without cell", ngap.LocationResult{TAI: &ngap.TAI{MCC: "001", MNC: "01", TAC: 1}}},
+		{"neither", ngap.LocationResult{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, mgr := newTestServer(t)
+			srv.SetProfile(profileNamed(t, "rel19"))
+			seedConnectedUE(mgr, "imsi-001010000000001")
+			srv.SetLocator(&fakeLocator{result: tc.result})
+			resp, raw := postLocInfo(t, srv, "imsi-001010000000001", []byte(`{"req5gsLoc":true}`))
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500; body=%s", resp.StatusCode, raw)
+			}
+			var pd ProblemDetails
+			if err := json.Unmarshal(raw, &pd); err != nil {
+				t.Fatalf("decode ProblemDetails: %v", err)
+			}
+			if pd.Cause != CauseSystemFailure {
+				t.Errorf("cause = %q, want %q", pd.Cause, CauseSystemFailure)
+			}
+		})
+	}
+}
+
+// TestProvideLocInfo_Rel17_NoTAIUnchanged: the legacy answer still carries the
+// cell id when the gNB reported no TAI.
+func TestProvideLocInfo_Rel17_NoTAIUnchanged(t *testing.T) {
+	srv, mgr := newTestServer(t)
+	seedConnectedUE(mgr, "imsi-001010000000001")
+	srv.SetLocator(&fakeLocator{result: ngap.LocationResult{NRCellID: "000000042"}})
+	resp, raw := postLocInfo(t, srv, "imsi-001010000000001", []byte(`{"req5gsLoc":true}`))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+	}
+	var ld LocationData
+	if err := json.Unmarshal(raw, &ld); err != nil {
+		t.Fatal(err)
+	}
+	if ld.NRCellId != "000000042" || ld.Tai != nil {
+		t.Errorf("LocationData = %+v", ld)
+	}
+}
+
+func TestGolden_ProvideLocInfo_Rel19(t *testing.T) {
+	checkLocGolden(t, "provide_loc_info_rel19_200.json", provideLocInfoBody(t, profileNamed(t, "rel19")))
+}

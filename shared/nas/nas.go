@@ -34,10 +34,10 @@ const (
 type SecurityHeaderType byte
 
 const (
-	SecurityHeaderPlainNAS             SecurityHeaderType = 0x00
-	SecurityHeaderIntegrityProtected   SecurityHeaderType = 0x01
-	SecurityHeaderIntegrityProtectedAndCiphered SecurityHeaderType = 0x02
-	SecurityHeaderIntegrityProtectedWithNewSC   SecurityHeaderType = 0x03
+	SecurityHeaderPlainNAS                               SecurityHeaderType = 0x00
+	SecurityHeaderIntegrityProtected                     SecurityHeaderType = 0x01
+	SecurityHeaderIntegrityProtectedAndCiphered          SecurityHeaderType = 0x02
+	SecurityHeaderIntegrityProtectedWithNewSC            SecurityHeaderType = 0x03
 	SecurityHeaderIntegrityProtectedAndCipheredWithNewSC SecurityHeaderType = 0x04
 )
 
@@ -47,56 +47,56 @@ type MessageType byte
 
 const (
 	// 5GS Mobility Management messages
-	MsgTypeRegistrationRequest      MessageType = 0x41
-	MsgTypeRegistrationAccept       MessageType = 0x42
-	MsgTypeRegistrationComplete     MessageType = 0x43
-	MsgTypeRegistrationReject       MessageType = 0x44
-	MsgTypeDeregistrationRequestUE  MessageType = 0x45
-	MsgTypeDeregistrationAcceptUE   MessageType = 0x46
-	MsgTypeDeregistrationRequestNW  MessageType = 0x47
-	MsgTypeDeregistrationAcceptNW   MessageType = 0x48
-	MsgTypeServiceRequest           MessageType = 0x4C
-	MsgTypeServiceReject            MessageType = 0x4D
-	MsgTypeServiceAccept            MessageType = 0x4E
-	MsgTypeControlPlaneServiceRequest MessageType = 0x4F
-	MsgTypeNetworkSliceSpecificAuthCommand    MessageType = 0x50
-	MsgTypeNetworkSliceSpecificAuthComplete   MessageType = 0x51
-	MsgTypeNetworkSliceSpecificAuthResult     MessageType = 0x52
-	MsgTypeConfigurationUpdateCommand  MessageType = 0x54
-	MsgTypeConfigurationUpdateComplete MessageType = 0x55
-	MsgTypeAuthenticationRequest    MessageType = 0x56
-	MsgTypeAuthenticationResponse   MessageType = 0x57
-	MsgTypeAuthenticationReject     MessageType = 0x58
-	MsgTypeAuthenticationFailure    MessageType = 0x59
-	MsgTypeAuthenticationResult     MessageType = 0x5A
-	MsgTypeIdentityRequest          MessageType = 0x5B
-	MsgTypeIdentityResponse         MessageType = 0x5C
-	MsgTypeSecurityModeCommand      MessageType = 0x5D
-	MsgTypeSecurityModeComplete     MessageType = 0x5E
-	MsgTypeSecurityModeReject       MessageType = 0x5F
-	MsgTypeStatus5GMM               MessageType = 0x64
-	MsgTypeNotification             MessageType = 0x65
-	MsgTypeNotificationResponse     MessageType = 0x66
-	MsgTypeULNASTransport           MessageType = 0x67
-	MsgTypeDLNASTransport           MessageType = 0x68
+	MsgTypeRegistrationRequest              MessageType = 0x41
+	MsgTypeRegistrationAccept               MessageType = 0x42
+	MsgTypeRegistrationComplete             MessageType = 0x43
+	MsgTypeRegistrationReject               MessageType = 0x44
+	MsgTypeDeregistrationRequestUE          MessageType = 0x45
+	MsgTypeDeregistrationAcceptUE           MessageType = 0x46
+	MsgTypeDeregistrationRequestNW          MessageType = 0x47
+	MsgTypeDeregistrationAcceptNW           MessageType = 0x48
+	MsgTypeServiceRequest                   MessageType = 0x4C
+	MsgTypeServiceReject                    MessageType = 0x4D
+	MsgTypeServiceAccept                    MessageType = 0x4E
+	MsgTypeControlPlaneServiceRequest       MessageType = 0x4F
+	MsgTypeNetworkSliceSpecificAuthCommand  MessageType = 0x50
+	MsgTypeNetworkSliceSpecificAuthComplete MessageType = 0x51
+	MsgTypeNetworkSliceSpecificAuthResult   MessageType = 0x52
+	MsgTypeConfigurationUpdateCommand       MessageType = 0x54
+	MsgTypeConfigurationUpdateComplete      MessageType = 0x55
+	MsgTypeAuthenticationRequest            MessageType = 0x56
+	MsgTypeAuthenticationResponse           MessageType = 0x57
+	MsgTypeAuthenticationReject             MessageType = 0x58
+	MsgTypeAuthenticationFailure            MessageType = 0x59
+	MsgTypeAuthenticationResult             MessageType = 0x5A
+	MsgTypeIdentityRequest                  MessageType = 0x5B
+	MsgTypeIdentityResponse                 MessageType = 0x5C
+	MsgTypeSecurityModeCommand              MessageType = 0x5D
+	MsgTypeSecurityModeComplete             MessageType = 0x5E
+	MsgTypeSecurityModeReject               MessageType = 0x5F
+	MsgTypeStatus5GMM                       MessageType = 0x64
+	MsgTypeNotification                     MessageType = 0x65
+	MsgTypeNotificationResponse             MessageType = 0x66
+	MsgTypeULNASTransport                   MessageType = 0x67
+	MsgTypeDLNASTransport                   MessageType = 0x68
 
 	// 5GS Session Management messages
-	MsgTypePDUSessionEstablishmentRequest  MessageType = 0xC1
-	MsgTypePDUSessionEstablishmentAccept   MessageType = 0xC2
-	MsgTypePDUSessionEstablishmentReject   MessageType = 0xC3
-	MsgTypePDUSessionAuthenticationCommand  MessageType = 0xC5
-	MsgTypePDUSessionAuthenticationComplete MessageType = 0xC6
-	MsgTypePDUSessionAuthenticationResult   MessageType = 0xC7
-	MsgTypePDUSessionModificationRequest    MessageType = 0xC9
-	MsgTypePDUSessionModificationReject     MessageType = 0xCA
-	MsgTypePDUSessionModificationCommand    MessageType = 0xCB
-	MsgTypePDUSessionModificationComplete   MessageType = 0xCC
+	MsgTypePDUSessionEstablishmentRequest      MessageType = 0xC1
+	MsgTypePDUSessionEstablishmentAccept       MessageType = 0xC2
+	MsgTypePDUSessionEstablishmentReject       MessageType = 0xC3
+	MsgTypePDUSessionAuthenticationCommand     MessageType = 0xC5
+	MsgTypePDUSessionAuthenticationComplete    MessageType = 0xC6
+	MsgTypePDUSessionAuthenticationResult      MessageType = 0xC7
+	MsgTypePDUSessionModificationRequest       MessageType = 0xC9
+	MsgTypePDUSessionModificationReject        MessageType = 0xCA
+	MsgTypePDUSessionModificationCommand       MessageType = 0xCB
+	MsgTypePDUSessionModificationComplete      MessageType = 0xCC
 	MsgTypePDUSessionModificationCommandReject MessageType = 0xCD
-	MsgTypePDUSessionReleaseRequest         MessageType = 0xD1
-	MsgTypePDUSessionReleaseReject          MessageType = 0xD2
-	MsgTypePDUSessionReleaseCommand         MessageType = 0xD3
-	MsgTypePDUSessionReleaseComplete        MessageType = 0xD4
-	MsgTypeStatus5GSM                       MessageType = 0xD6
+	MsgTypePDUSessionReleaseRequest            MessageType = 0xD1
+	MsgTypePDUSessionReleaseReject             MessageType = 0xD2
+	MsgTypePDUSessionReleaseCommand            MessageType = 0xD3
+	MsgTypePDUSessionReleaseComplete           MessageType = 0xD4
+	MsgTypeStatus5GSM                          MessageType = 0xD6
 )
 
 // ---- NAS PDU Header (TS 24.501 §9.1.1) -----------------------------------

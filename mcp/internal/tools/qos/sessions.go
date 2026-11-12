@@ -44,7 +44,8 @@ func (sessionListTool) Risk() registry.Risk { return registry.ReadOnly }
 func (sessionListTool) Description() string {
 	return "List all active PDU sessions held by the SMF session store. " +
 		"Returns supi, pduSessionId, dnn, sNssai, current5qi, qosSource, session AMBR, " +
-		"UPF TEID and session state for each session."
+		"UPF TEID, session state and the UE 5GSM capability (capability5gsm hex, " +
+		"capability5gsmBits names; \"\" and [] when the UE sent no IE) for each session."
 }
 func (sessionListTool) InputSchema() json.RawMessage {
 	return schema(`{"type":"object","properties":{}}`)
@@ -239,7 +240,7 @@ func (t sessionQoSSetTool) Plan(ctx context.Context, in json.RawMessage) (any, e
 		"ambr_dl_mbps":    a.AMBRDLMbps,
 		"ambr_ul_mbps":    a.AMBRULMbps,
 		"persist_policy":  a.PersistPolicy,
-		"current_session": json.RawMessage(current),
+		"current_session": current,
 		"effect":          "PFCP QER update to UPF, then NAS PDU Session Modification to the UE (CM-CONNECTED only)",
 	}, nil
 }

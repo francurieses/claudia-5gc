@@ -50,6 +50,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // secondaryAuthSpecRef is the TS 23.502 clause governing the whole secondary
@@ -115,8 +116,16 @@ type pendingSecondaryAuth struct {
 	// decode. Ref: TS 24.008 §10.5.6.3, TS 24.501 §9.11.4.2.
 	PCORequest *nas.PDUSessionEstablishmentRequest
 
+	// Capability5GSM is the UE's decoded 5GSM capability IE, carried to the
+	// deferred Session. Nil when absent. Ref: TS 24.501 §9.11.4.1
+	Capability5GSM *nas.FiveGSMCapability
+
 	ULTEID uint32
 	SEID   uint64
+
+	// Features is the Nsmf_PDUSession feature set negotiated at
+	// CreateSMContext, carried to the Session created on authorization.
+	Features features.Set
 }
 
 // DNAAAClient is the SMF's seam onto the Data Network AAA server reached over
@@ -210,7 +219,7 @@ func (s *Server) startSecondaryAuth(ctx context.Context, pending *pendingSeconda
 	n1Msg := nas.WrapPDUSessionAuthenticationCommandBody(pending.PDUSessionID, pending.PTI, eapReq)
 
 	log.Info("secondary authentication started — AUTH COMMAND built",
-		"nf", "SMF", "interface", "N1", "direction", "OUT",
+		"interface", "N1", "direction", "OUT",
 		"spec_ref", "TS 23.502 §4.3.2.3 step 3",
 		"supi", pending.SUPI, "pdu_session_id", pending.PDUSessionID, "dnn", pending.DNN,
 	)
@@ -233,7 +242,7 @@ func (s *Server) startSecondaryAuth(ctx context.Context, pending *pendingSeconda
 
 	if _, err := s.n1n2Push(ctx, pending.SUPI, pending.PDUSessionID, n1Msg, nil, ""); err != nil {
 		log.Warn("secondary authentication: N1N2MessageTransfer for AUTH COMMAND failed",
-			"nf", "SMF", "interface", "N1", "direction", "OUT", "error", err,
+			"interface", "N1", "direction", "OUT", "error", err,
 			"spec_ref", "TS 29.518 §5.2.2.3",
 		)
 	}
@@ -252,6 +261,10 @@ func (s *Server) pushN1N2Message(ctx context.Context, supi string, psi uint8, n1
 		return "", fmt.Errorf("smf: amf SBI peer not configured")
 	}
 	payload := map[string]any{"pduSessionId": psi}
+	offer := s.n1n2Offer()
+	if offer != "" { // rel19 only (decision D2); rel17 body unchanged
+		payload["supportedFeatures"] = offer
+	}
 	if len(n1SmMsg) > 0 {
 		payload["n1SmMsg"] = base64.StdEncoding.EncodeToString(n1SmMsg)
 	}
@@ -280,9 +293,11 @@ func (s *Server) pushN1N2Message(ctx context.Context, supi string, psi uint8, n1
 		return "", fmt.Errorf("smf: N1N2MessageTransfer: status %d", resp.StatusCode)
 	}
 	var rsp struct {
-		Cause string `json:"cause"`
+		Cause             string `json:"cause"`
+		SupportedFeatures string `json:"supportedFeatures"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&rsp)
+	s.acceptN1N2Features(ctx, offer, rsp.SupportedFeatures, "supi", supi, "pdu_session_id", psi)
 	return rsp.Cause, nil
 }
 
@@ -302,7 +317,7 @@ func (s *Server) handleSecondaryAuthComplete(w http.ResponseWriter, r *http.Requ
 	eapResp, err := nas.DecodePDUSessionAuthenticationCompleteBody(n1SmMsgBytes[4:])
 	if err != nil {
 		log.Warn("AUTH COMPLETE: malformed EAP message IE",
-			"nf", "SMF", "interface", "N1", "direction", "IN",
+			"interface", "N1", "direction", "IN",
 			"spec_ref", "TS 24.501 §9.11.2.2", "result", "REJECT", "error", err,
 		)
 		if span != nil {
@@ -321,7 +336,7 @@ func (s *Server) handleSecondaryAuthComplete(w http.ResponseWriter, r *http.Requ
 	pending := s.getPendingAuth(smContextRef)
 	if pending == nil {
 		log.Warn("AUTH COMPLETE: no pending secondary authentication for sm context",
-			"nf", "SMF", "smContextRef", smContextRef, "result", "REJECT")
+			"smContextRef", smContextRef, "result", "REJECT")
 		if span != nil {
 			span.SetAttributes(
 				attribute.String("result", "REJECT"),
@@ -344,7 +359,7 @@ func (s *Server) handleSecondaryAuthComplete(w http.ResponseWriter, r *http.Requ
 	}
 
 	log.Info("AUTH COMPLETE received — relaying EAP-Response to DN-AAA over N6",
-		"nf", "SMF", "interface", "N1", "direction", "IN",
+		"interface", "N1", "direction", "IN",
 		"spec_ref", "TS 23.502 §4.3.2.3 step 5",
 		"supi", pending.SUPI, "pdu_session_id", psi, "dnn", pending.DNN,
 	)
@@ -359,7 +374,7 @@ func (s *Server) handleSecondaryAuthComplete(w http.ResponseWriter, r *http.Requ
 
 	if aaErr != nil {
 		log.Warn("DN-AAA unreachable/timeout — rejecting PDU session establishment",
-			"nf", "SMF", "interface", "N6", "direction", "OUT",
+			"interface", "N6", "direction", "OUT",
 			"spec_ref", "TS 24.501 §9.11.4.2",
 			"supi", pending.SUPI, "pdu_session_id", psi, "dnn", pending.DNN,
 			"result", "REJECT", "cause", nas.Cause5GSMUserAuthOrAuthorizationFailed, "error", aaErr,
@@ -372,14 +387,14 @@ func (s *Server) handleSecondaryAuthComplete(w http.ResponseWriter, r *http.Requ
 	code, _ := eap.Code(terminal)
 	if code == eap.CodeSuccess {
 		log.Info("DN-AAA returned EAP-Success — proceeding to N4",
-			"nf", "SMF", "interface", "N6", "direction", "IN",
+			"interface", "N6", "direction", "IN",
 			"spec_ref", "TS 23.502 §4.3.2.3 step 6",
 			"supi", pending.SUPI, "pdu_session_id", psi, "dnn", pending.DNN, "result", "OK",
 		)
 		s.completeSecondaryAuth(detached, pending, terminal, log)
 	} else {
 		log.Info("DN-AAA returned EAP-Failure — rejecting PDU session establishment",
-			"nf", "SMF", "interface", "N6", "direction", "IN",
+			"interface", "N6", "direction", "IN",
 			"spec_ref", "TS 24.501 §9.11.4.2",
 			"supi", pending.SUPI, "pdu_session_id", psi, "dnn", pending.DNN,
 			"result", "REJECT", "cause", nas.Cause5GSMUserAuthOrAuthorizationFailed,
@@ -431,6 +446,8 @@ func (s *Server) completeSecondaryAuth(ctx context.Context, pending *pendingSeco
 		CreatedAt:      time.Now(),
 		PDUSessionType: pending.GrantedType,
 		UEIPv6Prefix:   v6PrefixStr,
+		Features:       pending.Features,
+		Capability5GSM: pending.Capability5GSM,
 	}
 	s.sessionMu.Lock()
 	s.sessions[pending.SmContextRef] = sess
@@ -480,7 +497,7 @@ func (s *Server) completeSecondaryAuth(ctx context.Context, pending *pendingSeco
 	}
 
 	log.Info("secondary authentication authorized — ESTABLISHMENT ACCEPT built",
-		"nf", "SMF", "interface", "N1", "direction", "OUT",
+		"interface", "N1", "direction", "OUT",
 		"spec_ref", "TS 23.502 §4.3.2.3 step 9",
 		"supi", pending.SUPI, "pdu_session_id", pending.PDUSessionID, "dnn", pending.DNN,
 		"5qi", policyQoS.FiveQI, "result", "OK",
@@ -535,7 +552,7 @@ func (s *Server) rejectSecondaryAuth(ctx context.Context, pending *pendingSecond
 		pending.PDUSessionID, pending.PTI, nas.Cause5GSMUserAuthOrAuthorizationFailed, eapFailure)
 
 	log.Info("secondary authentication rejected — ESTABLISHMENT REJECT built",
-		"nf", "SMF", "interface", "N1", "direction", "OUT",
+		"interface", "N1", "direction", "OUT",
 		"spec_ref", "TS 24.501 §9.11.4.2",
 		"supi", pending.SUPI, "pdu_session_id", pending.PDUSessionID, "dnn", pending.DNN,
 		"result", "REJECT", "cause", nas.Cause5GSMUserAuthOrAuthorizationFailed,
@@ -553,4 +570,12 @@ func (s *Server) rejectSecondaryAuth(ctx context.Context, pending *pendingSecond
 		log.Warn("secondary auth: N1N2MessageTransfer for ESTABLISHMENT REJECT failed",
 			"error", err, "spec_ref", "TS 29.518 §5.2.2.3")
 	}
+}
+
+// capability5GSMOf returns the decoded 5GSM capability of req, nil-safe.
+func capability5GSMOf(req *nas.PDUSessionEstablishmentRequest) *nas.FiveGSMCapability {
+	if req == nil {
+		return nil
+	}
+	return req.Capability5GSM
 }

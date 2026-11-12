@@ -1,0 +1,1 @@
+{"nfInstanceId":"11111111-2222-3333-4444-555555555555","nfType":"AUSF","nfStatus":"REGISTERED","nfServices":[{"serviceInstanceId":"11111111-2222-3333-4444-555555555555-nausf-auth","serviceName":"nausf-auth","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.2.3"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

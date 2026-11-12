@@ -14,11 +14,17 @@ import (
 	"time"
 )
 
+// jwtHeader is the JOSE header of an NRF-issued access token.
+//
+// oapi: none JWT header, not an SBI body
 type jwtHeader struct {
 	Alg string `json:"alg"`
 	Typ string `json:"typ"`
 }
 
+// jwtClaims is the claim set of an NRF-issued access token.
+//
+// oapi: TS29510_Nnrf_AccessToken.yaml#/components/schemas/AccessTokenClaims
 type jwtClaims struct {
 	Issuer    string   `json:"iss"`
 	Subject   string   `json:"sub"`

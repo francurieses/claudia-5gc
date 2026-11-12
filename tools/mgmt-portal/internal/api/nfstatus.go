@@ -26,14 +26,15 @@ var knownNFs = []struct {
 	{"bsf", "https://bsf:8010", "9111"},
 	{"nef", "https://nef:8011", "9112"},
 	{"lmf", "https://lmf:8012", "9113"},
+	{"vsepp", "https://vsepp:8014", "9115"},
 }
 
 // NFStatus holds the health status for a single NF.
 type NFStatus struct {
-	Name         string `json:"name"`
-	Registered   bool   `json:"registered"`
-	HealthzOK    bool   `json:"healthz_ok"`
-	MetricsOK    bool   `json:"metrics_ok"`
+	Name       string `json:"name"`
+	Registered bool   `json:"registered"`
+	HealthzOK  bool   `json:"healthz_ok"`
+	MetricsOK  bool   `json:"metrics_ok"`
 }
 
 func (d Deps) handleNFStatus(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +125,8 @@ func toNFType(name string) string {
 		return "NEF"
 	case "lmf":
 		return "LMF"
+	case "vsepp":
+		return "SEPP"
 	default:
 		return name
 	}

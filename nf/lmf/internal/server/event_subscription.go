@@ -5,13 +5,13 @@
 //	POST   /nlmf-loc/v1/subscriptions                → 201 + Location
 //	GET    /nlmf-loc/v1/subscriptions/{subId}         → 200 subscription resource
 //	DELETE /nlmf-loc/v1/subscriptions/{subId}         → 204 (CancelLocation)
-//	POST   /nlmf-loc/v1/ue-contexts/{id}/cancel-loc   → 204 (in-progress one-shot cancel)
+//	POST   /nlmf-loc/v1/cancel-location               → 204 (in-progress one-shot cancel)
 //
 // Each active subscription drives one goroutine that periodically calls s.locate()
 // and POSTs LocationNotification bodies to the caller's notificationUri.
 //
 // Ref: TS 29.572 §5.2.3 (EventSubscription Create/Get/Delete).
-// Ref: TS 29.572 §5.2.2.5 (CancelLocation).
+// Ref: TS 29.572 §5.2.2.4.2 (CancelLocation).
 // Ref: TS 29.572 §6.1.6.2.4 (LocationNotification body schema).
 // Ref: TS 23.273 §7.2 step B2 (deferred location subscription).
 package server
@@ -19,18 +19,22 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
-	"sync"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // locationEventSubscriptionRequest is the JSON body for POST /nlmf-loc/v1/subscriptions.
 // Ref: TS 29.572 §5.2.3.2, §6.1.6.2.x.
+//
+// oapi: none project-specific flat Nlmf_Location subscription API, not a TS 29.572 schema
 type locationEventSubscriptionRequest struct {
 	// UEContextId is the UE identity (supi, gpsi, or 5G-GUTI).
 	// Mutually exclusive with Supi/Gpsi in the flat body variant; accepted as alias.
@@ -58,6 +62,8 @@ type locationEventSubscriptionRequest struct {
 
 // areaOfInterestInput holds the polygon vertices.
 // Ref: TS 29.572 §6.1.6.2.2; TS 29.571 §5.4 (GeographicArea).
+//
+// oapi: none project-specific flat Nlmf_Location subscription API, not a TS 29.572 schema
 type areaOfInterestInput struct {
 	// Shape is optional; "POLYGON" is assumed when polygon is non-empty.
 	Shape string `json:"shape,omitempty"`
@@ -67,6 +73,8 @@ type areaOfInterestInput struct {
 
 // subscriptionResource is the JSON body returned on 201 Create and 200 Get.
 // Ref: TS 29.571 §5.2 (subscription resource schema).
+//
+// oapi: none project-specific flat Nlmf_Location subscription API, not a TS 29.572 schema
 type subscriptionResource struct {
 	SubId             string               `json:"subId"`
 	UEContextId       string               `json:"ueContextId"`
@@ -266,7 +274,19 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 
 	// Start the goroutine after inserting into the registry so that GET can see
 	// the resource immediately.
-	go s.runSubscription(gctx, subId, supi, corrID)
+	// The goroutine is tracked (goBG) so Shutdown can await it; once the server
+	// is draining the subscription is rolled back and refused.
+	if !s.goBG(func() { s.runSubscription(gctx, subId, supi, corrID) }) {
+		s.registry.delete(subId) // also cancels gctx
+		metrics.LMFSubscriptionsActive.Set(float64(s.registry.count()))
+		metrics.LMFSubscriptionCreateTotal.WithLabelValues("FAILURE").Inc()
+		log.Warn("EventSubscription Create: server is shutting down",
+			"result", "REJECT", "cause", "NF_CONGESTION", "sub_id", subId,
+			"spec_ref", "TS 29.500 §5.2.7.2")
+		w.Header().Set("Retry-After", strconv.Itoa(shutdownRetryAfterSecs))
+		s.problem(w, http.StatusServiceUnavailable, "NF_CONGESTION", "LMF is shutting down")
+		return
+	}
 
 	log = log.With("sub_id", subId, "supi", supi)
 	durationMs := time.Since(start).Milliseconds()
@@ -328,7 +348,7 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 // ---- handleDeleteSubscription (DELETE /nlmf-loc/v1/subscriptions/{subId}) ---------
 
 // handleDeleteSubscription cancels and removes a subscription (CancelLocation).
-// Ref: TS 29.572 §5.2.3.4 / §5.2.2.5.
+// Ref: TS 29.572 §5.2.3.4 / §5.2.2.4.2.
 func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	subId := r.PathValue("subId")
@@ -360,15 +380,45 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---- handleCancelLocation (POST /nlmf-loc/v1/ue-contexts/{id}/cancel-loc) ---------
+// ---- handleCancelLocation (POST /nlmf-loc/v1/cancel-location) ---------
+
+// cancelLocData is the CancelLocation request body (CancelLocData,
+// TS 29.572 §6.1.6.2.x) plus the LMF-local supi/gpsi hint used to find the
+// in-flight DetermineLocation.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/CancelLocData
+type cancelLocData struct {
+	HgmlcCallBackURI string `json:"hgmlcCallBackURI,omitempty"`
+	LdrReference     string `json:"ldrReference,omitempty"`
+	// LcsCorrelationID, when present, identifies the location session on its
+	// own: hgmlcCallBackURI / ldrReference are then ignored (NOTE 1).
+	LcsCorrelationID  string `json:"lcsCorrelationID,omitempty"`
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
+	// Supi / Gpsi: LMF-local extension identifying the UE of the pending request.
+	// Receiver-only: sent by this project's own consumers, never by a third party.
+	// oapi-ext: CancelLocData identifies the session by hgmlcCallBackURI/ldrReference/lcsCorrelationID and carries no UE identity (TS 29.572 §6.1.6.2.29); the LMF-local UE hint has no spec home.
+	Supi string `json:"supi,omitempty"`
+	// oapi-ext: see Supi.
+	Gpsi string `json:"gpsi,omitempty"`
+}
 
 // handleCancelLocation implements the CancelLocation one-shot cancel.
 // It aborts any currently blocked DetermineLocation request for the UE by
 // cancelling its stored context. Returns 204 even when no request is in progress
-// (idempotent). Ref: TS 29.572 §5.2.2.5.
+// (idempotent). Ref: TS 29.572 §5.2.2.4.2.
 func (s *Server) handleCancelLocation(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ueContextId := r.PathValue("ueContextId")
+	// CancelLocData (TS29572_Nlmf_Location.yaml) carries hgmlcCallBackURI and
+	// ldrReference only; it has no UE identity. The LMF locates the pending
+	// DetermineLocation through the optional supi/gpsi hint (an LMF-local
+	// extension) and otherwise treats the cancel as an idempotent no-op.
+	var cancelReq cancelLocData
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	decErr := json.NewDecoder(r.Body).Decode(&cancelReq) // empty/invalid body tolerated (idempotent)
+	ueContextId := cancelReq.Supi
+	if ueContextId == "" {
+		ueContextId = cancelReq.Gpsi
+	}
 	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
 	corrID := logging.CorrelationID(ctx)
 
@@ -376,10 +426,61 @@ func (s *Server) handleCancelLocation(w http.ResponseWriter, r *http.Request) {
 		"nf", "LMF",
 		"interface", "Nlmf",
 		"direction", "IN",
-		"spec_ref", "TS 29.572 §5.2.2.5",
+		"spec_ref", "TS 29.572 §5.2.2.4.2",
 		"correlation_id", corrID,
 		"ue_context_id", ueContextId,
 	)
+
+	// Rel-19 (spec-literal): CancelLocData identifies a deferred-location
+	// session by hgmlcCallBackURI + ldrReference; an oversized body is 413.
+	// rel17 / no profile keeps the legacy idempotent behaviour above.
+	// Ref: TS 29.572 §5.2.2.4.2; TS29572_Nlmf_Location.yaml CancelLocData.
+	if features.SpecLiteral(s.profile) {
+		var mbe *http.MaxBytesError
+		if errors.As(decErr, &mbe) {
+			payloadTooLarge(log, w)
+			return
+		}
+		var ute *json.UnmarshalTypeError
+		if errors.As(decErr, &ute) {
+			s.problemInvalid(w, "INVALID_MSG_FORMAT", "request body has an attribute of the wrong type")
+			return
+		}
+		// lcsCorrelationID present: hgmlcCallBackURI / ldrReference are ignored
+		// (CancelLocData NOTE 1) and the cancel goes to the pending location of
+		// the UE below.
+		if cancelReq.LcsCorrelationID == "" &&
+			(cancelReq.LdrReference != "" || cancelReq.HgmlcCallBackURI != "") {
+			if bad := validateCallback(cancelReq.HgmlcCallBackURI, cancelReq.LdrReference); len(bad) > 0 {
+				log.Warn("CancelLocation: invalid CancelLocData",
+					"result", "REJECT", "cause", "MANDATORY_IE_INCORRECT",
+					"duration_ms", time.Since(start).Milliseconds())
+				procDeferred("REJECT")
+				s.problemInvalid(w, "MANDATORY_IE_INCORRECT", "CancelLocData is invalid", bad...)
+				return
+			}
+			// The session is released silently: no EventNotify on a
+			// GMLC-initiated cancel (TS 23.273 §6.3.3 step 5).
+			if s.cancelDeferred(cancelReq.LdrReference, cancelReq.HgmlcCallBackURI) {
+				log.Info("CancelLocation: deferred location session cancelled",
+					"result", "OK", "ldr_reference", cancelReq.LdrReference,
+					"duration_ms", time.Since(start).Milliseconds())
+				procDeferred("OK")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			if _, pending := s.pendingLoc.Load(ueContextId); !pending {
+				log.Info("CancelLocation: no such deferred location session",
+					"result", "FAILURE", "cause", "LOCATION_SESSION_UNKNOWN",
+					"ldr_reference", cancelReq.LdrReference,
+					"duration_ms", time.Since(start).Milliseconds())
+				procDeferred("REJECT")
+				s.problem(w, http.StatusForbidden, "LOCATION_SESSION_UNKNOWN",
+					"no deferred location session for ldrReference "+cancelReq.LdrReference)
+				return
+			}
+		}
+	}
 
 	// Look up a cancel func registered by a pending DetermineLocation request.
 	if v, ok := s.pendingLoc.Load(ueContextId); ok {
@@ -392,7 +493,7 @@ func (s *Server) handleCancelLocation(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Info("CancelLocation: no in-progress locate for UE (idempotent no-op)",
 			"result", "OK",
-			"spec_ref", "TS 29.572 §5.2.2.5",
+			"spec_ref", "TS 29.572 §5.2.2.4.2",
 			"duration_ms", time.Since(start).Milliseconds())
 	}
 
@@ -423,6 +524,10 @@ func (s *Server) runSubscription(ctx context.Context, subId, supi, parentCorrID 
 	// AOI state machine: start UNKNOWN; first resolved state sets the baseline
 	// without firing a notification (suppress the synthetic UNKNOWN→IN/OUT transition).
 	prevState := aoiStateUnknown
+	var dstate deferredState // deferred-location sessions only
+	if snap.deferred != nil {
+		dstate = newDeferredState(snap)
+	}
 
 	for {
 		select {
@@ -430,16 +535,25 @@ func (s *Server) runSubscription(ctx context.Context, subId, supi, parentCorrID 
 			// Subscription cancelled (DELETE) or duration expired.
 			// Auto-remove from registry on expiry so registry stays consistent.
 			s.registry.mu.Lock()
-			_, stillPresent := s.registry.subs[subId]
+			sub, stillPresent := s.registry.subs[subId]
+			var expired *subscription
 			if stillPresent {
 				// context expired naturally (timeout); DELETE already removed it
 				// via registry.delete(), which also calls cancel(). We may arrive
 				// here from either path — only clean up when still present.
+				cp := *sub
+				expired = &cp
 				delete(s.registry.subs, subId)
 			}
 			s.registry.mu.Unlock()
 			if stillPresent {
 				metrics.LMFSubscriptionsActive.Set(float64(s.registry.count()))
+				// A deferred session that reached its duration is terminated by
+				// the LMF with a final EventNotify; shutdown (cancelAll empties
+				// the registry first) and cancel never get here.
+				if expired.deferred != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					s.sendTermination(expired, expired.deferred.ExpiryCause)
+				}
 			}
 			return
 
@@ -455,6 +569,10 @@ func (s *Server) runSubscription(ctx context.Context, subId, supi, parentCorrID 
 			tickCtx := logging.WithCorrelationID(ctx, tickCorrID)
 
 			locData, _, err := s.locate(tickCtx, snap.UEContextId, supi)
+			fixedAt := time.Now().UTC()
+			if err == nil {
+				dstate.failures = 0
+			}
 			if err != nil {
 				// Transient failure — skip this tick, keep subscription alive.
 				s.logger.WarnContext(tickCtx, "EventSubscription: locate failed on tick — skipping",
@@ -469,6 +587,28 @@ func (s *Server) runSubscription(ctx context.Context, subId, supi, parentCorrID 
 					"spec_ref", "TS 29.572 §5.2.3",
 					"error", err,
 				)
+				if snap.deferred != nil {
+					dstate.failures++
+					if dstate.failures >= maxConsecutiveLocateFailures {
+						// Repeated positioning failure: the LMF ends the session.
+						if s.registry.delete(subId) {
+							metrics.LMFSubscriptionsActive.Set(float64(s.registry.count()))
+							s.sendTermination(snap, terminationByNetwork)
+						}
+						return
+					}
+				}
+				continue
+			}
+
+			if snap.deferred != nil {
+				// TS 29.572 deferred-location session: EventNotify callback.
+				if s.deferredTick(tickCtx, snap, locData, fixedAt, &dstate, tickCorrID) {
+					if s.registry.delete(subId) {
+						metrics.LMFSubscriptionsActive.Set(float64(s.registry.count()))
+					}
+					return
+				}
 				continue
 			}
 
@@ -594,18 +734,15 @@ func resultLabel(attempt int) string {
 
 // pendingLoc is a sync.Map[ueContextId → context.CancelFunc] for in-progress
 // DetermineLocation requests. Registered on entry to handleDetermineLocation,
-// deregistered on return. The cancel-loc handler looks up and fires the cancel.
+// deregistered on return. The cancel-location handler looks up and fires the cancel.
 //
-// Declared here so event_subscription.go owns the cancel-loc mechanism;
+// Declared here so event_subscription.go owns the cancel-location mechanism;
 // handleDetermineLocation in server.go accesses it via s.pendingLoc.
 //
 // Note: this is a *field* on Server (declared below), not a package-level var.
 
-// cancelLocRegistration is a helper returned by registerPendingLoc so the caller
-// can defer the deregistration idiomatically.
-type cancelLocRegistration struct {
-	m   *sync.Map
-	key string
-}
-
-func (c *cancelLocRegistration) done() { c.m.Delete(c.key) }
+// shutdownRetryAfterSecs is the Retry-After hint (seconds) on the 503
+// NF_CONGESTION answer to a subscription Create received while the LMF is
+// shutting down. Implementation choice, not a 3GPP timer (TS 29.500 §5.2.7.2
+// allows Retry-After on 503).
+const shutdownRetryAfterSecs = 5

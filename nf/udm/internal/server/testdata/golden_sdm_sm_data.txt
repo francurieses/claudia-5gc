@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+[{"dnnConfigurations":{"internet":{"pduSessionTypes":{"defaultSessionType":"IPV4"}}},"singleNssai":{"sd":"000001","sst":1}},{"dnnConfigurations":{"ims":{"pduSessionTypes":{"defaultSessionType":"IPV4"}}},"singleNssai":{"sd":"000002","sst":2}}]

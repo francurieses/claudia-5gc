@@ -15,7 +15,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §4.4.13.2.5 — POST subscriptions → BSF discovery → PCF create → 201
   # ---------------------------------------------------------------------------
   Scenario: AF creates an AsSessionWithQoS subscription for a UE with a registered PCF binding
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     And the mock BSF returns a PcfBinding with pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org" and pcfId "pcf-instance-001" for ipv4Addr "10.60.0.1"
     And the mock PCF returns 201 Created with appSessionId "appsess-001" for a Npcf_PolicyAuthorization_Create request
     When the AF sends a POST to "/3gpp-as-session-with-qos/v1/af-001/subscriptions" with ueIpv4Addr "10.60.0.1" qosReference "GBR-VIDEO-LOW" and notificationDestination "https://af.example.com/notify"
@@ -50,7 +50,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §5.14.2.1.2 + TS 29.500 §5.2.7.2 — at least one UE address key is required
   # ---------------------------------------------------------------------------
   Scenario: Create subscription without any UE address is rejected with 400 MANDATORY_IE_MISSING
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     When the AF sends a POST to "/3gpp-as-session-with-qos/v1/af-001/subscriptions" with qosReference "GBR-VIDEO-LOW" and notificationDestination "https://af.example.com/notify" but no ueIpv4Addr
     Then the NEF responds with status 400
     And the cause is "MANDATORY_IE_MISSING"
@@ -60,7 +60,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §5.14.2.1.2 — qosReference is a mandatory IE
   # ---------------------------------------------------------------------------
   Scenario: Create subscription without qosReference is rejected with 400 MANDATORY_IE_MISSING
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     When the AF sends a POST to "/3gpp-as-session-with-qos/v1/af-001/subscriptions" with ueIpv4Addr "10.60.0.1" and notificationDestination "https://af.example.com/notify" but no qosReference
     Then the NEF responds with status 400
     And the cause is "MANDATORY_IE_MISSING"
@@ -71,7 +71,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # [VERIFY: confirm exact Rel-17 cause string against TS29522 OpenAPI — see B-1 in procedure doc]
   # ---------------------------------------------------------------------------
   Scenario: Create subscription when no PCF binding exists for the UE IP returns 404
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     And the mock BSF returns 404 for ipv4Addr "10.60.0.99"
     When the AF sends a POST to "/3gpp-as-session-with-qos/v1/af-001/subscriptions" with ueIpv4Addr "10.60.0.99" qosReference "GBR-VIDEO-LOW" and notificationDestination "https://af.example.com/notify"
     Then the NEF responds with status 404
@@ -82,7 +82,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.514 §5.2.2.2.4 — PCF 403 (e.g. unauthorized qosReference) → NEF propagates 403
   # ---------------------------------------------------------------------------
   Scenario: Create subscription when PCF rejects authorization propagates 403 to the AF
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     And the mock BSF returns a PcfBinding with pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org" and pcfId "pcf-instance-001" for ipv4Addr "10.60.0.2"
     And the mock PCF returns 403 for a Npcf_PolicyAuthorization_Create request
     When the AF sends a POST to "/3gpp-as-session-with-qos/v1/af-001/subscriptions" with ueIpv4Addr "10.60.0.2" qosReference "UNAUTHORIZED-QOS-REF" and notificationDestination "https://af.example.com/notify"
@@ -93,7 +93,7 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §4.4.13.2.5 — GET …/{subscriptionId} → 200 AsSessionWithQoSSubscription
   # ---------------------------------------------------------------------------
   Scenario: AF retrieves an existing AsSessionWithQoS subscription by subscriptionId
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-002"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-002"
     And the mock BSF returns a PcfBinding with pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org" and pcfId "pcf-instance-001" for ipv4Addr "10.60.0.3"
     And the mock PCF returns 201 Created with appSessionId "appsess-002" for a Npcf_PolicyAuthorization_Create request
     And an AsSessionWithQoS subscription has been created for scsAsId "af-002" with ueIpv4Addr "10.60.0.3" qosReference "GBR-AUDIO" and the subscriptionId has been stored
@@ -106,30 +106,30 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §4.4.13.2.5 — unknown subscriptionId → 404 ProblemDetails
   # ---------------------------------------------------------------------------
   Scenario: AF retrieves a non-existent subscriptionId returns 404
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     When the AF sends a GET to "/3gpp-as-session-with-qos/v1/af-001/subscriptions/00000000-0000-0000-0000-000000000000"
     Then the NEF responds with status 404
 
   # ---------------------------------------------------------------------------
   # Scenario 10 — DELETE an existing subscription → 204 + PCF app-session deleted (AC 8)
-  # TS 29.522 §4.4.13.2.5 + TS 29.514 §5.2.2.4 — DELETE → PCF DELETE → 204
+  # TS 29.522 §4.4.13.2.5 + TS 29.514 §4.2.4.2 — DELETE → PCF POST .../delete → 204
   # ---------------------------------------------------------------------------
   Scenario: AF deletes an AsSessionWithQoS subscription and the NEF relays deletion to the PCF
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-003"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-003"
     And the mock BSF returns a PcfBinding with pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org" and pcfId "pcf-instance-001" for ipv4Addr "10.60.0.4"
     And the mock PCF returns 201 Created with appSessionId "appsess-003" for a Npcf_PolicyAuthorization_Create request
     And the mock PCF returns 204 No Content for a Npcf_PolicyAuthorization_Delete request
     And an AsSessionWithQoS subscription has been created for scsAsId "af-003" with ueIpv4Addr "10.60.0.4" qosReference "GBR-VIDEO-LOW" and the subscriptionId has been stored
     When the AF sends a DELETE to "/3gpp-as-session-with-qos/v1/af-003/subscriptions/{subscriptionId}" using the stored subscriptionId
     Then the NEF responds with status 204 No Content
-    And the mock PCF received a DELETE to "/npcf-policyauthorization/v1/app-sessions/appsess-003"
+    And the mock PCF received a POST to "/npcf-policyauthorization/v1/app-sessions/appsess-003/delete"
 
   # ---------------------------------------------------------------------------
   # Scenario 11 — DELETE then GET the same subscriptionId → 404 (AC 8)
   # TS 29.522 §4.4.13.2.5 — subscription no longer exists after deletion
   # ---------------------------------------------------------------------------
   Scenario: GET after DELETE on the same subscriptionId returns 404
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-004"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-004"
     And the mock BSF returns a PcfBinding with pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org" and pcfId "pcf-instance-001" for ipv4Addr "10.60.0.5"
     And the mock PCF returns 201 Created with appSessionId "appsess-004" for a Npcf_PolicyAuthorization_Create request
     And the mock PCF returns 204 No Content for a Npcf_PolicyAuthorization_Delete request
@@ -143,6 +143,6 @@ Feature: Nnef_AFsessionWithQoS — AsSessionWithQoS Create / Get / Delete (TS 29
   # TS 29.522 §4.4.13.2.5 — unknown subscriptionId on DELETE → 404 ProblemDetails
   # ---------------------------------------------------------------------------
   Scenario: DELETE a non-existent subscriptionId returns 404
-    Given a valid OAuth2 bearer token with scope "nnef-afsessionwithqos" for scsAsId "af-001"
+    Given a valid OAuth2 bearer token with scope "3gpp-as-session-with-qos" for scsAsId "af-001"
     When the AF sends a DELETE to "/3gpp-as-session-with-qos/v1/af-001/subscriptions/00000000-0000-0000-0000-000000000000"
     Then the NEF responds with status 404

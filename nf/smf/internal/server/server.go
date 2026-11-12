@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	"github.com/free5gc/ngap/ngapType"
 	"github.com/google/uuid"
 	"github.com/oklog/ulid/v2"
 	pfcpie "github.com/wmnsk/go-pfcp/ie"
@@ -31,11 +32,13 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // SliceID identifies a network slice by SST and SD.
@@ -107,6 +110,16 @@ type Session struct {
 	// "Required" (TS 23.501 §5.10.3). This SMF never signals Required (the Security
 	// Indication IE is omitted), so it is false today; rule R1 reads it.
 	UPSecurityRequired bool
+	// Features is the Nsmf_PDUSession feature set negotiated with the AMF at
+	// CreateSMContext (TS 29.500 §6.6.2). In-memory only, deliberately NOT
+	// persisted in store.SessionRecord: startup purges every stored session
+	// (loadFromStore) and nothing is restored, so there is nothing to reload.
+	Features features.Set
+	// Capability5GSM is the UE's 5GSM capability IE (IEI 0x28) from the PDU
+	// Session Establishment Request, nil when the UE did not send it. In-memory
+	// only, not persisted (sessions are purged at startup). Ref: TS 24.501
+	// §9.11.4.1.
+	Capability5GSM *nas.FiveGSMCapability
 }
 
 // smPolicyQoS carries the QoS parameters extracted from the PCF SM Policy response.
@@ -122,6 +135,12 @@ type smPolicyQoS struct {
 }
 
 type Server struct {
+	shutdownDone chan struct{} // closed when the shutdown cleanup has finished
+	// orphanedByRestart lists the PDU sessions the previous SMF run had when it
+	// stopped; once associated with the UPF the SMF asks the AMF to release
+	// them so the UEs re-establish (TS 23.527 §4.3). Guarded by sessionMu.
+	orphanedByRestart []restartOrphan
+
 	cfg        *config.Config
 	logger     *slog.Logger
 	httpSrv    *http.Server
@@ -129,6 +148,8 @@ type Server struct {
 	mgmtHTTP   *http.Client // plain HTTP client for the AMF management API
 	sessions   map[string]*Session
 	sessionMu  sync.Mutex
+	// estLocks serialises CreateSMContext per SUPI+PSI (key "supi/psi" -> *sync.Mutex).
+	estLocks sync.Map
 	// ipPools holds one IP pool per DNN; keyed by DNN name.
 	// Ref: TS 23.501 §5.6.5 — each DNN has an isolated UE address space.
 	ipPools map[string]*IPPool
@@ -164,6 +185,13 @@ type Server struct {
 	releaseWG  sync.WaitGroup
 	guardWG    sync.WaitGroup // RELEASING guard timers (pfcp_node.go)
 	hoWG       sync.WaitGroup // detached target-failed release/deactivation tasks (pfcp_ho.go)
+
+	// profile is the release profile gating supportedFeatures wire behaviour
+	// (nil = rel17); nsmfCat / namfCat are the producer / consumer feature
+	// catalogs (features.go). Set by New and its Options, never mutated after.
+	profile *capability.Profile
+	nsmfCat *features.Catalog
+	namfCat *features.Catalog
 }
 
 type IPPool struct {
@@ -245,7 +273,7 @@ func incIP(ip net.IP) {
 }
 
 // New creates the SMF server. db may be nil for in-memory-only operation.
-func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, error) {
+func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option) (*Server, error) {
 	ipPools := make(map[string]*IPPool, len(cfg.DNNs))
 	for _, dnn := range cfg.DNNs {
 		pool, err := NewIPPool(dnn.UEIPPool)
@@ -295,6 +323,10 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		logger.Warn("SMF: could not build SBI HTTP/2 client, using H2C fallback", "error", err)
 		httpClient = sbi.NewH2CClient()
 	}
+	// ES3XX: follow 307/308 (same method/body/headers) and never 301/302/303,
+	// notably for N1N2MessageTransfer to the AMF. Ref: TS 29.500 §6.10.9.1,
+	// TS 29.518 §6.1.8 feature 7.
+	sbi.ApplyRedirectPolicy(httpClient, logger, sbi.WithNF("SMF"))
 
 	// Secondary authentication (TS 23.501 §5.6.6): per-DNN gate + the
 	// simulated DN-AAA's dev/test "unreachable" knob.
@@ -313,7 +345,7 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 
 	s := &Server{
 		cfg:               cfg,
-		logger:            logger.With("nf", "SMF"),
+		logger:            logger,
 		httpClient:        httpClient,
 		mgmtHTTP:          &http.Client{Timeout: 15 * time.Second},
 		sessions:          make(map[string]*Session),
@@ -327,6 +359,12 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store) (*Server, erro
 		pfcpTimers:        pfcpTimersFromConfig(cfg.N4),
 		assocKick:         make(chan struct{}, 1),
 		recoverCh:         make(chan struct{}, 1),
+		shutdownDone:      make(chan struct{}),
+		nsmfCat:           nsmfPDUSessionCatalog,
+		namfCat:           namfCommunicationCatalog,
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	s.assoc.state = assocSetupPending
 	s.n1n2Push = s.pushN1N2Message
@@ -391,7 +429,10 @@ func (s *Server) loadFromStore(ctx context.Context) error {
 		s.logger.Info("SMF: no stale sessions in store — starting fresh")
 		return nil
 	}
-	for ref := range sessions {
+	for ref, rec := range sessions {
+		if rec.PSI > 0 {
+			s.orphanedByRestart = append(s.orphanedByRestart, restartOrphan{supi: rec.SUPI, psi: rec.PSI})
+		}
 		if delErr := s.db.DeleteSession(ctx, ref); delErr != nil {
 			s.logger.Warn("SMF: failed to purge stale session from store",
 				"smContextRef", ref, "error", delErr)
@@ -403,9 +444,11 @@ func (s *Server) loadFromStore(ctx context.Context) error {
 	return nil
 }
 
-// cleanupAllSessions releases all currently active sessions: deletes them from
-// PostgreSQL and sends best-effort PFCP Session Deletion to the UPF. Called on
-// graceful shutdown so the next run starts with a clean store.
+// cleanupAllSessions releases the UPF side of all currently active sessions
+// (best-effort PFCP Session Deletion, awaited until ctx expires) and the SM
+// policies. The PostgreSQL rows are deliberately kept: the next run purges them
+// at start-up and asks the AMF to release those PDU sessions towards the UEs
+// (releaseOrphansOfPreviousRun, TS 23.527 §4.3). Called on graceful shutdown.
 func (s *Server) cleanupAllSessions(ctx context.Context) {
 	s.sessionMu.Lock()
 	sessions := make(map[string]*Session, len(s.sessions))
@@ -418,8 +461,8 @@ func (s *Server) cleanupAllSessions(ctx context.Context) {
 		return
 	}
 
-	for ref, sess := range sessions {
-		s.deleteSession(ctx, ref)
+	var wg sync.WaitGroup
+	for _, sess := range sessions {
 		s.deleteSMPolicy(ctx, sess.SmPolicyID)
 		// A session N4Stale (UPF restarted, SEID unknown to the new UPF) gets no
 		// PFCP deletion. Ref: TS 23.527 §4.3, TS 29.244 §7.5.6.
@@ -429,8 +472,13 @@ func (s *Server) cleanupAllSessions(ctx context.Context) {
 		if n4Stale {
 			continue
 		}
-		go s.sendPFCPSessionDeletion(context.Background(), sess)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sendPFCPSessionDeletion(ctx, sess)
+		}()
 	}
+	wg.Wait()
 	s.logger.Info("SMF: released all sessions on shutdown", "count", len(sessions))
 }
 
@@ -459,6 +507,7 @@ func (s *Server) persistSession(ctx context.Context, ref string, sess *Session) 
 		SEID:   sess.SEID,
 		SST:    sess.SliceID.SST,
 		SD:     sess.SliceID.SD,
+		PSI:    sess.PDUSessionID,
 	}
 	if err := s.db.UpsertSession(ctx, ref, rec); err != nil {
 		s.logger.Error("SMF: persistSession failed", "smContextRef", ref, "error", err)
@@ -475,12 +524,22 @@ func (s *Server) deleteSession(ctx context.Context, ref string) {
 	}
 }
 
+// WaitShutdown blocks until the shutdown cleanup started by Start has finished
+// or d elapses, so the process does not exit with sessions half-released.
+func (s *Server) WaitShutdown(d time.Duration) {
+	select {
+	case <-s.shutdownDone:
+	case <-time.After(d):
+	}
+}
+
 func (s *Server) Start(ctx context.Context) error {
 	s.logger.Info("SMF SBI server listening", "addr", s.cfg.SBI.Address)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		defer close(s.shutdownDone)
 		s.cleanupAllSessions(shutCtx)
 		_ = s.httpSrv.Shutdown(shutCtx)
 	}()
@@ -511,6 +570,14 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	var req map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", err.Error())
+		return
+	}
+
+	// supportedFeatures negotiation (TS 29.500 §6.6.2) runs before any side
+	// effect (IP allocation, PCF, PFCP, session creation) so the 400 path
+	// leaves no state behind.
+	negotiated, sfAnswer, ok := s.negotiateCreateFeatures(logging.WithCorrelationID(r.Context(), corrID), w, req)
+	if !ok {
 		return
 	}
 
@@ -549,6 +616,14 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 			requestedType = decoded.PDUSessionType
 		}
 	}
+	// Observability of the UE's 5GSM capability IE (IEI 0x28), only when the UE sent it.
+	if pduReq != nil && pduReq.Capability5GSM != nil {
+		log.Info("UE 5GSM capability decoded",
+			"capability_5gsm", pduReq.Capability5GSM.RawHex(),
+			"capability_5gsm_bits", strings.Join(pduReq.Capability5GSM.SetBitNames(), ","),
+			"spec_ref", "TS 24.501 §9.11.4.1",
+		)
+	}
 
 	// Extract S-NSSAI if provided (passed by AMF per TS 29.502 §6.1.6.2.2)
 	var slice SliceID
@@ -567,6 +642,14 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		attribute.Int("snssai_sst", int(slice.SST)),
 		attribute.String("snssai_sd", slice.SD),
 	)
+
+	// A new establishment for an existing PDU Session ID replaces the old SM
+	// context before any new resource is allocated (TS 23.502 §4.3.2.2.1 step 1).
+	// Establishments for the same SUPI+PSI are serialised so that concurrent
+	// requests cannot both pass the stale check before either is stored.
+	unlockEst := s.lockEstablishment(supi, uint8(pduSessionID))
+	defer unlockEst()
+	s.releaseStaleSessions(r.Context(), log, supi, uint8(pduSessionID))
 
 	// Allocate UE IP from the DNN-specific pool (TS 23.501 §5.6.5).
 	// Fall back to "internet" pool when the requested DNN is not explicitly configured.
@@ -632,19 +715,21 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	// straight through to the unchanged flow below (no regression).
 	if s.secondaryAuthRequired(dnn) {
 		pending := &pendingSecondaryAuth{
-			SmContextRef: smContextRef,
-			SUPI:         supi,
-			DNN:          dnn,
-			PDUSessionID: uint8(pduSessionID),
-			PTI:          pti,
-			Slice:        slice,
-			GrantedType:  grantedType,
-			IPv4:         ip,
-			V6Prefix:     v6Prefix,
-			V6IID:        v6IID,
-			PCORequest:   pduReq,
-			ULTEID:       ulTEID,
-			SEID:         seid,
+			SmContextRef:   smContextRef,
+			SUPI:           supi,
+			DNN:            dnn,
+			PDUSessionID:   uint8(pduSessionID),
+			PTI:            pti,
+			Slice:          slice,
+			GrantedType:    grantedType,
+			IPv4:           ip,
+			V6Prefix:       v6Prefix,
+			V6IID:          v6IID,
+			PCORequest:     pduReq,
+			Capability5GSM: capability5GSMOf(pduReq),
+			ULTEID:         ulTEID,
+			SEID:           seid,
+			Features:       negotiated,
 		}
 		s.startSecondaryAuth(r.Context(), pending)
 
@@ -661,9 +746,13 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Location", "/nsmf-pdusession/v1/sm-contexts/"+smContextRef)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		pendingResp := map[string]interface{}{
 			"smContextRef": smContextRef,
-		})
+		}
+		if sfAnswer != "" {
+			pendingResp["supportedFeatures"] = sfAnswer
+		}
+		_ = json.NewEncoder(w).Encode(pendingResp)
 		return
 	}
 
@@ -746,6 +835,10 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:      time.Now(),
 		PDUSessionType: grantedType,
 		UEIPv6Prefix:   v6PrefixStr,
+		Features:       negotiated,
+	}
+	if pduReq != nil {
+		sess.Capability5GSM = pduReq.Capability5GSM
 	}
 	s.sessionMu.Lock()
 	s.sessions[smContextRef] = sess
@@ -804,6 +897,9 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		"n1SmMsg":      n1SmRespB64,
 		"n2SmInfo":     n2SmInfoB64,
 		"n2SmInfoType": "PDU_RES_SETUP_REQ",
+	}
+	if sfAnswer != "" {
+		response["supportedFeatures"] = sfAnswer
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1161,6 +1257,13 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ICS/PDU Session Resource Setup failed PSI relayed by the AMF: 204 + detached UP deactivation.
+	// Ref: TS 23.502 §4.2.3.2 steps 12-15, TS 29.502 §5.2.2.3.2, TS 38.413 §9.3.4.16
+	if n2SmInfoType == n2SmInfoTypePduResSetupFail {
+		s.handlePduResSetupFail(r.Context(), w, hoLog, smContextRef, n2SmInfoBytes)
+		return
+	}
+
 	// Xn path switch: synchronous DL switch, answered after the PFCP response.
 	// Ref: TS 23.502 §4.9.1.2.2 steps 2-6, TS 29.502 §5.2.2.3.3.
 	if n2SmInfoType == "PATH_SWITCH_REQ" {
@@ -1220,6 +1323,9 @@ const (
 	n2SmInfoTypePathSwitchReqAck    = "PATH_SWITCH_REQ_ACK"
 	n2SmInfoTypePathSwitchReqFail   = "PATH_SWITCH_REQ_FAIL"
 	n2SmInfoTypePathSwitchSetupFail = "PATH_SWITCH_SETUP_FAIL"
+	// n2SmInfoTypePduResSetupFail carries the PDUSessionResourceSetupUnsuccessfulTransfer
+	// (TS 38.413 §9.3.4.16) of a PSI the gNB failed to set up (ICS / PDU Session Resource Setup).
+	n2SmInfoTypePduResSetupFail = "PDU_RES_SETUP_FAIL"
 	// n2SmInfoTypeHandoverResAllocFail carries the target's
 	// HandoverResourceAllocationUnsuccessfulTransfer (TS 23.502 §4.9.1.3.2 step 10).
 	n2SmInfoTypeHandoverResAllocFail = "HANDOVER_RES_ALLOC_FAIL"
@@ -1494,14 +1600,6 @@ func ngapCauseValue(c ngapType.Cause) int64 {
 	return -1
 }
 
-// extractHandoverAckTunnelInfo decodes the APER-encoded HandoverRequestAcknowledgeTransfer
-// and returns the target gNB DL NG-U GTP tunnel (IP, TEID).
-// Ref: TS 38.413 §9.3.4.11
-func extractHandoverAckTunnelInfo(n2SmInfo []byte) (net.IP, uint32, error) {
-	_, ip, teid, err := decodeHandoverAck(n2SmInfo)
-	return ip, teid, err
-}
-
 // decodeHandoverAck decodes the HandoverRequestAcknowledgeTransfer and returns it with the
 // target gNB DL NG-U GTP tunnel (IP, TEID). Ref: TS 38.413 §9.3.4.11
 func decodeHandoverAck(n2SmInfo []byte) (*ngapType.HandoverRequestAcknowledgeTransfer, net.IP, uint32, error) {
@@ -1584,12 +1682,55 @@ func (s *Server) releaseSessionLocal(ctx context.Context, ref string, sess *Sess
 	s.deleteSession(ctx, ref)
 
 	metrics.PDUSessionsActive.WithLabelValues("SMF", sess.DNN).Dec()
-	// Delete SM Policy association with PCF (TS 29.512 §5.2.2.4; TS 23.502 §4.3.4.2 step 3b)
+	// Delete SM Policy association with PCF (TS 29.512 §4.2.5.2; TS 23.502 §4.3.4.2 step 3b)
 	s.deleteSMPolicy(ctx, sess.SmPolicyID)
 	if sendN4 && !n4Stale {
 		go s.sendPFCPSessionDeletion(context.Background(), sess)
 	}
 	return true
+}
+
+// lockEstablishment takes the per-(SUPI, PSI) establishment lock and returns
+// its unlock function. Empty SUPI or PSI 0 take no lock.
+func (s *Server) lockEstablishment(supi string, psi uint8) func() {
+	if supi == "" || psi == 0 {
+		return func() {}
+	}
+	m, _ := s.estLocks.LoadOrStore(fmt.Sprintf("%s/%d", supi, psi), &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// releaseStaleSessions releases every existing SM context of the same SUPI and
+// PDU Session ID before a new one is created: IP/prefix freed, SM policy
+// association deleted and PFCP Session Deletion sent for the old SEID. This
+// happens e.g. after a UE restart, when the AMF never released the old context.
+// Ref: TS 23.502 §4.3.2.2.1 step 1, TS 24.501 §6.4.1.2.
+func (s *Server) releaseStaleSessions(ctx context.Context, log *slog.Logger, supi string, psi uint8) {
+	if supi == "" || psi == 0 {
+		return
+	}
+	type stale struct {
+		ref  string
+		sess *Session
+	}
+	var old []stale
+	s.sessionMu.Lock()
+	for ref, sess := range s.sessions {
+		if sess.SUPI == supi && sess.PDUSessionID == psi {
+			old = append(old, stale{ref, sess})
+		}
+	}
+	s.sessionMu.Unlock()
+	for _, o := range old {
+		if s.releaseSessionLocal(ctx, o.ref, o.sess, true) {
+			log.Info("replacing existing SM context for same PDU session ID",
+				"supi", supi, "pdu_session_id", psi, "smContextRef", o.ref,
+				"seid", o.sess.SEID, "ueIP", o.sess.UEIP, "result", "OK",
+				"spec_ref", "TS 23.502 §4.3.2.2.1 step 1")
+		}
+	}
 }
 
 // sendPFCPSessionDeletion sends a PFCP Session Deletion Request to the UPF.
@@ -1694,6 +1835,10 @@ func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session)
 	s.logger.Info("PFCP SessionDeactivation response", "type", msg.MessageTypeName(), "seid", sess.SEID)
 }
 
+// smPoliciesPath is the Npcf_SMPolicyControl sm-policies collection
+// (TS 29.512 §5.1).
+const smPoliciesPath = "/npcf-smpolicycontrol/v1/sm-policies"
+
 // createSMPolicy calls PCF to create an SM Policy association.
 // Returns the smPolicyId and QoS parameters assigned by PCF.
 //
@@ -1754,7 +1899,7 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 		}
 	}
 	body, _ := json.Marshal(reqBody)
-	pcfURL := "https://" + s.cfg.Peers.PCF + "/npcf-smpolicycontrol/v1/sm-policies"
+	pcfURL := "https://" + s.cfg.Peers.PCF + smPoliciesPath
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, pcfURL, bytes.NewReader(body))
 	if err != nil {
 		s.logger.Warn("PCF: create SM policy request build failed", "error", err)
@@ -1777,11 +1922,17 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 		return "", fallback
 	}
 
-	// Extract smPolicyId from Location header (e.g. /npcf-smpolicycontrol/v1/sm-policies/<id>)
-	smPolicyID := ""
-	if loc := resp.Header.Get("Location"); loc != "" {
-		parts := strings.Split(loc, "/")
-		smPolicyID = parts[len(parts)-1]
+	// Extract smPolicyId from the Location header: absolute {apiRoot}/npcf-smpolicycontrol/v1/sm-policies/<id>
+	// (TS 29.501 §4.4.1); the legacy relative form is still accepted. The path must be
+	// exactly the sm-policies collection plus one id. Without an id the decision is still
+	// applied, but the association cannot be deleted later - make that visible.
+	smPolicyID := sbi.ResourceIDFromLocationUnder(resp.Header.Get("Location"), smPoliciesPath)
+	if smPolicyID == "" {
+		s.logger.Warn("PCF: SM policy 201 without a usable Location - association id unknown, it cannot be deleted at release",
+			"procedure", "SmPolicyCreate", "interface", "N7", "direction", "IN",
+			"result", "FAILURE", "cause", "MISSING_LOCATION",
+			"location", resp.Header.Get("Location"),
+			"spec_ref", "TS 29.512 §4.2.2 / TS 29.501 §4.4.1")
 	}
 
 	// Parse QoS parameters from response body (TS 29.512 §5.2.2.2).
@@ -1842,31 +1993,58 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 	return smPolicyID, qos
 }
 
-// deleteSMPolicy calls PCF to delete an SM Policy association.
-// Best-effort: logs on failure but does not block session cleanup.
-// Ref: TS 29.512 §5.2.2.4 (Npcf_SMPolicyControl_Delete)
+// deleteSMPolicy calls PCF to delete an SM Policy association using the
+// custom "delete" operation: POST .../sm-policies/{smPolicyId}/delete with an
+// SmPolicyDeleteData body (minimal "{}"). Best-effort: logs on failure but
+// does not block session cleanup. The X-Correlation-Id of ctx is propagated
+// (a new ULID is minted when ctx has none).
+// Ref: TS 29.512 §4.2.5.2, §5.3.3.4.2 (Npcf_SMPolicyControl_Delete)
 func (s *Server) deleteSMPolicy(ctx context.Context, smPolicyID string) {
-	if smPolicyID == "" || s.cfg.Peers.PCF == "" {
+	if s.cfg.Peers.PCF == "" {
 		return
 	}
-	pcfURL := "https://" + s.cfg.Peers.PCF + "/npcf-smpolicycontrol/v1/sm-policies/" + smPolicyID
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, pcfURL, nil)
+	if smPolicyID == "" {
+		logging.NewProcedureLogger(ctx, s.logger, "SmPolicyDelete").Info(
+			"PCF: no SM policy association recorded for this session - nothing to delete",
+			"interface", "N7", "direction", "OUT", "result", "OK", "cause", "NO_ASSOCIATION",
+			"spec_ref", "TS 29.512 §4.2.5.2")
+		return
+	}
+	if logging.CorrelationID(ctx) == "" {
+		ctx = logging.WithCorrelationID(ctx, "")
+	}
+	corrID := logging.CorrelationID(ctx)
+	log := logging.NewProcedureLogger(ctx, s.logger, "SmPolicyDelete").With(
+		"interface", "Npcf", "direction", "OUT",
+		"smPolicyId", smPolicyID, "spec_ref", "TS 29.512 §4.2.5.2")
+
+	pcfURL := "https://" + s.cfg.Peers.PCF + "/npcf-smpolicycontrol/v1/sm-policies/" + smPolicyID + "/delete"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, pcfURL, strings.NewReader("{}"))
 	if err != nil {
-		s.logger.Warn("PCF: delete SM policy request build failed", "error", err)
+		log.Warn("PCF: delete SM policy request build failed", "error", err, "result", "FAILURE")
 		return
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Correlation-Id", corrID)
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		s.logger.Warn("PCF: delete SM policy call failed",
-			"smPolicyId", smPolicyID, "error", err,
-			"spec_ref", "TS 29.512 §5.2.2.4")
+		log.Warn("PCF: delete SM policy call failed", "error", err, "result", "FAILURE")
 		return
 	}
-	resp.Body.Close()
-	s.logger.Info("PCF: SM Policy deleted",
-		"smPolicyId", smPolicyID,
-		"spec_ref", "TS 29.512 §5.2.2.4",
-	)
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		var pd struct {
+			Cause string `json:"cause"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&pd)
+		log.Warn("PCF: unexpected status on SM policy delete",
+			"status", resp.StatusCode, "cause", pd.Cause, "result", "FAILURE")
+		return
+	}
+	log.Info("PCF: SM Policy deleted", "status", resp.StatusCode, "result", "OK")
 }
 
 // updateSMPolicy consults PCF to authorize a QoS modification on an existing SM
@@ -2042,7 +2220,7 @@ func buildPDUSessionResourceSetupRequestTransferOpts(upfIP net.IP, dlTEID uint32
 				// IE: PDUSessionAggregateMaximumBitRate (ID 130)
 				{
 					Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionAggregateMaximumBitRate},
-					Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
+					Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
 					Value: ngapType.PDUSessionResourceSetupRequestTransferIEsValue{
 						Present: ngapType.PDUSessionResourceSetupRequestTransferIEsPresentPDUSessionAggregateMaximumBitRate,
 						PDUSessionAggregateMaximumBitRate: &ngapType.PDUSessionAggregateMaximumBitRate{
@@ -2211,13 +2389,24 @@ func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 }
 
 func problem(w http.ResponseWriter, status int, cause, detail string) {
+	problemWithParams(w, status, cause, detail, nil)
+}
+
+// problemWithParams is problem plus the ProblemDetails invalidParams list
+// (TS 29.571 §5.2.4.6, InvalidParam{param, reason}); the attribute is omitted
+// when params is empty so the plain-problem bytes are unchanged.
+func problemWithParams(w http.ResponseWriter, status int, cause, detail string, params []map[string]string) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	body := map[string]interface{}{
 		"status": status,
 		"cause":  cause,
 		"detail": detail,
-	})
+	}
+	if len(params) > 0 {
+		body["invalidParams"] = params
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // usageReportingURRID is the single Usage Reporting Rule ID installed per PDU

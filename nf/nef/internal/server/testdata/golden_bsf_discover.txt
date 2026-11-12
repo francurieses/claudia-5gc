@@ -1,0 +1,5 @@
+GET /nbsf-management/v1/pcfBindings?ipv4Addr=10.60.0.1
+Content-Type: 
+Accept: application/json
+Content-Length: 
+

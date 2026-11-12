@@ -8,7 +8,7 @@ Feature: Nlmf_Location DetermineLocation — Cell-ID positioning (TS 29.572 §5.
   # spec_ref: TS 29.518 §5.2.2.6   (Namf_Location ProvideLocationInfo — consumer)
   # spec_ref: TS 38.413 §8.17.1    (NGAP LocationReportingControl / LocationReport)
   # spec_ref: TS 29.571            (ProblemDetails common types)
-  # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info → 200 LocationData
+  # endpoint: POST /nlmf-loc/v1/determine-location → 200 LocationData
 
   Background:
     Given a clean LMF instance is running on SBI port 8012

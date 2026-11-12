@@ -110,7 +110,7 @@ function SpecReference({ open, onToggle }: { open: boolean; onToggle: () => void
           <p>
             <span className="font-medium text-fg">PCF → AMF</span>
             <span className="ml-2 text-muted-fg">(N15)</span>
-            <span className="ml-2 font-mono text-fg">Npcf_UEPolicyControl POST /npcf-ue-policy-control/v1/ue-policies</span>
+            <span className="ml-2 font-mono text-fg">Npcf_UEPolicyControl POST /npcf-ue-policy-control/v1/policies</span>
             <span className="ml-2 italic text-muted-fg">— TS 29.525 §4.2.2</span>
           </p>
           <p>

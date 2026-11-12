@@ -5,14 +5,25 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
-// NFType per 3GPP TS 29.510 §6.1.6.3.3 (subset relevant to MVP).
+// NFType per 3GPP TS 29.510 §6.1.6.3.3 (Rel-17 enum plus the Rel-19 additions).
+//
+// The schema is anyOf [enum, string]: the type is extensible, so values not
+// listed below MUST be accepted and stored as-is. The NRF therefore never
+// validates NFType against this list. Wire values use underscores
+// (e.g. "MB_SMF", "5G_EIR").
 type NFType string
 
 const (
@@ -37,6 +48,56 @@ const (
 	NFTypeEASDF NFType = "EASDF"
 	NFTypeLMF   NFType = "LMF"  // Location Management Function (TS 23.273, TS 29.572)
 	NFTypeGMLC  NFType = "GMLC" // Gateway Mobile Location Centre (TS 23.273, TS 29.515)
+
+	// Remaining Rel-17 values (TS 29.510 §6.1.6.3.3).
+	NFType5GEIR     NFType = "5G_EIR"
+	NFTypeSEPP      NFType = "SEPP"
+	NFTypePCSCF     NFType = "PCSCF"
+	NFTypeCBCF      NFType = "CBCF"
+	NFTypeHSS       NFType = "HSS"
+	NFTypeUCMF      NFType = "UCMF"
+	NFTypeSORAF     NFType = "SOR_AF"
+	NFTypeSPAF      NFType = "SPAF"
+	NFTypeMME       NFType = "MME"
+	NFTypeSCSAS     NFType = "SCSAS"
+	NFTypeSCEF      NFType = "SCEF"
+	NFTypeNSSAAF    NFType = "NSSAAF"
+	NFTypeICSCF     NFType = "ICSCF"
+	NFTypeSCSCF     NFType = "SCSCF"
+	NFTypeDRA       NFType = "DRA"
+	NFTypeIMSAS     NFType = "IMS_AS"
+	NFTypeAANF      NFType = "AANF"
+	NFType5GDDNMF   NFType = "5G_DDNMF"
+	NFTypeNSACF     NFType = "NSACF"
+	NFTypeMFAF      NFType = "MFAF"
+	NFTypeDCCF      NFType = "DCCF"
+	NFTypeMBSMF     NFType = "MB_SMF"
+	NFTypeTSCTSF    NFType = "TSCTSF"
+	NFTypeADRF      NFType = "ADRF"
+	NFTypeGBABSF    NFType = "GBA_BSF"
+	NFTypeCEF       NFType = "CEF"
+	NFTypeMBUPF     NFType = "MB_UPF"
+	NFTypeNSWOF     NFType = "NSWOF"
+	NFTypePKMF      NFType = "PKMF"
+	NFTypeMNPF      NFType = "MNPF"
+	NFTypeSMSGMSC   NFType = "SMS_GMSC"
+	NFTypeSMSIWMSC  NFType = "SMS_IWMSC"
+	NFTypeMBSF      NFType = "MBSF"
+	NFTypeMBSTF     NFType = "MBSTF"
+	NFTypePANF      NFType = "PANF"
+	NFTypeIPSMGW    NFType = "IP_SM_GW"
+	NFTypeSMSRouter NFType = "SMS_ROUTER"
+
+	// Rel-19 additions (TS 29.510 V19 §6.1.6.3.3).
+	NFTypeDCSF   NFType = "DCSF"
+	NFTypeMRF    NFType = "MRF"
+	NFTypeMRFP   NFType = "MRFP"
+	NFTypeMF     NFType = "MF"
+	NFTypeSLPKMF NFType = "SLPKMF"
+	NFTypeRH     NFType = "RH"
+	NFTypeEIF    NFType = "EIF"
+	NFTypeAIOTF  NFType = "AIOTF"
+	NFTypeADM    NFType = "ADM"
 )
 
 // NFStatus per TS 29.510 §6.1.6.3.4.
@@ -66,10 +127,99 @@ type NFProfile struct {
 	DNNList  []string `json:"dnnList,omitempty"`
 	Capacity int      `json:"capacity,omitempty"` // 0..65535
 	Priority int      `json:"priority,omitempty"` // 0..65535
+	// NFServiceList is the map form (serviceInstanceId -> NFService) that
+	// replaces the deprecated NFServices array from Rel-17 on (TS 29.510 §6.1.6.2.2).
+	NFServiceList map[string]NFService `json:"nfServiceList,omitempty"`
+
+	// raw is the registered JSON object exactly as received (or as stored),
+	// kept next to the parsed subset so attributes this NRF does not model
+	// (Rel-18/19 additions, nested unknown keys) survive. Never mutated after
+	// being set, so copies of the struct may share it.
+	raw json.RawMessage
 
 	// internal bookkeeping (not serialized to clients)
 	registeredAt time.Time `json:"-"`
 	lastSeen     time.Time `json:"-"`
+}
+
+// profileAlias has the NFProfile fields but none of its methods; it avoids
+// recursion in (Un)MarshalJSON.
+type profileAlias NFProfile
+
+// authoritativeKeys are the top-level NFProfile keys the NRF itself sets or
+// mutates after decoding a registration (nfInstanceId from the URI, nfStatus
+// defaulted to REGISTERED, heartBeatTimer defaulted/forced). In the merged
+// JSON these come from the parsed struct; every other key is the raw value.
+// Any new NRF-side mutation of a modeled NFProfile field MUST be added here,
+// otherwise the mutation is silently lost in GET/discovery responses.
+var authoritativeKeys = []string{"nfInstanceId", "nfStatus", "heartBeatTimer"}
+
+// UnmarshalJSON parses the modeled subset and records the raw object.
+func (p *NFProfile) UnmarshalJSON(b []byte) error {
+	if string(bytes.TrimSpace(b)) == "null" {
+		return nil
+	}
+	var parsed profileAlias
+	if err := json.Unmarshal(b, &parsed); err != nil {
+		return err
+	}
+	parsed.registeredAt, parsed.lastSeen = p.registeredAt, p.lastSeen
+	parsed.raw = append(json.RawMessage(nil), b...)
+	*p = NFProfile(parsed)
+	return nil
+}
+
+// MarshalJSON returns the merged profile: with no raw it is byte-identical to
+// the plain struct encoding; with raw it is every raw key (sorted) with the
+// authoritativeKeys overridden from the parsed fields. Pointer receiver on
+// purpose: it never copies the struct, so it does not race with the
+// lastSeen bookkeeping done under the registry lock.
+func (p *NFProfile) MarshalJSON() ([]byte, error) {
+	base, err := json.Marshal((*profileAlias)(p))
+	if err != nil {
+		return nil, fmt.Errorf("nrf: marshal profile: %w", err)
+	}
+	if len(p.raw) == 0 {
+		return base, nil
+	}
+	var merged, parsed map[string]json.RawMessage
+	if err := json.Unmarshal(p.raw, &merged); err != nil || merged == nil {
+		return base, nil // unusable raw: fall back to the parsed subset
+	}
+	if err := json.Unmarshal(base, &parsed); err != nil {
+		return nil, fmt.Errorf("nrf: merge profile: %w", err)
+	}
+	for _, k := range authoritativeKeys {
+		if v, ok := parsed[k]; ok {
+			merged[k] = v
+		} else {
+			delete(merged, k)
+		}
+	}
+	out, err := json.Marshal(merged) // map keys are emitted sorted
+	if err != nil {
+		return nil, fmt.Errorf("nrf: marshal merged profile: %w", err)
+	}
+	return out, nil
+}
+
+// allServices returns the NFServices of both the deprecated array and the
+// nfServiceList map (sorted by instance id for determinism).
+func (p *NFProfile) allServices() []NFService {
+	if len(p.NFServiceList) == 0 {
+		return p.NFServices
+	}
+	out := make([]NFService, 0, len(p.NFServices)+len(p.NFServiceList))
+	out = append(out, p.NFServices...)
+	ids := make([]string, 0, len(p.NFServiceList))
+	for id := range p.NFServiceList {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		out = append(out, p.NFServiceList[id])
+	}
+	return out
 }
 
 type PLMN struct {
@@ -91,6 +241,9 @@ type NFService struct {
 	FQDN              string             `json:"fqdn,omitempty"`
 	IPEndpoints       []IPEndpoint       `json:"ipEndPoints,omitempty"`
 	APIPrefix         string             `json:"apiPrefix,omitempty"`
+	// SupportedFeatures is the NF service's feature bitmask, hex string
+	// (TS 29.510 §6.1.6.2.3, type SupportedFeatures TS 29.571 §5.2.2).
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
 }
 
 type NFServiceVersion struct {
@@ -122,6 +275,11 @@ type DiscoveryFilter struct {
 	SNSSAIs         []SNSSAI
 	// DNN filters to NFs that serve the given Data Network Name (TS 29.510 §6.2.3.2.3.1).
 	DNN string
+	// SupportedFeatures is the discovery "supported-features" query value
+	// (TS 29.510 §6.2.3.2.3.1). It only applies when ServiceNames has exactly
+	// one entry and is ignored otherwise. Rel-19 "required-features" is not
+	// implemented.
+	SupportedFeatures string
 }
 
 // DefaultHeartbeatTimer is the heartbeat interval suggested to NFs on register.
@@ -281,16 +439,7 @@ func (r *InMemory) Discover(filter DiscoveryFilter) []*NFProfile {
 
 	out := make([]*NFProfile, 0, len(r.profiles))
 	for _, p := range r.profiles {
-		if filter.TargetNFType != "" && p.NFType != filter.TargetNFType {
-			continue
-		}
-		if !matchServices(p.NFServices, filter.ServiceNames) {
-			continue
-		}
-		if !matchSNSSAIs(p.SNSSAIs, filter.SNSSAIs) {
-			continue
-		}
-		if filter.DNN != "" && !containsDNN(p.DNNList, filter.DNN) {
+		if !matches(p, filter) {
 			continue
 		}
 		out = append(out, p)
@@ -306,23 +455,84 @@ func (r *InMemory) Discover(filter DiscoveryFilter) []*NFProfile {
 	return out
 }
 
+// matches is the single discovery predicate shared by every Registry backend.
+func matches(p *NFProfile, f DiscoveryFilter) bool {
+	if f.TargetNFType != "" && p.NFType != f.TargetNFType {
+		return false
+	}
+	services := p.allServices()
+	if !matchServices(services, f.ServiceNames) {
+		return false
+	}
+	if !matchSupportedFeatures(services, f.ServiceNames, f.SupportedFeatures) {
+		return false
+	}
+	if !matchSNSSAIs(p.SNSSAIs, f.SNSSAIs) {
+		return false
+	}
+	if f.DNN != "" && !containsDNN(p.DNNList, f.DNN) {
+		return false
+	}
+	return true
+}
+
+// matchSupportedFeatures implements the supported-features discovery filter
+// (TS 29.510 §6.2.3.2.3.1): applicable only with exactly one service name; a
+// profile matches if at least one NFService of that name supports every
+// requested feature bit. A service without (or with unparseable)
+// supportedFeatures supports none. The SupportedFeatures type has no length
+// limit (TS 29.571 §5.2.2), so over-long values are evaluated after trimming
+// leading zeros; bits beyond features.MaxFeatures cannot be known to be
+// supported, so such a request fails closed (no match).
+func matchSupportedFeatures(services []NFService, serviceNames []string, requested string) bool {
+	if requested == "" || len(serviceNames) != 1 {
+		return true
+	}
+	req, ok := parseTrimmed(requested)
+	if !ok {
+		return false // fail closed; the server rejects non-hex values with 400
+	}
+	if req.IsEmpty() {
+		return true
+	}
+	for _, s := range services {
+		if s.ServiceName != serviceNames[0] {
+			continue
+		}
+		have, ok := parseTrimmed(s.SupportedFeatures)
+		if !ok {
+			continue
+		}
+		if req.Intersect(have).Equal(req) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseTrimmed parses a SupportedFeatures string after dropping leading '0'
+// digits (high-order, no information). ok is false when the value is invalid
+// or still exceeds features.MaxHexChars.
+func parseTrimmed(v string) (features.Set, bool) {
+	set, err := features.Parse(strings.TrimLeft(v, "0"))
+	return set, err == nil
+}
+
+// matchServices implements the service-names discovery filter: a profile
+// matches if it has at least one NF service matching one of the requested
+// names (TS 29.510 Table 6.2.3.2.3.1-1).
 func matchServices(have []NFService, want []string) bool {
 	if len(want) == 0 {
 		return true
 	}
 	for _, w := range want {
-		found := false
 		for _, h := range have {
 			if h.ServiceName == w {
-				found = true
-				break
+				return true
 			}
 		}
-		if !found {
-			return false
-		}
 	}
-	return true
+	return false
 }
 
 func containsDNN(list []string, dnn string) bool {

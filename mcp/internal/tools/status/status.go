@@ -9,6 +9,7 @@ package status
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -344,8 +345,9 @@ func (t deploymentTool) Invoke(ctx context.Context, _ json.RawMessage) (any, err
 // storeToolError maps a portal error on a store-backed route: a 503 is the portal
 // saying its store is unavailable (PORTAL_STORE_UNAVAILABLE); anything else is wrapped.
 func storeToolError(tool string, err error) *mcperr.Error {
-	if mapped := clients.StoreErr(err); mapped != err {
-		if me, ok := mapped.(*mcperr.Error); ok {
+	if mapped := clients.StoreErr(err); mapped != err { //nolint:errorlint // identity check: StoreErr returns err itself when unmapped
+		var me *mcperr.Error
+		if ok := errors.As(mapped, &me); ok {
 			return me
 		}
 	}
@@ -466,7 +468,8 @@ func (t configViewTool) Invoke(ctx context.Context, _ json.RawMessage) (any, err
 		}
 		raw, err := t.d.Portal.Get(ctx, s.path, nil)
 		if s.store && err != nil {
-			if mapped, ok := clients.StoreErr(err).(*mcperr.Error); ok {
+			var mapped *mcperr.Error
+			if ok := errors.As(clients.StoreErr(err), &mapped); ok {
 				entry["error"] = mapped.Message
 				entry["data"] = mapped.Data
 				sections[s.key] = entry

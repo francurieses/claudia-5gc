@@ -215,6 +215,21 @@ func postJSON(t *testing.T, client *http.Client, url string, body []byte) *http.
 	return resp
 }
 
+// putJSON issues the Activate request (PUT, TS 29.540 OpenAPI SMServiceActivation).
+func putJSON(t *testing.T, client *http.Client, url string, body []byte) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("PUT %s: %v", url, err)
+	}
+	return resp
+}
+
 func assertStatus(t *testing.T, resp *http.Response, want int) {
 	t.Helper()
 	if resp.StatusCode != want {
@@ -238,7 +253,7 @@ func TestActivate_201(t *testing.T) {
 	ts, _ := newTestServer(t, mock)
 
 	supi := "imsi-001010000000001"
-	resp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
+	resp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
 		activateBody(supi, "3GPP_ACCESS", "amf-001",
 			mock.srv.URL+"/namf-comm/v1/ue-contexts/"+supi+"/n1-n2-messages"))
 	defer resp.Body.Close()
@@ -272,7 +287,7 @@ func TestActivate_MissingAccessType(t *testing.T) {
 		"amfId": "amf-001",
 		// accessType intentionally missing
 	})
-	resp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi, body)
+	resp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi, body)
 	defer resp.Body.Close()
 
 	assertStatus(t, resp, http.StatusBadRequest)
@@ -293,7 +308,7 @@ func TestActivate_MissingSupiInBody(t *testing.T) {
 		"accessType": "3GPP_ACCESS",
 		"amfId":      "amf-001",
 	})
-	resp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi, body)
+	resp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi, body)
 	defer resp.Body.Close()
 
 	assertStatus(t, resp, http.StatusBadRequest)
@@ -332,7 +347,7 @@ func TestUplinkSMS_200_AndEchoMT(t *testing.T) {
 	callbackURI := mock.srv.URL + "/namf-comm/v1/ue-contexts/" + supi + "/n1-n2-messages"
 
 	// First: activate a context
-	activateResp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
+	activateResp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
 		activateBody(supi, "3GPP_ACCESS", "amf-001", callbackURI))
 	defer activateResp.Body.Close()
 	assertStatus(t, activateResp, http.StatusCreated)
@@ -378,7 +393,7 @@ func TestDeactivate_204_ThenUplinkSMS_404(t *testing.T) {
 	callbackURI := mock.srv.URL + "/namf-comm/v1/ue-contexts/" + supi + "/n1-n2-messages"
 
 	// Activate
-	aResp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
+	aResp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
 		activateBody(supi, "3GPP_ACCESS", "amf-001", callbackURI))
 	defer aResp.Body.Close()
 	assertStatus(t, aResp, http.StatusCreated)
@@ -431,7 +446,7 @@ func TestMTSMSTrigger_Internal(t *testing.T) {
 	callbackURI := mock.srv.URL + "/namf-comm/v1/ue-contexts/" + supi + "/n1-n2-messages"
 
 	// Activate context first
-	aResp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
+	aResp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
 		activateBody(supi, "3GPP_ACCESS", "amf-001", callbackURI))
 	defer aResp.Body.Close()
 	assertStatus(t, aResp, http.StatusCreated)
@@ -488,7 +503,7 @@ func TestUDMRegistration(t *testing.T) {
 	supi := "imsi-001010000000001"
 	callbackURI := mock.srv.URL + "/namf-comm/v1/ue-contexts/" + supi + "/n1-n2-messages"
 
-	resp := postJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
+	resp := putJSON(t, ts.Client(), ts.URL+"/nsmsf-sms/v2/ue-contexts/"+supi,
 		activateBody(supi, "3GPP_ACCESS", "amf-001", callbackURI))
 	defer resp.Body.Close()
 	assertStatus(t, resp, http.StatusCreated)

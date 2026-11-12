@@ -163,7 +163,7 @@ func splitHostPort(s string) (net.IP, uint16, error) {
 	}
 	ips, err := net.LookupIP(h)
 	if err != nil || len(ips) == 0 {
-		return nil, 0, fmt.Errorf("resolve %q: %v", h, err)
+		return nil, 0, fmt.Errorf("resolve %q: %w", h, err)
 	}
 	var port int
 	if _, err := fmt.Sscanf(p, "%d", &port); err != nil {

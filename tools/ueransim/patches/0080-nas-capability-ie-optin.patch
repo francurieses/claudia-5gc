@@ -1,0 +1,181 @@
+--- a/src/lib/nas/ie4.hpp
++++ b/src/lib/nas/ie4.hpp
+@@ -224,6 +224,8 @@
+ {
+     EReflectiveQoS rqos{};
+     EMultiHomedIPv6PduSession mh6pdu{};
++    /* Opt-in extra value octets (octet 3 first), OR-ed over the typed bits (TS 24.501 §9.11.4.1). Empty = stock. */
++    OctetString extOctets{};
+ 
+     IE5gSmCapability() = default;
+     IE5gSmCapability(EReflectiveQoS rqos, EMultiHomedIPv6PduSession mh6Pdu);
+@@ -452,6 +454,8 @@
+     EEpcNasSupported s1Mode{};
+     EHandoverAttachSupported hoAttach{};
+     ELtePositioningProtocolCapability lpp{};
++    /* Opt-in extra value octets (octet 3 first), OR-ed over the typed bits (TS 24.501 §9.11.3.1). Empty = stock. */
++    OctetString extOctets{};
+ 
+     IE5gMmCapability() = default;
+     IE5gMmCapability(EEpcNasSupported s1Mode, EHandoverAttachSupported hoAttach, ELtePositioningProtocolCapability lpp);
+--- a/src/lib/nas/ie4.cpp
++++ b/src/lib/nas/ie4.cpp
+@@ -425,7 +425,12 @@
+ 
+ void IE5gSmCapability::Encode(const IE5gSmCapability &ie, OctetString &stream)
+ {
+-    stream.appendOctet(static_cast<int>(ie.mh6pdu) << 1 | static_cast<int>(ie.rqos));
++    int first = static_cast<int>(ie.mh6pdu) << 1 | static_cast<int>(ie.rqos);
++    if (ie.extOctets.length() > 0)
++        first |= ie.extOctets.getI(0);
++    stream.appendOctet(first);
++    for (int i = 1; i < ie.extOctets.length(); i++)
++        stream.appendOctet(ie.extOctets.getI(i));
+ }
+ 
+ IEUeSecurityCapability::IEUeSecurityCapability()
+@@ -870,6 +875,8 @@
+     r.s1Mode = static_cast<EEpcNasSupported>(octet.bit(0));
+     r.hoAttach = static_cast<EHandoverAttachSupported>(octet.bit(1));
+     r.lpp = static_cast<ELtePositioningProtocolCapability>(octet.bit(2));
++    if (length > 1)
++        stream.readOctetString(length - 1);
+     return r;
+ }
+ 
+@@ -881,7 +888,11 @@
+     octet |= static_cast<int>(ie.hoAttach);
+     octet <<= 1;
+     octet |= static_cast<int>(ie.s1Mode);
++    if (ie.extOctets.length() > 0)
++        octet |= ie.extOctets.getI(0);
+     stream.appendOctet(octet);
++    for (int i = 1; i < ie.extOctets.length(); i++)
++        stream.appendOctet(ie.extOctets.getI(i));
+ }
+ 
+ IESmPduDnRequestContainer::IESmPduDnRequestContainer(OctetString &&dnSpecificIdentity)
+--- a/src/ue/types.hpp
++++ b/src/ue/types.hpp
+@@ -108,6 +108,9 @@
+     std::vector<std::string> gnbSearchList{};
+     std::vector<SessionConfig> defaultSessions{};
+     IntegrityMaxDataRateConfig integrityMaxRate{};
++    /* Opt-in 5GMM/5GSM capability bits (value octets, octet 3 first); empty = stock bytes. */
++    OctetString mmCapabilityExt{};
++    OctetString smCapabilityExt{};
+     NetworkSlice defaultConfiguredNssai{};
+     NetworkSlice configuredNssai{};
+     std::optional<std::string> tunName{};
+--- a/src/ue.cpp
++++ b/src/ue.cpp
+@@ -6,6 +6,7 @@
+ // See README, LICENSE, and CONTRIBUTING files for licensing details.
+ //
+ 
++#include <algorithm>
+ #include <chrono>
+ #include <iostream>
+ #include <stdexcept>
+@@ -100,6 +101,41 @@
+ 
+ static UeControllerTask *g_controllerTask;
+ 
++/*
++ * Parses an optional list of "octet.bit" capability bit positions (TS 24.501 Table 9.11.3.1.1 / 9.11.4.1.1
++ * numbering: octet 3 is the first value octet, bit 1 is the least significant) into value octets.
++ * Absent key -> empty string (stock bytes on the wire).
++ */
++static OctetString ParseCapabilityBits(const YAML::Node &config, const std::string &key)
++{
++    constexpr int firstOctet = 3;
++    constexpr int lastOctet = 15; // capability IEs are at most 15 octets (TS 24.501 §9.11.3.1, §9.11.4.1)
++    std::vector<int> octets(lastOctet - firstOctet + 1, 0);
++    int used = 0;
++
++    if (yaml::HasField(config, key))
++    {
++        for (auto &item : yaml::GetSequence(config, key))
++        {
++            auto text = item.as<std::string>();
++            auto dot = text.find('.');
++            if (dot == std::string::npos)
++                throw std::runtime_error(key + ": expected \"octet.bit\", got: " + text);
++            int octet = std::stoi(text.substr(0, dot));
++            int bit = std::stoi(text.substr(dot + 1));
++            if (octet < firstOctet || octet > lastOctet || bit < 1 || bit > 8)
++                throw std::runtime_error(key + ": octet must be 3..15 and bit 1..8, got: " + text);
++            octets[octet - firstOctet] |= 1 << (bit - 1);
++            used = std::max(used, octet - firstOctet + 1);
++        }
++    }
++
++    OctetString res;
++    for (int i = 0; i < used; i++)
++        res.appendOctet(octets[i]);
++    return res;
++}
++
+ static nr::ue::UeConfig *ReadConfigYaml()
+ {
+     auto *result = new nr::ue::UeConfig();
+@@ -232,6 +268,9 @@
+         result->integrityMaxRate.downlinkFull = downlink == "full";
+     }
+ 
++    result->mmCapabilityExt = ParseCapabilityBits(config, "mmCapabilityBits");
++    result->smCapabilityExt = ParseCapabilityBits(config, "smCapabilityBits");
++
+     yaml::AssertHasField(config, "uacAic");
+     {
+         result->uacAic.mps = yaml::GetBool(config["uacAic"], "mps");
+@@ -372,6 +411,8 @@
+     c->configureRouting = g_refConfig->configureRouting;
+     c->prefixLogger = g_refConfig->prefixLogger;
+     c->integrityMaxRate = g_refConfig->integrityMaxRate;
++    c->mmCapabilityExt = g_refConfig->mmCapabilityExt.copy();
++    c->smCapabilityExt = g_refConfig->smCapabilityExt.copy();
+     c->uacAic = g_refConfig->uacAic;
+     c->uacAcc = g_refConfig->uacAcc;
+ 
+--- a/src/ue/nas/sm/establishment.cpp
++++ b/src/ue/nas/sm/establishment.cpp
+@@ -16,9 +16,10 @@
+ namespace nr::ue
+ {
+ 
+-static nas::IE5gSmCapability MakeSmCapability()
++static nas::IE5gSmCapability MakeSmCapability(const UeConfig &config)
+ {
+     nas::IE5gSmCapability cap{};
++    cap.extOctets = config.smCapabilityExt.copy();
+     cap.rqos = nas::EReflectiveQoS::NOT_SUPPORTED;
+     cap.mh6pdu = nas::EMultiHomedIPv6PduSession::NOT_SUPPORTED;
+     return cap;
+@@ -123,7 +124,7 @@
+     req->sscMode = nas::IESscMode{};
+     req->sscMode->sscMode = nas::ESscMode::SSC_MODE_1;
+     req->extendedProtocolConfigurationOptions = std::move(iePco);
+-    req->smCapability = MakeSmCapability();
++    req->smCapability = MakeSmCapability(*m_base->config);
+ 
+     /* Set relevant fields of the PT, and start T3580 */
+     auto &pt = m_procedureTransactions[pti];
+--- a/src/ue/nas/mm/register.cpp
++++ b/src/ue/nas/mm/register.cpp
+@@ -88,6 +88,7 @@
+     request->mmCapability->s1Mode = nas::EEpcNasSupported::NOT_SUPPORTED;
+     request->mmCapability->hoAttach = nas::EHandoverAttachSupported::NOT_SUPPORTED;
+     request->mmCapability->lpp = nas::ELtePositioningProtocolCapability::NOT_SUPPORTED;
++    request->mmCapability->extOctets = m_base->config->mmCapabilityExt.copy();
+ 
+     // Assign other fields
+     request->mobileIdentity = getOrGeneratePreferredId();
+@@ -223,6 +224,7 @@
+         request->mmCapability->s1Mode = nas::EEpcNasSupported::NOT_SUPPORTED;
+         request->mmCapability->hoAttach = nas::EHandoverAttachSupported::NOT_SUPPORTED;
+         request->mmCapability->lpp = nas::ELtePositioningProtocolCapability::NOT_SUPPORTED;
++        request->mmCapability->extOctets = m_base->config->mmCapabilityExt.copy();
+     }
+ 
+     // Assign other fields

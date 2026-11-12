@@ -217,3 +217,40 @@ func TestNormalizeReportsInvalidPSIs(t *testing.T) {
 		t.Errorf("pdu_session_ids_invalid must be omitted when empty: %s", got["pdu_session_ids_invalid"])
 	}
 }
+
+// TestGetPassesCapability5GMM: capability_5gmm / capability_5gmm_bits from the
+// AMF snapshot reach the ue_context_get result unchanged, and the description
+// and output schema advertise them. Ref: TS 24.501 §9.11.3.1
+func TestGetPassesCapability5GMM(t *testing.T) {
+	tests := []struct {
+		name, body, wantHex, wantBits string
+	}{
+		{"enabled UE", `{"supi":"imsi-001010000000001","capability_5gmm":"00000000000c0400104008","capability_5gmm_bits":["ESI","ECI"]}`,
+			`"capability_5gmm":"00000000000c0400104008"`, `"capability_5gmm_bits":["ESI","ECI"]`},
+		{"default UE none", `{"supi":"imsi-001010000000001","capability_5gmm":"","capability_5gmm_bits":[]}`,
+			`"capability_5gmm":""`, `"capability_5gmm_bits":[]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			g := getTool{clients.NewAMF(srv.URL, http.DefaultClient)}
+			out, err := g.Invoke(context.Background(), json.RawMessage(`{"supi":"imsi-001010000000001"}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, _ := json.Marshal(out)
+			for _, want := range []string{tc.wantHex, tc.wantBits} {
+				if !strings.Contains(string(raw), want) {
+					t.Errorf("result lacks %s: %s", want, raw)
+				}
+			}
+		})
+	}
+	g := getTool{}
+	if !strings.Contains(g.Description(), "capability_5gmm") || !strings.Contains(string(g.OutputSchema()), "capability_5gmm_bits") {
+		t.Error("description/schema do not advertise the capability fields")
+	}
+}

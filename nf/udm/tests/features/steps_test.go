@@ -123,7 +123,7 @@ func (c *udmCtx) aCallbackListenerIsStarted() error {
 
 func (c *udmCtx) amfSubscribesWithCallbackURI(supi string) error {
 	sub := map[string]any{
-		"callbackReference":   c.callbackSrv.URL + "/callback",
+		"callbackReference":    c.callbackSrv.URL + "/callback",
 		"monitoredResourceUri": c.baseURL + "/nudm-sdm/v2/" + supi + "/am-data",
 	}
 	body, _ := json.Marshal(sub)

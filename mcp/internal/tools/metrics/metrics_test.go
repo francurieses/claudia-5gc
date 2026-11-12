@@ -19,11 +19,11 @@ func fakePrometheus(t *testing.T, queryBody, alertsBody string) (*httptest.Serve
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/api/v1/alerts":
+		switch r.URL.Path {
+		case "/api/v1/alerts":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(alertsBody))
-		case r.URL.Path == "/api/v1/query":
+		case "/api/v1/query":
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(queryBody))
 		default:

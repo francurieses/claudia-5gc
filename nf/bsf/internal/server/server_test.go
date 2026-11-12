@@ -11,8 +11,8 @@
 //   - DELETE → 404 (unknown bindingId)
 //   - GET /nbsf-management/v1/pcfBindings?ipv4Addr=… → 200 + PcfBinding
 //   - GET → 200 with supi query parameter
-//   - GET → 404 (no match)
-//   - GET → 400 MANDATORY_IE_MISSING (no query parameters)
+//   - GET → 204 No Content (no match)
+//   - GET → 400 MANDATORY_QUERY_PARAM_MISSING (no query parameters)
 //   - GET /healthz → 200 UP
 //
 // Ref: TS 29.521 §5
@@ -321,7 +321,7 @@ func TestDiscover_BySupi_OK(t *testing.T) {
 	}
 }
 
-// ---- Deregister then Discover → 404 -----------------------------------------
+// ---- Deregister then Discover → 204 -----------------------------------------
 
 func TestDeregisterThenDiscover_NotFound(t *testing.T) {
 	ts, _ := newTestServer(t)
@@ -343,33 +343,36 @@ func TestDeregisterThenDiscover_NotFound(t *testing.T) {
 		t.Fatalf("delete: expected 204, got %d", delResp.StatusCode)
 	}
 
-	// Discover — should be 404 now.
+	// Discover — no match, 204 now.
 	getResp, err := http.Get(ts.URL + "/nbsf-management/v1/pcfBindings?ipv4Addr=10.60.0.30")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
 	getResp.Body.Close()
-	if getResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404 after deregister, got %d", getResp.StatusCode)
+	if getResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 after deregister, got %d", getResp.StatusCode)
 	}
 }
 
-// ---- Discovery — 404 (no match) ---------------------------------------------
+// ---- Discovery — 204 (no match) ---------------------------------------------
 
-func TestDiscover_NoMatch_404(t *testing.T) {
+func TestDiscover_NoMatch_204(t *testing.T) {
 	ts, _ := newTestServer(t)
 
 	getResp, err := http.Get(ts.URL + "/nbsf-management/v1/pcfBindings?ipv4Addr=10.60.0.99")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	getResp.Body.Close()
-	if getResp.StatusCode != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", getResp.StatusCode)
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", getResp.StatusCode)
+	}
+	if b, _ := io.ReadAll(getResp.Body); len(b) != 0 {
+		t.Fatalf("204 must have empty body, got %q", b)
 	}
 }
 
-// ---- Discovery — 400 MANDATORY_IE_MISSING (no params) -----------------------
+// ---- Discovery — 400 MANDATORY_QUERY_PARAM_MISSING (no params) -----------------------
 
 func TestDiscover_NoQueryParam_400(t *testing.T) {
 	ts, _ := newTestServer(t)
@@ -382,8 +385,8 @@ func TestDiscover_NoQueryParam_400(t *testing.T) {
 		t.Fatalf("expected 400, got %d", getResp.StatusCode)
 	}
 	m := decodeBody(t, getResp)
-	if m["cause"] != "MANDATORY_IE_MISSING" {
-		t.Errorf("cause = %v, want MANDATORY_IE_MISSING", m["cause"])
+	if m["cause"] != "MANDATORY_QUERY_PARAM_MISSING" {
+		t.Errorf("cause = %v, want MANDATORY_QUERY_PARAM_MISSING", m["cause"])
 	}
 }
 

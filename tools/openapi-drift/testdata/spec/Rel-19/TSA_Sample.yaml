@@ -1,0 +1,74 @@
+openapi: 3.0.0
+info:
+  version: 1.4.0
+  title: Sample
+servers:
+  - url: '{apiRoot}/nsample/v1'
+components:
+  schemas:
+    Base:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+    Item:
+      allOf:
+        - $ref: '#/components/schemas/Base'
+        - type: object
+          required:
+            - name
+          properties:
+            name:
+              type: string
+            count:
+              type: integer
+            ratio:
+              type: number
+            ok:
+              type: boolean
+            tags:
+              type: array
+              items:
+                type: string
+            attrs:
+              type: object
+              additionalProperties:
+                type: string
+            supi:
+              $ref: 'TSB_Common.yaml#/components/schemas/Supi'
+            kind:
+              anyOf:
+                - type: string
+                  enum: [A, B]
+                - type: string
+            nested:
+              $ref: '#/components/schemas/Base'
+            loop:
+              $ref: '#/components/schemas/Item'
+            choice:
+              oneOf:
+                - $ref: '#/components/schemas/Base'
+                - $ref: 'TSB_Common.yaml#/components/schemas/Supi'
+    Choice:
+      oneOf:
+        - type: object
+          required: [x]
+          properties:
+            x:
+              type: string
+        - type: object
+          required: [y]
+          properties:
+            y:
+              type: integer
+    CycA:
+      $ref: '#/components/schemas/CycB'
+    CycB:
+      $ref: '#/components/schemas/CycA'
+    BadRef:
+      type: object
+      properties:
+        z:
+          $ref: 'Missing.yaml#/components/schemas/Z'

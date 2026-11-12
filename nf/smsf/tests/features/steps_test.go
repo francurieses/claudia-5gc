@@ -240,7 +240,16 @@ func (c *smsfCtx) callbackURI(supi string) string {
 }
 
 func (c *smsfCtx) postJSON(path string, body []byte) error {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.ts.URL+path, bytes.NewReader(body))
+	return c.sendJSON(http.MethodPost, path, body)
+}
+
+// putJSON issues the Activate request (PUT, TS 29.540 SMServiceActivation).
+func (c *smsfCtx) putJSON(path string, body []byte) error {
+	return c.sendJSON(http.MethodPut, path, body)
+}
+
+func (c *smsfCtx) sendJSON(method, path string, body []byte) error {
+	req, err := http.NewRequestWithContext(context.Background(), method, c.ts.URL+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -287,7 +296,7 @@ func (c *smsfCtx) activeContextExists(supi string) error {
 		"amfId":          "amf-instance-001",
 		"amfCallbackUri": c.callbackURI(supi),
 	})
-	if err := c.postJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body); err != nil {
+	if err := c.putJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body); err != nil {
 		return err
 	}
 	if c.lastResp.StatusCode != http.StatusCreated {
@@ -307,7 +316,7 @@ func (c *smsfCtx) sendActivate(supi, accessType, amfID, callbackURI string) erro
 		"amfId":          amfID,
 		"amfCallbackUri": callbackURI,
 	})
-	return c.postJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body)
+	return c.putJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body)
 }
 
 func (c *smsfCtx) sendActivateNoAccessType(supi, amfID, callbackURI string) error {
@@ -316,7 +325,7 @@ func (c *smsfCtx) sendActivateNoAccessType(supi, amfID, callbackURI string) erro
 		"amfId":          amfID,
 		"amfCallbackUri": callbackURI,
 	})
-	return c.postJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body)
+	return c.putJSON("/nsmsf-sms/v2/ue-contexts/"+supi, body)
 }
 
 func (c *smsfCtx) sendActivateNoSupi(accessType, amfID string) error {
@@ -325,7 +334,7 @@ func (c *smsfCtx) sendActivateNoSupi(accessType, amfID string) error {
 		"amfId":      amfID,
 	})
 	// Path param carries a placeholder; the body lacks supi → 400.
-	return c.postJSON("/nsmsf-sms/v2/ue-contexts/imsi-placeholder", body)
+	return c.putJSON("/nsmsf-sms/v2/ue-contexts/imsi-placeholder", body)
 }
 
 func (c *smsfCtx) sendUplinkSMS(supi, recordID, payload string) error {

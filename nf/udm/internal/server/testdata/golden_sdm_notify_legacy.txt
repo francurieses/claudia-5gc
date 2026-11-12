@@ -1,0 +1,15 @@
+status: Created
+Content-Type: application/json
+Location: /nudm-sdm/v2/imsi-001010000000001/sdm-subscriptions/<ID>
+
+{"nfInstanceId":"amf-1","callbackReference":"CALLBACK","monitoredResourceUri":"https://udm/nudm-sdm/v2/imsi-001010000000001/am-data","subscriptionId":"<ID>"}
+
+--- trigger ---
+status: No Content
+Content-Type: 
+Location: 
+
+
+--- notification ---
+application/json
+{"resourceChanges":[{"changeType":"REPLACE","resourcePath":"/subscribedUeAmbr/uplink","newValue":"2 Mbps","originalValue":"1 Mbps"}]}

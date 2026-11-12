@@ -4,15 +4,17 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // NFEvent represents an NF status event type per TS 29.510 §6.1.6.3.6.
 type NFEvent string
 
 const (
-	NFEventRegistered      NFEvent = "NF_REGISTERED"
-	NFEventDeregistered    NFEvent = "NF_DEREGISTERED"
-	NFEventProfileChanged  NFEvent = "NF_PROFILE_CHANGED"
+	NFEventRegistered     NFEvent = "NF_REGISTERED"
+	NFEventDeregistered   NFEvent = "NF_DEREGISTERED"
+	NFEventProfileChanged NFEvent = "NF_PROFILE_CHANGED"
 )
 
 // Subscription is one NFStatus subscription (TS 29.510 §5.2.2.7-9).
@@ -23,13 +25,18 @@ type Subscription struct {
 	ReqNFType NFType
 	// ReqNFInstanceID filters events to a specific NF instance (empty = all).
 	ReqNFInstanceID string
+	// Features is the Nnrf_NFManagement feature set negotiated for this
+	// subscription: the intersection of the consumer's requesterFeatures and
+	// the NRF's own set (TS 29.500 §6.6.2). Empty when the consumer sent none.
+	// In memory only (the store is never serialised).
+	Features features.Set
 }
 
 // NotificationData is the body of a NFStatusNotify POST (TS 29.510 §6.1.6.2.3).
 type NotificationData struct {
-	Event          NFEvent    `json:"event"`
-	NFInstanceURI  string     `json:"nfInstanceUri"`
-	NFProfile      *NFProfile `json:"nfProfile,omitempty"`
+	Event         NFEvent    `json:"event"`
+	NFInstanceURI string     `json:"nfInstanceUri"`
+	NFProfile     *NFProfile `json:"nfProfile,omitempty"`
 }
 
 // SubscriptionStore holds NF status subscriptions in memory.

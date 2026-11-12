@@ -117,7 +117,7 @@ func TestEncodeDeregistrationAcceptUE_RoundTrip(t *testing.T) {
 // Ref: TS 24.501 §8.2.13.1
 func TestEncodeDeregistrationRequestNW_WithCause(t *testing.T) {
 	r := &DeregistrationRequestNW{
-		AccessType: 1, // 3GPP
+		AccessType: 1,    // 3GPP
 		Cause5GMM:  0x16, // Deregistration
 	}
 	b, err := EncodeDeregistrationRequestNW(r)

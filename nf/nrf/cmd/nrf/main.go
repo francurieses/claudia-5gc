@@ -24,6 +24,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/registry"
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 )
 
@@ -68,6 +69,18 @@ func main() {
 		"plmn", cfg.PLMN,
 	)
 
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to the
+	// pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
+
 	// Construir registry: Redis si REDIS_URL está configurado, InMemory en otro caso.
 	evictionTimeout := time.Duration(cfg.HeartbeatTimeoutSec) * time.Second
 
@@ -93,6 +106,8 @@ func main() {
 		logger.Error("building SBI server", "error", err)
 		os.Exit(1)
 	}
+
+	srv.SetProfile(relProfile)
 
 	// Arranque
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

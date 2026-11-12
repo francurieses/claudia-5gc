@@ -78,7 +78,7 @@ func Encode5GGUTI(g *GUTIMobileIdentity) []byte {
 	// AMF Region ID
 	out = append(out, g.AMFRegionID)
 	// AMF Set ID (10 bits) + AMF ID (6 bits) = 2 bytes
-	amfRef := uint16(g.AMFSetID&0x3FF)<<6 | uint16(g.AMFID&0x3F)
+	amfRef := (g.AMFSetID&0x3FF)<<6 | uint16(g.AMFID&0x3F)
 	out = append(out, byte(amfRef>>8), byte(amfRef))
 	// 5G-TMSI (4 bytes)
 	tmsi := make([]byte, 4)
@@ -136,12 +136,21 @@ func decodeIMEIDigits(b []byte) string {
 	return string(out)
 }
 
+// SUCI SUPI format field position in octet 4 of the 5GS mobile identity IE
+// (bits 5-7). Ref: TS 24.501 §9.11.3.4
+const (
+	suciSUPIFormatShift = 4
+	suciSUPIFormatMask  = 0x07
+)
+
 func decodeSUCI(b []byte) (*SUCIMobileIdentity, error) {
 	if len(b) < 8 {
 		return nil, errors.New("nas: SUCI too short")
 	}
 	suci := &SUCIMobileIdentity{}
-	suci.SUPIFormat = (b[0] >> 3) & 0x07 // bits 5-3 of byte 0
+	// Octet 4: spare (bit 8) | SUPI format (bits 7-5) | spare (bit 4) | type
+	// of identity (bits 3-1). Ref: TS 24.501 §9.11.3.4
+	suci.SUPIFormat = (b[0] >> suciSUPIFormatShift) & suciSUPIFormatMask
 	suci.MCC, suci.MNC = decodeMCCMNC(b[1:4])
 	// Routing Indicator: up to 4 decimal digits, BCD low-nibble-first with 0xF
 	// padding (TS 24.501 §9.11.3.4). Previously decoded with a wrong nibble
@@ -193,7 +202,28 @@ func decodeGUTI(b []byte) (*GUTIMobileIdentity, error) {
 type SNSSAI struct {
 	SST uint8  // Slice/Service Type (1 byte)
 	SD  uint32 // Slice Differentiator (3 bytes, 0xFFFFFF = not set)
+
+	// HasMappedHPLMN reports that the mapped HPLMN SST (octet 7) is present
+	// (S-NSSAI contents length 2, 5 or 8, TS 24.501 §9.11.2.8). The zero value
+	// (false) is the non-roaming form; MappedHPLMNSST/SD are then unused.
+	HasMappedHPLMN bool
+	// MappedHPLMNSST is the HPLMN SST the SST is mapped to (octet 7).
+	MappedHPLMNSST uint8
+	// MappedHPLMNSD is the HPLMN SD the SD is mapped to (octets 8-10);
+	// SDNotPresent when only the mapped HPLMN SST is included.
+	MappedHPLMNSD uint32
 }
+
+// S-NSSAI contents lengths (octet 2 of the S-NSSAI IE, also the per-entry
+// length in an NSSAI value). All other values are reserved.
+// Ref: TS 24.501 §9.11.2.8, Table 9.11.2.8.1
+const (
+	snssaiLenSST                    = 1 // SST
+	snssaiLenSSTMappedSST           = 2 // SST and mapped HPLMN SST
+	snssaiLenSSTSD                  = 4 // SST and SD
+	snssaiLenSSTSDMappedSST         = 5 // SST, SD and mapped HPLMN SST
+	snssaiLenSSTSDMappedSSTMappedSD = 8 // SST, SD, mapped HPLMN SST and SD
+)
 
 const SDNotPresent uint32 = 0xFFFFFF
 
@@ -216,37 +246,77 @@ type NSSAI struct {
 }
 
 // EncodeNSSAI encodes an NSSAI IE value (without IEI + length prefix).
+// An S-NSSAI without a mapped HPLMN S-NSSAI is encoded with contents length 1
+// (no SD) or 4; one with HasMappedHPLMN uses length 2, 5 or 8. When a mapped
+// HPLMN SD is present the SD octets are always included, carrying
+// SDNotPresent ("no SD value associated with the SST") if the SST has none.
+// Ref: TS 24.501 §9.11.3.37, §9.11.2.8
 func EncodeNSSAI(n NSSAI) []byte {
 	var out []byte
 	for _, s := range n.SNSSAIs {
-		if s.SD == SDNotPresent {
-			out = append(out, 1, s.SST)
-		} else {
-			sd := []byte{byte(s.SD >> 16), byte(s.SD >> 8), byte(s.SD)}
-			out = append(out, 4, s.SST)
-			out = append(out, sd...)
-		}
+		out = append(out, encodeSNSSAIContents(s)...)
 	}
 	return out
 }
 
-// DecodeNSSAI parses an NSSAI IE value.
+// encodeSNSSAIContents returns length octet + S-NSSAI contents for s.
+func encodeSNSSAIContents(s SNSSAI) []byte {
+	sd := []byte{byte(s.SD >> 16), byte(s.SD >> 8), byte(s.SD)}
+	if !s.HasMappedHPLMN {
+		if s.SD == SDNotPresent {
+			return []byte{snssaiLenSST, s.SST}
+		}
+		return append([]byte{snssaiLenSSTSD, s.SST}, sd...)
+	}
+	if s.MappedHPLMNSD != SDNotPresent {
+		msd := []byte{byte(s.MappedHPLMNSD >> 16), byte(s.MappedHPLMNSD >> 8), byte(s.MappedHPLMNSD)}
+		out := append([]byte{snssaiLenSSTSDMappedSSTMappedSD, s.SST}, sd...)
+		out = append(out, s.MappedHPLMNSST)
+		return append(out, msd...)
+	}
+	if s.SD == SDNotPresent {
+		return []byte{snssaiLenSSTMappedSST, s.SST, s.MappedHPLMNSST}
+	}
+	out := append([]byte{snssaiLenSSTSDMappedSST, s.SST}, sd...)
+	return append(out, s.MappedHPLMNSST)
+}
+
+// decodeSD decodes a 3-octet Slice Differentiator. b must hold 3 octets.
+func decodeSD(b []byte) uint32 {
+	return uint32(b[0])<<16 | uint32(b[1])<<8 | uint32(b[2])
+}
+
+// DecodeNSSAI parses an NSSAI IE value: a list of length-prefixed S-NSSAI
+// contents of length 1, 2, 4, 5 or 8 (TS 24.501 §9.11.3.37, §9.11.2.8). A
+// truncated entry or a reserved length is a syntax error; the caller treats
+// the whole optional IE as not present (TS 24.501 §7.7.1).
 func DecodeNSSAI(b []byte) (NSSAI, error) {
 	var n NSSAI
 	i := 0
 	for i < len(b) {
-		if i >= len(b) {
-			break
-		}
 		length := int(b[i])
 		i++
 		if i+length > len(b) {
 			return n, fmt.Errorf("nas: NSSAI truncated")
 		}
+		v := b[i : i+length]
 		s := SNSSAI{SD: SDNotPresent}
-		s.SST = b[i]
-		if length == 4 {
-			s.SD = uint32(b[i+1])<<16 | uint32(b[i+2])<<8 | uint32(b[i+3])
+		switch length {
+		case snssaiLenSST:
+			s.SST = v[0]
+		case snssaiLenSSTMappedSST:
+			s.SST = v[0]
+			s.HasMappedHPLMN, s.MappedHPLMNSST, s.MappedHPLMNSD = true, v[1], SDNotPresent
+		case snssaiLenSSTSD:
+			s.SST, s.SD = v[0], decodeSD(v[1:4])
+		case snssaiLenSSTSDMappedSST:
+			s.SST, s.SD = v[0], decodeSD(v[1:4])
+			s.HasMappedHPLMN, s.MappedHPLMNSST, s.MappedHPLMNSD = true, v[4], SDNotPresent
+		case snssaiLenSSTSDMappedSSTMappedSD:
+			s.SST, s.SD = v[0], decodeSD(v[1:4])
+			s.HasMappedHPLMN, s.MappedHPLMNSST, s.MappedHPLMNSD = true, v[4], decodeSD(v[5:8])
+		default:
+			return n, fmt.Errorf("nas: NSSAI: reserved S-NSSAI contents length %d", length)
 		}
 		n.SNSSAIs = append(n.SNSSAIs, s)
 		i += length
@@ -376,22 +446,24 @@ type ABBA [2]byte
 
 // ---- 5GMM Cause (TS 24.501 §9.11.3.2) -----------------------------------
 
+// Cause5GMM is a 5GMM cause value (TS 24.501 §9.11.3.2). The full value set
+// and String() are in cause.go.
 type Cause5GMM byte
 
 const (
-	CauseIllegalUE                 Cause5GMM = 3
-	CauseIdentificationNotAccepted Cause5GMM = 5
-	CauseIllegalME                 Cause5GMM = 6
-	Cause5GSServicesNotAllowed     Cause5GMM = 7
-	CauseUEIdentityNotDerived      Cause5GMM = 9
-	CauseImplicitlyDeregistered    Cause5GMM = 10
-	CausePLMNNotAllowed            Cause5GMM = 11
-	CauseTANotAllowed              Cause5GMM = 12
-	CauseRoamingNotAllowed         Cause5GMM = 13
-	CauseNoSuitableCellsInTA       Cause5GMM = 15
-	CauseMACFailure                Cause5GMM = 20
-	CauseSynchFailure              Cause5GMM = 21
-	CauseCongestino                Cause5GMM = 22
+	CauseIllegalUE              Cause5GMM = 3
+	CausePEINotAccepted         Cause5GMM = 5 // #5 "PEI not accepted"
+	CauseIllegalME              Cause5GMM = 6
+	Cause5GSServicesNotAllowed  Cause5GMM = 7
+	CauseUEIdentityNotDerived   Cause5GMM = 9
+	CauseImplicitlyDeregistered Cause5GMM = 10
+	CausePLMNNotAllowed         Cause5GMM = 11
+	CauseTANotAllowed           Cause5GMM = 12
+	CauseRoamingNotAllowed      Cause5GMM = 13
+	CauseNoSuitableCellsInTA    Cause5GMM = 15
+	CauseMACFailure             Cause5GMM = 20
+	CauseSynchFailure           Cause5GMM = 21
+	CauseCongestion             Cause5GMM = 22
 	// Causes returned in DL NAS TRANSPORT when the AMF does not forward a
 	// 5GSM message to the SMF. Ref: TS 24.501 §5.4.5.2.5, Table 9.11.3.2.1.
 	CausePayloadNotForwarded    Cause5GMM = 90

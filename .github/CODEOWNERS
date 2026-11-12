@@ -1,0 +1,11 @@
+# Hard-stop areas (AGENTS.md): every change needs the owner's review.
+/docker-compose*.yml  @francurieses
+/shared/crypto/       @francurieses
+/shared/aka/          @francurieses
+
+# Agent roles, gates and workflow contract
+/AGENTS.md            @francurieses
+/CLAUDE.md            @francurieses
+/.claude/             @francurieses
+/.opencode/           @francurieses
+/docs/DOC_MAP.md      @francurieses

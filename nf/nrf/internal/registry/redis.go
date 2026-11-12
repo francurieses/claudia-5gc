@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/shared/jsoncompat"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -18,9 +18,9 @@ const keyPrefix = "nrf:nf:"
 // Redis native TTL replaces the eviction goroutine used by InMemory.
 // Ref: TS 29.510 §5.2.2.3.4
 type RedisRegistry struct {
-	client    *redis.Client
-	ttl       time.Duration // per-key TTL (2 × heartBeatTimer)
-	logger    *slog.Logger
+	client *redis.Client
+	ttl    time.Duration // per-key TTL (2 × heartBeatTimer)
+	logger *slog.Logger
 }
 
 // NewRedis connects to Redis and returns a RedisRegistry.
@@ -37,6 +37,36 @@ func NewRedis(addr string, ttl time.Duration, logger *slog.Logger) (*RedisRegist
 	}, nil
 }
 
+// encodeProfile serialises p for storage: the merged raw JSON, so attributes
+// the NRF does not model survive the Redis round trip.
+func encodeProfile(p *NFProfile) ([]byte, error) {
+	js, err := json.Marshal(p)
+	if err != nil {
+		return nil, fmt.Errorf("nrf redis: marshal: %w", err)
+	}
+	// schema_version lives only in the stored copy (never in SBI responses):
+	// decodeProfile strips it (so a re-save writes this build's version).
+	stamped, err := jsoncompat.StampVersion(js, ProfileSchemaVersion)
+	if err != nil {
+		return nil, fmt.Errorf("nrf redis: stamp schema_version: %w", err)
+	}
+	return stamped, nil
+}
+
+// ProfileSchemaVersion is the Redis profile schema version this build writes.
+const ProfileSchemaVersion = 1
+
+// decodeProfile is the inverse of encodeProfile; the stored object becomes the
+// profile's raw again.
+func decodeProfile(js []byte) (*NFProfile, error) {
+	var p NFProfile
+	if err := json.Unmarshal(js, &p); err != nil {
+		return nil, fmt.Errorf("nrf redis: unmarshal: %w", err)
+	}
+	p.raw = stripSchemaVersion(p.raw)
+	return &p, nil
+}
+
 func (r *RedisRegistry) key(id string) string { return keyPrefix + id }
 
 func (r *RedisRegistry) Register(p *NFProfile) error {
@@ -50,9 +80,9 @@ func (r *RedisRegistry) Register(p *NFProfile) error {
 		p.NFStatus = NFStatusRegistered
 	}
 	p.HeartBeatTimer = DefaultHeartbeatTimer
-	js, err := json.Marshal(p)
+	js, err := encodeProfile(p)
 	if err != nil {
-		return fmt.Errorf("nrf redis: marshal: %w", err)
+		return err
 	}
 	if err := r.client.Set(context.Background(), r.key(p.NFInstanceID), js, r.ttl).Err(); err != nil {
 		return fmt.Errorf("nrf redis: SET: %w", err)
@@ -70,9 +100,9 @@ func (r *RedisRegistry) Register(p *NFProfile) error {
 
 func (r *RedisRegistry) Update(id string, p *NFProfile) error {
 	p.NFInstanceID = id
-	js, err := json.Marshal(p)
+	js, err := encodeProfile(p)
 	if err != nil {
-		return fmt.Errorf("nrf redis: marshal: %w", err)
+		return err
 	}
 	// KEEPTTL preserves the remaining TTL — heartBeatTimer restarts on Heartbeat.
 	if err := r.client.Set(context.Background(), r.key(id), js, redis.KeepTTL).Err(); err != nil {
@@ -109,11 +139,11 @@ func (r *RedisRegistry) Get(id string) (*NFProfile, bool) {
 	if err != nil {
 		return nil, false
 	}
-	var p NFProfile
-	if err := json.Unmarshal(js, &p); err != nil {
+	p, err := decodeProfile(js)
+	if err != nil {
 		return nil, false
 	}
-	return &p, true
+	return p, true
 }
 
 func (r *RedisRegistry) Heartbeat(id string) error {
@@ -158,23 +188,18 @@ func (r *RedisRegistry) Discover(filter DiscoveryFilter) []*NFProfile {
 		if v == nil {
 			continue
 		}
-		var p NFProfile
-		if err := json.Unmarshal([]byte(v.(string)), &p); err != nil {
+		s, ok := v.(string)
+		if !ok {
 			continue
 		}
-		if filter.TargetNFType != "" && p.NFType != filter.TargetNFType {
+		p, err := decodeProfile([]byte(s))
+		if err != nil {
 			continue
 		}
-		if !matchServices(p.NFServices, filter.ServiceNames) {
+		if !matches(p, filter) {
 			continue
 		}
-		if !matchSNSSAIs(p.SNSSAIs, filter.SNSSAIs) {
-			continue
-		}
-		if filter.DNN != "" && !containsDNN(p.DNNList, filter.DNN) {
-			continue
-		}
-		out = append(out, &p)
+		out = append(out, p)
 	}
 	r.logger.Info("NF discovery",
 		"procedure", "NFDiscover",
@@ -190,5 +215,19 @@ func (r *RedisRegistry) Discover(filter DiscoveryFilter) []*NFProfile {
 // Close releases the Redis connection.
 func (r *RedisRegistry) Close() error { return r.client.Close() }
 
-// idFromKey strips the keyPrefix from a Redis key.
-func idFromKey(k string) string { return strings.TrimPrefix(k, keyPrefix) }
+// stripSchemaVersion removes the storage-only schema_version key from raw.
+func stripSchemaVersion(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || m == nil {
+		return raw
+	}
+	if _, ok := m[jsoncompat.SchemaVersionKey]; !ok {
+		return raw
+	}
+	delete(m, jsoncompat.SchemaVersionKey)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
+}

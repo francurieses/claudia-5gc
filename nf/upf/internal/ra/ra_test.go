@@ -126,7 +126,7 @@ func TestBuildRouterAdvertisement_PrefixInformationOption(t *testing.T) {
 	gotPrefix := net.IP(opt[16:32])
 	wantPrefix := prefix.IP.To16()
 	if !gotPrefix.Equal(wantPrefix) {
-		t.Errorf("prefix bytes = %s, want %s", gotPrefix, net.IP(wantPrefix))
+		t.Errorf("prefix bytes = %s, want %s", gotPrefix, wantPrefix)
 	}
 }
 

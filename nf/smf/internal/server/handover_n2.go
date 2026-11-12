@@ -18,8 +18,8 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	"github.com/free5gc/ngap/ngapType"
 
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )

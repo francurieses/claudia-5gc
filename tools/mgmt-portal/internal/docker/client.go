@@ -36,24 +36,49 @@ type ExecResult struct {
 
 // Client wraps the Docker SDK client.
 type Client struct {
-	cli *client.Client
+	cli     *client.Client
+	project string
 }
 
-// New returns a Client connected to the local Docker daemon.
-func New() (*Client, error) {
+// DefaultComposeProject is the compose project name used when
+// COMPOSE_PROJECT_NAME is unset or empty.
+const DefaultComposeProject = "5gc-rel17"
+
+// composeProjectLabel is the label Docker Compose sets on every container.
+const composeProjectLabel = "com.docker.compose.project"
+
+// ProjectName returns project, or DefaultComposeProject when it is blank.
+func ProjectName(project string) string {
+	if p := strings.TrimSpace(project); p != "" {
+		return p
+	}
+	return DefaultComposeProject
+}
+
+// New returns a Client connected to the local Docker daemon. project is the
+// compose project whose containers List returns (blank = DefaultComposeProject).
+func New(project string) (*Client, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
-	return &Client{cli: cli}, nil
+	return &Client{cli: cli, project: ProjectName(project)}, nil
+}
+
+// Project returns the compose project name this client filters on.
+func (c *Client) Project() string { return ProjectName(c.project) }
+
+// projectFilter returns the container-list filter for the compose project.
+func (c *Client) projectFilter() filters.Args {
+	return filters.NewArgs(filters.Arg("label", composeProjectLabel+"="+c.Project()))
 }
 
 // Close closes the underlying Docker client.
 func (c *Client) Close() { c.cli.Close() }
 
-// List returns all containers belonging to the 5gc-rel17 compose project.
+// List returns all containers belonging to the configured compose project.
 func (c *Client) List(ctx context.Context) ([]Service, error) {
-	f := filters.NewArgs(filters.Arg("label", "com.docker.compose.project=5gc-rel17"))
+	f := c.projectFilter()
 	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
 		Filters: f,
@@ -354,4 +379,45 @@ func (c *Client) IPOnNetwork(ctx context.Context, name, network string) string {
 		return ep.IPAddress
 	}
 	return ""
+}
+
+// startupLogWindow bounds how much of a container's log, counted from its last
+// start, StartupLogs returns. NFs print their release-profile line within the
+// first seconds of boot, so a short window keeps the read cheap on long-lived
+// containers.
+const startupLogWindow = 30 * time.Second
+
+// StartupLogs returns the first startupLogWindow of output of a RUNNING
+// container since its most recent start. It returns "" (no error) when the
+// container is missing or not running.
+func (c *Client) StartupLogs(ctx context.Context, name string) (string, error) {
+	info, err := c.cli.ContainerInspect(ctx, name)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	if info.State == nil || !info.State.Running {
+		return "", nil
+	}
+	started, err := time.Parse(time.RFC3339Nano, info.State.StartedAt)
+	if err != nil {
+		return "", err
+	}
+	rc, err := c.cli.ContainerLogs(ctx, name, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Since:      started.Add(-time.Second).Format(time.RFC3339Nano),
+		Until:      started.Add(startupLogWindow).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	var out, errb bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errb, rc); err != nil {
+		return "", err
+	}
+	return out.String() + errb.String(), nil
 }

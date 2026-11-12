@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
+	"github.com/francurieses/claudia-5gc/shared/dbmigrate"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -36,20 +38,7 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 }
 
 func (p *Postgres) migrate(ctx context.Context) error {
-	entries, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		sql, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return err
-		}
-		if _, err := p.pool.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("migration %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+	return dbmigrate.Run(ctx, dbmigrate.PgxDB{Pool: p.pool}, "amf", migrationsFS, "migrations", slog.Default())
 }
 
 func (p *Postgres) Close() { p.pool.Close() }

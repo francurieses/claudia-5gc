@@ -160,9 +160,9 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 - **Limits**: no live AF in the lab; exercised with mocks.
 
 ### UE location (LMF)
-- **What**: `Nlmf_Location` positioning with automatic method selection and fallback: Cell-ID, E-CID over NRPPa, and A-GNSS over LPP. Supports periodic and area-of-interest event subscriptions and cancel. Positions appear on Portal → UE Location.
+- **What**: `Nlmf_Location` positioning with automatic method selection and fallback: Cell-ID, E-CID over NRPPa, and A-GNSS over LPP. Supports periodic and area-of-interest event subscriptions and cancel. Under the `rel19` release profile, `DetermineLocation` can also activate periodic or area-triggered deferred location reported to an HTTPS callback. Positions appear on Portal → UE Location.
 - **Spec**: TS 29.572, TS 23.273, TS 38.455, TS 37.355. Port 8012.
-- **Try**: `make ueransim`, then `curl -sk --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt -X POST https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info -H 'Content-Type: application/json' -d '{"supi":"'$SUPI'","req5gsLoc":true,"reqCurrentLoc":true}'`; patched-UERANSIM checks: `bash scripts/validate-ueransim-mod.sh location|gnss`.
+- **Try**: `make ueransim`, then `curl -sk --cert pki/smf.crt --key pki/smf.key --cacert pki/ca.crt -X POST https://localhost:8012/nlmf-loc/v1/determine-location -H 'Content-Type: application/json' -d '{"supi":"'$SUPI'","req5gsLoc":true,"reqCurrentLoc":true}'`; patched-UERANSIM checks: `bash scripts/validate-ueransim-mod.sh location|gnss`.
 - **Limits**: Cell-ID coordinates are synthesised around the configured cell position; GMLC interface not implemented.
 
 ## User plane & operations
@@ -184,6 +184,31 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 ### Throughput benchmarking
 - **What**: bench tooling and a tuned zero-allocation GTP-U datapath. Headline figures are in [`performance/summary.md`](performance/summary.md).
 - **Try**: `make perf-up`, then `make perf-dn` / `make perf-multi-ue` / `make perf-bench`.
+
+### SBI feature negotiation
+- **What**: AMF, SMF, AUSF, UDM, NEF, BSF, SMSF, LMF, NSSF, PCF, NRF and UDR negotiate the SBI `supportedFeatures` bitmask per API (intersection of both sides). On by default (`rel19` is the default release profile); `release.profile: rel17` (or `NF_RELEASE_PROFILE=rel17`) restores the frozen legacy behaviour, which keeps the previous messages byte for byte. The BSF, SMSF, LMF, NSSF and PCF producers answer the intersection too (the PCF on SM policy, AM policy, UE policy and application-session creation); none of them implements an optional feature yet, so under `rel19` they offer `"0"`. The NRF implements the Service-Map feature and reports its own feature set (`"1"` for NF management, `"20"` for discovery) in `nrfSupportedFeatures`; the UDR offers `"0"`.
+- **Spec**: TS 29.500 §6.6.2, TS 29.571 §5.2.2, TS 29.502 / TS 29.518 §6.1.8.
+- **Try**: set `NF_RELEASE_PROFILE=rel19` on `amf`, `smf`, `ausf`, `udm` (and `nef`), or set `release: {profile: rel19}` in the `bsf`/`smsf`/`lmf`/`nssf`/`pcf`/`nrf`/`udr` YAML, restart, register a UE and open a PDU session, then `docker logs ausf | grep FeatureNegotiation`.
+- **HTTP redirection**: the AMF and SMF SBI clients follow HTTP 307/308 redirects (same method, body and headers, at most 5, never from https to http) and advertise the ES3XX feature bit under `rel19`; 301/302/303 are not followed.
+- **Limits**: only the ES3XX bit is implemented, so the negotiated AMF-SMF set is empty (`0`); AMF, SMF, AUSF, UDM and NEF take part so far; the AUSF, UDM and NEF implement no optional feature (they answer `0`). The NEF also takes part as a client of the PCF (application sessions) and the BSF (discovery), offering the ES3XX bit under `rel19`; its outbound SBI client follows HTTP 307/308 redirects.
+
+### Mixed-release deployments
+- **What**: Rel-19 and Rel-17 NFs run in the same core. Each NF takes its release profile from `release.profile` or `NF_RELEASE_PROFILE`; the AMF also infers each gNB's release at NG Setup (default Rel-17) and can cap it per gNB with `ngap.ran_profiles`. Legacy peers receive byte-identical messages.
+- **Spec**: TS 29.500 §6.6.2, TS 38.413.
+- **Try**: `make ueransim UE_COUNT=1 && make mixed-release-e2e` (Rel-19 AMF against Rel-17 SMF/PCF and the reverse, ~150 s).
+- **Limits**: only the profiles `rel17` and `rel19` exist; Rel-18/19 features stay opt-in.
+
+### NGAP error handling
+- **What**: the AMF handles transfer-syntax and abstract-syntax errors and unknown IEs per their criticality (reject / ignore / notify), answering with NGAP Error Indication where the spec requires it.
+- **Spec**: TS 38.413 §8.7.5, §10.
+- **Try**: send a malformed or unknown-IE NGAP message from a test gNB, then `docker logs amf | grep ErrorIndication`.
+- **Limits**: AMF side only.
+
+### Roaming (SEPP)
+- **What**: a vSEPP and hSEPP pair with N32-c capability handshake and N32-f forwarding between two PLMNs, registered in each PLMN's NRF.
+- **Spec**: TS 29.573, TS 23.501 §4.2.4.
+- **Try**: `docker compose --profile core --profile roaming up -d vsepp hsepp hnrf`, then `make sepp-e2e` (`PROFILE=rel17|rel19`).
+- **Limits**: N32-f runs in TLS protection mode and carries NF discovery in the E2E; see [`implementation-status.md`](implementation-status.md).
 
 ## Tooling
 

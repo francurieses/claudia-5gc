@@ -1,0 +1,2 @@
+/nudm-ueau/v1/imsi-001010000000001/security-information/generate-auth-data
+{"ausfInstanceId":"11111111-2222-3333-4444-555555555555","resynchronizationInfo":{"auts":"00112233445566778899aabbccdd","rand":"00112233445566778899aabbccddeeff"},"servingNetworkName":"5G:mnc001.mcc001.3gppnetwork.org"}

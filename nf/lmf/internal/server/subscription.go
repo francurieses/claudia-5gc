@@ -67,6 +67,11 @@ type subscription struct {
 	LastNotified      time.Time // zero until first notification
 	State             aoiState  // AOI only; meaningless for PERIODIC_REPORTING
 
+	// deferred is non-nil for TS 29.572 deferred-location sessions created via
+	// DetermineLocation (periodicEventInfo / areaEventInfo); nil for the legacy
+	// /subscriptions resources. Immutable after add.
+	deferred *deferredSession
+
 	cancel context.CancelFunc // stops the goroutine
 }
 
@@ -108,6 +113,85 @@ func (r *subscriptionRegistry) delete(subId string) bool {
 	s.cancel()
 	delete(r.subs, subId)
 	return true
+}
+
+// findDeferred returns the deferred-location session identified by
+// (ldrReference, hgmlcCallBackURI), or (nil, false).
+func (r *subscriptionRegistry) findDeferred(ldr, uri string) (*subscription, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if s := r.findDeferredLocked(ldr, uri); s != nil {
+		cp := *s
+		return &cp, true
+	}
+	return nil, false
+}
+
+// findDeferredLocked is findDeferred for callers holding r.mu.
+func (r *subscriptionRegistry) findDeferredLocked(ldr, uri string) *subscription {
+	for _, s := range r.subs {
+		if s.deferred != nil && s.deferred.LdrReference == ldr && s.deferred.HgmlcCallBackURI == uri {
+			return s
+		}
+	}
+	return nil
+}
+
+// deleteDeferred atomically removes (and cancels) the deferred-location
+// session identified by (ldrReference, hgmlcCallBackURI). It returns a copy of
+// the removed session, or (nil, false) when none exists.
+func (r *subscriptionRegistry) deleteDeferred(ldr, uri string) (*subscription, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.findDeferredLocked(ldr, uri)
+	if s == nil {
+		return nil, false
+	}
+	s.cancel()
+	delete(r.subs, s.SubId)
+	cp := *s
+	return &cp, true
+}
+
+// addDeferred atomically inserts a deferred-location session. A session with
+// the same (ldrReference, hgmlcCallBackURI) is replaced (and cancelled); the
+// replaced copy is returned. When the number of deferred sessions other than
+// the replaced one is already max, nothing changes (the old session survives)
+// and ok is false.
+func (r *subscriptionRegistry) addDeferred(sub *subscription, max int) (replaced *subscription, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.findDeferredLocked(sub.deferred.LdrReference, sub.deferred.HgmlcCallBackURI)
+	n := 0
+	for _, s := range r.subs {
+		if s.deferred != nil && s != old {
+			n++
+		}
+	}
+	if n >= max {
+		return nil, false
+	}
+	if old != nil {
+		old.cancel()
+		delete(r.subs, old.SubId)
+		cp := *old
+		replaced = &cp
+	}
+	r.subs[sub.SubId] = sub
+	return replaced, true
+}
+
+// countDeferred returns the number of active deferred-location sessions.
+func (r *subscriptionRegistry) countDeferred() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, s := range r.subs {
+		if s.deferred != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // count returns the current number of active subscriptions.

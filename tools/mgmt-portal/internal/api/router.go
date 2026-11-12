@@ -41,6 +41,8 @@ type Deps struct {
 	// MTLSClient is an HTTP client carrying the portal's mTLS client certificate.
 	// Used for /healthz probes against NFs that enforce mutual TLS (NRF, AMF).
 	MTLSClient *http.Client
+	// Release resolves the core's release profile from NF startup logs (nil = unknown).
+	Release *ReleaseResolver
 }
 
 // NewRouter builds the chi router for the management portal API.
@@ -112,6 +114,7 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 
 		// Deployment mode (standalone core vs. RAN simulators) and gNB registry (AMF)
 		r.Get("/deployment", deps.handleDeployment)
+		r.Get("/release", deps.handleRelease)
 		r.Get("/ran/gnbs", deps.handleRANGnbs)
 
 		// UERANSIM management — mutating calls need UERANSIM deployed (409 otherwise)
@@ -207,6 +210,9 @@ func spaFallback(staticFS http.FileSystem) http.HandlerFunc {
 
 		if f, err := staticFS.Open(r.URL.Path); err == nil {
 			_ = f.Close()
+			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
@@ -258,5 +264,8 @@ func serveSPAIndex(w http.ResponseWriter, r *http.Request, staticFS http.FileSys
 		writeError(w, http.StatusInternalServerError, "failed to read index.html")
 		return
 	}
+	// The shell references content-hashed bundles; never let a browser keep a
+	// stale one, or a redeploy keeps serving the previous JS.
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 }

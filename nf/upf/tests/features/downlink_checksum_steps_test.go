@@ -1009,8 +1009,9 @@ func e2e() error {
 func InitializeScenario(sc *godog.ScenarioContext) {
 	w := &world{repair: true}
 	a := &ambrWorld{}
-	registerN4Steps(sc, a)   // N4SessionInspection (MCP-012) steps; must precede registerAmbrSteps (first match wins)
-	registerAmbrSteps(sc, a) // AmbrEnforcement (UPF-005) steps, ambr_enforcement_steps_test.go
+	registerCPRecoverySteps(sc) // CP-restart recovery (TS 29.244 §6.2.6)
+	registerN4Steps(sc, a)      // N4SessionInspection (MCP-012) steps; must precede registerAmbrSteps (first match wins)
+	registerAmbrSteps(sc, a)    // AmbrEnforcement (UPF-005) steps, ambr_enforcement_steps_test.go
 	sc.After(func(ctx context.Context, _ *godog.Scenario, err error) (context.Context, error) {
 		w.teardown()
 		*w = world{repair: true}

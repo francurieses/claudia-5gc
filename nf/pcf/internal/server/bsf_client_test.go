@@ -75,9 +75,9 @@ func postSmPolicyWithIP(t *testing.T, s *Server, supi, dnn, ipv4 string) (map[st
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	smPolicyId, _ := resp["smPolicyId"].(string)
+	smPolicyId := lastSegment(w.Header().Get("Location"))
 	if smPolicyId == "" {
-		t.Fatal("smPolicyId missing in response")
+		t.Fatal("smPolicyId missing in Location header")
 	}
 	return resp, smPolicyId
 }
@@ -164,7 +164,7 @@ func TestSmPolicyCreateRegistersBSFBinding(t *testing.T) {
 	}
 }
 
-// TestSmPolicyDeleteDeregistersBSFBinding verifies that handleDeleteSmPolicy sends
+// TestSmPolicyDeleteDeregistersBSFBinding verifies that handleDeleteSmPolicyPost sends
 // DELETE /nbsf-management/v1/pcfBindings/{bindingId} for the stored binding.
 //
 // Ref: TS 29.521 §5.2.2.3
@@ -194,16 +194,16 @@ func TestSmPolicyDeleteDeregistersBSFBinding(t *testing.T) {
 	waitBindingID(t, s, smPolicyId, 500*time.Millisecond)
 
 	// Now delete the SM policy → should call BSF DELETE.
-	r := httptest.NewRequest(http.MethodDelete,
-		"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyId, nil)
+	r := httptest.NewRequest(http.MethodPost,
+		"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyId+"/delete", nil)
 	r.SetPathValue("smPolicyId", smPolicyId)
 	w := httptest.NewRecorder()
-	s.handleDeleteSmPolicy(w, r)
+	s.handleDeleteSmPolicyPost(w, r)
 	if w.Code != http.StatusNoContent {
-		t.Fatalf("handleDeleteSmPolicy: expected 204, got %d", w.Code)
+		t.Fatalf("handleDeleteSmPolicyPost: expected 204, got %d", w.Code)
 	}
 
-	// The DELETE to the BSF should have been called synchronously in handleDeleteSmPolicy.
+	// The DELETE to the BSF should have been called synchronously in handleDeleteSmPolicyPost.
 	wantPath := "/nbsf-management/v1/pcfBindings/" + wantBindingID
 	if got, _ := deletedPath.Load().(string); got != wantPath {
 		t.Errorf("BSF DELETE path: got %q want %q", got, wantPath)
@@ -236,13 +236,13 @@ func TestSmPolicyDeleteNoBSFClient(t *testing.T) {
 
 	_, smPolicyId := postSmPolicyWithIP(t, s, "imsi-001010000000001", "internet", "10.60.0.3")
 
-	r := httptest.NewRequest(http.MethodDelete,
-		"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyId, nil)
+	r := httptest.NewRequest(http.MethodPost,
+		"/npcf-smpolicycontrol/v1/sm-policies/"+smPolicyId+"/delete", nil)
 	r.SetPathValue("smPolicyId", smPolicyId)
 	w := httptest.NewRecorder()
-	s.handleDeleteSmPolicy(w, r)
+	s.handleDeleteSmPolicyPost(w, r)
 	if w.Code != http.StatusNoContent {
-		t.Fatalf("handleDeleteSmPolicy (no BSF): expected 204, got %d", w.Code)
+		t.Fatalf("handleDeleteSmPolicyPost (no BSF): expected 204, got %d", w.Code)
 	}
 }
 

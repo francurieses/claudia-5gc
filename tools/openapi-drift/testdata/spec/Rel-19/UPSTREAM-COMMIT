@@ -1,0 +1,4 @@
+repo=https://example.invalid/x.git
+branch=REL-19
+commit=abc123
+fetched=2026-01-01T00:00:00Z

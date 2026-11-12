@@ -104,7 +104,7 @@ func (t sliceStatusTool) Invoke(ctx context.Context, in json.RawMessage) (any, e
 	wg.Wait()
 
 	if uesErr != nil && smfErr != nil && ambrErr != nil && gnbErr != nil {
-		return nil, mcperr.ToolError(fmt.Errorf("slice_status: every source failed: prometheus: %v; smf: %v", uesErr, smfErr), nil)
+		return nil, mcperr.ToolError(fmt.Errorf("slice_status: every source failed: prometheus: %w; smf: %w", uesErr, smfErr), nil)
 	}
 
 	keys := map[sliceKey]bool{}

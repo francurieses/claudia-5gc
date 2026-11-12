@@ -21,14 +21,13 @@ type TokenResponse struct {
 // TokenCache fetches and caches OAuth2 access tokens from the NRF.
 // It automatically refreshes before expiry.
 type TokenCache struct {
-	mu          sync.Mutex
-	http        *http.Client
-	tokenURL    string
+	mu           sync.Mutex
+	http         *http.Client
+	tokenURL     string
 	nfInstanceID string
-	scope       string
-	secret      []byte // used for local validation only
-	token       string
-	expiresAt   time.Time
+	scope        string
+	token        string
+	expiresAt    time.Time
 }
 
 // NewTokenCache creates a token cache for the given NRF token endpoint.
@@ -112,5 +111,10 @@ func NewBearerClient(base *http.Client, cache *TokenCache) *http.Client {
 			Cache: cache,
 		},
 		Timeout: base.Timeout,
+		// Keep the redirect policy (ES3XX, shared/sbi.ApplyRedirectPolicy)
+		// and cookie jar of the wrapped client; the bearer is re-attached on
+		// every hop by BearerTransport.
+		CheckRedirect: base.CheckRedirect,
+		Jar:           base.Jar,
 	}
 }

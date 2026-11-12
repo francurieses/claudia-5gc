@@ -11,12 +11,15 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
+	"github.com/francurieses/claudia-5gc/shared/nas"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // ---- CM State Machine (TS 23.501 §5.3.2) --------------------------------
@@ -57,6 +60,12 @@ const (
 	GMMDeregisteredInitiated
 	// GMMServiceRequestInitiated: Service Request procedure ongoing.
 	GMMServiceRequestInitiated
+	// GMMCommonProcedureInitiated: the AMF has started a common procedure and
+	// waits for the UE's answer; for a registration it is the state between the
+	// REGISTRATION ACCEPT carrying a new 5G-GUTI (T3550 running) and the
+	// REGISTRATION COMPLETE. Appended after the existing values so persisted
+	// state numbers keep their meaning. Ref: TS 24.501 §5.1.3.3, §5.5.1.2.4
+	GMMCommonProcedureInitiated
 )
 
 func (s GMM5State) String() string {
@@ -69,6 +78,8 @@ func (s GMM5State) String() string {
 		return "5GMM-DEREGISTERED-INITIATED"
 	case GMMServiceRequestInitiated:
 		return "5GMM-SERVICE-REQUEST-INITIATED"
+	case GMMCommonProcedureInitiated:
+		return "5GMM-COMMON-PROCEDURE-INITIATED"
 	default:
 		return "unknown"
 	}
@@ -115,6 +126,8 @@ func (g GUTI5G) String() string {
 
 // UEContext is the central per-UE state object in the AMF.
 // Access is serialized through mu — do not hold mu across SBI calls.
+//
+// oapi: none AMF-internal UE state, not an SBI body (persisted as store.UERecord)
 type UEContext struct {
 	mu sync.Mutex
 
@@ -123,6 +136,10 @@ type UEContext struct {
 	SUCI string // Concealed identifier (from Registration Request)
 	GUTI *GUTI5G
 	PEI  string // Permanent Equipment Identifier (IMEISV)
+	// GPSI is the UE's public identifier from the Nudm_SDM am-data "gpsis"
+	// (msisdn- form preferred, "" when none). Runtime-only, not persisted.
+	// Ref: TS 29.503 §6.1.6.2.4
+	GPSI string
 
 	// NGAP IDs (TS 38.413 §9.3.3)
 	AMFUENGAPId int64  // assigned by AMF
@@ -149,6 +166,15 @@ type UEContext struct {
 	// CM state (TS 23.501 §5.3.2)
 	CMState CMState
 
+	// NASOnNewN2Connection is true only while the NAS message being processed
+	// arrived in an INITIAL UE MESSAGE, i.e. it is the message that moved the UE
+	// from CM-IDLE to CM-CONNECTED. Only then is a new KgNB derived from its
+	// uplink NAS COUNT and an INITIAL CONTEXT SETUP REQUEST sent; a message
+	// received over an existing N2 connection (UPLINK NAS TRANSPORT) derives
+	// none. In-memory only (not persisted); set/cleared by the NGAP layer around
+	// HandleNASMessage. Ref: TS 33.501 §6.8.1.2.1
+	NASOnNewN2Connection bool
+
 	// 5GMM state machine
 	State GMM5State
 	// Registration type of ongoing procedure
@@ -156,6 +182,14 @@ type UEContext struct {
 
 	// Security
 	SecurityCtx SecurityContext
+	// secCtxPending / prevSecurityCtx: a SECURITY MODE COMMAND is taking SecurityCtx
+	// into use; prevSecurityCtx is the context in use before it (secctx.go).
+	secCtxMu        sync.Mutex
+	secCtxPending   bool
+	prevSecurityCtx *SecurityContext
+	// secureExchange: the secure exchange of NAS messages is established for the
+	// current N1 signalling connection (secctx.go). In-memory only, never persisted.
+	secureExchange bool
 	// UE security capabilities (reported in Registration Request)
 	UESecCapEA [8]bool // EA0..EA7
 	UESecCapIA [8]bool // IA0..IA7
@@ -177,8 +211,21 @@ type UEContext struct {
 	// The same value is carried into the SecurityModeCommand and the resulting
 	// SecurityContext. Ref: TS 24.501 §5.4.1.2.1, §5.4.1.3.2, §5.4.1.3.7.
 	PendingNGKSI byte
-	KAUSF        []byte
-	KSEAF        []byte
+	// PendingAUTN is the AUTN of the in-flight 5G authentication challenge, kept
+	// so that the same challenge can be re-sent with a new ngKSI after an
+	// AUTHENTICATION FAILURE #71. Ref: TS 24.501 §5.4.1.3.7 e)
+	PendingAUTN [16]byte `json:"-"`
+	// AuthViaGUTI is true while the in-flight authentication runs on the SUPI
+	// resolved from a 5G-GUTI (not on a SUCI); it selects identification versus
+	// AUTHENTICATION REJECT after a #20 / #26 failure. Ref: TS 24.501 §5.4.1.3.7 c), d)
+	AuthViaGUTI bool `json:"-"`
+	// AuthSynchFailures / AuthNgKSIFailures count consecutive AUTHENTICATION
+	// FAILURE #21 / #71 messages of the in-flight authentication (reset by a new
+	// REGISTRATION REQUEST). Ref: TS 24.501 §5.4.1.3.7 e), f) NOTE 4
+	AuthSynchFailures int `json:"-"`
+	AuthNgKSIFailures int `json:"-"`
+	KAUSF             []byte
+	KSEAF             []byte
 
 	// Subscription data (from UDM)
 	AllowedNSSAI []SNSSAISubscribed
@@ -196,8 +243,46 @@ type UEContext struct {
 	PendingNSSAA    []SNSSAISubscribed
 	NSSAAInProgress *SNSSAISubscribed
 	NSSAAEAPID      byte
-	RejectedNSSAI   []SNSSAISubscribed
-	SubscribedAMBR  struct {
+	// NSSAAPendingStatus holds slices whose NSSAA could not be completed (no
+	// GPSI, NSSAAF unreachable/5xx): status PENDING, neither allowed nor rejected.
+	// Ref: TS 29.526 §5.2.2.2.1, TS 23.502 §4.2.9.2
+	NSSAAPendingStatus []SNSSAISubscribed
+	// RejectedNSSAI holds the slices that failed (or lost) NSSAA. Under rel19 the
+	// AMF reports them with Rejected NSSAI cause "failed or revoked NSSAA" (2,
+	// TS 24.501 Table 9.11.3.46.1); the legacy rel17 text called it "cause #3".
+	RejectedNSSAI []SNSSAISubscribed
+	// SubscribedNSSAI is the subscription's S-NSSAI list as read from am-data
+	// nssai.defaultSingleNssais (the only list the AMF reads), with the
+	// subjectToNetworkSliceSpecificAuthenticationAndAuthorization flag. It is
+	// what "default S-NSSAIs" means for the rel19 de-registration decision of
+	// TS 24.501 §4.6.2.4 c) / TS 23.502 §4.2.9.2 step 19b. Set at registration.
+	SubscribedNSSAI []SNSSAISubscribed
+	// EmergencyPDUSession reports that the UE has (or is establishing) an
+	// emergency PDU session; it selects the Configuration Update exception of
+	// TS 24.501 §4.6.2.4 c). The AMF does not establish emergency PDU sessions
+	// yet, so nothing sets it: the exception is not reachable in a running AMF.
+	EmergencyPDUSession bool
+	// NSSAAPendingAt records, per slice (see procedures.NSSAASliceKey), when the
+	// slice was last left PENDING; the PENDING retry waits a minimum interval
+	// from it (implementation choice, not a 3GPP value). Serial-queue only.
+	NSSAAPendingAt map[string]time.Time
+	// NSSAAResultsChanged (rel19) is set whenever a slice's NSSAA ends with a new
+	// result (EAP-Success, EAP-Failure, T3575 abort) and cleared when the one
+	// CONFIGURATION UPDATE COMMAND of the drained queue is sent.
+	// Ref: TS 23.502 §4.2.9.2 step 19a. Serial-queue only.
+	NSSAAResultsChanged bool
+	// NSSAAAuthCtxID is the Nnssaaf authCtxId of the in-flight multi-round
+	// exchange of NSSAAInProgress (rel19: set from the 201 SliceAuthContext /
+	// Location, used for the PUT of every following EAP-Response); empty when
+	// the AAA-S has no open context. NSSAARounds counts the EAP-Requests the
+	// AAA-S has relayed for that exchange. Both are reset when the slice
+	// resolves. Ref: TS 29.526 §5.2.2.2.1 steps 4-9, §6.1.3.3.3.1, TS 23.502 §4.2.9.2 steps 7-14
+	NSSAAAuthCtxID string
+	NSSAARounds    int
+	// NSSAARestarts counts the restarts of the current exchange after the NSSAAF
+	// lost the context (404 on the PUT); bounded by procedures.NSSAAMaxContextRestarts.
+	NSSAARestarts  int
+	SubscribedAMBR struct {
 		UL, DL uint64 // kbps
 	}
 
@@ -246,9 +331,16 @@ type UEContext struct {
 	// PolicyAssociationID is the PCF UE policy association identifier (URSP, npcf-ue-policy-control).
 	// Empty when no N15 call was made or when PCF is unavailable.
 	PolicyAssociationID string
-	// AMPolicyAssocID is the PCF AM policy association identifier (npcf-ampolicycontrol, TS 29.507).
+	// AMPolicyAssocID is the PCF AM policy association identifier (npcf-am-policy-control, TS 29.507).
 	// Empty when PCF AM policy association was not created.
 	AMPolicyAssocID string
+	// SDMSubscriptionID is the Nudm_SDM subscription id (last segment of the
+	// Location of the 201) created at registration; "" when none. In memory
+	// only. Removed (DELETE) where the AMF calls Nudm_UECM_Deregistration.
+	// Ref: TS 29.503 §5.2.2.3, §6.1.3.2
+	// Access through SetSDMSubscriptionID / TakeSDMSubscriptionID (own mutex).
+	SDMSubscriptionID string
+	sdmMu             sync.Mutex
 	// RFSP is the Radio Frequency Selection Priority index returned by PCF (1-256).
 	// Zero means PCF did not provide one.
 	// Ref: TS 23.501 §5.3.4.2, TS 29.507 §6.1.1.2.4
@@ -306,7 +398,166 @@ type UEContext struct {
 	taskMu       sync.Mutex
 	taskQueue    []func()
 	taskDraining bool
+
+	// mgr is the Manager that allocated this context (nil for contexts built
+	// outside AllocateUEContext). The serial-queue panic containment uses it to
+	// log and release the UE (panic.go).
+	mgr *Manager
+
+	// prevTMSI is the 5G-TMSI of the previous 5G-GUTI, kept in the Manager's
+	// 5G-TMSI index only until the new 5G-GUTI is confirmed (ConfirmGUTI) or the
+	// context is removed. Guarded by Manager.mu. Ref: TS 24.501 §5.5.1.3.8 a)
+	prevTMSI    uint32
+	hasPrevTMSI bool
+
+	// Supervision timers kept on the UE context (rel19 only) so that Remove /
+	// re-registration stop them and nothing is keyed by SUPI in a handler-wide
+	// map: T3575 of the NSSAA COMMAND (nas/nssaa_timer.go) and T3522 of the
+	// network-initiated DEREGISTRATION REQUEST (nas/dereg_timer.go). Each has
+	// its own leaf lock, never held across a call out.
+	nssaaT RetxTimer
+	deregT RetxTimer
+
+	// regT supervises the one outstanding registration common-procedure message
+	// (T3550 / T3560 / T3570, see regproc.go); regProc is the pending-procedure
+	// marker. Guarded by regProcMu (leaf lock).
+	regT       RetxTimer
+	regProcMu  sync.Mutex
+	regProc    regProcState
+	pendingICS ICSKind // procedure of the in-flight ICS Request (guarded by regProcMu)
+
+	// ERNSSAISupported records the ER-NSSAI bit of the 5GMM capability IE of the
+	// UE's last REGISTRATION REQUEST (octet 5 bit 5, TS 24.501 §9.11.3.1): the
+	// UE supports the Extended rejected NSSAI IE. It selects which IE carries the
+	// rejected NSSAI in the REGISTRATION ACCEPT, CONFIGURATION UPDATE COMMAND and
+	// network-initiated DEREGISTRATION REQUEST (rel19, TS 24.501 §5.5.1.2.4,
+	// §5.4.4.2, §5.5.2.3.1). Runtime-only: not persisted (ueContextToRecord
+	// ignores it), so a restored context reads "not supported" until the UE's
+	// next REGISTRATION REQUEST. Written on the UE's serial queue.
+	ERNSSAISupported bool `json:"-"`
+
+	// Capability5GMM is the decoded 5GMM capability IE of the UE's last
+	// REGISTRATION REQUEST, nil when the UE did not send it (TS 24.501
+	// §9.11.3.1). Persisted as raw value octets (UERecord.Capability5GMM) and
+	// re-decoded on restore. Written on the UE's serial queue.
+	Capability5GMM *nas.FiveGMMCapability `json:"-"`
 }
+
+// TimerStopper is the stop handle of a scheduled timer (*time.Timer or a test
+// fake).
+type TimerStopper interface{ Stop() bool }
+
+// NSSAATimerStopper is the T3575 name of TimerStopper (kept for callers).
+type NSSAATimerStopper = TimerStopper
+
+// RetxTimer is a retransmission-supervised timer (T3575, T3522): the scheduled
+// timer, a generation counter that invalidates callbacks already fired when it
+// is stopped or re-armed, the message to retransmit and the expiry count. The
+// zero value is ready; every method is safe from any goroutine.
+type RetxTimer struct {
+	mu       sync.Mutex
+	timer    TimerStopper
+	gen      uint64
+	expiries int
+	msg      any
+}
+
+// Arm (re)starts the timer: it stops any running one, bumps the generation so
+// callbacks of the old timer are ignored, and stores msg (what to retransmit)
+// with the expiry count. start receives the new generation and returns the
+// scheduled timer; it must not block or re-enter the UE context.
+func (r *RetxTimer) Arm(msg any, expiries int, start func(gen uint64) TimerStopper) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+	}
+	r.gen++
+	r.msg, r.expiries = msg, expiries
+	r.timer = start(r.gen)
+}
+
+// Stop stops the timer and invalidates callbacks already fired. Safe when none
+// is armed.
+func (r *RetxTimer) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+	r.gen++
+	r.msg = nil
+}
+
+// Current returns the message and expiry count of the timer armed with
+// generation gen, or ok=false when it was stopped or replaced meanwhile.
+func (r *RetxTimer) Current(gen uint64) (msg any, expiries int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if gen != r.gen || r.msg == nil {
+		return nil, 0, false
+	}
+	return r.msg, r.expiries, true
+}
+
+// State returns the message and expiry count of the armed timer whatever its
+// generation, or ok=false when none is armed.
+func (r *RetxTimer) State() (msg any, expiries int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.msg == nil {
+		return nil, 0, false
+	}
+	return r.msg, r.expiries, true
+}
+
+// Running reports whether the timer is armed.
+func (r *RetxTimer) Running() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timer != nil
+}
+
+// ArmNSSAATimer (re)starts T3575 supervision (see RetxTimer.Arm); cmd is the
+// COMMAND to retransmit.
+func (u *UEContext) ArmNSSAATimer(cmd any, expiries int, start func(gen uint64) NSSAATimerStopper) {
+	u.nssaaT.Arm(cmd, expiries, start)
+}
+
+// StopNSSAATimer stops T3575 and invalidates callbacks already fired. Safe on a
+// UE with no timer, from any goroutine.
+func (u *UEContext) StopNSSAATimer() { u.nssaaT.Stop() }
+
+// NSSAATimerCurrent returns the COMMAND and expiry count of the T3575 armed
+// with generation gen, or ok=false when it was stopped or replaced meanwhile.
+func (u *UEContext) NSSAATimerCurrent(gen uint64) (cmd any, expiries int, ok bool) {
+	return u.nssaaT.Current(gen)
+}
+
+// NSSAATimerRunning reports whether a T3575 supervision is armed.
+func (u *UEContext) NSSAATimerRunning() bool { return u.nssaaT.Running() }
+
+// ArmDeregTimer (re)starts T3522 supervision of a network-initiated
+// DEREGISTRATION REQUEST; req is the message to retransmit.
+// Ref: TS 24.501 §5.5.2.3.1, §5.5.2.3.5 a)
+func (u *UEContext) ArmDeregTimer(req any, expiries int, start func(gen uint64) TimerStopper) {
+	u.deregT.Arm(req, expiries, start)
+}
+
+// StopDeregTimer stops T3522 (DEREGISTRATION ACCEPT received, procedure aborted
+// or context removed) and invalidates callbacks already fired. Safe on a UE with
+// no timer, from any goroutine.
+func (u *UEContext) StopDeregTimer() { u.deregT.Stop() }
+
+// DeregTimerCurrent returns the DEREGISTRATION REQUEST and expiry count of the
+// T3522 armed with generation gen, or ok=false when it was stopped or replaced.
+func (u *UEContext) DeregTimerCurrent(gen uint64) (req any, expiries int, ok bool) {
+	return u.deregT.Current(gen)
+}
+
+// DeregTimerRunning reports whether a T3522 supervision is armed.
+func (u *UEContext) DeregTimerRunning() bool { return u.deregT.Running() }
 
 // EnqueueSerial appends f to this UE's serial task queue and returns
 // immediately. Tasks run one at a time in FIFO order on a lazily started
@@ -333,7 +584,7 @@ func (u *UEContext) EnqueueSerial(f func()) {
 			next := u.taskQueue[0]
 			u.taskQueue = u.taskQueue[1:]
 			u.taskMu.Unlock()
-			next()
+			u.runSerialTask(next)
 		}
 	}()
 }
@@ -358,6 +609,82 @@ type ServiceAreaRestriction struct {
 	NotAllowedTACs []string
 }
 
+// AllowsTAC reports whether tac is inside the allowed area defined by the
+// restriction. A nil restriction, an unknown restriction type, or ALLOWED_AREAS
+// with an absent (nil) area list means "no restriction". ALLOWED_AREAS with a
+// non-nil EMPTY list means the UE is allowed nowhere (TS 29.571 §5.4.4.18 note:
+// "the empty array is used when service is allowed/restricted nowhere").
+// Ref: TS 23.501 §5.3.4.1, TS 29.507 §6.1.1.2.5
+func (s *ServiceAreaRestriction) AllowsTAC(tac uint32) bool {
+	if s == nil {
+		return true
+	}
+	tacHex := fmt.Sprintf("%06x", tac)
+	switch s.RestrictionType {
+	case "ALLOWED_AREAS":
+		if s.AllowedTACs == nil {
+			return true
+		}
+		for _, allowed := range s.AllowedTACs {
+			if strings.EqualFold(allowed, tacHex) {
+				return true
+			}
+		}
+		return false
+	case "NOT_ALLOWED_AREAS":
+		for _, blocked := range s.NotAllowedTACs {
+			if strings.EqualFold(blocked, tacHex) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+// InNonAllowedArea reports whether the UE's current TA is a Non-Allowed Area or
+// lies outside its Allowed Area (TS 23.501 §3.1, §5.3.4.1). It is the single
+// decision point for the 5GMM cause #28 enforcement paths.
+//
+// It takes the UE lock to snapshot ServAreaRes and the TAI: callers must not
+// hold it.
+func (u *UEContext) InNonAllowedArea() bool {
+	if u == nil {
+		return false
+	}
+	sar, tac := u.ServiceAreaSnapshot()
+	if sar == nil {
+		return false
+	}
+	return !sar.AllowsTAC(tac)
+}
+
+// ServiceAreaSnapshot returns a copy of the PCF service area restriction (nil
+// when none) and the current TAC, read consistently under the UE lock. Callers
+// must not hold the UE lock.
+func (u *UEContext) ServiceAreaSnapshot() (*ServiceAreaRestriction, uint32) {
+	u.Lock()
+	defer u.Unlock()
+	if u.ServAreaRes == nil {
+		return nil, u.TAI.TAC
+	}
+	c := *u.ServAreaRes
+	if u.ServAreaRes.AllowedTACs != nil { // nil (no list) differs from empty (allowed nowhere)
+		c.AllowedTACs = append([]string{}, u.ServAreaRes.AllowedTACs...)
+	}
+	c.NotAllowedTACs = append([]string(nil), u.ServAreaRes.NotAllowedTACs...)
+	return &c, u.TAI.TAC
+}
+
+// SetServiceAreaRestriction stores the PCF service area restriction under the
+// UE lock.
+func (u *UEContext) SetServiceAreaRestriction(sar *ServiceAreaRestriction) {
+	u.Lock()
+	u.ServAreaRes = sar
+	u.Unlock()
+}
+
 // SNSSAISubscribed mirrors the UDR subscription type.
 // DNN carries the portal-assigned preferred DNN for this slice; when non-empty
 // the AMF enforces it at PDU session establishment regardless of what the UE requests.
@@ -372,6 +699,10 @@ type SNSSAISubscribed struct {
 }
 
 // PDUSession represents an established PDU session in the AMF.
+// SMFInstanceID holds the SM context reference returned by the SMF, not the
+// SMF NF instance id.
+//
+// oapi: none AMF-internal PDU session state, not an SBI body (persisted as store.PDUSessionRecord)
 type PDUSession struct {
 	PDUSessionID   uint8
 	SMFInstanceID  string
@@ -385,6 +716,14 @@ type PDUSession struct {
 	// HandoverRequestTransfer during N2 handover without re-querying the SMF.
 	// Ref: TS 38.413 §9.3.4.1 (PDU Session Resource Setup Request Transfer, also used as the Handover Request Transfer)
 	N2SmTransfer []byte
+	// Features is the Nsmf_PDUSession supportedFeatures set negotiated with
+	// the SMF when the session was created (TS 29.500 §6.6.2, TS 29.502
+	// §6.1.8): the intersection of what this AMF offered and what the SMF
+	// answered. Empty when nothing was offered (rel17 profile) or negotiated.
+	// Runtime-only: tagged json:"-" so any JSON encoding of the session, and
+	// therefore the persisted context_json, is unchanged; after a restart the
+	// set is simply empty again.
+	Features features.Set `json:"-"`
 }
 
 // nccModulus is the Next Hop Chaining Count range: NCC is a 3-bit counter
@@ -606,6 +945,10 @@ type Manager struct {
 	// the context package must not depend on the SBI layer.
 	// Ref: TS 23.007 §16, TS 29.502 §5.2.2.3.3.
 	releaseSMContext func(ctx context.Context, smContextRef string) error
+
+	// panicReleaser releases a UE after a recovered serial-queue panic
+	// (panic.go). Guarded by mu; set via SetPanicReleaser.
+	panicReleaser PanicReleaser
 }
 
 // SetSMContextReleaser installs the callback LoadFromStore uses to release the
@@ -762,6 +1105,7 @@ func (m *Manager) AllocateUEContext(ranID int64) *UEContext {
 		State:        GMMDeregistered,
 		PDUSessions:  make(map[uint8]*PDUSession),
 		LastActivity: time.Now(),
+		mgr:          m,
 	}
 	m.mu.Lock()
 	m.uesByNGAPId[amfID] = ue
@@ -836,13 +1180,45 @@ func (m *Manager) AssignGUTI(ctx context.Context, ue *UEContext) *GUTI5G {
 		TMSI:        tmsi,
 	}
 	ue.Lock()
+	old := ue.GUTI
 	ue.GUTI = guti
 	ue.Unlock()
 
+	// The previous 5G-TMSI stays resolvable only until the new 5G-GUTI is
+	// confirmed (ConfirmGUTI): the index holds at most the current and one
+	// previous 5G-TMSI per UE, so repeated reallocation cannot grow it.
+	// Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.8 a) 1) i)
 	m.mu.Lock()
+	if old != nil && old.TMSI != tmsi {
+		if ue.hasPrevTMSI {
+			m.dropTMSILocked(ue, ue.prevTMSI)
+		}
+		ue.prevTMSI, ue.hasPrevTMSI = old.TMSI, true
+	}
 	m.uesByTMSI[tmsi] = ue
 	m.mu.Unlock()
 	return guti
+}
+
+// ConfirmGUTI drops the previous 5G-TMSI of ue from the 5G-TMSI index once the
+// new 5G-GUTI is in use (REGISTRATION COMPLETE received): from then on the old
+// 5G-GUTI is invalid. No-op when no previous 5G-TMSI is pending.
+// Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.8 a) 1) i)
+func (m *Manager) ConfirmGUTI(ue *UEContext) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ue.hasPrevTMSI {
+		m.dropTMSILocked(ue, ue.prevTMSI)
+		ue.prevTMSI, ue.hasPrevTMSI = 0, false
+	}
+}
+
+// dropTMSILocked deletes the 5G-TMSI index entry tmsi only if it still points to
+// ue (a value reused by another context is left alone). Caller holds m.mu.
+func (m *Manager) dropTMSILocked(ue *UEContext, tmsi uint32) {
+	if m.uesByTMSI[tmsi] == ue {
+		delete(m.uesByTMSI, tmsi)
+	}
 }
 
 // RegisteredCount returns the number of UEs currently in GMMRegistered state.
@@ -891,6 +1267,8 @@ func (m *Manager) CountBySlice() map[SliceKey]int {
 // UESnapshot is a flat, JSON-safe view of a UEContext exposing only the fields
 // that are safe to surface on the read-only management API (no keys, no
 // pointers). Consumed by the MCP server's ue_list / ue_context_get tools.
+//
+// oapi: none O&M view on the plain-HTTP mgmt port :9002, not an SBI body
 type UESnapshot struct {
 	SUPI             string    `json:"supi"`
 	SUCI             string    `json:"suci,omitempty"`
@@ -905,6 +1283,11 @@ type UESnapshot struct {
 	// PDUSessionIDs is []int (not []uint8) so encoding/json emits a numeric array
 	// instead of a base64 string. Ascending order.
 	PDUSessionIDs []int `json:"pdu_session_ids"`
+	// Capability5GMM is the UE's 5GMM capability IE value octets (hex) and
+	// Capability5GMMBits the names of the set bits; "" and [] when the UE never
+	// sent the IE. Ref: TS 24.501 §9.11.3.1
+	Capability5GMM     string   `json:"capability_5gmm"`
+	Capability5GMMBits []string `json:"capability_5gmm_bits"`
 }
 
 // Snapshot returns a JSON-safe view of the UE context. It takes the per-UE lock
@@ -930,6 +1313,11 @@ func (u *UEContext) Snapshot() UESnapshot {
 		snap.PDUSessionIDs = append(snap.PDUSessionIDs, int(psi))
 	}
 	sort.Ints(snap.PDUSessionIDs)
+	snap.Capability5GMM = u.Capability5GMM.RawHex()
+	snap.Capability5GMMBits = u.Capability5GMM.SetBitNames()
+	if snap.Capability5GMMBits == nil {
+		snap.Capability5GMMBits = []string{}
+	}
 	return snap
 }
 
@@ -961,6 +1349,11 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 	ue.Lock()
 	ue.StopAllTimers()
 	ue.Unlock()
+	// The NSSAA T3575 supervision dies with the context (it is not a lifecycle
+	// timer: StopAllTimers also runs on a UE's reconnection).
+	ue.StopNSSAATimer()
+	ue.StopDeregTimer()
+	ue.StopRegTimer() // T3550 / T3560 / T3570 die with the context
 
 	m.mu.Lock()
 	delete(m.uesByNGAPId, ue.AMFUENGAPId)
@@ -973,6 +1366,10 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 	}
 	if ue.GUTI != nil {
 		delete(m.uesByTMSI, ue.GUTI.TMSI)
+	}
+	if ue.hasPrevTMSI {
+		m.dropTMSILocked(ue, ue.prevTMSI)
+		ue.prevTMSI, ue.hasPrevTMSI = 0, false
 	}
 	m.mu.Unlock()
 
@@ -989,35 +1386,70 @@ func (u *UEContext) CorrelationID() string {
 		return u.SUPI
 	}
 	if u.SUCI != "" {
-		return "suci-" + u.SUCI[len(u.SUCI)-8:]
+		// Last 8 characters; a shorter value (e.g. the "unknown" placeholder of
+		// a non-SUCI identity) is used whole instead of slicing out of range.
+		s := u.SUCI
+		if len(s) > correlationSUCISuffixLen {
+			s = s[len(s)-correlationSUCISuffixLen:]
+		}
+		return "suci-" + s
 	}
 	return fmt.Sprintf("amf-ue-ngap-%d", u.AMFUENGAPId)
 }
 
 // ---- Persistence conversion helpers -------------------------------------
 
+// capability5GMMRaw returns the value octets of c for persistence, nil if absent.
+func capability5GMMRaw(c *nas.FiveGMMCapability) []byte {
+	if c == nil {
+		return nil
+	}
+	b, err := nas.Encode5GMMCapability(c)
+	if err != nil {
+		slog.Debug("amf: encode 5GMM capability for persistence", "error", err)
+		return nil
+	}
+	return b
+}
+
+// capability5GMMFromRaw re-decodes persisted 5GMM capability octets; empty or
+// invalid input yields nil (capability unknown).
+func capability5GMMFromRaw(b []byte) *nas.FiveGMMCapability {
+	if len(b) == 0 {
+		return nil
+	}
+	c, err := nas.Decode5GMMCapability(b)
+	if err != nil {
+		slog.Debug("amf: decode persisted 5GMM capability", "error", err)
+		return nil
+	}
+	return c
+}
+
 // ueContextToRecord converts an in-memory UEContext to a serialisable UERecord.
 // Caller must hold ue.mu (or be the sole owner) while calling.
 func ueContextToRecord(ue *UEContext) *store.UERecord {
+	sc := ue.persistableSecurityCtx()
 	rec := &store.UERecord{
 		SUPI:             ue.SUPI,
 		GMMState:         int(ue.State),
 		CMState:          int(ue.CMState),
 		RawUESecCap:      ue.RawUESecCap,
+		Capability5GMM:   capability5GMMRaw(ue.Capability5GMM),
 		SubscribedAMBRUL: ue.SubscribedAMBR.UL,
 		SubscribedAMBRDL: ue.SubscribedAMBR.DL,
 		RegistrationTime: ue.RegistrationTime,
 		LastActivity:     time.Now(),
 		SecurityCtx: store.SecurityRecord{
-			NGKSI:          ue.SecurityCtx.NGKSI,
-			IntegrityAlgID: ue.SecurityCtx.IntegrityAlgID,
-			CipheringAlgID: ue.SecurityCtx.CipheringAlgID,
-			KAMF:           ue.SecurityCtx.KAMF,
-			KNASint:        ue.SecurityCtx.KNASint,
-			KNASenc:        ue.SecurityCtx.KNASenc,
-			UplinkCount:    ue.SecurityCtx.UplinkCount,
-			DownlinkCount:  ue.SecurityCtx.DownlinkCount,
-			Active:         ue.SecurityCtx.Active,
+			NGKSI:          sc.NGKSI,
+			IntegrityAlgID: sc.IntegrityAlgID,
+			CipheringAlgID: sc.CipheringAlgID,
+			KAMF:           sc.KAMF,
+			KNASint:        sc.KNASint,
+			KNASenc:        sc.KNASenc,
+			UplinkCount:    sc.UplinkCount,
+			DownlinkCount:  sc.DownlinkCount,
+			Active:         sc.Active,
 		},
 	}
 	if ue.GUTI != nil {
@@ -1059,6 +1491,7 @@ func recordToUEContext(rec *store.UERecord) *UEContext {
 		State:            GMM5State(rec.GMMState),
 		CMState:          CMState(rec.CMState),
 		RawUESecCap:      rec.RawUESecCap,
+		Capability5GMM:   capability5GMMFromRaw(rec.Capability5GMM),
 		PDUSessions:      make(map[uint8]*PDUSession),
 		RegistrationTime: rec.RegistrationTime,
 		LastActivity:     rec.LastActivity,
@@ -1105,4 +1538,21 @@ func recordToUEContext(rec *store.UERecord) *UEContext {
 		}
 	}
 	return ue
+}
+
+// SetSDMSubscriptionID records the Nudm_SDM subscription id.
+func (u *UEContext) SetSDMSubscriptionID(id string) {
+	u.sdmMu.Lock()
+	u.SDMSubscriptionID = id
+	u.sdmMu.Unlock()
+}
+
+// TakeSDMSubscriptionID returns the Nudm_SDM subscription id and clears it, so
+// the subscription is deleted once.
+func (u *UEContext) TakeSDMSubscriptionID() string {
+	u.sdmMu.Lock()
+	defer u.sdmMu.Unlock()
+	id := u.SDMSubscriptionID
+	u.SDMSubscriptionID = ""
+	return id
 }

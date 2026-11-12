@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"MANDATORY_IE_MISSING","detail":"callbackReference is mandatory","status":400}

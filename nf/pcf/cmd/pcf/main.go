@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/pcf/internal/config"
+	pcfsbi "github.com/francurieses/claudia-5gc/nf/pcf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/pcf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -36,6 +38,7 @@ func main() {
 			return a
 		},
 	}))
+	// "nf" is added exactly once here; server.New does not add it again.
 	logger = logger.With("nf", "PCF", "nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
 
@@ -44,8 +47,20 @@ func main() {
 		logger.Error("tracing init failed", "error", err)
 	}
 	if tp != nil {
-		defer tp.Shutdown(context.Background())
+		defer func() { _ = tp.Shutdown(context.Background()) }()
 	}
+
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	logger.Info("PCF starting", "instance_id", cfg.NFInstanceID)
 
@@ -68,6 +83,7 @@ func main() {
 		logger.Error("SBI server creation failed", "error", err)
 		os.Exit(1)
 	}
+	sbiSrv.SetProfile(relProfile)
 
 	// ---- UDR client (N36 — per-subscriber URSP policy lookup) -----------
 	var httpClient *http.Client
@@ -81,7 +97,7 @@ func main() {
 	} else {
 		if cfg.Peers.UDR != "" {
 			udrBaseURL := "https://" + cfg.Peers.UDR
-			sbiSrv.WithUDRClient(server.NewHTTPUDRClient(udrBaseURL, httpClient))
+			sbiSrv.WithUDRClient(server.NewHTTPUDRClient(udrBaseURL, httpClient).WithFeatures(relProfile, logger))
 			logger.Info("UDR client configured", "udr", udrBaseURL, "interface", "N36")
 		}
 		// ---- BSF client (Nbsf_Management — PCF binding register/deregister) ---
@@ -122,27 +138,9 @@ func main() {
 		}
 		if nrfHTTPClient != nil {
 			nrfClient := nrf.New(nrfAddr, nrfHTTPClient, logger)
-			profile := &nrf.NFProfile{
-				NFInstanceID: cfg.NFInstanceID,
-				NFType:       "PCF",
-				NFStatus:     "REGISTERED",
-				NFServices: []nrf.NFService{
-					{
-						ServiceInstanceID: cfg.NFInstanceID + "-npcf-smpolicycontrol",
-						ServiceName:       "npcf-smpolicycontrol",
-						Scheme:            "https",
-						NFServiceStatus:   "REGISTERED",
-						Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-					},
-					{
-						ServiceInstanceID: cfg.NFInstanceID + "-npcf-ue-policy-control",
-						ServiceName:       "npcf-ue-policy-control",
-						Scheme:            "https",
-						NFServiceStatus:   "REGISTERED",
-						Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-					},
-				},
-			}
+			profile := pcfsbi.BuildNFProfile(cfg.NFInstanceID, relProfile,
+				pcfsbi.NpcfSMPolicyControlCatalog(), pcfsbi.NpcfUEPolicyControlCatalog(),
+				pcfsbi.NpcfAMPolicyControlCatalog(), pcfsbi.NpcfPolicyAuthorizationCatalog())
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,

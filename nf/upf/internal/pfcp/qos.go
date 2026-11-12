@@ -273,8 +273,8 @@ func buildQoSView(s *Session, cfg QoSConfig) *qosView {
 	var accessPDR, corePDR *PDRState
 	for _, p := range s.PDRs {
 		v.byPDR[p.PDRID] = buildPDRView(s, p)
-		switch {
-		case p.SourceInterface == srcInterfaceCore:
+		switch p.SourceInterface {
+		case srcInterfaceCore:
 			corePDR = lowerPrecedence(corePDR, p)
 		default:
 			accessPDR = lowerPrecedence(accessPDR, p)

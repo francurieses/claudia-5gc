@@ -11,10 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,12 +31,14 @@ import (
 	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/oauth2"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 )
@@ -53,6 +57,11 @@ type NGAPSenderWithSMF struct {
 // SendDownlinkNASTransport delegates to NGAP server.
 func (s *NGAPSenderWithSMF) SendDownlinkNASTransport(ue *amfctx.UEContext, nasPDU []byte) error {
 	return s.ngap.SendDownlinkNASTransport(ue, nasPDU)
+}
+
+// HasN2Association delegates to NGAP server.
+func (s *NGAPSenderWithSMF) HasN2Association(ue *amfctx.UEContext) bool {
+	return s.ngap.HasN2Association(ue)
 }
 
 // SendInitialContextSetupRequest delegates to NGAP server.
@@ -85,12 +94,12 @@ func (s *NGAPSenderWithSMF) SendPDUSessionResourceReleaseCommand(ue *amfctx.UECo
 // If an NRF discovery client is configured, the SMF address is resolved per slice;
 // otherwise falls back to the statically configured SMF address.
 func (s *NGAPSenderWithSMF) CallSMF(ctx context.Context, supi, dnn string,
-	pduSessionID uint8, n1SmMsg []byte, snssai amfctx.SNSSAISubscribed) (string, []byte, []byte, error) {
+	pduSessionID uint8, n1SmMsg []byte, snssai amfctx.SNSSAISubscribed) (string, []byte, []byte, features.Set, error) {
 	smf := s.smf
 	if s.nrfDisc != nil {
 		addr, err := s.nrfDisc.DiscoverSMFAddress(ctx, snssai)
 		if err == nil && addr != "" {
-			smf = &HTTPSMFClient{address: addr, client: s.smf.client}
+			smf = s.smf.withAddress(addr)
 		}
 	}
 	return smf.CreateSMContext(ctx, supi, dnn, pduSessionID, n1SmMsg, snssai)
@@ -152,6 +161,18 @@ func main() {
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
 
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
+
 	// ---- Tracing (OTel → Jaeger) ------------------------------------------
 	otlpEndpoint := getEnvDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318")
 	tracingCtx := context.Background()
@@ -195,6 +216,10 @@ func main() {
 		os.Exit(1)
 	}
 	httpClient.Transport = otelhttp.NewTransport(httpClient.Transport)
+	// ES3XX: follow 307/308 (same method/body/headers) for every SBI request
+	// and never 301/302/303. Installed before the OAuth2 wrap, which copies
+	// CheckRedirect. Ref: TS 29.500 §6.10.9.1, TS 29.502 §6.1.8 feature 8.
+	sbi.ApplyRedirectPolicy(httpClient, logger, sbi.WithNF("AMF"))
 
 	// Wrap client with OAuth2 Bearer transport when NRF and secret are configured.
 	sbiClient := httpClient
@@ -213,14 +238,22 @@ func main() {
 	ausfClient := &HTTPAUSFClient{
 		address: cfg.Peers.AUSFAddress,
 		client:  sbiClient,
+		profile: relProfile,
+		logger:  logger,
 	}
 	udmClient := &HTTPUDMClient{
 		address: cfg.Peers.UDMAddress,
 		client:  sbiClient,
+		profile: relProfile,
+		logger:  logger,
 	}
+	udmClient.SetSelf(cfg.NFInstanceID, ownAPIRoot(cfg.SBI.APIRoot, cfg.SBI.Address),
+		cfg.PLMN.MCC, cfg.PLMN.MNC, cfg.AMFRegionID, cfg.AMFSetID, cfg.AMFID)
 	smfClient := &HTTPSMFClient{
 		address: cfg.Peers.SMFAddress,
 		client:  sbiClient,
+		profile: relProfile,
+		logger:  logger,
 	}
 
 	// ---- Persistent store (PostgreSQL) + cache (Redis) --------------------
@@ -275,7 +308,9 @@ func main() {
 	// ---- NRF discovery client (optional) -----------------------------------
 	var nrfDiscClient *HTTPNRFClient
 	if nrfBase != "" {
-		nrfDiscClient = NewHTTPNRFClient(nrfBase, sbiClient)
+		// host:port, not nrfBase: the client prepends "https://" itself, and a
+		// base URL here made the request host "https" (8 s DNS stall per call).
+		nrfDiscClient = NewHTTPNRFClient(cfg.Peers.NRFAddress, sbiClient).WithFeatures(relProfile, logger)
 	}
 
 	// ---- Registration handler (procedures) --------------------------------
@@ -341,7 +376,9 @@ func main() {
 		regHandler.WithNSSAA(&HTTPNSSAAClient{
 			address: cfg.Peers.AUSFAddress,
 			client:  sbiClient,
+			profile: relProfile,
 		})
+		regHandler.WithNSSAASpecLiteral(features.SpecLiteral(relProfile))
 		logger.Info("NSSAA slice authentication enabled",
 			"ausf_addr", cfg.Peers.AUSFAddress,
 			"spec_ref", "TS 23.502 §4.2.9",
@@ -373,6 +410,9 @@ func main() {
 		T3512Secs:          cfg.Timers.T3512Secs,
 		GuardSecs:          cfg.Timers.MobileReachableGuardSecs,
 		ImplicitDetachSecs: cfg.Timers.ImplicitDetachSecs,
+		T3550Secs:          cfg.Timers.T3550Secs,
+		T3560Secs:          cfg.Timers.T3560Secs,
+		T3570Secs:          cfg.Timers.T3570Secs,
 	})
 	regHandler.WithTimerStore(timerStore)
 	// Registration area (TAI list, IEI 0x54) sent in every Registration Accept.
@@ -390,6 +430,7 @@ func main() {
 		imsVoPS = *cfg.Operator.IMSVoPSSupported
 	}
 	regHandler.WithIMSVoPS3GPP(imsVoPS)
+	regHandler.WithNetworkFeatureSupportBits(cfg.Operator.NetworkFeatureSupport.Bits())
 	logger.Info("IMS VoPS-3GPP-access bit configured",
 		"ims_vops_3gpp", imsVoPS,
 		"spec_ref", "TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)",
@@ -422,6 +463,13 @@ func main() {
 		AMFID:    cfg.AMFID,
 		SNSSAIs:  amfSNSSAIs,
 	}, logger)
+	// Per-gNB release override (already validated in loadConfig).
+	rp, err := ngap.NewRANProfiles(cfg.NGAP.RANProfiles)
+	if err != nil {
+		logger.Error("invalid ngap.ran_profiles", "error", err)
+		os.Exit(1)
+	}
+	ngapSrv.WithRANProfiles(rp)
 	// Configure UE lifecycle timer durations.
 	// Ref: TS 24.501 §5.3.7, TS 23.501 §5.4.1.1 (Mobile Reachable, Implicit Detach), TS 38.413 §8.3.3
 	ngapSrv.WithTimerConfig(ngap.TimerConfig{
@@ -439,6 +487,7 @@ func main() {
 		nrfDisc: nrfDiscClient,
 	}
 	nasHandler := nasmsg.NewHandler(sender, regHandler, logger)
+	nasHandler.WithIntegrityEnforcement(nasmsg.IntegrityEnforcement(cfg.NASSecurity.IntegrityEnforcement))
 
 	// Operator name shown on the handset. Delivered in a Configuration Update
 	// Command after Registration Complete. Ref: TS 24.501 §8.2.19
@@ -458,6 +507,7 @@ func main() {
 		nasHandler.WithSMSFClient(&HTTPSMSFClient{
 			address: cfg.Peers.SMSFAddress,
 			client:  sbiClient,
+			profile: relProfile,
 		})
 		logger.Info("SMS over NAS enabled — UL NAS Transport SMS routed to SMSF",
 			"smsf_addr", cfg.Peers.SMSFAddress,
@@ -471,6 +521,8 @@ func main() {
 
 	// Wire NAS handler back into NGAP server (circular dep resolved via interface)
 	ngapSrv.SetNASHandler(nasHandler)
+	// Panic containment on the per-UE serial queue releases the affected UE.
+	mgr.SetPanicReleaser(nasHandler.ReleaseAfterPanic)
 
 	// sbiSrv is forward-declared here so the onUEReachable closure below can
 	// reference it without a circular init dependency. It is assigned later in
@@ -527,6 +579,16 @@ func main() {
 				"smContextRef", smContextRef, "error", err)
 		}
 	})
+
+	// An initial registration rolled back after an ICS failure releases the UDM
+	// registration and PCF associations before the context is removed (AMF-034).
+	// Ref: TS 23.502 §4.2.2.3.2 step 3
+	ngapSrv.SetRegistrationAbortHandler(regHandler.ReleaseUERegistration)
+
+	// PDU Session Resource Setup Unsuccessful Transfers from an ICS Response /
+	// Failure go to the SMF as PDU_RES_SETUP_FAIL; the SMF decides (AMF-034).
+	// Ref: TS 38.413 §8.3.1.3, TS 23.502 §4.2.3.2 steps 12-15
+	ngapSrv.SetPDUSessionSetupFailRelayHandler(smfClient.UpdatePDUSessionSetupFail)
 
 	// When UE Context Release Complete is received (UE → CM-IDLE), notify the SMF
 	// for each PDU session so it can deactivate the UPF DL forwarding path.
@@ -587,6 +649,12 @@ func main() {
 		}
 
 		if supi != "" {
+			if id := ue.TakeSDMSubscriptionID(); id != "" {
+				if err := udmClient.UnsubscribeSDM(ctx, supi, id); err != nil {
+					logger.Warn("UDM SDM unsubscribe failed", "supi", supi, "error", err,
+						"spec_ref", "TS 29.503 §5.2.2.4")
+				}
+			}
 			if err := udmClient.DeregisterUECM(ctx, supi); err != nil {
 				logger.Warn("UDM UECM deregistration failed on gNB disconnect",
 					"supi", supi, "error", err)
@@ -605,7 +673,11 @@ func main() {
 	// Reachable Timer expired), release all PDU sessions, deregister from UDM,
 	// and remove the UE context. Same cleanup path as gNB disconnect.
 	// Ref: TS 23.501 §5.3.2
-	ngapSrv.SetImplicitDetachHandler(func(ctx context.Context, ue *amfctx.UEContext) {
+	var removeUEContext func(ctx context.Context, ue *amfctx.UEContext, releaseSM, deregUECM bool)
+	localDetach := func(ctx context.Context, ue *amfctx.UEContext) {
+		removeUEContext(ctx, ue, true, true)
+	}
+	removeUEContext = func(ctx context.Context, ue *amfctx.UEContext, releaseSM, deregUECM bool) {
 		ue.Lock()
 		sessions := make(map[uint8]*amfctx.PDUSession, len(ue.PDUSessions))
 		for k, v := range ue.PDUSessions {
@@ -615,7 +687,7 @@ func main() {
 		ue.Unlock()
 
 		for _, sess := range sessions {
-			if sess.SMFInstanceID == "" {
+			if !releaseSM || sess.SMFInstanceID == "" {
 				continue
 			}
 			if err := smfClient.DeleteSMContext(ctx, sess.SMFInstanceID); err != nil {
@@ -635,9 +707,17 @@ func main() {
 		}
 
 		if supi != "" {
-			if err := udmClient.DeregisterUECM(ctx, supi); err != nil {
-				logger.Warn("UDM UECM deregistration failed on implicit detach",
-					"supi", supi, "error", err)
+			if id := ue.TakeSDMSubscriptionID(); id != "" {
+				if err := udmClient.UnsubscribeSDM(ctx, supi, id); err != nil {
+					logger.Warn("UDM SDM unsubscribe failed", "supi", supi, "error", err,
+						"spec_ref", "TS 29.503 §5.2.2.4")
+				}
+			}
+			if deregUECM {
+				if err := udmClient.DeregisterUECM(ctx, supi); err != nil {
+					logger.Warn("UDM UECM deregistration failed on implicit detach",
+						"supi", supi, "error", err)
+				}
 			}
 		}
 
@@ -648,7 +728,8 @@ func main() {
 			"result", "OK",
 			"spec_ref", "TS 23.501 §5.3.2",
 		)
-	})
+	}
+	ngapSrv.SetImplicitDetachHandler(localDetach)
 
 	// Handover SMF leg (AMF-012): the AMF waits for each Nsmf_PDUSession_UpdateSMContext
 	// answer and relays the SMF N2 SM information (wiring only — logic in internal/ngap).
@@ -673,18 +754,7 @@ func main() {
 	// ---- NRF registration + heartbeat ------------------------------------
 	if nrfBase != "" {
 		nrfClient := nrf.New(nrfBase, httpClient, logger)
-		profile := &nrf.NFProfile{
-			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "AMF",
-			NFStatus:     "REGISTERED",
-			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-namf-comm",
-				ServiceName:       "namf-comm",
-				Scheme:            "https",
-				NFServiceStatus:   "REGISTERED",
-				Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-			}},
-		}
+		profile := amfsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, amfsbi.NamfCommunicationCatalog())
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfBase, "error", err,
@@ -712,6 +782,21 @@ func main() {
 		// Wire NGAP paging trigger for N1N2MessageTransfer (CN paging of CM-IDLE UEs).
 		// Ref: TS 23.502 §4.2.3.3 step 4b, TS 38.413 §8.5.1 / §9.2.4.1.
 		sbiSrv.SetPager(ngapSrv)
+		// UDM DeregistrationNotification -> same local deregistration as the
+		// implicit-detach path. Ref: TS 29.503 §5.3.2.2; TS 23.502 §4.2.2.3.3.
+		// The UDM has already removed this AMF's registration, so no UECM DELETE
+		// is sent back (it could remove the new serving AMF's registration).
+		// SM contexts are released only when the UE re-registered from scratch or
+		// the subscription was withdrawn; on an AMF change (UE_REGISTRATION_AREA_CHANGE
+		// and similar) the PDU sessions move to the new AMF and must survive.
+		// Ref: TS 23.502 §4.2.2.2.2 step 14d, §4.2.2.3.3; TS 29.503 §6.2.6.3.x DeregistrationReason.
+		sbiSrv.SetDeregistrationHandler(func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error {
+			releaseSM := deregReason == "UE_INITIAL_REGISTRATION" || deregReason == "SUBSCRIPTION_WITHDRAWN"
+			removeUEContext(ctx, ue, releaseSM, false)
+			return nil
+		})
+		// Release profile gating supportedFeatures answers. Ref: TS 29.500 §6.6.2.
+		sbiSrv.SetProfile(relProfile)
 		// Wire NGAP location trigger for Namf_Location_ProvideLocationInfo.
 		// The NGAP server sends LocationReportingControl and delivers the LocationReport
 		// via a channel keyed by AMF-UE-NGAP-ID.
@@ -1225,7 +1310,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	mgmtSrv := &http.Server{Addr: mgmtAddr, Handler: mgmtMux}
+	mgmtSrv := &http.Server{Addr: mgmtAddr, Handler: mgmtMux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		logger.Info("management server listening", "addr", mgmtAddr)
 		if err := mgmtSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1288,7 +1373,10 @@ func main() {
 // ---- Config ---------------------------------------------------------------
 
 type Config struct {
-	NFInstanceID string `yaml:"nf_instance_id"`
+	// Release selects the release profile (rel17 default | rel19) and the
+	// per-feature enable map. Ref: REL19-2.1; TS 29.500 §6.6.2.
+	Release      capability.ReleaseConfig `yaml:"release"`
+	NFInstanceID string                   `yaml:"nf_instance_id"`
 	PLMN         struct {
 		MCC string `yaml:"mcc"`
 		MNC string `yaml:"mnc"`
@@ -1306,12 +1394,19 @@ type Config struct {
 	RedisURL    string `yaml:"redis_url"`
 	NGAP        struct {
 		Address string `yaml:"address"` // host:port (38412)
+		// RANProfiles caps the per-gNB release capability inferred at NG Setup
+		// (REL19-4.8); validated by ngap.NewRANProfiles in loadConfig.
+		RANProfiles []ngap.RANProfileConfig `yaml:"ran_profiles"`
 	} `yaml:"ngap"`
 	SBI struct {
 		Address string `yaml:"address"` // SBI HTTP/2 port
 		TLSCert string `yaml:"cert_file"`
 		TLSKey  string `yaml:"key_file"`
 		TLSCa   string `yaml:"ca_file"`
+		// APIRoot is the AMF's own SBI apiRoot (scheme://host:port) used to
+		// build the UDM callback URIs; empty = https://<os hostname>:<port of
+		// Address>. Ref: TS 29.503 §6.2.6.2.2 deregCallbackUri
+		APIRoot string `yaml:"api_root"`
 	} `yaml:"sbi"`
 	Peers struct {
 		NRFAddress  string `yaml:"nrf"`
@@ -1330,6 +1425,12 @@ type Config struct {
 	Metrics struct {
 		Address string `yaml:"address"`
 	} `yaml:"metrics"`
+	// NASSecurity configures uplink NAS integrity enforcement (AMF-033/AMF-024).
+	// IntegrityEnforcement: strict (default, TS 24.501 §4.4.4.3) | relaxed (debug
+	// only: log and process). Env AMF_NAS_INTEGRITY_ENFORCEMENT overrides it.
+	NASSecurity struct {
+		IntegrityEnforcement string `yaml:"integrity_enforcement"`
+	} `yaml:"nas_security"`
 	// Timers configures UE lifecycle timers. All values in seconds.
 	// Ref: TS 23.501 §5.3.2 (Mobile Reachable / Implicit Detach),
 	//      TS 24.501 §10.2 (T3512), TS 38.413 §8.3.3 (PendingRemoval watchdog).
@@ -1339,6 +1440,11 @@ type Config struct {
 		MobileReachableGuardSecs   int `yaml:"mobile_reachable_guard_secs"`
 		ImplicitDetachSecs         int `yaml:"implicit_detach_secs"`
 		PendingRemovalWatchdogSecs int `yaml:"pending_removal_watchdog_secs"`
+		// NAS common-procedure supervision timers (0 = TS 24.501 §10.2 default, 6 s;
+		// range timercfg.MinNASTimerSecs..MaxNASTimerSecs).
+		T3550Secs int `yaml:"t3550_secs"` // REGISTRATION ACCEPT
+		T3560Secs int `yaml:"t3560_secs"` // AUTHENTICATION REQUEST / SECURITY MODE COMMAND
+		T3570Secs int `yaml:"t3570_secs"` // IDENTITY REQUEST
 	} `yaml:"timers"`
 	// Security overrides — for dev/debug only.
 	// null_ciphering: true forces NEA0+NIA0 so NAS PDUs travel in plain text.
@@ -1367,6 +1473,11 @@ type Config struct {
 		// IMS DNN is actually reachable, matching Open5GS's no_ims config knob.
 		// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
 		IMSVoPSSupported *bool `yaml:"ims_vops_supported"`
+		// NetworkFeatureSupport enables the optional Rel-17..19 bits of the same
+		// IE (REL19-5.5). Absent = none (legacy bytes). Post-Rel-17 bits also
+		// need release.features.NAS-NFS-EXT; every bit also needs the UE's
+		// matching 5GMM capability bit. See procedures.NetworkFeatureSupportConfig.
+		NetworkFeatureSupport *procedures.NetworkFeatureSupportConfig `yaml:"network_feature_support"`
 		// NetworkFullName is the operator name pushed to every UE in a
 		// Configuration Update Command once registration completes, as the
 		// "Full name for network" IE (IEI 0x43). Empty = push nothing.
@@ -1451,6 +1562,9 @@ func loadConfig(path string) (*Config, error) {
 	if c.NGAP.Address == "" {
 		c.NGAP.Address = "0.0.0.0:38412"
 	}
+	if _, err := ngap.NewRANProfiles(c.NGAP.RANProfiles); err != nil {
+		return nil, fmt.Errorf("amf: ngap config: %w", err)
+	}
 	// Apply timer defaults (dev-friendly values; override in config YAML for prod).
 	if c.Timers.T3512Secs == 0 {
 		c.Timers.T3512Secs = 60
@@ -1464,9 +1578,32 @@ func loadConfig(path string) (*Config, error) {
 	if c.Timers.PendingRemovalWatchdogSecs == 0 {
 		c.Timers.PendingRemovalWatchdogSecs = 30
 	}
+	// NAS common-procedure timers: TS 24.501 §10.2 Table 10.2.2 defaults (6 s).
+	for _, t := range []struct {
+		name string
+		v    *int
+		def  int
+	}{
+		{"t3550_secs", &c.Timers.T3550Secs, timercfg.DefaultT3550Secs},
+		{"t3560_secs", &c.Timers.T3560Secs, timercfg.DefaultT3560Secs},
+		{"t3570_secs", &c.Timers.T3570Secs, timercfg.DefaultT3570Secs},
+	} {
+		if *t.v == 0 {
+			*t.v = t.def
+		}
+		if *t.v < timercfg.MinNASTimerSecs || *t.v > timercfg.MaxNASTimerSecs {
+			return nil, fmt.Errorf("amf: timers.%s %d out of range %d..%d", t.name, *t.v,
+				timercfg.MinNASTimerSecs, timercfg.MaxNASTimerSecs)
+		}
+	}
 	if len(c.ServedTACs) == 0 {
 		c.ServedTACs = []uint32{1}
 	}
+	mode, err := nasmsg.ResolveIntegrityEnforcement(c.NASSecurity.IntegrityEnforcement)
+	if err != nil {
+		return nil, err
+	}
+	c.NASSecurity.IntegrityEnforcement = string(mode)
 	return &c, nil
 }
 
@@ -1491,8 +1628,27 @@ func healthcheck() int {
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(addr)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
 	return 0
+}
+
+// ownAPIRoot returns the AMF's own SBI apiRoot: the configured value, else
+// https://<hostname>:<port of the listen address> (the container hostname is
+// the DNS name peers resolve; nothing is hardcoded).
+func ownAPIRoot(configured, listen string) string {
+	if configured != "" {
+		return strings.TrimRight(configured, "/")
+	}
+	host, _ := os.Hostname()
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil || port == "" {
+		port = "8001"
+	}
+	return "https://" + net.JoinHostPort(host, port)
 }

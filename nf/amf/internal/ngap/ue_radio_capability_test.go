@@ -7,9 +7,9 @@ import (
 	"bytes"
 	"testing"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 )
 
 // TestDecodeUERadioCapabilityInfoIndication builds a real APER-encoded

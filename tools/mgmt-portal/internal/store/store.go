@@ -59,6 +59,10 @@ type Subscriber struct {
 	Slices []SNSSAI `json:"slices"`
 	AMBRUL uint64   `json:"ambr_ul"`
 	AMBRDL uint64   `json:"ambr_dl"`
+	// GPSIs are the subscriber's Gpsi values (subscription_am.gpsis JSONB,
+	// TS 29.571 §5.3.2 pattern). On write, nil = unspecified (keep stored; the default
+	// msisdn- only when the AM row is created), non-nil = replace (also [] = clear).
+	GPSIs []string `json:"gpsis,omitempty"`
 }
 
 // ---- Subscribers --------------------------------------------------------
@@ -68,7 +72,8 @@ func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT a.supi, a.enc_permanent_key, a.enc_opc_key, a.amf, a.sqn,
 		       COALESCE(m.snssais, '[]'::jsonb),
-		       COALESCE(m.subscribed_ue_ambr_uplink, 0), COALESCE(m.subscribed_ue_ambr_downlink, 0)
+		       COALESCE(m.subscribed_ue_ambr_uplink, 0), COALESCE(m.subscribed_ue_ambr_downlink, 0),
+		       COALESCE(m.gpsis, '[]'::jsonb)
 		FROM subscription_auth a
 		LEFT JOIN subscription_am m USING (supi)
 		ORDER BY a.supi`)
@@ -80,13 +85,16 @@ func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 	var subs []Subscriber
 	for rows.Next() {
 		var sub Subscriber
-		var snssaisJSON []byte
+		var snssaisJSON, gpsisJSON []byte
 		if err := rows.Scan(&sub.SUPI, &sub.K, &sub.OPc, &sub.AMF, &sub.SQN,
-			&snssaisJSON, &sub.AMBRUL, &sub.AMBRDL); err != nil {
+			&snssaisJSON, &sub.AMBRUL, &sub.AMBRDL, &gpsisJSON); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(snssaisJSON, &sub.Slices); err != nil {
 			sub.Slices = []SNSSAI{}
+		}
+		if err := json.Unmarshal(gpsisJSON, &sub.GPSIs); err != nil {
+			return nil, fmt.Errorf("store: ListSubscribers: decode gpsis of %s: %w", sub.SUPI, err)
 		}
 		subs = append(subs, sub)
 	}
@@ -96,16 +104,17 @@ func (s *Store) ListSubscribers(ctx context.Context) ([]Subscriber, error) {
 // GetSubscriber returns a single subscriber by SUPI.
 func (s *Store) GetSubscriber(ctx context.Context, supi string) (*Subscriber, error) {
 	var sub Subscriber
-	var snssaisJSON []byte
+	var snssaisJSON, gpsisJSON []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT a.supi, a.enc_permanent_key, a.enc_opc_key, a.amf, a.sqn,
 		       COALESCE(m.snssais, '[]'::jsonb),
-		       COALESCE(m.subscribed_ue_ambr_uplink, 0), COALESCE(m.subscribed_ue_ambr_downlink, 0)
+		       COALESCE(m.subscribed_ue_ambr_uplink, 0), COALESCE(m.subscribed_ue_ambr_downlink, 0),
+		       COALESCE(m.gpsis, '[]'::jsonb)
 		FROM subscription_auth a
 		LEFT JOIN subscription_am m USING (supi)
 		WHERE a.supi = $1`, supi).
 		Scan(&sub.SUPI, &sub.K, &sub.OPc, &sub.AMF, &sub.SQN,
-			&snssaisJSON, &sub.AMBRUL, &sub.AMBRDL)
+			&snssaisJSON, &sub.AMBRUL, &sub.AMBRDL, &gpsisJSON)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -114,6 +123,9 @@ func (s *Store) GetSubscriber(ctx context.Context, supi string) (*Subscriber, er
 	}
 	if err := json.Unmarshal(snssaisJSON, &sub.Slices); err != nil {
 		sub.Slices = []SNSSAI{}
+	}
+	if err := json.Unmarshal(gpsisJSON, &sub.GPSIs); err != nil {
+		return nil, fmt.Errorf("store: GetSubscriber: decode gpsis of %s: %w", sub.SUPI, err)
 	}
 	return &sub, nil
 }
@@ -131,6 +143,15 @@ func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber, preserveSQ
 	snssaisJSON, err := json.Marshal(sub.Slices)
 	if err != nil {
 		return err
+	}
+
+	gpsis, gpsisExplicit, err := resolveGPSIs(sub.SUPI, sub.GPSIs)
+	if err != nil {
+		return err
+	}
+	gpsisJSON, err := json.Marshal(gpsis)
+	if err != nil {
+		return fmt.Errorf("store: marshal gpsis: %w", err)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -160,12 +181,13 @@ func (s *Store) UpsertSubscriber(ctx context.Context, sub Subscriber, preserveSQ
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO subscription_am (supi, gpsis, snssais, subscribed_ue_ambr_uplink, subscribed_ue_ambr_downlink)
-		VALUES ($1,'[]'::jsonb,$2,$3,$4)
+		VALUES ($1,$5::jsonb,$2,$3,$4)
 		ON CONFLICT (supi) DO UPDATE SET
+		    gpsis                         = CASE WHEN $6 THEN EXCLUDED.gpsis ELSE subscription_am.gpsis END,
 		    snssais                       = EXCLUDED.snssais,
 		    subscribed_ue_ambr_uplink     = EXCLUDED.subscribed_ue_ambr_uplink,
 		    subscribed_ue_ambr_downlink   = EXCLUDED.subscribed_ue_ambr_downlink`,
-		sub.SUPI, snssaisJSON, sub.AMBRUL, sub.AMBRDL)
+		sub.SUPI, snssaisJSON, sub.AMBRUL, sub.AMBRDL, gpsisJSON, gpsisExplicit)
 	if err != nil {
 		return fmt.Errorf("store: upsert am: %w", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -219,6 +220,9 @@ func TestAMFTimerRiskFor(t *testing.T) {
 		`{"implicit_detach_secs":120}`:      registry.Mutating,
 		`{"mobile_reachable_guard_secs":0}`: registry.Mutating,
 		`{"reset":true}`:                    registry.Mutating,
+		`{"t3550_secs":6}`:                  registry.Mutating,
+		`{"t3560_secs":6}`:                  registry.Mutating,
+		`{"t3570_secs":6}`:                  registry.Mutating,
 		`{"t3512_secs":"junk"}`:             registry.Mutating,
 	} {
 		if got := rf.RiskFor(json.RawMessage(in)); got != want {
@@ -237,6 +241,9 @@ func TestAMFTimerValidation(t *testing.T) {
 		"guard too high":    `{"mobile_reachable_guard_secs":3601}`,
 		"guard negative":    `{"mobile_reachable_guard_secs":-1}`,
 		"implicit too low":  `{"implicit_detach_secs":59}`,
+		"t3550 zero":        `{"t3550_secs":0}`,
+		"t3560 too high":    `{"t3560_secs":61}`,
+		"t3570 negative":    `{"t3570_secs":-1}`,
 		"float":             `{"t3512_secs":1800.5}`,
 		"string":            `{"t3512_secs":"1800"}`,
 		"null":              `{"t3512_secs":null}`,
@@ -321,7 +328,8 @@ func TestAMFTimerUpstreamErrors(t *testing.T) {
 	// Unreachable AMF.
 	deps := Deps{AMF: clients.NewAMF("http://127.0.0.1:1", http.DefaultClient)}
 	_, err := timerConfigTool{deps}.Invoke(context.Background(), json.RawMessage(`{}`))
-	if e, ok := err.(*mcperr.Error); !ok || e.Code != mcperr.CodeToolError {
+	var e *mcperr.Error
+	if ok := errors.As(err, &e); !ok || e.Code != mcperr.CodeToolError {
 		t.Errorf("unreachable AMF: %v %v", err, nil)
 	}
 }

@@ -1,0 +1,1 @@
+{"req5gsLoc":true,"reqCurrentLoc":true,"supportedGADShapes":["POINT"]}

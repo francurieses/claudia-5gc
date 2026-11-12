@@ -94,7 +94,12 @@ func (s *Server) triggerN1N2MessageTransfer(ctx context.Context, supi string, ps
 	if s.cfg.Peers.AMF == "" {
 		return "", fmt.Errorf("smf: amf SBI peer not configured")
 	}
-	payload, _ := json.Marshal(map[string]any{"pduSessionId": psi})
+	body := map[string]any{"pduSessionId": psi}
+	offer := s.n1n2Offer()
+	if offer != "" { // rel19 only (decision D2); rel17 body unchanged
+		body["supportedFeatures"] = offer
+	}
+	payload, _ := json.Marshal(body)
 	u := fmt.Sprintf("https://%s/namf-comm/v1/ue-contexts/%s/n1-n2-messages",
 		s.cfg.Peers.AMF, url.PathEscape(supi))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(payload)))
@@ -112,8 +117,10 @@ func (s *Server) triggerN1N2MessageTransfer(ctx context.Context, supi string, ps
 		return "", fmt.Errorf("smf: N1N2MessageTransfer: status %d", resp.StatusCode)
 	}
 	var rsp struct {
-		Cause string `json:"cause"`
+		Cause             string `json:"cause"`
+		SupportedFeatures string `json:"supportedFeatures"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&rsp)
+	s.acceptN1N2Features(ctx, offer, rsp.SupportedFeatures, "supi", supi, "pdu_session_id", psi)
 	return rsp.Cause, nil
 }

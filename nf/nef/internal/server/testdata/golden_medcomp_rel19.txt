@@ -1,0 +1,1 @@
+{"1":{"medCompN":1,"medSubComps":{"1":{"fNum":1,"fDescs":["permit out ip from any to any"]},"2":{"fNum":2,"fDescs":["permit out 17 from 1.2.3.4 to 5.6.7.8","permit in 17 from 5.6.7.8 to 1.2.3.4"]}},"medType":"DATA","qosReference":"qos-1"}}

@@ -340,7 +340,7 @@ func (w *ecidWorld) postWithHAccuracy(c *lmfCtx, ueContextID, supi string, hAccu
 	if err != nil {
 		return fmt.Errorf("postWithHAccuracy: marshal body: %w", err)
 	}
-	url := w.ts.URL + "/nlmf-loc/v1/ue-contexts/" + ueContextID + "/provide-loc-info"
+	url := w.ts.URL + "/nlmf-loc/v1/determine-location"
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("postWithHAccuracy: new request: %w", err)

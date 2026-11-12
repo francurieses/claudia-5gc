@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"locationPrivacy":"ALLOW_ALL"}

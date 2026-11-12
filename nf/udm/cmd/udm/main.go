@@ -13,7 +13,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	udmsbi "github.com/francurieses/claudia-5gc/nf/udm/internal/sbi"
 	udmsrv "github.com/francurieses/claudia-5gc/nf/udm/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
@@ -43,6 +45,18 @@ func main() {
 	}
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
+
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	udrAddr := cfg.Peers.UDR
 	sbiAddr := cfg.SBI.Address
@@ -84,7 +98,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	udrClient := udmsrv.NewHTTPUDRClient(udrAddr, httpClient)
+	udrClient := udmsrv.NewHTTPUDRClient(udrAddr, httpClient).WithFeatures(relProfile, logger)
 	srv, err := udmsrv.New(sbiAddr, snName, udmsrv.TLSConfig{
 		CertFile: cfg.SBI.TLS.CertFile,
 		KeyFile:  cfg.SBI.TLS.KeyFile,
@@ -94,16 +108,16 @@ func main() {
 		logger.Error("building SBI server", "error", err)
 		os.Exit(1)
 	}
+	srv.SetProfile(relProfile)
 
-	// Load SUCI Profile A (X25519) home-network private key if configured.
-	// Set hn_private_key_x25519 in config.yaml or HN_PRIVATE_KEY_X25519 env var.
-	// Ref: TS 33.501 §6.12, Annex C.3
-	hnPrivKey := cfg.HNPrivKeyX25519
-	if hnPrivKey == "" {
-		hnPrivKey = os.Getenv("HN_PRIVATE_KEY_X25519")
-	}
-	if err := srv.WithHomeNetPrivKeyA(hnPrivKey); err != nil {
-		logger.Error("SUCI Profile A key load failed", "error", err)
+	// Load SUCI Profile A/B home-network private keys (file > env > yaml).
+	// Ref: TS 33.501 §6.12.2, Annex C.3, C.3.4
+	if err := srv.LoadHNKeys(os.Getenv, udmsrv.HNKeyConfig{
+		X25519: cfg.HNPrivKeyX25519, X25519File: cfg.HNPrivKeyX25519File,
+		P256: cfg.HNPrivKeyP256, P256File: cfg.HNPrivKeyP256File,
+		KeyIDX25519: cfg.HNKeyIDX25519, KeyIDP256: cfg.HNKeyIDP256,
+	}); err != nil {
+		logger.Error("SUCI home network key load failed", "error", err)
 		os.Exit(1)
 	}
 
@@ -114,18 +128,7 @@ func main() {
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
-		profile := &nrf.NFProfile{
-			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "UDM",
-			NFStatus:     "REGISTERED",
-			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-nudm-ueau",
-				ServiceName:       "nudm-ueau",
-				Scheme:            "https",
-				NFServiceStatus:   "REGISTERED",
-				Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-			}},
-		}
+		profile := udmsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, udmsbi.NudmUEAUCatalog())
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr, "error", err,
@@ -193,6 +196,21 @@ type Config struct {
 	// Also readable from HN_PRIVATE_KEY_X25519 env var.
 	// Ref: TS 33.501 §6.12, Annex C.3
 	HNPrivKeyX25519 string `yaml:"hn_private_key_x25519"`
+	// HNPrivKeyP256 is the Home Network secp256r1 private scalar (hex) for
+	// SUCI Profile B. Also readable from HN_PRIVATE_KEY_P256.
+	// Ref: TS 33.501 §6.12, Annex C.3.4
+	HNPrivKeyP256 string `yaml:"hn_private_key_p256"`
+	// HNPrivKeyX25519File / HNPrivKeyP256File name mounted secret files holding the
+	// hex key (override env and inline values; HN_PRIVATE_KEY_*_FILE env wins).
+	HNPrivKeyX25519File string `yaml:"hn_private_key_x25519_file"`
+	HNPrivKeyP256File   string `yaml:"hn_private_key_p256_file"`
+	// HNKeyIDX25519 / HNKeyIDP256 are the Home Network Public Key Identifiers
+	// of the two key pairs (0 = accept any). Ref: TS 33.501 Annex C.1
+	HNKeyIDX25519 uint8 `yaml:"hn_key_id_x25519"`
+	HNKeyIDP256   uint8 `yaml:"hn_key_id_p256"`
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 func loadConfig() (*Config, error) {

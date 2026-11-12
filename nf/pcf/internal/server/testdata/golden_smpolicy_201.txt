@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: https://example.com/npcf-smpolicycontrol/v1/sm-policies/<UUID>
+
+{"pccRules":{"pr-1":{"flowInfos":[{"flowDesc":""}],"pccRuleId":"pr-1","precedence":0}},"qosDecs":{"qd-1":{"5qi":9,"arp":{"preemptCap":"","preemptVuln":"","priorityLevel":8}}},"sessRules":{"sr-1":{"sessAmbr":{"downlink":"100 Mbps","uplink":"100 Mbps"}}},"x5gcQosSource":"OPERATOR_DEFAULT"}

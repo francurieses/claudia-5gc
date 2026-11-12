@@ -1,0 +1,4 @@
+POST /nausf-nssaa/v1/imsi-001010000000003/authenticate
+Content-Type: application/json
+
+{"eapPayload":"AgcACQFhQGJj","gpsi":"msisdn-12025550100","snssai":{"sd":"000003","sst":1},"supi":"imsi-001010000000003"}

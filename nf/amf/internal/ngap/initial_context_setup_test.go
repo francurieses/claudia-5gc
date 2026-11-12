@@ -6,8 +6,10 @@ package ngap
 import (
 	"testing"
 
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/capability"
+
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 )
@@ -30,6 +32,7 @@ func buildTestICSRWithSessions(rfsp int, pduSessions []PDUSessionSetupItemCxtReq
 		0, 0, // subscribed UE-AMBR absent → builder falls back to 1 Gbps
 		rfsp,
 		pduSessions,
+		capability.PeerRAN{},
 	)
 }
 
@@ -212,7 +215,7 @@ func TestBuildInitialContextSetupRequest_WithPDUSessions(t *testing.T) {
 	}
 	// TS 38.413 §8.1: IEs must appear in table order — id=71 sits between
 	// GUAMI (id=28) and AllowedNSSAI (id=0).
-	if !(idxGUAMI < idxList && idxList < idxNSSAI) {
+	if idxGUAMI >= idxList || idxList >= idxNSSAI {
 		t.Fatalf("IE order violated: GUAMI=%d, CxtReq=%d, AllowedNSSAI=%d", idxGUAMI, idxList, idxNSSAI)
 	}
 

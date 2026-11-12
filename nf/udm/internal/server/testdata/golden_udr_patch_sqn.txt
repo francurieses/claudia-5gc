@@ -1,0 +1,8 @@
+PATCH /nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription
+Content-Type: application/merge-patch+json
+Accept: 
+
+{"sequenceNumber":{"sqn":"000000000040"}}
+
+--- result
+null

@@ -1,0 +1,5 @@
+status: Created
+Location: /nausf-auth/v1/ue-authentications/<AUTHCTXID>
+Content-Type: application/json
+
+{"_links":{"5g-aka":{"href":"/nausf-auth/v1/ue-authentications/<AUTHCTXID>/5g-aka-confirmation"}},"authType":"5G_AKA","autn":"ffeeddccbbaa99887766554433221100","hxresStar":"000102030405060708090a0b0c0d0e0f","rand":"00112233445566778899aabbccddeeff","supi":"imsi-001010000000001"}

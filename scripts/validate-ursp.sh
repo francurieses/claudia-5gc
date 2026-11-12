@@ -236,7 +236,7 @@ elif [ ! -f "$DECODE_PY" ]; then
 else
     # NF images are distroless (no curl inside): sbi_curl uses the published PCF port
     # with an mTLS client cert from pki/, or a throw-away curl container on the SBI net.
-    N15_JSON=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \
+    N15_JSON=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/policies \
         -X POST -H 'Content-Type: application/json' \
         -d "{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}")
 
@@ -260,33 +260,62 @@ fi
 section "U5 · N15 endpoint — direct PCF smoke-test"
 # ─────────────────────────────────────────────────────────────────────────────
 
-info "Calling PCF N15 directly: POST /npcf-ue-policy-control/v1/ue-policies"
+info "Calling PCF N15 directly: POST /npcf-ue-policy-control/v1/policies"
 # SBI is always mTLS + HTTP/2: go through sbi_curl (published port + client cert, or
-# a throw-away curl container on the SBI network). Body and status come back together;
-# the status is the last line (-w '\n%{http_code}').
-N15_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/n15-resp-XXXXXX")
-N15_RAW=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \
+# a throw-away curl container on the SBI network). The association id is only in the
+# Location response header (TS 29.525 §5.6.2.2 PolicyAssociation has no id attribute),
+# so we ask curl for the response headers (-i): status line, headers, blank line, body.
+# n15_split_response — read `curl -i` output on stdin and print, for the LAST
+# non-1xx response block only (a "100 Continue" or other interim block, each with
+# its own status line and headers, is skipped): line 1 = status code, line 2 =
+# Location header value (empty if none), remaining lines = body. CR is stripped.
+n15_split_response() {
+    tr -d '\r' | awk '
+        BEGIN { st = "start"; status = "000"; loc = ""; body = "" }
+        st == "start" && /^HTTP\// { status = $2; loc = ""; body = ""; st = "hdr"; next }
+        st == "hdr" {
+            if ($0 == "") { st = (status ~ /^1[0-9][0-9]$/) ? "start" : "body"; next }
+            if (tolower($0) ~ /^location:/) { v = $0; sub(/^[^:]*:[ \t]*/, "", v); loc = v }
+            next
+        }
+        st == "body" { body = body $0 "\n" }
+        END { print status; print loc; printf "%s", body }'
+}
+
+N15_RAW=$(sbi_curl https://pcf:8006/npcf-ue-policy-control/v1/policies \
     -X POST -H "Content-Type: application/json" \
     -d "{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}" \
-    -w '\n%{http_code}')
-N15_RESP=$(tail -n 1 <<<"$N15_RAW")
+    -i)
+N15_PARSED=$(n15_split_response <<<"$N15_RAW")
+N15_RESP=$(sed -n 1p <<<"$N15_PARSED")
+N15_LOCATION=$(sed -n 2p <<<"$N15_PARSED")
+N15_BODY=$(sed '1,2d' <<<"$N15_PARSED")
 case "$N15_RESP" in [0-9][0-9][0-9]) ;; *) N15_RESP="000" ;; esac
-sed '$d' <<<"$N15_RAW" > "$N15_BODY_FILE"
 
 if [ "$N15_RESP" = "201" ]; then
     pass "PCF N15 returned 201 Created"
-    N15_BODY=$(cat "$N15_BODY_FILE" 2>/dev/null || echo "{}")
-    rm -f "$N15_BODY_FILE"
+    # Location must be https://<apiRoot>/npcf-ue-policy-control/v1/policies/<polAssoId>
+    # (TS 29.501 §4.4.1, SBA is always TLS); the id is the single segment after
+    # "policies/" (query / fragment / trailing slash ignored) and must be non-empty
+    # with no "/" or ":".
+    POL_ID=""
+    case "$N15_LOCATION" in
+        https://*/npcf-ue-policy-control/v1/policies/*)
+            POL_ID=${N15_LOCATION#*/npcf-ue-policy-control/v1/policies/}
+            POL_ID=${POL_ID%%[?#]*}
+            POL_ID=${POL_ID%/}
+            ;;
+    esac
+    case "$POL_ID" in
+        ""|*/*|*:*) fail "PCF 201 Location is not https://<apiRoot>/npcf-ue-policy-control/v1/policies/<id> (TS 29.501 §4.4.1): '$N15_LOCATION'" ;;
+        *) pass "PCF returned absolute https Location with polAssoId: $POL_ID" ;;
+    esac
     if text_has '"polAssoId"' "$N15_BODY"; then
-        POL_ID=$(json_str_last polAssoId "$N15_BODY")
-        POL_ID=${POL_ID:-?}
-        pass "PCF returned polAssoId: $POL_ID"
-    else
-        fail "PCF response missing polAssoId field"
+        fail "PCF body still carries the non-schema polAssoId attribute"
     fi
-    if text_has '"uePolicySections"' "$N15_BODY"; then
-        pass "PCF response contains uePolicySections with encoded URSP"
-        CONT_B64=$(json_str_last uePolicySectionContent "$N15_BODY")
+    if text_has '"uePolicy"' "$N15_BODY"; then
+        pass "PCF response contains uePolicy with encoded URSP"
+        CONT_B64=$(json_str_last uePolicy "$N15_BODY")
         if [ -n "$CONT_B64" ] && [ ${#CONT_B64} -gt 8 ]; then
             CONT_BYTES=$(( (${#CONT_B64} * 3) / 4 ))
             pass "Base64 container size: ~$CONT_BYTES bytes"
@@ -297,10 +326,10 @@ if [ "$N15_RESP" = "201" ]; then
                 python3 "$DECODE_PY" <<<"$N15_BODY" 2>&1 | sed 's/^/    /' || true
             fi
         else
-            fail "PCF returned uePolicySections but uePolicySectionContent is empty"
+            fail "PCF returned uePolicy but it is empty"
         fi
     else
-        fail "PCF response missing uePolicySections — URSP not encoded"
+        fail "PCF response missing uePolicy — URSP not encoded"
         info "Body: $N15_BODY"
     fi
 elif [ "$N15_RESP" = "000" ]; then
@@ -308,8 +337,7 @@ elif [ "$N15_RESP" = "000" ]; then
     info "Check: curl -sk --http2 --cert pki/amf.crt --key pki/amf.key https://localhost:8006/healthz"
 else
     fail "PCF N15 returned unexpected HTTP $N15_RESP"
-    info "Body: $(cat "$N15_BODY_FILE" 2>/dev/null || echo '?')"
-    rm -f "$N15_BODY_FILE"
+    info "Body: ${N15_BODY:-?}"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -481,7 +509,7 @@ if [ $FAIL -gt 0 ]; then
     echo ""
     echo "  URSP decode (requires stack up; PCF requires an mTLS client cert):"
     echo "    curl -sk --http2 --cert pki/amf.crt --key pki/amf.key \\"
-    echo "      -X POST https://localhost:8006/npcf-ue-policy-control/v1/ue-policies \\"
+    echo "      -X POST https://localhost:8006/npcf-ue-policy-control/v1/policies \\"
     echo "      -H 'Content-Type: application/json' \\"
     echo "      -d '{\"supi\":\"$SUPI\",\"servingPlmn\":\"00101\"}' | \\"
     echo "      python3 scripts/decode-ursp.py"

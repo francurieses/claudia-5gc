@@ -1,10 +1,19 @@
 <!-- tier: public -->
-# Implementation Status — 5GC Rel-17
+# Implementation Status — 5GC Rel-19
 
 What is implemented in ClaudIA 5GC, how complete each network function is, and which 3GPP
 specifications it follows. For code conventions and workflow, see [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 Legend: ✅ complete for the supported scope · 🟡 working, with documented gaps.
+
+## Release support
+
+The core targets 3GPP Release 19 (5G-Advanced) and stays backward compatible with Rel-15/16/17 RAN and UE.
+
+- Each NF runs a release profile (`rel19` default, `rel17` frozen legacy). Rel-18/19 behaviour is opt-in per feature and is only used towards peers that signal support; Rel-15/16/17 peers get byte-identical messages.
+- gNB release is inferred from NG Setup (default: legacy Rel-15/16/17 behaviour) and can be capped per gNB (`ngap.ran_profiles`); SBI peers negotiate `supportedFeatures` per API.
+- NFs on the `rel17` and `rel19` profiles can run side by side (mixed-release deployments), and the SEPP supports roaming over N32.
+- Configuration: [`configuration.md`](configuration.md). Feature descriptions: [`features.md`](features.md).
 
 ---
 
@@ -13,7 +22,7 @@ Legend: ✅ complete for the supported scope · 🟡 working, with documented ga
 | NF | Status | Notes | 3GPP specs |
 |---|---|---|---|
 | NRF | ✅ | Register / Discover / Deregister, heartbeat eviction, OAuth2 access tokens, mTLS, Redis-backed state | TS 29.510 |
-| AMF | ✅ | Registration and mobility (incl. periodic update), PDU session establishment/release/modification relay, NAS security (NIA2/NEA2), slice (NSSAI) validation via NSSF, slice-specific authentication (NSSAA), CN paging and service request, O&M-triggered AN release, runtime timer config (T3512 / mobile reachable / implicit detach), Xn and N2 handover, UE context transfer, Public Warning System broadcast, PostgreSQL UE contexts | TS 23.501, TS 23.502, TS 24.501, TS 38.413, TS 29.518, TS 33.501 |
+| AMF | ✅ | Registration and mobility (incl. periodic update), PDU session establishment/release/modification relay, NAS security (NIA2/NEA2), slice (NSSAI) validation via NSSF, slice-specific authentication (NSSAA), CN paging and service request, O&M-triggered AN release, runtime timer config (T3512 / mobile reachable / implicit detach / T3550 / T3560 / T3570), Xn and N2 handover, UE context transfer, Public Warning System broadcast, PostgreSQL UE contexts | TS 23.501, TS 23.502, TS 24.501, TS 38.413, TS 29.518, TS 33.501 |
 | AUSF | 🟡 | 5G-AKA, EAP-AKA′, NSSAA EAP relay (simulated AAA server), SUCI null-scheme and Profile A | TS 33.501, TS 29.509, RFC 5448 |
 | UDM | 🟡 | Authentication data, access & mobility data, UE context management, subscription data notifications, SUCI deconcealment | TS 29.503, TS 33.501 |
 | UDR | ✅ | PostgreSQL-backed subscriber and policy data (UE policy / URSP, SM policy), per slice/DNN Session-AMBR, auto-migrated, seeded subscribers | TS 29.504, TS 29.519 |
@@ -25,6 +34,7 @@ Legend: ✅ complete for the supported scope · 🟡 working, with documented ga
 | BSF | ✅ | Binding registration, deregistration and discovery; PCF binds sessions automatically | TS 29.521 |
 | NEF | 🟡 | AF session with required QoS (create / get / delete) with OAuth2, mapped onto PCF policy authorization | TS 29.522, TS 29.514 |
 | LMF | 🟡 | UE location: Cell-ID, E-CID (NRPPa) and GNSS (LPP) with automatic fallback; periodic and area-of-interest event subscriptions. MT location paging and GMLC interface not yet implemented | TS 29.572, TS 38.455, TS 37.355, TS 23.273 |
+| SEPP | 🚧 | Wired in compose (REL19-9.6/9.7): `vsepp` (core), `hsepp` + `hnrf` (profile roaming), n32-net, `sepp healthcheck` subcommand, PCAP sidecars, Prometheus, portal NF status/PCAP, CI docker matrix, root Makefile. N32-c exchange-capability responder + initiator (startup, `n32.peers`, retry/backoff, max 10 attempts) and N32-f forwarder (SBI listener -> Outbound, N32 listener -> Inbound) mounted. Live (`make sepp-e2e`, 23 checks, rel17 + rel19): N32-c both ways; NFDiscover vSEPP -> hSEPP -> hNRF via `3gpp-Sbi-Target-apiRoot` and telescopic FQDN (hNRF needs a registered target NF). Spec-verified CONFORMANT, 5 MINOR (compliance matrix). TLS security mode only; PRINS out of scope | TS 29.573, TS 29.500 §6.1.4.3, TS 33.501 §13 |
 | MCP | ✅ | AI-tooling server (stdio + SSE, port 9300): NAS codec, NF discovery, UE inspection, QoS, crypto, metrics, status and analysis tools, network-control tools, runtime-config and subscriber tools (74 tools) | — |
 
 Per-procedure conformance, sequence diagrams and validation recipes are part of the
@@ -45,7 +55,7 @@ and live data from the running core.
 | QoS | Live SMF QoS, modify a flow, subscription inspector, network-triggered additional PDU session (URSP) |
 | Policies | URSP templates and per-subscriber policies; apply and push to the UE |
 | UERANSIM | Run scenarios, container grid, UEs table, ping, nr-cli, inline logs |
-| PacketRusher | Xn / N2 mobility scenarios with log viewer and checklist |
+| PacketRusher | Xn / N2 mobility scenarios with log viewer and checklist; `--release rel19` mode (Rel-18/19 5GMM capability bits, shared/nas + shared/ngap decode logs) |
 | Logs | Streaming Docker logs |
 | PCAP | Start / stop / rotate packet captures, list and download files |
 | Public Warning | Cell-broadcast console: compose, per-gNB status, cancel, resend |

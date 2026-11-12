@@ -18,7 +18,7 @@ Feature: Nlmf_Location DetermineLocation — LPP Relay and GNSS Positioning (TS 
   # spec_ref: TS 29.572 §5.2.2.2     (DetermineLocation — method selection trigger + LocationData response)
   # spec_ref: TS 29.572 §6.1.6.2.2   (LocationData schema: locationEstimate, accuracy, positioningDataList)
   # spec_ref: TS 29.571 §5.2.7       (ProblemDetails / cause strings)
-  # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info → 200 LocationData (reused — DetermineLocation entry)
+  # endpoint: POST /nlmf-loc/v1/determine-location → 200 LocationData (reused — DetermineLocation entry)
   # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/ul-lpp-info      → 202 Accepted (new — AMF→LMF UL LPP relay receive)
   # endpoint: POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-lpp-info      → 202 Accepted (new — LMF→AMF DL LPP dispatch)
 

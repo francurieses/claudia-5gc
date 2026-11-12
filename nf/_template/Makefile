@@ -1,7 +1,7 @@
 # nf/{{nf_name}}/Makefile — copy with the rest of the template.
 # Identical in shape to every other NF Makefile so tooling stays uniform.
 # All targets run from the repo ROOT ($(ROOT)) because each NF is part of the
-# root Go module (github.com/francurieses/5gc-rel17) — there is no per-NF go.mod.
+# root Go module (github.com/francurieses/claudia-5gc) — there is no per-NF go.mod.
 .PHONY: build test test-functional lint docker run clean
 NF      := {{nf_name}}
 BIN     := bin/$(NF)

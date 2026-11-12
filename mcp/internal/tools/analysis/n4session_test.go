@@ -3,6 +3,7 @@ package analysis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -84,7 +85,8 @@ func callN4(t *testing.T, d Deps, args string) (map[string]any, *mcperr.Error) {
 	t.Helper()
 	out, err := n4SessionTool{d}.Invoke(context.Background(), json.RawMessage(args))
 	if err != nil {
-		me, ok := err.(*mcperr.Error)
+		var me *mcperr.Error
+		ok := errors.As(err, &me)
 		if !ok {
 			t.Fatalf("non-mcperr error %T: %v", err, err)
 		}

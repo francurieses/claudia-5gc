@@ -3,7 +3,7 @@ package api
 // location.go — UE location endpoints.
 //
 // The portal acts as an LCS client of the LMF: it calls Nlmf_Location DetermineLocation
-// (POST /nlmf-loc/v1/ue-contexts/{supi}/provide-loc-info, mTLS) which in turn drives the
+// (POST /nlmf-loc/v1/determine-location, mTLS) which in turn drives the
 // AMF Namf_Location → NGAP LocationReportingControl → gNB LocationReport flow and synthesizes
 // WGS84 coordinates. The portal adds no positioning logic — it relays results for the map.
 //
@@ -73,7 +73,7 @@ type lmfProblem struct {
 func (d Deps) locateUE(r *http.Request, supi string) (UELocation, error) {
 	loc := UELocation{SUPI: supi, Timestamp: time.Now()}
 
-	u := strings.TrimRight(d.LMFBaseURL, "/") + "/nlmf-loc/v1/ue-contexts/" + supi + "/provide-loc-info"
+	u := strings.TrimRight(d.LMFBaseURL, "/") + "/nlmf-loc/v1/determine-location"
 	body, _ := json.Marshal(map[string]string{"supi": supi})
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {

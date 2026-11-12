@@ -3,11 +3,15 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // UDMSDMClient fetches location-privacy data from UDM Nudm_SDM.
@@ -16,15 +20,80 @@ type UDMSDMClient interface {
 	GetLcsPrivacyData(ctx context.Context, supi string) (*LcsPrivacyData, error)
 }
 
-// LcsPrivacyData is the subscriber location-privacy policy returned by UDM.
-// Ref: TS 29.571 §5.2.7.5.
+// LcsPrivacyData is the LMF's internal location-privacy policy record, filled
+// from the Nudm_SDM lcs-privacy-data answer by lcsPrivacyWire /
+// legacyLcsPrivacyWire (never serialised on a 3GPP wire).
+//
+// oapi: none internal LMF policy record; wire shapes are lcsPrivacyWire (TS 29.503 LcsPrivacyData) and legacyLcsPrivacyWire
 type LcsPrivacyData struct {
 	// LocationPrivacy is the overall location-privacy indicator.
 	// Known values: "ALLOW_ALL", "ALLOW_PLMN_OPERATOR_SERVICES", "BLOCK_ALL".
-	LocationPrivacy string `json:"locationPrivacy,omitempty"`
+	LocationPrivacy string
 	// LcsPrivacyExceptionList lists LCS client identities allowed despite
 	// a restrictive LocationPrivacy setting.
+	LcsPrivacyExceptionList []string
+}
+
+// lcsPrivacyWire is the consumer view of the TS 29.503 LcsPrivacyData answer.
+// Only lpi.locationPrivacyInd is consumed: LOCATION_DISALLOWED maps to
+// BLOCK_ALL and LOCATION_ALLOWED to ALLOW_ALL; unknown values (the enumeration
+// is anyOf[enum, string], TS 29.501 §5.3.12) are ignored.
+//
+// oapi: TS29503_Nudm_SDM.yaml#/components/schemas/LcsPrivacyData
+type lcsPrivacyWire struct {
+	Lpi *lpiWire `json:"lpi,omitempty"`
+}
+
+// lpiWire is the Lpi data type. Ref: TS 29.503 (Lpi).
+//
+// oapi: TS29503_Nudm_SDM.yaml#/components/schemas/Lpi
+type lpiWire struct {
+	LocationPrivacyInd string `json:"locationPrivacyInd"`
+}
+
+// legacyLcsPrivacyWire is the answer shape of this project's UDM stub
+// (Rel-17 baseline), decoded in every profile next to the spec shape.
+//
+// oapi: none legacy project UDM stub answer shape of LcsPrivacyData, see lcsPrivacyWire
+type legacyLcsPrivacyWire struct {
+	LocationPrivacy         string   `json:"locationPrivacy,omitempty"`
 	LcsPrivacyExceptionList []string `json:"lcsPrivacyExceptionList,omitempty"`
+}
+
+// decodeLcsPrivacy decodes a lcs-privacy-data body in either shape (TS 29.500
+// §6.6.2 tolerant reader): the spec attribute wins when present and known, the
+// legacy attributes fill the rest. Each view is decoded independently so a type
+// clash in one cannot fail the other; an undecodable object in both is an error.
+func decodeLcsPrivacy(body []byte) (*LcsPrivacyData, error) {
+	// {} and null carry no member at all: not a usable answer (unknown members
+	// and unknown enum values alone stay tolerated, TS 29.500 §6.6.2).
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err == nil && len(members) == 0 {
+		return nil, errors.New("lmf: decode lcs-privacy-data: empty body")
+	}
+	var spec lcsPrivacyWire
+	specErr := json.Unmarshal(body, &spec)
+	if specErr != nil {
+		spec = lcsPrivacyWire{}
+	}
+	var legacy legacyLcsPrivacyWire
+	legacyErr := json.Unmarshal(body, &legacy)
+	if legacyErr != nil {
+		legacy = legacyLcsPrivacyWire{}
+	}
+	if (specErr != nil && legacyErr != nil) || (legacyErr != nil && spec.Lpi == nil) {
+		return nil, fmt.Errorf("lmf: decode lcs-privacy-data: %w", errors.Join(specErr, legacyErr))
+	}
+	out := &LcsPrivacyData{LocationPrivacy: legacy.LocationPrivacy, LcsPrivacyExceptionList: legacy.LcsPrivacyExceptionList}
+	if spec.Lpi != nil {
+		switch spec.Lpi.LocationPrivacyInd {
+		case "LOCATION_DISALLOWED":
+			out.LocationPrivacy = "BLOCK_ALL"
+		case "LOCATION_ALLOWED":
+			out.LocationPrivacy = "ALLOW_ALL"
+		}
+	}
+	return out, nil
 }
 
 type udmCacheEntry struct {
@@ -71,10 +140,18 @@ func (c *HTTPUDMSDMClient) GetLcsPrivacyData(ctx context.Context, supi string) (
 		return &LcsPrivacyData{LocationPrivacy: "ALLOW_ALL"}, nil
 	}
 
-	var data LcsPrivacyData
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, features.MaxRequestBodyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("udm: read lcs-privacy-data: %w", err)
+	}
+	if int64(len(raw)) > features.MaxRequestBodyBytes {
+		return nil, fmt.Errorf("udm: read lcs-privacy-data: body exceeds %d bytes", features.MaxRequestBodyBytes)
+	}
+	dp, err := decodeLcsPrivacy(raw)
+	if err != nil {
 		return nil, fmt.Errorf("udm: decode lcs-privacy-data: %w", err)
 	}
+	data := *dp
 
 	c.mu.Lock()
 	if c.cache == nil {

@@ -14,8 +14,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	udrsbi "github.com/francurieses/claudia-5gc/nf/udr/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/server"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
@@ -34,8 +36,7 @@ func main() {
 			return a
 		},
 	}))
-	// base carries no "nf": server.New adds it itself (avoids a duplicate key).
-	base := logger
+	// The one place "nf" is added: server.New uses this logger as is.
 	logger = logger.With("nf", "UDR")
 	slog.SetDefault(logger)
 
@@ -44,6 +45,18 @@ func main() {
 		logger.Error("loading config", "error", err)
 		os.Exit(1)
 	}
+
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to the
+	// pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	var st store.Store
 	if dsn := getEnvDefault("DATABASE_URL", ""); dsn != "" {
@@ -108,12 +121,46 @@ func main() {
 		sliceProfiles = append(sliceProfiles,
 			[]store.SNSSAISubscribed{internet, {SST: uint8(s.SST), SD: s.SD}})
 	}
+	// GPSI per seeded subscriber (AMF-020): msisdn-<SEED_GPSI_PREFIX><MSIN>,
+	// derived from the SUPI by store.SeedMSISDN. SEED_GPSI_PREFIX="off"
+	// disables; an invalid prefix is logged and also disables. Existing GPSIs
+	// (portal-provisioned) are never replaced; seeded rows that predate the
+	// feature get their GPSI backfilled by one conditional update, only for the
+	// SUPIs this seed owns (UE_COUNT range, SEED_EXTRA_SUPIS). Known limit: a
+	// seeded row whose GPSIs a portal cleared gets the default back at the next
+	// restart (the schema cannot tell cleared from never-set). Prefix 490 is a
+	// dev convention. The UDR serves it under the rel19 profile only.
+	gpsiPrefix := getEnvDefault("SEED_GPSI_PREFIX", store.DefaultSeedMSISDNPrefix)
+	seedGPSI := func(supi string) {
+		if gpsiPrefix == "off" {
+			return
+		}
+		added, err := store.EnsureSeedGPSI(st, supi, gpsiPrefix)
+		if err != nil {
+			logger.Error("seed GPSI failed", "supi", supi, "error", err)
+			return
+		}
+		if !added {
+			// No AM row yet, or GPSIs already provisioned: nothing to do.
+			logger.Debug("seed GPSI skipped (no AM row or GPSI already set)", "supi", supi)
+			return
+		}
+		gpsi, _ := store.SeedMSISDN(supi, gpsiPrefix)
+		logger.Info("seeded subscriber GPSI", "supi", supi, "gpsi", gpsi)
+	}
+	if gpsiPrefix != "off" {
+		if _, ok := store.SeedMSISDN("imsi-001010000000001", gpsiPrefix); !ok {
+			logger.Warn("SEED_GPSI_PREFIX invalid (digits only, MSISDN <= 15 digits), GPSI seeding disabled", "prefix", gpsiPrefix)
+			gpsiPrefix = "off"
+		}
+	}
 	ueCount := getEnvIntDefault("UE_COUNT", 1)
 	for i := 1; i <= ueCount; i++ {
 		supi := fmt.Sprintf("imsi-00101%010d", i)
 		// Do not overwrite data already provisioned (e.g. via management portal).
 		if existing, _ := st.GetAuthSubscription(supi); existing != nil {
 			logger.Info("subscriber already provisioned, skipping seed", "supi", supi)
+			seedGPSI(supi)
 			continue
 		}
 		profile := sliceProfiles[(i-1)%len(sliceProfiles)]
@@ -133,6 +180,7 @@ func main() {
 			snssaiLog[j] = fmt.Sprintf("SST=%d/SD=%s", s.SST, s.SD)
 		}
 		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
+		seedGPSI(supi)
 	}
 
 	// SEED_EXTRA_SUPIS: comma-separated SUPIs seeded outside the UE_COUNT range
@@ -145,6 +193,7 @@ func main() {
 	for _, supi := range extraSUPIs {
 		if existing, _ := st.GetAuthSubscription(supi); existing != nil {
 			logger.Info("subscriber already provisioned, skipping seed", "supi", supi)
+			seedGPSI(supi)
 			continue
 		}
 		// Same cyclic slice rule as the UE_COUNT range, keyed on the SUPI's MSIN.
@@ -165,6 +214,7 @@ func main() {
 			snssaiLog[j] = fmt.Sprintf("SST=%d/SD=%s", sn.SST, sn.SD)
 		}
 		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
+		seedGPSI(supi)
 	}
 
 	// ---- Tracing ---------------------------------------------------------
@@ -193,11 +243,13 @@ func main() {
 		CertFile: cfg.SBI.TLS.CertFile,
 		KeyFile:  cfg.SBI.TLS.KeyFile,
 		CAFile:   cfg.SBI.TLS.CAFile,
-	}, st, base)
+	}, st, logger)
 	if err != nil {
 		logger.Error("building SBI server", "error", err)
 		os.Exit(1)
 	}
+
+	srv.SetProfile(relProfile)
 
 	// Entries were already validated (and warned about) by the seed above.
 	srv.SetSliceQoSSeed(store.OperatorSeedEntries(op, slog.New(slog.DiscardHandler)))
@@ -224,18 +276,7 @@ func main() {
 			logger.Warn("building NRF HTTP client failed", "err", err)
 		} else {
 			nrfClient := nrf.New(nrfAddr, httpClient, logger)
-			profile := &nrf.NFProfile{
-				NFInstanceID: cfg.NFInstanceID,
-				NFType:       "UDR",
-				NFStatus:     "REGISTERED",
-				NFServices: []nrf.NFService{{
-					ServiceInstanceID: cfg.NFInstanceID + "-nudr-dr",
-					ServiceName:       "nudr-dr",
-					Scheme:            "https",
-					NFServiceStatus:   "REGISTERED",
-					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-				}},
-			}
+			profile := udrsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, udrsbi.NudrDataRepositoryCatalog())
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,
@@ -298,6 +339,10 @@ type Config struct {
 	Peers struct {
 		NRF string `yaml:"nrf"`
 	} `yaml:"peers"`
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	// Ref: TS 29.500 §6.6.2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 func loadConfig() (*Config, error) {

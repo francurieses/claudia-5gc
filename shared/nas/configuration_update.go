@@ -28,6 +28,9 @@ type ConfigurationUpdateCommand struct {
 	TAIList []byte
 	// IEI 0x15 — Allowed NSSAI (TLV, 1-byte length)
 	AllowedNSSAI *NSSAI
+	// IEI 0x27 — Service area list (TLV, TS 24.501 §9.11.3.49; Table 8.2.19.1.1:
+	// after Allowed NSSAI, before Full name for network). nil = absent.
+	ServiceAreaList *ServiceAreaList
 	// IEI 0x43 — Full name for network (TLV, 1-byte length). The operator name
 	// a handset shows on its status bar. Ref: TS 24.501 §9.11.3.35
 	FullNameForNetwork string
@@ -36,8 +39,16 @@ type ConfigurationUpdateCommand struct {
 	ShortNameForNetwork string
 	// IEI 0x31 — Configured NSSAI (TLV, 1-byte length)
 	ConfiguredNSSAI *NSSAI
-	// IEI 0x9A — Network slicing indication (TV, 1 byte, high nibble 0x9)
+	// IEI 9- — Network slicing indication (TV, 1 byte, high nibble 0x9; Table 8.2.19.1.1
+	// position: after Short name for network, before Configured NSSAI)
 	NetworkSlicingIndication *byte
+	// IEI 0x11 — Rejected NSSAI (TLV, 1-byte length; TS 24.501 Table 8.2.19.1.1,
+	// §9.11.3.46). nil/empty = IE absent. Encoded after Configured NSSAI and
+	// Network slicing indication, matching the table order.
+	RejectedNSSAI []RejectedSNSSAI
+	// IEI 0x68 — Extended rejected NSSAI (TLV, TS 24.501 §9.11.3.75, Table
+	// 8.2.19.1.1). Encoded after Rejected NSSAI. nil = absent.
+	ExtendedRejectedNSSAI *ExtendedRejectedNSSAI
 }
 
 // ConfigUpdateIndicationACK is the Configuration Update Indication value with ACK
@@ -80,6 +91,15 @@ func EncodeConfigurationUpdateCommand(c *ConfigurationUpdateCommand) ([]byte, er
 		out = append(out, nssaiBytes...)
 	}
 
+	// IEI 0x27 — Service area list (TLV)
+	if c.ServiceAreaList != nil {
+		tlv, err := EncodeServiceAreaList(c.ServiceAreaList)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tlv...)
+	}
+
 	// IEI 0x43 — Full name for network (TLV, 1-byte length)
 	// Order matters: TS 24.501 Table 8.2.19.1.1 places both network-name IEs
 	// after the Allowed NSSAI and before the Configured NSSAI.
@@ -100,6 +120,12 @@ func EncodeConfigurationUpdateCommand(c *ConfigurationUpdateCommand) ([]byte, er
 		out = append(out, nameBytes...)
 	}
 
+	// IEI 9- — Network slicing indication (TV, 1 byte, high nibble 0x9).
+	// TS 24.501 Table 8.2.19.1.1 places it BEFORE Configured NSSAI (0x31).
+	if c.NetworkSlicingIndication != nil {
+		out = append(out, 0x90|(*c.NetworkSlicingIndication&0x0F))
+	}
+
 	// IEI 0x31 — Configured NSSAI (TLV, 1-byte length)
 	if c.ConfiguredNSSAI != nil {
 		nssaiBytes := EncodeNSSAI(*c.ConfiguredNSSAI)
@@ -107,9 +133,23 @@ func EncodeConfigurationUpdateCommand(c *ConfigurationUpdateCommand) ([]byte, er
 		out = append(out, nssaiBytes...)
 	}
 
-	// IEI 0x9A — Network slicing indication (TV, 1 byte, high nibble 0x9)
-	if c.NetworkSlicingIndication != nil {
-		out = append(out, 0x90|(*c.NetworkSlicingIndication&0x0F))
+	// IEI 0x11 — Rejected NSSAI (TLV, 1-byte length)
+	if len(c.RejectedNSSAI) > 0 {
+		rej, err := EncodeRejectedNSSAI(c.RejectedNSSAI)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, 0x11, byte(len(rej)))
+		out = append(out, rej...)
+	}
+
+	// IEI 0x68 — Extended rejected NSSAI (TLV), Table 8.2.19.1.1.
+	if c.ExtendedRejectedNSSAI != nil {
+		tlv, err := encodeExtendedRejectedNSSAITLV(c.ExtendedRejectedNSSAI)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tlv...)
 	}
 
 	return out, nil
@@ -155,6 +195,12 @@ func DecodeConfigurationUpdateCommand(b []byte) (*ConfigurationUpdateCommand, er
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
 			nssai, _ := DecodeNSSAI(nssaiBytes)
 			c.AllowedNSSAI = &nssai
+		case 0x27: // Service area list — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			v, _ := rdr.ReadBytes(int(l))
+			if sal, err := DecodeServiceAreaListValue(v); err == nil {
+				c.ServiceAreaList = sal
+			}
 		case 0x43: // Full name for network — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			nameBytes, _ := rdr.ReadBytes(int(l))
@@ -172,16 +218,31 @@ func DecodeConfigurationUpdateCommand(b []byte) (*ConfigurationUpdateCommand, er
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
 			nssai, _ := DecodeNSSAI(nssaiBytes)
 			c.ConfiguredNSSAI = &nssai
-		default:
-			// Skip unknown optional TLV IEs; skip half-byte TV IEs already handled above
-			if iei >= 0x80 {
-				continue // single-byte TV IE (no length byte)
+		case 0x11: // Rejected NSSAI — TLV (1-byte length)
+			l, _ := rdr.ReadByte()
+			rejBytes, _ := rdr.ReadBytes(int(l))
+			if rej, err := DecodeRejectedNSSAI(rejBytes); err == nil {
+				c.RejectedNSSAI = rej
 			}
+		case IEIExtendedRejectedNSSAI: // Extended rejected NSSAI — TLV (1-byte length)
 			l, err := rdr.ReadByte()
 			if err != nil {
-				break
+				return nil, fmt.Errorf("nas: configuration update command: extended rejected NSSAI length: %w", err)
 			}
-			_, _ = rdr.ReadBytes(int(l))
+			v, err := rdr.ReadBytes(int(l))
+			if err != nil {
+				return nil, fmt.Errorf("nas: configuration update command: extended rejected NSSAI: %w", err)
+			}
+			if c.ExtendedRejectedNSSAI, err = DecodeExtendedRejectedNSSAI(v); err != nil {
+				return nil, fmt.Errorf("nas: configuration update command: %w", err)
+			}
+		default:
+			// Unhandled or unknown IEs are skipped by the IE table / TS 24.007
+			// §11.2.4 rule (type 1/2, TLV, TLV-E, fixed TV). A syntactically
+			// incorrect IE is treated as not present. Ref: TS 24.501 §7.7.1
+			if err := rdr.skipIE(IEMsgConfigurationUpdateCommand); err != nil {
+				return c, nil
+			}
 		}
 	}
 	return c, nil

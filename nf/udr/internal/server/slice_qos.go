@@ -39,12 +39,16 @@ const (
 )
 
 // invalidParam is a TS 29.571 InvalidParam (ProblemDetails.invalidParams).
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/InvalidParam
 type invalidParam struct {
 	Param  string `json:"param"`
 	Reason string `json:"reason,omitempty"`
 }
 
 // sliceQoSView is the SliceDnnQos JSON object of the internal API.
+//
+// oapi: none project-specific UDR slice QoS internal API, no 3GPP schema
 type sliceQoSView struct {
 	Snssai             sliceQoSSnssai `json:"snssai"`
 	DNN                string         `json:"dnn"`
@@ -55,6 +59,9 @@ type sliceQoSView struct {
 	UpdatedAt          time.Time      `json:"updatedAt"`
 }
 
+// sliceQoSSnssai is the S-NSSAI of a slice QoS record in the UDR slice QoS API.
+//
+// oapi: none project-specific UDR slice QoS internal API, no 3GPP schema
 type sliceQoSSnssai struct {
 	SST uint8  `json:"sst"`
 	SD  string `json:"sd,omitempty"`
@@ -69,12 +76,18 @@ func toSliceQoSView(q store.SliceDNNQoS) sliceQoSView {
 	}
 }
 
+// resyncView reports the subscriber resync that follows a slice QoS write.
+//
+// oapi: none project-specific UDR slice QoS internal API, no 3GPP schema
 type resyncView struct {
 	AffectedSubscribers int                   `json:"affectedSubscribers"`
 	Synced              int                   `json:"synced"`
 	Failed              []store.ResyncFailure `json:"failed"`
 }
 
+// sliceQoSWriteResponse is the response body of a slice QoS write.
+//
+// oapi: none project-specific UDR slice QoS internal API, no 3GPP schema
 type sliceQoSWriteResponse struct {
 	Item    sliceQoSView `json:"item"`
 	Changed bool         `json:"changed"`

@@ -108,7 +108,7 @@ func NewH2CClient() *http.Client {
 	slog.Default().Warn("NewH2CClient: using cleartext HTTP/2 (DEV ONLY, not for production)")
 	transport := &http2.Transport{
 		AllowHTTP: true,
-		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+		DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) { //nolint:staticcheck // SA1019: h2c needs the cfg-less dial; DialTLSContext is not a drop-in for AllowHTTP
 			return net.Dial(network, addr)
 		},
 		ReadIdleTimeout: readIdleTimeout,

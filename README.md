@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml"><img src="https://github.com/francurieses/claudia-5gc/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/Go-1.26.2-00ADD8?logo=go&logoColor=white" alt="Go 1.26.2">
-  <img src="https://img.shields.io/badge/3GPP-Rel--17-blue" alt="3GPP Rel-17">
+  <img src="https://img.shields.io/badge/3GPP-Rel--19%20(5G--Advanced)-blue" alt="3GPP Rel-19 (5G-Advanced)">
   <img src="https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>
 </p>
@@ -18,13 +18,13 @@
   <a href="https://buymeacoffee.com/claudia5gc"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=%E2%98%95&slug=claudia5gc&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="36"></a>
 </p>
 
-**A from-scratch, spec-faithful 5G Core (Standalone, 3GPP Rel-17) in Go — 13 network functions in Docker, Wireshark-clean N1/N2/N4/N3, validated with UERANSIM, PacketRusher, and a commercial gNB with COTS 5G handsets.**
+**A from-scratch, spec-faithful 5G Core (Standalone, 3GPP Rel-19 / 5G-Advanced, backward compatible with Rel-15/16/17 RAN/UE) in Go — 14 network functions in Docker, Wireshark-clean N1/N2/N4/N3, validated with UERANSIM, PacketRusher, and a commercial gNB with COTS 5G handsets.**
 
 [Quickstart](#quickstart) · [Network Functions](#network-functions) · [Features](#features) · [Docs](#documentation)
 
 ## Why ClaudIA 5GC
 
-ClaudIA 5GC is an open-source 5G Core built to be developed and operated with AI, not just run next to it. An integrated MCP server lets LLM clients inspect, test and control the core in natural language, covering NF status, NAS decoding, traces and QoS policy. The same AI-assisted workflow shortens the path from idea to validated feature. New procedures and NFs take a fraction of the time of traditional telecom development, so innovation and validation move faster. The cloud-native, containerized SBA scales horizontally, one NF per container. A web portal handles day-to-day operation, and logs, metrics, traces and dashboards come wired in by default. The result is a Release 17 core you can bring up in minutes and debug, extend and automate, with people and AI agents working on the same system.
+ClaudIA 5GC is an open-source 5G Core built to be developed and operated with AI, not just run next to it. An integrated MCP server lets LLM clients inspect, test and control the core in natural language, covering NF status, NAS decoding, traces and QoS policy. The same AI-assisted workflow shortens the path from idea to validated feature. New procedures and NFs take a fraction of the time of traditional telecom development, so innovation and validation move faster. The cloud-native, containerized SBA scales horizontally, one NF per container. A web portal handles day-to-day operation, and logs, metrics, traces and dashboards come wired in by default. The result is a Release 19 core (backward compatible with Rel-15/16/17 RAN and UE) you can bring up in minutes and debug, extend and automate, with people and AI agents working on the same system.
 
 ## Architecture
 
@@ -77,7 +77,7 @@ Every NF registers with and discovers its peers through the NRF (Nnrf edges omit
 
 Prerequisites: Docker ≥ 24 usable without `sudo`, Docker Compose v2, GNU Make (Node 18+ only for the portal). Details and troubleshooting: [`docs/getting-started.md`](docs/getting-started.md#prerequisites).
 
-The core deploys **standalone** by default: the 13 NFs plus PostgreSQL and Redis, with no RAN simulator built or started. Point any gNB at the AMF (`N2`, `38412/sctp`) and it shows up on the portal's **gNBs (RAN)** page.
+The core deploys **standalone** by default: the 14 NFs plus PostgreSQL and Redis, with no RAN simulator built or started. Point any gNB at the AMF (`N2`, `38412/sctp`) and it shows up on the portal's **gNBs (RAN)** page.
 
 ```bash
 git clone https://github.com/francurieses/claudia-5gc && cd claudia-5gc
@@ -120,6 +120,15 @@ The portal detects the mode at runtime: in standalone mode the UERANSIM and Pack
 | Prometheus | http://localhost:9090 |
 | MCP server (with `MCP=on`) | http://localhost:9300 (`/mcp/health`) |
 
+## Release profile
+
+Rel-19 is the default release profile. Rel-18/19 behaviour is still used only towards peers that signal support, so legacy Rel-15/16/17 peers keep receiving byte-identical messages. The Rel-17 profile stays available as the frozen legacy baseline.
+
+- **Per NF, environment:** `NF_RELEASE_PROFILE=rel17|rel19` (overrides the YAML).
+- **Per NF, YAML:** `release: {profile: rel17|rel19}` in `nf/<nf>/config/dev.yaml` (a commented example is in each NF config), then restart the NF.
+- **Docker Compose (whole stack):** `docker-compose.yml` forwards `NF_RELEASE_PROFILE` to every core NF and the SEPPs, so one variable switches the stack: `NF_RELEASE_PROFILE=rel17 make up` (also `make ueransim`, `make 5gcsa`, ...). Unset or empty = the YAML value, else `rel19`. Environment changes need container recreation: `make down` then bring the stack up again with the variable set. Verify with `docker logs amf 2>&1 | grep '"release profile loaded"'` (`release_profile` field) or `docker compose exec amf env | grep NF_RELEASE_PROFILE`.
+- **Mixed release:** `docker-compose.mixed-release.yml` runs the AMF, SMF and PCF under different profiles (`MIXED_AMF_PROFILE`, `MIXED_CORE_PROFILE`); `make ueransim UE_COUNT=1 && make mixed-release-e2e` exercises both directions.
+
 ## Screenshots
 
 <!-- TODO(maintainer): add docs/assets/*.png — portal dashboard, UE Location map, Grafana 5G KPI dashboard, Wireshark NGAP/NAS decode. -->
@@ -141,6 +150,7 @@ Screenshots are coming soon. Run `make full` to see the portal, Grafana and Jaeg
 | [PCF](nf/pcf/) | ✅ | N7, N15, `Npcf_*` | SM policy lifecycle, AM policy, URSP, DNN-scoped QoS overrides |
 | [NSSF](nf/nssf/) | ✅ | `Nnssf_NSSelection` | Allowed-NSSAI selection |
 | [SMSF](nf/smsf/) | 🟡 | `Nsmsf_SMService` | SMS over NAS |
+| [SEPP](nf/sepp/) | 🟡 | `N32-c` / `N32-f` (TLS mode) | Roaming interconnect: capability exchange + forwarding with telescopic FQDN; `make sepp-e2e` |
 | [BSF](nf/bsf/) | ✅ | `Nbsf_Management` | PCF binding registry |
 | [NEF](nf/nef/) | 🟡 | `Nnef_AFsessionWithQoS` | AF-requested QoS via BSF + PCF |
 | [LMF](nf/lmf/) | 🟡 | `Nlmf_Location` | Cell-ID, E-CID (NRPPa), A-GNSS (LPP), event subscriptions |
@@ -266,7 +276,7 @@ tools/ueransim/      UERANSIM build + patch set
 observability/       Loki, Prometheus, Grafana, Promtail
 config/              Operator, UERANSIM and PacketRusher configs
 docs/                Getting started, architecture, features, configuration, status
-specs/3gpp-openapi/  3GPP Rel-17 OpenAPI YAMLs
+specs/3gpp-openapi/  3GPP OpenAPI YAMLs, fetched per release (Rel-19 default, older release for diffs)
 scripts/             PKI, test suites, PCAP control
 ```
 

@@ -1,0 +1,4 @@
+status: Bad Request
+Content-Type: application/problem+json
+
+{"cause":"MANDATORY_QUERY_PARAM_MISSING","detail":"nf-type and nf-id are mandatory","status":400}

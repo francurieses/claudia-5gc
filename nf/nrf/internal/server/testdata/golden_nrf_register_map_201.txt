@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: /nnrf-nfm/v1/nf-instances/bbbbbbbb-0000-0000-0000-00000000000b
+
+{"heartBeatTimer":60,"nfInstanceId":"bbbbbbbb-0000-0000-0000-00000000000b","nfServiceList":{"m1":{"serviceInstanceId":"m1","serviceName":"nudm-sdm","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.0.0"}],"scheme":"https","nfServiceStatus":"REGISTERED"}},"nfStatus":"REGISTERED","nfType":"UDM"}

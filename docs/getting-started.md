@@ -31,7 +31,7 @@ make up-obs             # Standalone core + observability only
 make up                 # Standalone core only
 
 make 5gcsa MCP=on      # Standalone core + obs + portal + MCP server container (SSE :9300)
-make full               # Everything: 13 NFs + obs + portal + 4 multi-slice UEs + PacketRusher containers
+make full               # Everything: 14 NFs + obs + portal + 4 multi-slice UEs + PacketRusher containers
 make down               # Stop and remove volumes (every profile, every simulator)
 make full-down          # Same, for the full stack
 ```
@@ -135,7 +135,7 @@ Run `make help` for the full, always-current list. The main groups:
 | `make ueransim` | Bring up core + obs + UERANSIM (gNB + N UEs). Accepts `UE_COUNT=N` |
 | `make ueransim-ursp` | Build + bring up the full core + obs + UERANSIM **with URSP delivery** (default) |
 | `make ueransim-no-ursp` | Build + bring up the full core + obs + UERANSIM **without URSP delivery** |
-| `make ueransim-only` | Bring up UERANSIM only (without touching core). Accepts `UE_COUNT=N` |
+| `make ueransim-only` | Force-recreate the gNB then the UEs (core untouched, no UDR reseed). Accepts `UE_COUNT=N` |
 | `make ueransim-down` | Stop UERANSIM containers |
 | `make ueransim-all` | Bring up core + obs + **every** UERANSIM scenario (default gNB/UEs, multi-slice, SUCI Profile A) side by side |
 | `make ueransim-all-down` | Remove the 8 UERANSIM services (core keeps running) |

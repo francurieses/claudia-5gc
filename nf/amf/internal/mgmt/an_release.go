@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
@@ -46,6 +46,9 @@ type ANReleaser interface {
 	SendUEContextReleaseCommandForUEStrict(ue *amfctx.UEContext, causePresent int, causeValue int64) error
 }
 
+// anReleaseResponse is the body of an O&M AN release answer.
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI
 type anReleaseResponse struct {
 	Accepted            bool   `json:"accepted"`
 	SUPI                string `json:"supi"`

@@ -15,6 +15,7 @@ package server
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -31,6 +32,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/config"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/pfcpx"
 )
 
 // Default PFCP supervision timers. 3GPP gives no values: TS 29.244 §6.4 only
@@ -167,6 +169,11 @@ type pfcpAssociation struct {
 	remoteRTS        time.Time // zero = unknown (baseline not yet learned)
 	associatedAt     time.Time
 	missingRTSWarned bool
+	// peerUPFeaturesRaw is a private copy of the UP Function Features payload
+	// (TS 29.244 §8.2.25) from the last Association Setup Response, including
+	// octets beyond the known bit table; nil = IE absent.
+	peerUPFeaturesRaw []byte
+	peerUPFeatures    []string // decoded names of the set, known bits
 }
 
 // PFCPAssociationStatus is a read-only snapshot of the association state.
@@ -175,6 +182,10 @@ type PFCPAssociationStatus struct {
 	PeerNodeID   string    // Node ID returned in the Association Setup Response
 	RemoteRTS    time.Time // UPF Recovery Time Stamp baseline (zero = unknown)
 	AssociatedAt time.Time
+	// PeerUPFeaturesRaw: raw UP Function Features octets (nil = not signalled).
+	PeerUPFeaturesRaw []byte
+	// PeerUPFeatures: names of the known UP Function Features bits set.
+	PeerUPFeatures []string
 }
 
 // PFCPAssociation returns a snapshot of the UPF association state.
@@ -186,6 +197,9 @@ func (s *Server) PFCPAssociation() PFCPAssociationStatus {
 		PeerNodeID:   s.assoc.peerNodeID,
 		RemoteRTS:    s.assoc.remoteRTS,
 		AssociatedAt: s.assoc.associatedAt,
+
+		PeerUPFeaturesRaw: append([]byte(nil), s.assoc.peerUPFeaturesRaw...),
+		PeerUPFeatures:    append([]string(nil), s.assoc.peerUPFeatures...),
 	}
 }
 
@@ -391,8 +405,19 @@ func (s *Server) runAssociationSetup(ctx context.Context) bool {
 			"cause", causeRTSMissing)
 	}
 
+	// Optional UP Function Features (TS 29.244 §8.2.25): copy the payload, the
+	// receive buffer may be reused. Parse-and-log only; nothing is sent back.
+	var upFeatRaw []byte
+	var upFeatNames []string
+	if rsp.UPFunctionFeatures != nil {
+		upFeatRaw = append(make([]byte, 0, len(rsp.UPFunctionFeatures.Payload)), rsp.UPFunctionFeatures.Payload...)
+		upFeatNames = pfcpx.SetUPFeatures(rsp.UPFunctionFeatures)
+	}
+
 	s.assoc.mu.Lock()
 	s.assoc.state = assocAssociated
+	s.assoc.peerUPFeaturesRaw = upFeatRaw
+	s.assoc.peerUPFeatures = upFeatNames
 	s.assoc.peerNodeID = peerNode
 	s.assoc.associatedAt = time.Now()
 	s.assoc.missingRTSWarned = false
@@ -401,8 +426,13 @@ func (s *Server) runAssociationSetup(ctx context.Context) bool {
 	log.InfoContext(ctx, "PFCP Association Setup accepted",
 		"interface", "N4", "direction", "IN", "spec_ref", specAssocSetup,
 		"result", "OK", "cause", cause, "peer_node_id", peerNode,
-		"peer_rts", fmtRTS(peerRTS), "duration_ms", time.Since(start).Milliseconds())
+		"peer_rts", fmtRTS(peerRTS),
+		"peer_up_features", upFeatNames,
+		"peer_up_features_hex", hex.EncodeToString(upFeatRaw),
+		"peer_up_features_octets", len(upFeatRaw),
+		"duration_ms", time.Since(start).Milliseconds())
 	metrics.ProcedureTotal.WithLabelValues("SMF", procAssocSetup, "OK").Inc()
+	s.releaseOrphansOfPreviousRun(ctx)
 	return true
 }
 
@@ -768,7 +798,7 @@ func (s *Server) skipN4ForReleasing(sess *Session, op string) bool {
 	if releasing {
 		s.logger.Debug("PFCP "+op+" skipped — session RELEASING after UPF restart/failure",
 			"procedure", procRecovery, "interface", "N4", "direction", "OUT",
-			"nf", "SMF", "correlation_id", ulid.Make().String(),
+			"correlation_id", ulid.Make().String(),
 			"spec_ref", specRestore, "seid", sess.SEID, "supi", sess.SUPI)
 	}
 	return releasing
@@ -788,5 +818,38 @@ func (s *Server) warnIfNotAssociated(ctx context.Context, corrID string) {
 	select {
 	case s.assocKick <- struct{}{}:
 	default:
+	}
+}
+
+// restartOrphan is a PDU session persisted by a previous SMF run.
+type restartOrphan struct {
+	supi string
+	psi  uint8
+}
+
+// releaseOrphansOfPreviousRun asks the AMF to release, towards the UE, the PDU
+// sessions this SMF lost by restarting (the UPF drops its side on seeing the new
+// Recovery Time Stamp, TS 29.244 §6.2.6), so the UE re-establishes them. It runs
+// once, after the first successful Association Setup. Ref: TS 23.527 §4.3,
+// TS 23.502 §4.3.4.2 (via the AMF management API, see releaseOne).
+func (s *Server) releaseOrphansOfPreviousRun(ctx context.Context) {
+	s.sessionMu.Lock()
+	orphans := s.orphanedByRestart
+	s.orphanedByRestart = nil
+	s.sessionMu.Unlock()
+	if len(orphans) == 0 {
+		return
+	}
+	log := logging.NewProcedureLogger(ctx, s.logger, procRecovery)
+	for _, o := range orphans {
+		attrs := []any{"interface", "Namf-mgmt", "direction", "OUT", "spec_ref", specAMFRelease,
+			"supi", o.supi, "pdu_session_id", o.psi}
+		if err := s.requestAMFRelease(ctx, o.supi, o.psi); err != nil {
+			log.WarnContext(ctx, "SMF restart: AMF release of orphaned PDU session failed",
+				append(attrs, "result", "FAILURE", "cause", causeAMFReleaseFailed, "error", err)...)
+			continue
+		}
+		log.InfoContext(ctx, "SMF restart: AMF asked to release orphaned PDU session",
+			append(attrs, "result", "OK")...)
 	}
 }

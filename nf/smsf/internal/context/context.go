@@ -8,7 +8,11 @@
 // Ref: TS 29.540 §5.2, TS 23.502 §4.13.2
 package context
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
+)
 
 // State is the per-UE SMS context state.
 type State int
@@ -39,6 +43,10 @@ type UESMSContext struct {
 	AmfCallbackURI string
 	// State is the current SMS context state.
 	State State
+	// Features is the set of Nsmsf_SMService features negotiated with the AMF
+	// at Activate (TS 29.500 §6.6.2; UeSmsContextData.supportedFeatures). The
+	// context is in memory only, so no serialisation tag is involved.
+	Features features.Set
 }
 
 // Store is a thread-safe in-memory store of UE SMS contexts, keyed by SUPI.

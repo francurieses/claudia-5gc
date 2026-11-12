@@ -1,0 +1,4 @@
+status: Not Found
+Content-Type: application/problem+json
+
+{"cause":"DATA_NOT_FOUND","detail":"no SM policy data for imsi-001010000000001","status":404}

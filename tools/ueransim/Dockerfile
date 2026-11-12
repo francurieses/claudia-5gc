@@ -53,6 +53,10 @@ RUN wget -qO- \
 #   0060 — IPv4/IPv6/IPv4v6 PDU session type selection (nr-cli ps-establish
 #          <type>, config sessions[].type); TUN IPv6 SLAAC via "ip -6 token"
 #          once the UPF's Router Advertisement arrives (TS 23.501 §5.8.2.2.2)
+#   0080 — opt-in 5GMM capability (IEI 0x10, TS 24.501 §9.11.3.1) / 5GSM
+#          capability (IEI 0x28, §9.11.4.1) bits from ue.yaml
+#          mmCapabilityBits / smCapabilityBits ("octet.bit" lists); absent =
+#          byte-identical stock encoding
 COPY tools/ueransim/patches/ /patches/
 RUN set -e; for p in /patches/*.patch; do \
         echo "Applying $p"; \

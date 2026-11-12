@@ -1,0 +1,8 @@
+GET /nudr-dr/v2/subscription-data/imsi-001010000000001/001/provisioned-data/sm-data
+Content-Type: 
+Accept: 
+
+
+
+--- result
+[{"singleNssai":{"sst":1,"sd":"000001"},"dnnConfigurations":{"internet":{"pduSessionTypes":{"defaultSessionType":"IPV4"}}}}]

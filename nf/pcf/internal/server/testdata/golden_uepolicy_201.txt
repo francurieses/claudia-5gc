@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: https://example.com/npcf-ue-policy-control/v1/policies/<UUID>
+
+{"uePolicy":"gAEAFAASAAAAAA0AAQAJAQAG/wABAQAA"}

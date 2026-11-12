@@ -1,7 +1,7 @@
 # {{NF_NAME}} — multi-stage Dockerfile (template)
 #
 # IMPORTANT: every NF is part of the ROOT Go module
-# (github.com/francurieses/5gc-rel17). NFs do NOT have their own go.mod — the
+# (github.com/francurieses/claudia-5gc). NFs do NOT have their own go.mod — the
 # build context is the repo root (docker-compose: `context: .`,
 # `dockerfile: nf/{{nf_name}}/Dockerfile`). Keep this shape identical to the
 # other NFs (ausf, bsf, nef, …) so builds stay aligned. NRF is the lone
@@ -15,6 +15,11 @@ COPY go.mod go.sum* ./
 RUN go mod download
 # Shared libraries + this NF's source, copied from the repo root.
 COPY shared/ ./shared/
+# Private-edition sources (dev/rel19/PLAN.md §1.2): the glob copies private/ when it
+# exists (private repo) and matches nothing in the public snapshot, which strips both
+# private/ and the *_private.go bridges, so one Dockerfile builds both editions.
+# Build stage only: nothing from private/ is copied into the runtime image beyond the binary.
+COPY privat[e]/ ./private/
 COPY nf/{{nf_name}}/ ./nf/{{nf_name}}/
 ENV CGO_ENABLED=0
 RUN go build -ldflags="-s -w" -o /out/{{nf_name}} ./nf/{{nf_name}}/cmd/{{nf_name}}

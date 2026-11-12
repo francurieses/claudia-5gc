@@ -1,0 +1,98 @@
+-- Project-authored synthetic ASN.1 used to test tools/asn1gen. Not 3GPP text.
+-- It reproduces the structure (not the wording) of the NGAP container module.
+
+SYN-Base { itu-t (0) example (99) base (1) }
+
+DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+EXPORTS ProtocolIE-Container{}, ProtocolIE-SingleContainer{};
+
+Criticality    ::= ENUMERATED { reject, ignore, notify }
+Presence       ::= ENUMERATED { optional, conditional, mandatory }
+ProtocolIE-ID  ::= INTEGER (0..65535)
+ProtocolExtensionID ::= INTEGER (0..65535)
+ProcedureCode  ::= INTEGER (0..255)
+PrivateIE-ID   ::= CHOICE {
+	local   INTEGER (0..65535),
+	global  OBJECT IDENTIFIER
+}
+
+maxIEs   INTEGER ::= 65535
+maxExts  INTEGER ::= 65535
+maxPriv  INTEGER ::= 65535
+
+SYN-IES ::= CLASS {
+	&id           ProtocolIE-ID  UNIQUE,
+	&criticality  Criticality,
+	&Value,
+	&presence     Presence
+}
+WITH SYNTAX {
+	ID          &id
+	CRITICALITY &criticality
+	TYPE        &Value
+	PRESENCE    &presence
+}
+
+SYN-EXT ::= CLASS {
+	&id           ProtocolExtensionID UNIQUE,
+	&criticality  Criticality,
+	&Extension,
+	&presence     Presence
+}
+WITH SYNTAX {
+	ID          &id
+	CRITICALITY &criticality
+	EXTENSION   &Extension
+	PRESENCE    &presence
+}
+
+SYN-PRIVATE ::= CLASS {
+	&id           PrivateIE-ID,
+	&criticality  Criticality,
+	&Value,
+	&presence     Presence
+}
+WITH SYNTAX {
+	ID          &id
+	CRITICALITY &criticality
+	TYPE        &Value
+	PRESENCE    &presence
+}
+
+ProtocolIE-Container { SYN-IES : IEsSetParam } ::=
+	SEQUENCE (SIZE (0..maxIEs)) OF
+	ProtocolIE-Field {{IEsSetParam}}
+
+ProtocolIE-SingleContainer { SYN-IES : IEsSetParam } ::=
+	ProtocolIE-Field {{IEsSetParam}}
+
+ProtocolIE-Field { SYN-IES : IEsSetParam } ::= SEQUENCE {
+	id          SYN-IES.&id          ({IEsSetParam}),
+	criticality SYN-IES.&criticality ({IEsSetParam}{@id}),
+	value       SYN-IES.&Value       ({IEsSetParam}{@id})
+}
+
+ProtocolExtensionContainer { SYN-EXT : ExtensionSetParam } ::=
+	SEQUENCE (SIZE (1..maxExts)) OF
+	ProtocolExtensionField {{ExtensionSetParam}}
+
+ProtocolExtensionField { SYN-EXT : ExtensionSetParam } ::= SEQUENCE {
+	id             SYN-EXT.&id          ({ExtensionSetParam}),
+	criticality    SYN-EXT.&criticality ({ExtensionSetParam}{@id}),
+	extensionValue SYN-EXT.&Extension   ({ExtensionSetParam}{@id})
+}
+
+PrivateIE-Container { SYN-PRIVATE : IEsSetParam } ::=
+	SEQUENCE (SIZE (1..maxPriv)) OF
+	PrivateIE-Field {{IEsSetParam}}
+
+PrivateIE-Field { SYN-PRIVATE : IEsSetParam } ::= SEQUENCE {
+	id          SYN-PRIVATE.&id          ({IEsSetParam}),
+	criticality SYN-PRIVATE.&criticality ({IEsSetParam}{@id}),
+	value       SYN-PRIVATE.&Value       ({IEsSetParam}{@id})
+}
+
+END

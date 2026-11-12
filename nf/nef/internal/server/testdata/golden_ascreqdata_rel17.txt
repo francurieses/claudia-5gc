@@ -1,0 +1,1 @@
+{"ascReqData":{"aspId":"af-1","afAppId":"app-1","ueIpv4":"10.60.0.1","qosReference":"qos-1","dnn":"internet","medComponents":{"1":{"medType":"DATA","fDescs":["permit out ip from any to any"]}}}}

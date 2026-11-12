@@ -38,7 +38,7 @@ const (
 	// specAFQoS is the spec reference of the af_qos_session_* tools.
 	specAFQoS = "TS 29.522 §4.4.13; TS 23.502 §4.15.6.6"
 	// specPWSResend is the spec reference of pws_resend.
-	specPWSResend = "TS 38.413 §8.9.1"
+	specPWSResend = "TS 38.413 §8.9.1" //nolint:gosec // G101: spec reference text, not a credential
 	// specMTSMS is the spec reference of sms_send_mt.
 	specMTSMS = "TS 23.502 §4.13.3"
 )
@@ -363,7 +363,7 @@ func (afCreateTool) Risk() registry.Risk { return registry.Disruptive }
 func (afCreateTool) Description() string {
 	return "Create an AF session with required QoS at the NEF (Nnef_AFsessionWithQoS): the NEF finds the PCF through " +
 		"the BSF and the PCF installs the QoS rule on the UE's PDU session. The tool gets an NRF access token " +
-		"(scope nnef-afsessionwithqos) first. The UE IPv4 must belong to a live SMF session. " +
+		"(scope 3gpp-as-session-with-qos) first. The UE IPv4 must belong to a live SMF session. " +
 		"Spec: TS 29.522 §4.4.13, TS 23.502 §4.15.6.6."
 }
 func (afCreateTool) InputSchema() json.RawMessage {

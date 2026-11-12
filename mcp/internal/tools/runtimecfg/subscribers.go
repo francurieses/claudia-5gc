@@ -179,8 +179,6 @@ func decodeProfile(m map[string]json.RawMessage, where string) (profile, *mcperr
 	return p, perr
 }
 
-func (p profile) empty() bool { return !p.hasUL && !p.hasDL && !p.hasSl }
-
 // apply merges the profile into a subscriber record map. The portal stores
 // ambr_ul and ambr_dl as integer kbps, not as BitRate strings.
 func (p profile) apply(rec map[string]any) {
@@ -384,7 +382,7 @@ func (t subscriberProfileUpdateTool) Plan(ctx context.Context, in json.RawMessag
 	}
 	return map[string]any{
 		"supi":                    a.supi,
-		"previous":                json.RawMessage(prev),
+		"previous":                prev,
 		"changes":                 changes,
 		"ue_will_be_deregistered": true,
 		"note":                    "the portal deregisters the UE (re-registration required, TS 23.502 §4.2.2.3.3)",
@@ -662,7 +660,7 @@ func (t subscriberDeleteTool) Plan(ctx context.Context, in json.RawMessage) (any
 	if !exists {
 		return nil, errSubscriberNotFound()
 	}
-	return map[string]any{"supi": supi, "exists": true, "current": json.RawMessage(prev),
+	return map[string]any{"supi": supi, "exists": true, "current": prev,
 		"effect": "the subscriber is removed from the UDR; a UE registered now keeps its AMF context until its next authentication or registration"}, nil
 }
 

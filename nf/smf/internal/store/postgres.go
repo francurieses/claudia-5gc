@@ -5,7 +5,10 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 
+	"github.com/francurieses/claudia-5gc/shared/dbmigrate"
+	"github.com/francurieses/claudia-5gc/shared/jsoncompat"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,29 +38,21 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 }
 
 func (p *Postgres) migrate(ctx context.Context) error {
-	entries, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		sql, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return err
-		}
-		if _, err := p.pool.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("migration %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+	return dbmigrate.Run(ctx, dbmigrate.PgxDB{Pool: p.pool}, "smf", migrationsFS, "migrations", slog.Default())
 }
 
 func (p *Postgres) Close() { p.pool.Close() }
 
 func (p *Postgres) UpsertSession(ctx context.Context, ref string, s *SessionRecord) error {
-	_, err := p.pool.Exec(ctx, `
+	extra, err := encodeExtra(s.Extra)
+	if err != nil {
+		return err
+	}
+	_, err = p.pool.Exec(ctx, `
 		INSERT INTO smf_sessions
-		    (sm_context_ref, supi, dnn, ue_ip, ul_teid, seid, sst, sd)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		    (sm_context_ref, supi, dnn, ue_ip, ul_teid, seid, sst, sd, pdu_session_id,
+		     schema_version, extra)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (sm_context_ref) DO UPDATE SET
 		    supi    = EXCLUDED.supi,
 		    dnn     = EXCLUDED.dnn,
@@ -65,8 +60,12 @@ func (p *Postgres) UpsertSession(ctx context.Context, ref string, s *SessionReco
 		    ul_teid = EXCLUDED.ul_teid,
 		    seid    = EXCLUDED.seid,
 		    sst     = EXCLUDED.sst,
-		    sd      = EXCLUDED.sd`,
-		ref, s.SUPI, s.DNN, s.UEIP, s.ULTEID, s.SEID, s.SST, s.SD,
+		    sd      = EXCLUDED.sd,
+		    pdu_session_id = EXCLUDED.pdu_session_id,
+		    schema_version = EXCLUDED.schema_version,
+		    extra          = EXCLUDED.extra`,
+		ref, s.SUPI, s.DNN, s.UEIP, s.ULTEID, s.SEID, s.SST, s.SD, int(s.PSI),
+		jsoncompat.NextVersion(s.SchemaVersion, SessionSchemaVersion), extra,
 	)
 	if err != nil {
 		return fmt.Errorf("smf store: UpsertSession %s: %w", ref, err)
@@ -85,7 +84,8 @@ func (p *Postgres) DeleteSession(ctx context.Context, ref string) error {
 
 func (p *Postgres) ListSessions(ctx context.Context) (map[string]*SessionRecord, error) {
 	rows, err := p.pool.Query(ctx, `
-		SELECT sm_context_ref, supi, dnn, ue_ip, ul_teid, seid, sst, sd
+		SELECT sm_context_ref, supi, dnn, ue_ip, ul_teid, seid, sst, sd, pdu_session_id,
+		       schema_version, extra
 		FROM smf_sessions`)
 	if err != nil {
 		return nil, fmt.Errorf("smf store: ListSessions: %w", err)
@@ -95,9 +95,16 @@ func (p *Postgres) ListSessions(ctx context.Context) (map[string]*SessionRecord,
 	for rows.Next() {
 		var ref string
 		var s SessionRecord
-		if err := rows.Scan(&ref, &s.SUPI, &s.DNN, &s.UEIP, &s.ULTEID, &s.SEID, &s.SST, &s.SD); err != nil {
+		var psi int
+		var extra []byte
+		if err := rows.Scan(&ref, &s.SUPI, &s.DNN, &s.UEIP, &s.ULTEID, &s.SEID, &s.SST, &s.SD, &psi,
+			&s.SchemaVersion, &extra); err != nil {
 			return nil, fmt.Errorf("smf store: scan session: %w", err)
 		}
+		if s.Extra, err = decodeExtra(extra); err != nil {
+			return nil, err
+		}
+		s.PSI = uint8(psi)
 		result[ref] = &s
 	}
 	return result, rows.Err()
@@ -113,10 +120,10 @@ func (p *Postgres) MaxCounters(ctx context.Context) (maxSEID uint64, maxTEID uin
 		}
 	}
 	if seid != nil {
-		maxSEID = uint64(*seid)
+		maxSEID = uint64(*seid) //nolint:gosec // SEID is stored as bigint; the uint64 bit pattern round-trips
 	}
 	if teid != nil {
-		maxTEID = uint32(*teid)
+		maxTEID = uint32(*teid) //nolint:gosec // TEID is stored as bigint holding a uint32
 	}
 	return maxSEID, maxTEID, nil
 }

@@ -3,6 +3,7 @@ package qos
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -86,7 +87,8 @@ func TestQoSPolicyListSupiFilterAndValidation(t *testing.T) {
 	}
 	n := len(rec.calls)
 	_, err := tl.Invoke(context.Background(), json.RawMessage(`{"supi":"not-a-supi"}`))
-	if e, ok := err.(*mcperr.Error); !ok || e.Code != mcperr.CodeInvalidParams {
+	var e *mcperr.Error
+	if ok := errors.As(err, &e); !ok || e.Code != mcperr.CodeInvalidParams {
 		t.Errorf("want -32602, got %v", err)
 	}
 	if len(rec.calls) != n {
@@ -97,7 +99,8 @@ func TestQoSPolicyListSupiFilterAndValidation(t *testing.T) {
 func TestQoSPolicyListUpstreamError(t *testing.T) {
 	tl, _ := listTool(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
 	_, err := tl.Invoke(context.Background(), json.RawMessage(`{}`))
-	e, ok := err.(*mcperr.Error)
+	var e *mcperr.Error
+	ok := errors.As(err, &e)
 	if !ok || e.Code != mcperr.CodeToolError || !strings.Contains(e.Message, "500") || e.Data["status"] != 500 {
 		t.Errorf("want -32000 with status 500, got %#v", err)
 	}

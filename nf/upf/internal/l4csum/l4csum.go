@@ -143,7 +143,7 @@ func finish(seg []byte, proto byte, ip string, acc uint64, v6 bool) (Result, boo
 	acc = sum(seg[:off], acc)
 	acc = sum(seg[off+2:], acc)
 	computed := ^fold(acc)
-	if !(proto == ipProtoUDP && v6 && stored == 0) && fold(acc+uint64(stored)) == csumValid {
+	if (proto != ipProtoUDP || !v6 || stored != 0) && fold(acc+uint64(stored)) == csumValid {
 		return Result{}, false
 	}
 	if proto == ipProtoUDP && computed == 0 {

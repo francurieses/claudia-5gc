@@ -83,6 +83,7 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Paged Service Request user-plane re-activation (TS 23.502 §4.2.3.3 step 6) —
 	// real in-process steps driving the NAS handler; shares ICS assertions above.
 	initNTSRSteps(sc)
+	initServiceAreaRestrictionSteps(sc)
 
 	// Service Accept IEs (0x50 / 0x26) + local release of PDU sessions the UE
 	// reports inactive (TS 24.501 §5.6.1.4.1) — in-process, reuses ntsrW.
@@ -118,14 +119,25 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// in-process: real mgmt route, timercfg store, Registration Accept builders
 	// and ngap timer arming.
 	initTimerConfigSteps(sc)
+
+	// NGAP error handling (TS 38.413 §10, §8.7.5) — in-process: real ngap.Server,
+	// fake SCTP association, wire-decoded ERROR INDICATION assertions.
+	initNGAPErrorHandlingSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {
 	suite := godog.TestSuite{
 		ScenarioInitializer: InitializeScenario,
 		Options: &godog.Options{
-			Format:   "pretty",
-			Paths:    []string{"./"},
+			Format: "pretty",
+			Paths:  []string{"./"},
+			// sbi_redirection.feature (@es3xx) runs in nf/amf/cmd/amf
+			// (TestSBIRedirectionFeature): its steps drive HTTPSMFClient in
+			// package main, which this package cannot import.
+			// feature_negotiation.feature runs strictly in its own runners:
+			// @namf-producer in TestFeatureNegotiationProducer (this package),
+			// @nsmf-consumer in nf/amf/cmd/amf (TestFeatureNegotiationConsumer).
+			Tags:     "~@es3xx && ~@nsmf-consumer && ~@namf-producer",
 			TestingT: t,
 		},
 	}

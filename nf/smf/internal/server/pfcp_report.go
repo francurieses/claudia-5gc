@@ -14,6 +14,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -83,7 +84,7 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 	}()
 
 	s.logger.Info("SMF: PFCP receiver listening",
-		"nf", "SMF", "interface", "N4", "direction", "IN",
+		"interface", "N4", "direction", "IN",
 		"spec_ref", "TS 29.244 §6.2.1", "addr", addr)
 
 	buf := make([]byte, pfcpReceiveBufferSize)
@@ -97,21 +98,22 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pfcpReceiveReadTimeout))
 		n, raddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			var netErr net.Error
+			if ok := errors.As(err, &netErr); ok && netErr.Timeout() {
 				continue
 			}
 			if ctx.Err() != nil {
 				return nil
 			}
 			s.logger.Warn("SMF: PFCP receiver read error",
-				"nf", "SMF", "interface", "N4", "direction", "IN", "error", err)
+				"interface", "N4", "direction", "IN", "error", err)
 			continue
 		}
 
 		msg, err := pfcpmsg.Parse(buf[:n])
 		if err != nil {
 			s.logger.Warn("SMF: PFCP receiver parse error",
-				"nf", "SMF", "interface", "N4", "direction", "IN",
+				"interface", "N4", "direction", "IN",
 				"error", err, "bytes", n, "remote", raddr)
 			continue
 		}
@@ -125,7 +127,7 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 			s.handlePFCPHeartbeatRequest(ctx, conn, raddr, m)
 		default:
 			s.logger.Info("SMF: PFCP receiver: unhandled message type",
-				"nf", "SMF", "interface", "N4", "direction", "IN",
+				"interface", "N4", "direction", "IN",
 				"type", msg.MessageTypeName(), "remote", raddr)
 		}
 	}
@@ -146,13 +148,13 @@ func (s *Server) handleSessionReport(ctx context.Context, conn *net.UDPConn, rad
 	b := make([]byte, resp.MarshalLen())
 	if err := resp.MarshalTo(b); err != nil {
 		s.logger.Error("SMF: PFCP Session Report Response marshal",
-			"nf", "SMF", "interface", "N4", "direction", "OUT",
+			"interface", "N4", "direction", "OUT",
 			"error", fmt.Errorf("smf: usage report: %w", err), "seid", req.SEID())
 		return
 	}
 	if _, err := conn.WriteToUDP(b, raddr); err != nil {
 		s.logger.Warn("SMF: PFCP Session Report Response send failed",
-			"nf", "SMF", "interface", "N4", "direction", "OUT",
+			"interface", "N4", "direction", "OUT",
 			"error", fmt.Errorf("smf: usage report: %w", err), "seid", req.SEID(), "remote", raddr)
 	}
 }
@@ -171,7 +173,7 @@ func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionR
 	sess := s.sessionBySEID(seid)
 	if sess == nil {
 		logger.Warn("PFCP Session Report: session not found",
-			"nf", "SMF", "interface", "N4", "direction", "IN",
+			"interface", "N4", "direction", "IN",
 			"spec_ref", "TS 29.244 §5.2.2.4",
 			"seid", seid, "result", "REJECT", "cause", "SessionContextNotFound")
 		return pfcpie.CauseSessionContextNotFound, UsageSummary{SEID: seid}
@@ -186,7 +188,7 @@ func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionR
 		if summary.URRID != usageReportingURRID {
 			summary.KnownURR = false
 			logger.Warn("PFCP Session Report: unknown URR ID",
-				"nf", "SMF", "interface", "N4", "direction", "IN",
+				"interface", "N4", "direction", "IN",
 				"spec_ref", "TS 29.244 §7.5.9",
 				"seid", seid, "urr_id", summary.URRID)
 		} else {
@@ -194,7 +196,7 @@ func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionR
 		}
 
 		logger.Info("PFCP Usage Report consumed",
-			"nf", "SMF", "interface", "N4", "direction", "IN",
+			"interface", "N4", "direction", "IN",
 			"spec_ref", "TS 29.244 §5.2.2.4",
 			"seid", seid, "urr_id", summary.URRID, "ur_seqn", summary.URSeqn,
 			"trigger", summary.Trigger,

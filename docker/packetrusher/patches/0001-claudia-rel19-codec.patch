@@ -1,0 +1,896 @@
+claudia-5gc: PacketRusher --release rel19 (shared codec libraries, Rel-18/19 capability + decoders)
+
+This patch MODIFIES PacketRusher (https://github.com/HewlettPackard/PacketRusher, Apache License 2.0,
+pinned at acf96b571dff4b58d9f33d66a8cfd48dd1500620). Per Apache-2.0 section 4(b) the files changed are
+marked below; the patch itself is distributed under GPL-3.0-or-later as part of claudia-5gc, the
+modified PacketRusher files remain under Apache-2.0.
+
+Changes:
+  cmd/packetrusher.go                     new global flag --release rel17|rel19 (env PACKETRUSHER_RELEASE)
+  internal/claudia/                       new package: release profile, Rel-18/19 5GMM capability bits,
+                                          Registration Accept IE scan, NGAP DL decode, GTP-U PDU Set parser
+  third_party/free5gc-nas/ie/5gmm_capability.go    Raw field (verbatim capability octets)
+  third_party/free5gc-nas/message/message.go       PlainObserver hook (nil by default)
+  .../mm_5gs/registration-request.go      capability IE through claudia.Capability5GMM() (rel17 = unchanged)
+  .../gnb/ngap/service.go                 claudia.ObserveNGAP(payload) before Parse (no-op in rel17)
+  go.mod / go.sum                         require+replace github.com/francurieses/claudia-5gc =>
+                                          ./third_party/claudia-5gc (staged by scripts/packetrusher-vendor.sh)
+
+---
+diff --git a/cmd/packetrusher.go b/cmd/packetrusher.go
+index 737b82e..bfd372d 100644
+--- a/cmd/packetrusher.go
++++ b/cmd/packetrusher.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"my5G-RANTester/config"
++	"my5G-RANTester/internal/claudia"
+ 	"my5G-RANTester/internal/templates"
+ 	pcap "my5G-RANTester/internal/utils"
+ 
+@@ -9,6 +10,7 @@ import (
+ 	"os"
+ 
+ 	"github.com/davecgh/go-spew/spew"
++	nasmsg "github.com/free5gc/nas/message"
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/urfave/cli/v2"
+ )
+@@ -25,6 +27,19 @@ func newApp() *cli.App {
+ 	app := &cli.App{
+ 		Flags: []cli.Flag{
+ 			&cli.PathFlag{Name: "config", Usage: "Configuration file path. (Default: ./config/config.yml)"},
++			&cli.StringFlag{Name: "release", Value: "rel17", EnvVars: []string{"PACKETRUSHER_RELEASE"}, Usage: "3GPP release profile: rel17 (default, unchanged) or rel19 (claudia-5gc: Rel-18/19 5GMM capability bits, Rel-18/19 NAS/NGAP/GTP-U decoding, log only)."},
++		},
++		Before: func(c *cli.Context) error {
++			r, err := claudia.ParseRelease(c.String("release"))
++			if err != nil {
++				return err
++			}
++			claudia.SetRelease(r)
++			if r == claudia.Rel19 {
++				nasmsg.PlainObserver = claudia.ObservePlainNAS
++				log.Info("[claudia] --release rel19: Rel-18/19 capability bits and decoders enabled")
++			}
++			return nil
+ 		},
+ 		Commands: []*cli.Command{
+ 			{
+diff --git a/go.mod b/go.mod
+index 8b8d50a..fa4ac7c 100644
+--- a/go.mod
++++ b/go.mod
+@@ -24,12 +24,14 @@ require (
+ 
+ require (
+ 	github.com/cpuguy83/go-md2man/v2 v2.0.6 // indirect
++	github.com/free5gc/aper v1.1.1 // indirect
+ 	github.com/golang-jwt/jwt/v5 v5.2.2 // indirect
+ 	github.com/khirono/go-genl v1.0.1 // indirect
+ 	github.com/khirono/go-rtnllink v1.1.1 // indirect
+ 	github.com/pkg/errors v0.9.1 // indirect
+ 	github.com/pmezard/go-difflib v1.0.0 // indirect
+ 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
++	github.com/tim-ywliu/nested-logrus-formatter v1.3.2 // indirect
+ 	github.com/vishvananda/netns v0.0.5 // indirect
+ 	github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1 // indirect
+ 	golang.org/x/net v0.55.0 // indirect
+@@ -39,3 +41,8 @@ require (
+ 
+ // Native v1.3.0 codec fixes; see third_party/free5gc-nas/README.packetrusher.md.
+ replace github.com/free5gc/nas => ./third_party/free5gc-nas
++
++// claudia-5gc: build-time copy of shared/{ngap,nas,capability}, staged by scripts/packetrusher-vendor.sh.
++require github.com/francurieses/claudia-5gc v0.0.0
++
++replace github.com/francurieses/claudia-5gc => ./third_party/claudia-5gc
+diff --git a/go.sum b/go.sum
+index 75dd2e7..7b16b5c 100644
+--- a/go.sum
++++ b/go.sum
+@@ -13,6 +13,8 @@ github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6N
+ github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+ github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/free5gc/aper v1.1.1 h1:O1WHg8J/Ab+TtpYuDjdUkoVv1dpR/K7L1/edP9+OujI=
++github.com/free5gc/aper v1.1.1/go.mod h1:erN7J8emgUvCFydYcPhHtknRfeHocPRJuGldpvXLE5I=
+ github.com/free5gc/go-gtp5gnl v1.6.2 h1:hJpwuhQLV004xU5/1PTygyTqN4ksBF+mVkLaxUyswDQ=
+ github.com/free5gc/go-gtp5gnl v1.6.2/go.mod h1:g7YGMHUU8a1AXesEOCibtKW+K6GjuwTVaugh/pGadVM=
+ github.com/free5gc/ngap v1.2.0 h1:tZPokNiF/J97dmq0DVATcE1lZi7stCo7LZaosSB8otQ=
+diff --git a/internal/claudia/capability.go b/internal/claudia/capability.go
+new file mode 100644
+index 0000000..069d1e0
+--- /dev/null
++++ b/internal/claudia/capability.go
+@@ -0,0 +1,41 @@
++package claudia
++
++import (
++	"github.com/free5gc/nas/ie"
++	log "github.com/sirupsen/logrus"
++
++	claudianas "github.com/francurieses/claudia-5gc/shared/nas"
++)
++
++// Rel19CapabilityBits are the 5GMM capability bits (TS 24.501 §9.11.3.1, Table 9.11.3.1.1) that the
++// rel19 profile sets on top of the legacy N3 data / LPP / HO attach / S1 mode set. They are limited to
++// "the UE can receive and ignore this network-provided information" bits: PacketRusher implements no
++// behaviour behind them, it only decodes and logs the matching Registration Accept IEs.
++//
++//	Rel-18: LADN-DS (LADN per DNN and S-NSSAI), NSR (network slice replacement), PNS (partial
++//	        network slice), TempNS (S-NSSAI time validity), SLVI (S-NSSAI location validity),
++//	        NSUC (network slice usage control)
++//	Rel-19: ATUC (access technology utilization control)
++func Rel19CapabilityBits() claudianas.FiveGMMCapability {
++	return claudianas.FiveGMMCapability{
++		S1Mode: true, HOAttach: true, LPP: true, // N3DataNotSupported=false: N3 data supported
++		LADNDS: true, NSR: true, PNS: true, TempNS: true, SLVI: true, NSUC: true,
++		ATUC: true,
++	}
++}
++
++// Capability5GMM returns the 5GMM capability IE of the Registration Request. rel17 returns exactly the
++// legacy PacketRusher value {N3 data, LPP, HO attach, S1 mode} (1 octet); rel19 returns the encoding
++// of Rel19CapabilityBits through the shared/nas codec (octets 3..11).
++func Capability5GMM() *ie.Capability5GMM {
++	if !IsRel19() {
++		return &ie.Capability5GMM{Length: 1, N3Data: true, LPP: true, HOAttach: true, S1Mode: true}
++	}
++	c := Rel19CapabilityBits()
++	raw, err := claudianas.Encode5GMMCapability(&c)
++	if err != nil || len(raw) == 0 {
++		log.Warnf("[UE][NAS][rel19] 5GMM capability encode failed (err=%v, %d octets); falling back to the rel17 capability", err, len(raw))
++		return &ie.Capability5GMM{Length: 1, N3Data: true, LPP: true, HOAttach: true, S1Mode: true}
++	}
++	return &ie.Capability5GMM{Length: len(raw), Raw: raw}
++}
+diff --git a/internal/claudia/claudia_test.go b/internal/claudia/claudia_test.go
+new file mode 100644
+index 0000000..a3200a1
+--- /dev/null
++++ b/internal/claudia/claudia_test.go
+@@ -0,0 +1,273 @@
++package claudia
++
++import (
++	"bytes"
++	"encoding/binary"
++	"testing"
++	"time"
++
++	"github.com/free5gc/nas/ie"
++
++	claudianas "github.com/francurieses/claudia-5gc/shared/nas"
++	"github.com/francurieses/claudia-5gc/shared/ngap"
++	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
++)
++
++func TestParseRelease(t *testing.T) {
++	for in, want := range map[string]Release{"": Rel17, "rel17": Rel17, " REL19 ": Rel19} {
++		got, err := ParseRelease(in)
++		if err != nil || got != want {
++			t.Errorf("ParseRelease(%q) = %v, %v; want %v", in, got, err, want)
++		}
++	}
++	if _, err := ParseRelease("rel20"); err == nil {
++		t.Error("ParseRelease(rel20): want error")
++	}
++}
++
++// TestCapabilityRel17Unchanged proves the default profile emits exactly the pre-patch value:
++// {N3 data, LPP, HO attach, S1 mode} as the single octet 0x07.
++func TestCapabilityRel17Unchanged(t *testing.T) {
++	SetRelease(Rel17)
++	got, err := Capability5GMM().MarshalBinary()
++	if err != nil || !bytes.Equal(got, []byte{0x07}) {
++		t.Fatalf("rel17 capability = %x, %v; want 07", got, err)
++	}
++	legacy, _ := (&ie.Capability5GMM{Length: 1, N3Data: true, LPP: true, HOAttach: true, S1Mode: true}).MarshalBinary()
++	if !bytes.Equal(got, legacy) {
++		t.Fatalf("rel17 differs from legacy literal: %x vs %x", got, legacy)
++	}
++}
++
++func TestCapabilityRel19(t *testing.T) {
++	SetRelease(Rel19)
++	defer SetRelease(Rel17)
++	raw, err := Capability5GMM().MarshalBinary()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(raw) != 9 { // octets 3..11
++		t.Fatalf("rel19 capability length = %d (%x), want 9", len(raw), raw)
++	}
++	if raw[0] != 0x07 {
++		t.Errorf("legacy octet 3 = %02x, want 07", raw[0])
++	}
++	c, err := claudianas.Decode5GMMCapability(raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for name, set := range map[string]bool{"LADNDS": c.LADNDS, "NSR": c.NSR, "PNS": c.PNS, "TempNS": c.TempNS, "SLVI": c.SLVI, "NSUC": c.NSUC, "ATUC": c.ATUC} {
++		if !set {
++			t.Errorf("rel19 capability bit %s not set (set: %v)", name, c.SetBitNames())
++		}
++	}
++	if c.N3DataNotSupported {
++		t.Error("N3DataNotSupported set; N3 data must be supported")
++	}
++}
++
++func TestScanRegistrationAcceptIEs(t *testing.T) {
++	_, k1 := claudianas.LookupIE(claudianas.IEMsgRegistrationAccept, 0x01)
++	_, k2 := claudianas.LookupIE(claudianas.IEMsgRegistrationAccept, 0xF1)
++	if k1 || k2 {
++		t.Skip("IEI 0x01/0xF1 became known; pick other unknown IEIs")
++	}
++	plain := []byte{0x7E, 0x00, 0x42, 0x01, 0x09, // header + 5GS registration result LV
++		0x5E, 0x01, 0x21, // T3512 value (known TLV)
++		0x01, 0x02, 0xAA, 0xBB, // unknown TLV (Rel-19 IE this table does not know)
++		0xF1} // unknown type-1 IE (high bit set)
++	ies, err := ScanRegistrationAcceptIEs(plain)
++	if err != nil || len(ies) != 3 {
++		t.Fatalf("ScanRegistrationAcceptIEs = %v, %v", ies, err)
++	}
++	if !ies[0].Known || ies[0].IEI != 0x5E || ies[1].Known || ies[1].Len != 2 || ies[2].Known || ies[2].IEI != 0xF1 {
++		t.Errorf("unexpected scan: %v", ies)
++	}
++	if _, err := ScanRegistrationAcceptIEs(plain[:len(plain)-3]); err == nil {
++		t.Error("truncated IE: want error")
++	}
++	SetRelease(Rel19)
++	defer SetRelease(Rel17)
++	ObservePlainNAS(plain)
++	if ies2, err := ScanRegistrationAcceptIEs(plain); err != nil || len(ies2) != 3 {
++		t.Errorf("scan after observe = %v, %v; want 3 IEs", ies2, err)
++	}
++}
++
++// pduSetPacket builds a G-PDU; with ext it carries a PDU Session Container then a PDU Set Information
++// Container (PSSize 1024). The GTP length field is computed from the built packet.
++func pduSetPacket(withExt bool) []byte {
++	var pkt []byte
++	if !withExt {
++		pkt = []byte{0x30, 0xFF, 0, 0, 0, 0, 0, 1, 0xDE, 0xAD, 0xBE, 0xEF}
++	} else {
++		// E flag; PDU Session Container (0x85) then PDU Set Information Container (0x04) with PSSize.
++		pkt = []byte{0x34, 0xFF, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x85,
++			0x01, 0x00, 0x09, 0x04, // PDU session container: len=1 (4 octets), DL type, QFI 9, next=0x04
++			0x03,              // len = 3 (12 octets: len + 10 content + next)
++			0x02,              // PDU type 0 | EDB 0 | EPDU 0 | PSSI 1
++			9<<2 | 0x02, 0x9A, // QFI 9, PSSN = 0x29A
++			0x07, 0x05, // PSI 7, PSN 5
++			0x00, 0x04, 0x00, // PSSize 1024
++			0x00, 0x00, // padding to 4n-2
++			0x00, // next ext = none
++			0xDE, 0xAD}
++	}
++	binary.BigEndian.PutUint16(pkt[2:4], uint16(len(pkt)-8))
++	return pkt
++}
++
++func TestPDUSetFixtureShape(t *testing.T) {
++	pkt := pduSetPacket(true)
++	if got := 12 + 4 + 12 + 2; len(pkt) != got { // GTP hdr+opt, PDU session ext, PDU set ext (12), payload
++		t.Fatalf("fixture length %d, want %d", len(pkt), got)
++	}
++	if pkt[16] != 0x03 || pkt[16]*4 != 12 || pkt[16+12-1] != 0x00 {
++		t.Fatalf("PDU set ext declares %d octets, next-type octet at declared end = %02x", int(pkt[16])*4, pkt[16+12-1])
++	}
++}
++
++func TestParsePDUSetInfo(t *testing.T) {
++	if _, found, err := ParsePDUSetInfo(pduSetPacket(false)); found || err != nil {
++		t.Fatalf("legacy G-PDU: found=%v err=%v", found, err)
++	}
++	p, found, err := ParsePDUSetInfo(pduSetPacket(true))
++	if err != nil || !found {
++		t.Fatalf("found=%v err=%v", found, err)
++	}
++	want := PDUSetInfo{QFI: 9, PSSN: 0x29A, PSI: 7, PSN: 5, HasPSSize: true, PSSize: 1024}
++	if p != want {
++		t.Errorf("got %+v want %+v", p, want)
++	}
++}
++
++func TestParsePDUSetInfoErrors(t *testing.T) {
++	full := pduSetPacket(true)
++	mut := func(f func(b []byte) []byte) []byte { return f(append([]byte(nil), full...)) }
++	tests := []struct {
++		name string
++		pkt  []byte
++	}{
++		{"too short", full[:5]},
++		{"bad PDU type (echo request)", mut(func(b []byte) []byte { b[1] = 0x01; return b })},
++		{"bad PDU type (end marker)", mut(func(b []byte) []byte { b[1] = 0xFE; return b })},
++		{"length field overruns packet", mut(func(b []byte) []byte { b[3] += 5; return b })},
++		{"truncated chain", full[:20]},
++		{"zero-length extension header", mut(func(b []byte) []byte { b[12] = 0; return b })},
++		{"PDU set type not DL", mut(func(b []byte) []byte { b[17] = 0x12; return b })},
++		{"PSSize truncated", mut(func(b []byte) []byte {
++			// PSSI set but content shortened to 5 octets: len=2 (8 octets = len + 6 content + next).
++			b[16] = 0x02
++			b = b[:16+8]
++			b[16+7] = 0x00
++			binary.BigEndian.PutUint16(b[2:4], uint16(len(b)-8))
++			return b
++		})},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, found, err := ParsePDUSetInfo(tc.pkt); err == nil || found {
++				t.Errorf("found=%v err=%v; want error", found, err)
++			}
++		})
++	}
++}
++
++// TestParsePDUSetInfoTrailingBytes: octets beyond the GTP length field are ignored.
++func TestParsePDUSetInfoTrailingBytes(t *testing.T) {
++	pkt := append(pduSetPacket(false), 0xFF, 0xFF)
++	if _, found, err := ParsePDUSetInfo(pkt); found || err != nil {
++		t.Fatalf("found=%v err=%v", found, err)
++	}
++}
++
++func TestScanTVAndTLVE(t *testing.T) {
++	// 0x77 5G-GUTI is TLV-E in Registration Accept: [iei][len hi][len lo][value].
++	plain := []byte{0x7E, 0x00, 0x42, 0x01, 0x09,
++		0x77, 0x00, 0x02, 0xAA, 0xBB, // TLV-E, 2 octets
++		0x5E, 0x01, 0x21} // TLV
++	ies, err := ScanRegistrationAcceptIEs(plain)
++	if err != nil || len(ies) != 2 || ies[0].IEI != 0x77 || ies[0].Len != 2 || !ies[0].Known || ies[1].IEI != 0x5E {
++		t.Fatalf("TLV-E scan = %v, %v", ies, err)
++	}
++	if _, err := ScanRegistrationAcceptIEs(plain[:8]); err == nil {
++		t.Error("TLV-E overrun: want error")
++	}
++	// The Registration Accept table has no fixed-length TV IE: drive the TV path with an injected table.
++	lookup := func(iei byte) (claudianas.IEDef, bool) {
++		switch iei {
++		case 0x52:
++			return claudianas.IEDef{IEI: 0x52, Name: "tv3", Format: claudianas.IEFormatTV, Len: 3}, true
++		case 0x53:
++			return claudianas.IEDef{IEI: 0x53, Name: "tv0", Format: claudianas.IEFormatTV, Len: 0}, true
++		}
++		return claudianas.IEDef{}, false
++	}
++	ies, err = scanIEs([]byte{0x52, 1, 2, 0x52, 3, 4}, 0, lookup)
++	if err != nil || len(ies) != 2 || ies[0].Len != 2 {
++		t.Fatalf("TV scan = %v, %v", ies, err)
++	}
++	if _, err = scanIEs([]byte{0x52, 1}, 0, lookup); err == nil {
++		t.Error("TV overrun: want error")
++	}
++}
++
++// TestScanZeroLengthTV: a TV IE whose table length is 0 must stop with an error, never loop.
++func TestScanZeroLengthTV(t *testing.T) {
++	lookup := func(iei byte) (claudianas.IEDef, bool) {
++		return claudianas.IEDef{IEI: iei, Name: "tv0", Format: claudianas.IEFormatTV, Len: 0}, true
++	}
++	done := make(chan error, 1)
++	go func() { _, err := scanIEs([]byte{0x53, 0x00}, 0, lookup); done <- err }()
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Error("zero-length TV: want error")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("scanIEs did not terminate on a zero-length TV IE")
++	}
++}
++
++func TestScanRegistrationResultOverrun(t *testing.T) {
++	ies, err := ScanRegistrationAcceptIEs([]byte{0x7E, 0x00, 0x42, 0x09, 0x01})
++	if err == nil || ies != nil {
++		t.Fatalf("result length > body: ies=%v err=%v; want nil, error", ies, err)
++	}
++}
++
++func TestObserversDoNotPanic(t *testing.T) {
++	SetRelease(Rel19)
++	defer SetRelease(Rel17)
++	// Garbage in must be absorbed (log only); the assertion is that the calls return.
++	for _, b := range [][]byte{nil, {0x7E}, {0x7E, 0x00, 0x42}, {0x7E, 0x00, 0x42, 0xFF, 0xFF, 0xFF}, {0xFF}} {
++		ObservePlainNAS(b)
++		ObserveNGAP(b)
++		ObserveGTPU(b)
++	}
++}
++
++func TestDescribeNGAP(t *testing.T) {
++	pdu := ngapType.NGAPPDU{
++		Present: ngapType.NGAPPDUPresentInitiatingMessage,
++		InitiatingMessage: &ngapType.InitiatingMessage{
++			ProcedureCode: ngapType.ProcedureCode{Value: ngapType.ProcedureCodeErrorIndication},
++			Criticality:   ngapType.Criticality{Value: ngapType.CriticalityPresentIgnore},
++			Value: ngapType.InitiatingMessageValue{
++				Present:         ngapType.InitiatingMessagePresentErrorIndication,
++				ErrorIndication: &ngapType.ErrorIndication{},
++			},
++		},
++	}
++	b, err := ngap.Encoder(pdu)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := DescribeNGAP(b)
++	if err != nil || k.Choice != "initiatingMessage" || k.ProcedureCode != ngapType.ProcedureCodeErrorIndication {
++		t.Fatalf("DescribeNGAP = %+v, %v", k, err)
++	}
++	if _, err := DescribeNGAP([]byte{0xFF}); err == nil {
++		t.Error("garbage: want error")
++	}
++}
+diff --git a/internal/claudia/nasobserve.go b/internal/claudia/nasobserve.go
+new file mode 100644
+index 0000000..4492f5d
+--- /dev/null
++++ b/internal/claudia/nasobserve.go
+@@ -0,0 +1,124 @@
++package claudia
++
++import (
++	"fmt"
++	"strings"
++
++	log "github.com/sirupsen/logrus"
++
++	claudianas "github.com/francurieses/claudia-5gc/shared/nas"
++)
++
++// gmmHeaderLen is the length of the plain 5GMM header (EPD, security header type, message type).
++const gmmHeaderLen = 3
++
++// regAcceptMsgType is the Registration Accept message type (TS 24.501 §8.2.7, Table 9.7.1).
++const regAcceptMsgType = 0x42
++
++// IEInfo describes one optional IE found in a downlink NAS message.
++type IEInfo struct {
++	IEI        byte
++	Name       string // "" when the IEI is not in the shared/nas table
++	Introduced string // release the IE was introduced in ("" when unknown)
++	Len        int    // value length in octets (0 for type 1/2 IEs)
++	Known      bool
++}
++
++// String renders the IE as "0x68 Extended rejected NSSAI (Rel-17, 5 octets)".
++func (i IEInfo) String() string {
++	if !i.Known {
++		return fmt.Sprintf("0x%02X unknown (%d octets)", i.IEI, i.Len)
++	}
++	return fmt.Sprintf("0x%02X %s (%s, %d octets)", i.IEI, i.Name, i.Introduced, i.Len)
++}
++
++// ScanRegistrationAcceptIEs walks the optional IEs of a plain Registration Accept (EPD 0x7E, SHT 0,
++// type 0x42) using the shared/nas IE table. Unknown IEIs are skipped with the TS 24.007 §11.2.4 rule
++// (high bit set: 1 octet; otherwise TLV) instead of aborting, which is how a UE must treat a Rel-19
++// IE it does not know (TS 24.501 §7.6.1). It returns the IEs in wire order.
++func ScanRegistrationAcceptIEs(plain []byte) ([]IEInfo, error) {
++	if len(plain) < gmmHeaderLen+2 || plain[2] != regAcceptMsgType {
++		return nil, fmt.Errorf("claudia: not a Registration Accept")
++	}
++	body := plain[gmmHeaderLen:]
++	// Mandatory 5GS registration result: LV.
++	off := 1 + int(body[0])
++	if off > len(body) {
++		return nil, fmt.Errorf("claudia: 5GS registration result length %d overruns the message (%d octets)", body[0], len(body)-1)
++	}
++	return scanIEs(body, off, func(iei byte) (claudianas.IEDef, bool) {
++		return claudianas.LookupIE(claudianas.IEMsgRegistrationAccept, iei)
++	})
++}
++
++// scanIEs walks the optional IEs of body from off using lookup for the IE definitions. It stops with
++// an error on a truncated, overrunning or zero-progress (malformed) IE.
++func scanIEs(body []byte, off int, lookup func(byte) (claudianas.IEDef, bool)) ([]IEInfo, error) {
++	var out []IEInfo
++	for off < len(body) {
++		iei := body[off]
++		info := IEInfo{IEI: iei}
++		def, known := lookup(iei)
++		var end int
++		switch {
++		case known && (def.Format == claudianas.IEFormatTV1 || def.Format == claudianas.IEFormatT), !known && iei&0x80 != 0:
++			end = off + 1
++		case known && def.Format == claudianas.IEFormatTV:
++			end = off + def.Len
++			info.Len = def.Len - 1
++		case known && def.Format == claudianas.IEFormatTLVE:
++			if off+3 > len(body) {
++				return out, fmt.Errorf("claudia: IE 0x%02X truncated", iei)
++			}
++			end = off + 3 + int(body[off+1])<<8 + int(body[off+2])
++			info.Len = end - off - 3
++		default: // TLV (known or unknown)
++			if off+2 > len(body) {
++				return out, fmt.Errorf("claudia: IE 0x%02X truncated", iei)
++			}
++			end = off + 2 + int(body[off+1])
++			info.Len = end - off - 2
++		}
++		if end <= off {
++			return out, fmt.Errorf("claudia: IE 0x%02X malformed (zero length, no progress at offset %d)", iei, off)
++		}
++		if end > len(body) {
++			return out, fmt.Errorf("claudia: IE 0x%02X overruns the message (%d > %d)", iei, end, len(body))
++		}
++		if known {
++			info.Known, info.Name, info.Introduced = true, def.Name, def.Introduced.String()
++		}
++		out = append(out, info)
++		off = end
++	}
++	return out, nil
++}
++
++// ObservePlainNAS is installed as the NAS codec's plaintext observer. In the rel17 profile it does
++// nothing. In rel19 it logs the IEs of a downlink Registration Accept and the decode result of the
++// shared/nas codec; it never alters or drops the message.
++func ObservePlainNAS(plain []byte) {
++	defer func() {
++		if r := recover(); r != nil {
++			log.Errorf("[UE][NAS][rel19] observer recovered from decoder panic: %v", r)
++		}
++	}()
++	if !IsRel19() || len(plain) < gmmHeaderLen+2 || plain[0] != 0x7E || plain[1]&0x0F != 0 || plain[2] != regAcceptMsgType {
++		return
++	}
++	ies, err := ScanRegistrationAcceptIEs(plain)
++	var names []string
++	for _, i := range ies {
++		names = append(names, i.String())
++	}
++	if err != nil {
++		log.Warnf("[UE][NAS][rel19] Registration Accept IE scan: %v", err)
++	}
++	log.Infof("[UE][NAS][rel19] Registration Accept IEs: [%s]", strings.Join(names, "; "))
++	if ra, derr := claudianas.DecodeRegistrationAccept(plain[gmmHeaderLen:]); derr != nil {
++		log.Warnf("[UE][NAS][rel19] shared/nas could not decode Registration Accept: %v", derr)
++	} else {
++		log.Infof("[UE][NAS][rel19] Registration Accept decoded: result=0x%02X guti=%t allowed_nssai=%t ext_rejected_nssai=%t",
++			ra.RegistrationResult, ra.FiveGGUTI != nil, ra.AllowedNSSAI != nil, ra.ExtendedRejectedNSSAI != nil)
++	}
++}
+diff --git a/internal/claudia/ngapobserve.go b/internal/claudia/ngapobserve.go
+new file mode 100644
+index 0000000..4918e44
+--- /dev/null
++++ b/internal/claudia/ngapobserve.go
+@@ -0,0 +1,51 @@
++package claudia
++
++import (
++	log "github.com/sirupsen/logrus"
++
++	"github.com/francurieses/claudia-5gc/shared/ngap"
++	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
++)
++
++// NGAPKind names the NGAP-PDU alternative and procedure code of a decoded PDU.
++type NGAPKind struct {
++	Choice        string // initiatingMessage | successfulOutcome | unsuccessfulOutcome
++	ProcedureCode int64
++}
++
++// DescribeNGAP decodes an NGAP PDU with the 5GC shared/ngap codec (TS 38.413 V19.x ASN.1) and reports
++// its alternative and procedure code. It accepts Rel-18/19 extensions the legacy codec rejects.
++func DescribeNGAP(payload []byte) (NGAPKind, error) {
++	pdu, err := ngap.Decoder(payload)
++	if err != nil {
++		return NGAPKind{}, err
++	}
++	switch pdu.Present {
++	case ngapType.NGAPPDUPresentInitiatingMessage:
++		return NGAPKind{"initiatingMessage", pdu.InitiatingMessage.ProcedureCode.Value}, nil
++	case ngapType.NGAPPDUPresentSuccessfulOutcome:
++		return NGAPKind{"successfulOutcome", pdu.SuccessfulOutcome.ProcedureCode.Value}, nil
++	case ngapType.NGAPPDUPresentUnsuccessfulOutcome:
++		return NGAPKind{"unsuccessfulOutcome", pdu.UnsuccessfulOutcome.ProcedureCode.Value}, nil
++	}
++	return NGAPKind{}, nil
++}
++
++// ObserveNGAP logs every downlink NGAP PDU decoded by the shared/ngap codec in the rel19 profile. It
++// never alters or drops the message; rel17 does nothing.
++func ObserveNGAP(payload []byte) {
++	defer func() {
++		if r := recover(); r != nil {
++			log.Errorf("[GNB][NGAP][rel19] observer recovered from decoder panic: %v", r)
++		}
++	}()
++	if !IsRel19() {
++		return
++	}
++	k, err := DescribeNGAP(payload)
++	if err != nil {
++		log.Warnf("[GNB][NGAP][rel19] shared/ngap could not decode DL PDU: %v", err)
++		return
++	}
++	log.Infof("[GNB][NGAP][rel19] DL %s procedureCode=%d (shared/ngap TS 38.413 V19)", k.Choice, k.ProcedureCode)
++}
+diff --git a/internal/claudia/pduset.go b/internal/claudia/pduset.go
+new file mode 100644
+index 0000000..ce4a604
+--- /dev/null
++++ b/internal/claudia/pduset.go
+@@ -0,0 +1,131 @@
++package claudia
++
++import (
++	"encoding/binary"
++	"fmt"
++
++	log "github.com/sirupsen/logrus"
++)
++
++// GTP-U constants for the PDU Set Information Container (TS 29.281 V19.2.0 §5.2.1 Figure 5.2.1-3, §5.2.2.8;
++// content layout TS 38.415 V19.1.0 §6.5.2.1, same wire reference as the claudia-5gc UPF
++// nf/upf/internal/gtpu/dl_header.go).
++const (
++	// ExtHdrPDUSetInfo is the Next Extension Header Type of the PDU Set Information Container (0x04).
++	ExtHdrPDUSetInfo = 0x04
++	// ExtHdrPDUSession is the Next Extension Header Type of the PDU Session Container (0x85).
++	ExtHdrPDUSession = 0x85
++	// gtpuMinHdr is the mandatory GTP-U header; the E flag adds seq(2)+N-PDU(1)+next-ext(1).
++	gtpuMinHdr = 8
++	// gtpuOptHdr is the optional 4-octet part present when any of E/S/PN is set.
++	gtpuOptHdr = 4
++	// gtpuMsgTypeGPDU is the G-PDU message type (TS 29.281 §6.1, Table 6.1-1).
++	gtpuMsgTypeGPDU = 0xFF
++	gtpuFlagE       = 0x04
++	gtpuFlagS       = 0x02
++	gtpuFlagPN      = 0x01
++)
++
++// PDUSetInfo is the decoded DL PDU SET INFORMATION (TS 38.415 §6.5.2.1, §6.5.3).
++type PDUSetInfo struct {
++	EDB, EPDU bool
++	QFI       uint8
++	PSI       uint8
++	PSSN      uint16
++	PSN       uint8
++	HasPSSize bool
++	PSSize    uint32
++}
++
++// ParsePDUSetInfo extracts the PDU Set Information Container from a G-PDU (GTP-U message type 0xFF,
++// TS 29.281 §5.1). It walks the extension header chain; found=false (and no error) when the packet
++// has none, so legacy G-PDUs pass untouched. A non-G-PDU message type or a GTP length field that
++// overruns the packet is an error; octets beyond the length field are ignored.
++func ParsePDUSetInfo(pkt []byte) (info PDUSetInfo, found bool, err error) {
++	if len(pkt) < gtpuMinHdr {
++		return info, false, fmt.Errorf("claudia: GTP-U packet too short (%d)", len(pkt))
++	}
++	if pkt[1] != gtpuMsgTypeGPDU {
++		return info, false, fmt.Errorf("claudia: GTP-U message type 0x%02X is not a G-PDU (0xFF)", pkt[1])
++	}
++	// Length (octets 3-4) counts the octets after the mandatory 8-octet header (TS 29.281 §5.1).
++	total := gtpuMinHdr + int(binary.BigEndian.Uint16(pkt[2:4]))
++	if total > len(pkt) {
++		return info, false, fmt.Errorf("claudia: GTP-U length field %d overruns the packet (%d octets)", total-gtpuMinHdr, len(pkt)-gtpuMinHdr)
++	}
++	pkt = pkt[:total]
++	flags := pkt[0]
++	if flags&(gtpuFlagE) == 0 {
++		return info, false, nil
++	}
++	if len(pkt) < gtpuMinHdr+gtpuOptHdr {
++		return info, false, fmt.Errorf("claudia: GTP-U optional header truncated")
++	}
++	next := pkt[gtpuMinHdr+3]
++	off := gtpuMinHdr + gtpuOptHdr
++	for next != 0 {
++		if off >= len(pkt) {
++			return info, false, fmt.Errorf("claudia: GTP-U extension header chain truncated")
++		}
++		l := int(pkt[off]) * 4 // length in 4-octet units, includes length and next-type octets
++		if l < 4 || off+l > len(pkt) {
++			return info, false, fmt.Errorf("claudia: GTP-U extension header 0x%02X bad length %d", next, l)
++		}
++		if next == ExtHdrPDUSetInfo {
++			info, err = decodePDUSetContent(pkt[off+1 : off+l-1])
++			return info, err == nil, err
++		}
++		next = pkt[off+l-1]
++		off += l
++	}
++	return info, false, nil
++}
++
++// decodePDUSetContent decodes the content (without length octet and trailing next-type octet).
++func decodePDUSetContent(c []byte) (PDUSetInfo, error) {
++	var p PDUSetInfo
++	if len(c) < 5 {
++		return p, fmt.Errorf("claudia: PDU Set Information content too short (%d)", len(c))
++	}
++	if t := c[0] >> 4; t != 0 {
++		return p, fmt.Errorf("claudia: PDU Set Information PDU type %d, want 0 (DL PDU SET INFORMATION)", t)
++	}
++	p.EDB = c[0]&(1<<3) != 0
++	p.EPDU = c[0]&(1<<2) != 0
++	p.HasPSSize = c[0]&(1<<1) != 0
++	p.QFI = c[1] >> 2
++	p.PSSN = binary.BigEndian.Uint16([]byte{c[1] & 0x03, c[2]})
++	p.PSI = c[3] & 0x0F
++	p.PSN = c[4]
++	if p.HasPSSize {
++		if len(c) < 8 {
++			return p, fmt.Errorf("claudia: PDU Set Information PSSize truncated")
++		}
++		p.PSSize = uint32(c[5])<<16 | uint32(c[6])<<8 | uint32(c[7])
++	}
++	return p, nil
++}
++
++// ObserveGTPU logs the PDU Set fields of a downlink G-PDU in the rel19 profile (log only; the packet
++// is never dropped). rel17 does nothing.
++//
++// NOTE: nothing in PacketRusher calls ObserveGTPU. The live data plane is the kernel gtp5g module, which
++// terminates GTP-U in the kernel, so user space never sees the packets and there is no live hook. This is
++// a library function (unit-tested) for user-space GTP-U consumers, tests and tooling only.
++func ObserveGTPU(pkt []byte) {
++	if !IsRel19() {
++		return
++	}
++	defer func() {
++		if r := recover(); r != nil {
++			log.Errorf("[GNB][GTPU][rel19] observer recovered from panic: %v", r)
++		}
++	}()
++	p, found, err := ParsePDUSetInfo(pkt)
++	switch {
++	case err != nil:
++		log.Warnf("[GNB][GTPU][rel19] PDU Set Information: %v", err)
++	case found:
++		log.Infof("[GNB][GTPU][rel19] DL PDU Set: qfi=%d pssn=%d psn=%d psi=%d epdu=%t edb=%t pssize=%d", p.QFI, p.PSSN, p.PSN, p.PSI, p.EPDU, p.EDB, p.PSSize)
++	}
++}
+diff --git a/internal/claudia/release.go b/internal/claudia/release.go
+new file mode 100644
+index 0000000..02ee3a8
+--- /dev/null
++++ b/internal/claudia/release.go
+@@ -0,0 +1,51 @@
++// Package claudia holds the opt-in claudia-5gc Rel-18/19 behaviour of PacketRusher (modified
++// Apache-2.0 PacketRusher, see docker/packetrusher/patches/README.md in the claudia-5gc repository).
++//
++// The default release is "rel17": nothing in this package changes what the UE/gNB sends or how it
++// handles downlink data. "rel19" (flag --release rel19) advertises Rel-18/19 5GMM capability bits
++// and decodes Rel-18/19 downlink NAS IEs, NGAP PDUs and GTP-U PDU Set information with the 5GC
++// shared codecs, logging what it sees.
++package claudia
++
++import (
++	"fmt"
++	"strings"
++	"sync/atomic"
++)
++
++// Release is the 3GPP release profile of the simulator.
++type Release string
++
++const (
++	// Rel17 is the default profile: byte-identical legacy behaviour.
++	Rel17 Release = "rel17"
++	// Rel19 enables Rel-18/19 capability bits and Rel-18/19 decoding (log only).
++	Rel19 Release = "rel19"
++)
++
++var current atomic.Value // Release
++
++// ParseRelease validates a --release value ("" selects rel17).
++func ParseRelease(s string) (Release, error) {
++	switch Release(strings.ToLower(strings.TrimSpace(s))) {
++	case "", Rel17:
++		return Rel17, nil
++	case Rel19:
++		return Rel19, nil
++	}
++	return Rel17, fmt.Errorf("unknown --release %q (want rel17 or rel19)", s)
++}
++
++// SetRelease selects the profile for the whole process.
++func SetRelease(r Release) { current.Store(r) }
++
++// CurrentRelease returns the selected profile (rel17 until SetRelease is called).
++func CurrentRelease() Release {
++	if r, ok := current.Load().(Release); ok {
++		return r
++	}
++	return Rel17
++}
++
++// IsRel19 reports whether the rel19 profile is active.
++func IsRel19() bool { return CurrentRelease() == Rel19 }
+diff --git a/internal/control_test_engine/gnb/ngap/service.go b/internal/control_test_engine/gnb/ngap/service.go
+index 753caef..9fb55dc 100644
+--- a/internal/control_test_engine/gnb/ngap/service.go
++++ b/internal/control_test_engine/gnb/ngap/service.go
+@@ -8,6 +8,7 @@ import (
+ 	stdcontext "context"
+ 	"errors"
+ 	"fmt"
++	"my5G-RANTester/internal/claudia"
+ 	"my5G-RANTester/internal/control_test_engine/gnb/context"
+ 	"my5G-RANTester/internal/control_test_engine/gnb/ngap/trigger"
+ 	"net/netip"
+@@ -242,6 +243,7 @@ func readAssociation(amf *context.GNBAmf, gnb *context.GNBContext, conn *sctp.SC
+ 
+ 		// Decode before enqueueing: launching a goroutine per packet can reorder
+ 		// a NAS PDU and the following UE Context Release Command.
++		claudia.ObserveNGAP(forwardData) // rel19 log-only decode with shared/ngap; no-op in rel17
+ 		message, err := ngapmsg.Parse(forwardData)
+ 		if err != nil || message == nil {
+ 			log.Error("[GNB][NGAP] Cannot decode received message: ", err)
+diff --git a/internal/control_test_engine/ue/nas/message/nas_control/mm_5gs/registration-request.go b/internal/control_test_engine/ue/nas/message/nas_control/mm_5gs/registration-request.go
+index 3668795..4e1e18d 100644
+--- a/internal/control_test_engine/ue/nas/message/nas_control/mm_5gs/registration-request.go
++++ b/internal/control_test_engine/ue/nas/message/nas_control/mm_5gs/registration-request.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/free5gc/nas/ie"
+ 	nas "github.com/free5gc/nas/message"
+ 	log "github.com/sirupsen/logrus"
++	"my5G-RANTester/internal/claudia"
+ 	"my5G-RANTester/internal/control_test_engine/ue/context"
+ )
+ 
+@@ -32,7 +33,7 @@ func GetRegistrationRequest(registrationType uint8, requestedNSSAI *ie.NSSAI, up
+ 		UplinkDataStatus: uplinkDataStatus,
+ 	}
+ 	if capability {
+-		msg.Capability5GMM = &ie.Capability5GMM{Length: 1, N3Data: true, LPP: true, HOAttach: true, S1Mode: true}
++		msg.Capability5GMM = claudia.Capability5GMM()
+ 	}
+ 	psi := sessionStatus(ue)
+ 	active := false
+diff --git a/third_party/free5gc-nas/ie/5gmm_capability.go b/third_party/free5gc-nas/ie/5gmm_capability.go
+index eb52b75..15a0faa 100644
+--- a/third_party/free5gc-nas/ie/5gmm_capability.go
++++ b/third_party/free5gc-nas/ie/5gmm_capability.go
+@@ -7,6 +7,9 @@ import (
+ // Capability5GMM is detailed in 9.11.3.1 5GMM capability, 24.501
+ type Capability5GMM struct {
+ 	Length int // value should be 1-13
++	// Raw, when non-empty, is the complete value encoded verbatim by MarshalBinary (claudia-5gc patch,
++	// used for Rel-18/19 capability octets beyond the named fields). Length must equal len(Raw).
++	Raw []byte
+ 	// Name, uint8, Bits, Octet
+ 	SGC          bool // 8 -> 8 , 3 ->  3
+ 	IPHCCPCiot5G bool // 7 -> 7 , 3 ->  3
+@@ -137,6 +140,13 @@ func (i *Capability5GMM) MarshalBinary() ([]byte, error) {
+ 		return nil, errors.Errorf("Bad Capability5GMM  IE length(%d)", i.Length)
+ 	}
+ 
++	if len(i.Raw) > 0 {
++		if i.Length != len(i.Raw) {
++			return nil, errors.Errorf("Capability5GMM Raw length %d != Length %d", len(i.Raw), i.Length)
++		}
++		return append([]byte(nil), i.Raw...), nil
++	}
++
+ 	b := make([]byte, i.Length)
+ 	b[0] = SetBit8(b[0], bool2uint8(i.SGC))
+ 	b[0] = SetBit7(b[0], bool2uint8(i.IPHCCPCiot5G))
+diff --git a/third_party/free5gc-nas/message/message.go b/third_party/free5gc-nas/message/message.go
+index 227d82c..403533d 100644
+--- a/third_party/free5gc-nas/message/message.go
++++ b/third_party/free5gc-nas/message/message.go
+@@ -478,7 +478,15 @@ func Parse(b []byte, sc *SecCtx) (m Message, err error) {
+ 	return msg, nil
+ }
+ 
++// PlainObserver, when non-nil, receives every plaintext NAS message (after deciphering) before it is
++// parsed, so a caller can decode IEs this package does not know. It must not modify or retain b.
++// claudia-5gc patch: used by --release rel19 to decode Rel-18/19 IEs; nil by default.
++var PlainObserver func(b []byte)
++
+ func parsePlainMsg(b []byte) (Message, error) {
++	if PlainObserver != nil {
++		PlainObserver(b)
++	}
+ 	epd, err := getEpd(b)
+ 	if err != nil {
+ 		return nil, errors.Wrap(err, "parsePlainMsg()")

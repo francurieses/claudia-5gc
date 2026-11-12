@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"

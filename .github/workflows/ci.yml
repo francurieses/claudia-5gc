@@ -81,6 +81,26 @@ jobs:
           fi
           ./scripts/docs-lint.sh --only tiers
 
+  release-leak:
+    name: Release leak — no private artefact in the public tree (blocking)
+    runs-on: ubuntu-22.04
+    # Blocking on purpose: a private-edition artefact (canary fixture, private-class path,
+    # import of private/) must never merge into the public tree (Rel-19 M0 exit evidence).
+    # The leak scripts are path-internal and not shipped publicly, so the public repo skips.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Release leak test (dry-run, no push)
+        run: |
+          if [ ! -x scripts/test-release-leak.sh ]; then
+            echo "release-leak test not shipped in this repo — skipping"; exit 0
+          fi
+          make release-leak-test
+
   nrppa-codec:
     name: shared/nrppa — golden-byte + ProcedureCode regression
     runs-on: ubuntu-22.04
@@ -97,6 +117,32 @@ jobs:
       # procedures — LMF-004 fix, 2026-07-01) or desync the APER wire format.
       - name: Run shared/nrppa unit tests (race)
         run: GOWORK=off go test -race -v ./shared/nrppa/...
+
+  openapi-drift:
+    name: OpenAPI drift — Rel-19 YAMLs vs oapi annotations (optional)
+    runs-on: ubuntu-22.04
+    # Optional while it beds in (REL19-3.7): needs the network (make sync-openapi clones the
+    # 3GPP forge). Remove `continue-on-error` once it has been green for a few weeks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test tools/openapi-drift
+        run: GOWORK=off go test ./tools/...
+
+      - name: Fetch Rel-19 OpenAPI YAMLs (network)
+        run: make sync-openapi REL=Rel-19
+
+      # Build the binary: `go run` masks exit code 2 (usage/config) as 1.
+      - name: Drift report (fail on missing-mandatory)
+        run: |
+          GOWORK=off go build -o "$RUNNER_TEMP/openapi-drift" ./tools/openapi-drift
+          "$RUNNER_TEMP/openapi-drift" -spec specs/3gpp-openapi/Rel-19 \
+            -fail-on missing-mandatory ./nf/... ./shared/...
 
   ueransim-build:
     name: UERANSIM patch set — apply + compile
@@ -126,11 +172,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        nf: [nrf, amf, ausf, bsf, lmf, nef, nssf, pcf, smf, smsf, udm, udr, upf]
+        nf: [nrf, amf, ausf, bsf, lmf, nef, nssf, pcf, sepp, smf, smsf, udm, udr, upf]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      # The 13 matrix jobs start at once and each resolves the same Docker Hub
+      # The 14 matrix jobs start at once and each resolves the same Docker Hub
       # base images (golang:1.26.2-alpine, distroless). Anonymous-pull rate
       # limiting makes auth.docker.io reset connections intermittently
       # ("failed to fetch oauth token ... connection reset by peer"). Jitter to

@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/shared/logging"
@@ -47,6 +47,9 @@ type n2HandoverState struct {
 	// SMF with upCnxState=DEACTIVATED (TS 23.502 §4.3.7 step 1). Never acted on if the
 	// handover is not executed. Guarded by Server.pendingN2HOMu.
 	targetFailed []uint8
+	// notifyCD is the Criticality Diagnostics of the HANDOVER REQUIRED's ignored "notify"
+	// IEs; it goes into the HANDOVER COMMAND (TS 38.413 §10.3.4.2).
+	notifyCD *ngapType.CriticalityDiagnostics
 }
 
 // Spec references used by the Xn handover logs (TS 23.502 / TS 38.413 / TS 33.501).
@@ -322,7 +325,7 @@ func (s *Server) completePathSwitch(ctx context.Context, base *slog.Logger, ue *
 
 	// Security context: advance the chain only now that an Ack will be built, in one
 	// critical section so two hops in flight cannot reuse an NCC (doc §7.2).
-	encBm, intBm := s.ueSecCapBitmaps(ue) // takes ue.mu: call before Lock
+	stored := s.ueSecCapBitmaps(ue) // takes ue.mu: call before Lock
 	ue.Lock()
 	allowed, fallback := resolveAllowedNSSAI(ue.AllowedNSSAI, ue.PDUSessions)
 	nh, ncc, chainOK := ue.NextNHLocked()
@@ -348,9 +351,9 @@ func (s *Server) completePathSwitch(ctx context.Context, base *slog.Logger, ue *
 	// UE Security Capabilities: echo the stored ones only when the target's differ.
 	var secCap *UESecCapBitmaps
 	if req.UESecCap != nil &&
-		(req.UESecCap.Enc&secCapCompareMask != encBm&secCapCompareMask ||
-			req.UESecCap.Int&secCapCompareMask != intBm&secCapCompareMask) {
-		secCap = &UESecCapBitmaps{Enc: encBm, Int: intBm}
+		(req.UESecCap.Enc&secCapCompareMask != stored.Enc&secCapCompareMask ||
+			req.UESecCap.Int&secCapCompareMask != stored.Int&secCapCompareMask) {
+		secCap = &stored
 		base.Warn("UE Security Capabilities in PathSwitchRequest differ from stored ones",
 			"interface", "N2", "direction", "IN", "result", "MISMATCH", "spec_ref", refXnSecCapCheck)
 	}
@@ -365,6 +368,7 @@ func (s *Server) completePathSwitch(ctx context.Context, base *slog.Logger, ue *
 		Switched:     switched,
 		Released:     released,
 		AllowedNSSAI: allowed,
+		CD:           req.NotifyCD, // ignored "notify" IEs of the request, TS 38.413 §10.3.4.2
 	})
 	if ack == nil {
 		base.Error("failed to build PathSwitchRequestAcknowledge",
@@ -580,7 +584,7 @@ func (s *Server) rejectPathSwitch(log *slog.Logger, targetGNB *GNBContext, req *
 	)
 	metrics.HandoverTotal.WithLabelValues("AMF", "xn", "REJECT").Inc()
 	metrics.ProcedureTotal.WithLabelValues("AMF", "XnHandover", "REJECT").Inc()
-	pdu := BuildPathSwitchRequestFailure(req.SourceAMFUENGAPId, req.RANUENGAPId, items)
+	pdu := BuildPathSwitchRequestFailureWithDiagnostics(req.SourceAMFUENGAPId, req.RANUENGAPId, items, req.NotifyCD)
 	if pdu == nil {
 		log.Error("failed to build PathSwitchRequestFailure",
 			"interface", "N2", "direction", "OUT", "result", "FAILURE", "cause", reason, "spec_ref", refXnFailure)
@@ -793,7 +797,7 @@ func (s *Server) continueHandoverPreparation(ctx context.Context, log *slog.Logg
 
 	// ueSecCapBitmaps must be called OUTSIDE the lock — it acquires ue.Lock() internally and
 	// Go's sync.Mutex is not reentrant.
-	encAlgsBitmap, intAlgsBitmap := s.ueSecCapBitmaps(ue)
+	secCapBitmaps := s.ueSecCapBitmaps(ue)
 	ue.Lock()
 	allowedNSSAI := ue.AllowedNSSAI
 	ueAMBR := NewUEAMBRFromKbps(ue.SubscribedAMBR.UL, ue.SubscribedAMBR.DL)
@@ -925,13 +929,13 @@ func (s *Server) continueHandoverPreparation(ctx context.Context, log *slog.Logg
 	log.Info("HandoverRequired: NH chain advanced",
 		"interface", "N2", "direction", "IN", "ncc", nhNCC, "spec_ref", "TS 33.501 §6.9.2.3.3")
 
-	pdu := BuildHandoverRequest(
+	pdu := buildHandoverRequest(
 		req.AMFUENGAPId,
 		req.HandoverType,
 		req.CausePresent, req.CauseValue,
 		ueAMBR,
 		nhNCC, nh,
-		encAlgsBitmap, intAlgsBitmap,
+		secCapBitmaps,
 		sessions,
 		allowedNSSAI,
 		req.SourceToTargetTransparentContainer,
@@ -958,6 +962,7 @@ func (s *Server) continueHandoverPreparation(ctx context.Context, log *slog.Logg
 		causeValue:        req.CauseValue,
 		prepReleased:      prepReleased,
 		correlationID:     logging.CorrelationID(ctx),
+		notifyCD:          req.NotifyCD,
 	}
 	s.pendingN2HOMu.Lock()
 	s.pendingN2HO[req.AMFUENGAPId] = state
@@ -1075,7 +1080,7 @@ func (s *Server) rejectHandoverPreparation(log *slog.Logger, sourceGNB *GNBConte
 	)
 	metrics.HandoverTotal.WithLabelValues("AMF", "n2", "REJECT").Inc()
 	metrics.ProcedureTotal.WithLabelValues("AMF", procN2Handover, "REJECT").Inc()
-	pdu := BuildHandoverPreparationFailure(req.AMFUENGAPId, req.RANUENGAPId, causePresent, causeValue)
+	pdu := BuildHandoverPreparationFailureWithDiagnostics(req.AMFUENGAPId, req.RANUENGAPId, causePresent, causeValue, req.NotifyCD)
 	if pdu == nil {
 		log.Error("failed to build HandoverPreparationFailure",
 			"interface", "N2", "direction", "OUT", "result", smfResultFailure, "cause", reason, "spec_ref", "TS 38.413 §9.2.3.3")
@@ -1276,13 +1281,14 @@ func (s *Server) completeHandoverPreparation(ctx context.Context, base *slog.Log
 	state.targetFailed = targetFailed
 	s.pendingN2HOMu.Unlock()
 
-	cmdPDU := BuildHandoverCommand(
+	cmdPDU := BuildHandoverCommandWithDiagnostics(
 		ack.AMFUENGAPId,
 		state.sourceRANUENGAPId,
 		state.handoverType,
 		handled,
 		toRelease,
 		ack.TargetToSourceTransparentContainer,
+		state.notifyCD,
 	)
 	if cmdPDU == nil {
 		base.Error("BuildHandoverCommand failed",
@@ -1656,28 +1662,29 @@ func (s *Server) findGNBByGlobalID(globalID []byte) *GNBContext {
 	return nil
 }
 
-// ueSecCapBitmaps returns the UE security capability bitmaps for NGAP
-// from the stored UESecCapEA/IA fields. Caller must NOT hold ue.mu.
-func (s *Server) ueSecCapBitmaps(ue *amfctx.UEContext) (enc, integ uint16) {
+// ueSecCapBitmaps returns the UE security capability bitmaps for NGAP. They
+// are mapped from the verbatim NAS UE security capability IE when stored (NR bits
+// 1-7 and the E-UTRA octets 5/6, TS 38.413 §9.3.1.86), else from the decoded
+// UESecCapEA/IA[1..3] fields. Caller must NOT hold ue.mu.
+func (s *Server) ueSecCapBitmaps(ue *amfctx.UEContext) UESecCapBitmaps {
 	ue.Lock()
 	defer ue.Unlock()
-	if ue.UESecCapEA[1] {
-		enc |= 1 << 15
+	return ueSecCapBitmapsLocked(ue)
+}
+
+// ueSecCapBitmapsLocked is ueSecCapBitmaps for a caller holding ue.mu.
+func ueSecCapBitmapsLocked(ue *amfctx.UEContext) UESecCapBitmaps {
+	if c, ok := ueSecCapFromNAS(ue.RawUESecCap); ok {
+		return c
 	}
-	if ue.UESecCapEA[2] {
-		enc |= 1 << 14
+	var c UESecCapBitmaps
+	for i, bit := range []uint16{1 << 15, 1 << 14, 1 << 13} {
+		if ue.UESecCapEA[i+1] {
+			c.Enc |= bit
+		}
+		if ue.UESecCapIA[i+1] {
+			c.Int |= bit
+		}
 	}
-	if ue.UESecCapEA[3] {
-		enc |= 1 << 13
-	}
-	if ue.UESecCapIA[1] {
-		integ |= 1 << 15
-	}
-	if ue.UESecCapIA[2] {
-		integ |= 1 << 14
-	}
-	if ue.UESecCapIA[3] {
-		integ |= 1 << 13
-	}
-	return
+	return c
 }

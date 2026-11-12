@@ -20,6 +20,14 @@ metrics:
 nf_instance_id: 00000000-0000-4001-8000-000000000001
 ngap:
     address: 0.0.0.0:38412
+    # Optional per-gNB release cap (REL19-4.8). The release is inferred from the
+    # NG Setup Request (default Rel-17); max_release only lowers it. One selector
+    # per entry; a global_ran_node_id match beats a gnb_name match.
+    # ran_profiles:
+    #   - global_ran_node_id: "000001/24"   # GlobalRANNode.IDString()
+    #     max_release: Rel-17
+    #   - gnb_name: "lab-gnb-*"             # path.Match glob
+    #     max_release: Rel-18
 peers:
     ausf: ausf:8002
     nrf: nrf:8000
@@ -46,10 +54,28 @@ snssais:
       sst: 3
     - sd: "001234"
       sst: 1
+# Uplink NAS integrity enforcement (TS 24.501 §4.4.4.3): strict (default) | relaxed
+# (debug only - integrity failures are logged and processed). Env: AMF_NAS_INTEGRITY_ENFORCEMENT.
+nas_security:
+  integrity_enforcement: strict
 timers:
     implicit_detach_secs: 60
     mobile_reachable_guard_secs: 120
     pending_removal_watchdog_secs: 30
     t3512_secs: 60
+    # NAS common-procedure timers, TS 24.501 §10.2 Table 10.2.2 default 6 s (range 1..60)
+    t3550_secs: 6
+    t3560_secs: 6
+    t3570_secs: 6
 operator:
     default_rfsp: 1
+    # 5GS network feature support IE (0x21) optional bits (REL19-5.5). All off by default
+    # (Registration Accept stays byte-identical). A bit is advertised only if set here AND
+    # the UE set the matching 5GMM capability bit. un_per/lcs_upp/supl/rslp/mlcsup/ef5l
+    # (post-Rel-17) additionally need, at top level:
+    #   release: { profile: rel19, features: { NAS-NFS-EXT: true } }
+    # network_feature_support:
+    #   ncr: true
+    #   rpr: true
+    #   pr: true
+    #   rslp: true

@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"nssai":{"defaultSingleNssais":[{"dnn":"internet","sd":"000001","sst":1},{"sd":"000002","sst":2,"subjectToNetworkSliceSpecificAuthenticationAndAuthorization":true}]},"subscribedUeAmbr":{"downlink":"2000000 Kbps","uplink":"1000000 Kbps"}}

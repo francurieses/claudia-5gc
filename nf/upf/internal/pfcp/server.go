@@ -4,6 +4,7 @@ package pfcp
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -69,6 +70,11 @@ type Session struct {
 	// source address of the Session Establishment Request. Session Report
 	// Requests (node-initiated) are sent here. Ref: TS 29.244 §7.5.5.
 	SMFAddr *net.UDPAddr
+
+	// CPNodeID is the Node ID of the CP function that created the session
+	// (Session Establishment Request Node ID IE); used to delete the session
+	// when that CP function restarts. Ref: TS 29.244 §6.2.6, §8.2.38.
+	CPNodeID string
 
 	// QoS enforcement state (TS 29.244 §5.2.5, §7.5.2.5): QERs keyed by QER ID
 	// and the QER ID list of each PDR. Mutated only by the PFCP goroutine under
@@ -295,6 +301,14 @@ type Server struct {
 	recoveryTS time.Time
 	// qosCfg is the normalised QoS enforcement configuration.
 	qosCfg QoSConfig
+	// cpPeerRTS holds the last Recovery Time Stamp seen per CP peer (restart
+	// detection, TS 29.244 §6.2.6).
+	cpMu       sync.Mutex
+	cpPeerRTS  map[string]time.Time
+	cpAddrPeer map[string]string // source IP -> CP peer key
+	// cpFeatures holds the CP Function Features announced by each CP peer in
+	// its last Association Setup Request (guarded by cpMu).
+	cpFeatures map[string]cpPeerFeatures
 }
 
 // New creates a PFCP server.
@@ -319,6 +333,9 @@ func New(cfg Config, logger *slog.Logger, sessions *SessionTable) (*Server, erro
 		raInterval: raInterval,
 		recoveryTS: time.Now().UTC().Truncate(time.Second),
 		qosCfg:     cfg.QoS.normalized(),
+		cpPeerRTS:  make(map[string]time.Time),
+		cpAddrPeer: make(map[string]string),
+		cpFeatures: make(map[string]cpPeerFeatures),
 	}, nil
 }
 
@@ -380,6 +397,10 @@ func (s *Server) dispatch(ctx context.Context, raddr *net.UDPAddr, msg pfcpmsg.M
 }
 
 func (s *Server) handleAssociationSetup(raddr *net.UDPAddr, req *pfcpmsg.AssociationSetupRequest) {
+	peer := cpPeerKey(req.NodeID, raddr)
+	s.learnCPAddr(raddr, peer)
+	s.observeCPPeerRTS(peer, req.RecoveryTimeStamp, "association_setup_request")
+	feat := s.recordCPFeatures(peer, req.CPFunctionFeatures)
 	resp := pfcpmsg.NewAssociationSetupResponse(
 		req.Sequence(),
 		pfcpie.NewNodeID("", "", upfNodeFQDN),
@@ -388,10 +409,16 @@ func (s *Server) handleAssociationSetup(raddr *net.UDPAddr, req *pfcpmsg.Associa
 	)
 	s.sendResponse(raddr, resp)
 	s.logger.Info("PFCP AssociationSetup accepted", "remote", raddr,
-		"spec_ref", "TS 29.244 §7.4.4.2")
+		"peer_cp_features", feat.Names,
+		"peer_cp_features_hex", hex.EncodeToString(feat.Raw),
+		"peer_cp_features_octets", len(feat.Raw),
+		"spec_ref", "TS 29.244 §6.2.6, §7.4.4.2, §8.2.58")
 }
 
 func (s *Server) handleHeartbeat(raddr *net.UDPAddr, req *pfcpmsg.HeartbeatRequest) {
+	// Heartbeat carries no Node ID: attribute it to the peer by source IP,
+	// falling back to the Node ID learned at Association Setup.
+	s.observeCPPeerRTS(s.cpPeerForAddr(raddr), req.RecoveryTimeStamp, "heartbeat_request")
 	resp := pfcpmsg.NewHeartbeatResponse(req.Sequence(), pfcpie.NewRecoveryTimeStamp(s.recoveryTS))
 	s.sendResponse(raddr, resp)
 }
@@ -476,6 +503,7 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 	// UP SEID = CP SEID (simplified; avoids SMF needing to track a separate value)
 	upSEID := cpSEID
 
+	s.learnCPAddr(raddr, cpPeerKey(req.NodeID, raddr))
 	sess := &Session{
 		CPSEID: cpSEID,
 		UPSEID: upSEID,
@@ -486,7 +514,8 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 		// The SMF's persistent PFCP receiver is bound to :8805 on the same
 		// host that sent this establishment request. Node-initiated Session
 		// Report Requests are sent there. Ref: TS 29.244 §7.5.5, §6.2.1.
-		SMFAddr: &net.UDPAddr{IP: raddr.IP, Port: smfPFCPPort},
+		SMFAddr:  &net.UDPAddr{IP: raddr.IP, Port: smfPFCPPort},
+		CPNodeID: cpPeerKey(req.NodeID, raddr),
 	}
 
 	// Create QER — QoS enforcement rules, several per session keyed by QER ID,

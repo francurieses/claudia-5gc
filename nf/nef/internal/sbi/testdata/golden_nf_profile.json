@@ -1,0 +1,1 @@
+{"nfInstanceId":"11111111-2222-3333-4444-555555555555","nfType":"NEF","nfStatus":"REGISTERED","fqdn":"nef.5gc.test","nfServices":[{"serviceInstanceId":"11111111-2222-3333-4444-555555555555-3gpp-as-session-with-qos","serviceName":"3gpp-as-session-with-qos","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.2.3"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

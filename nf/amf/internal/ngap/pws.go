@@ -16,9 +16,9 @@ import (
 	"fmt"
 	"time"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 
 	"github.com/francurieses/claudia-5gc/shared/gsm7"
 	"github.com/francurieses/claudia-5gc/shared/logging"
@@ -482,6 +482,8 @@ func buildTAIListForWarning(tais []TAIForPaging) []ngapType.TAI {
 // Only the TAI-broadcast NR variant is decoded in MVP (our gNBs are NR); other
 // CHOICE variants (EUTRA, cell-ID, emergency-area) are counted but not detailed.
 // Ref: TS 38.413 §9.3.1.56/.57.
+//
+// oapi: none mgmt API PWS status (/amf/v1/pws/* on :9002), not SBI
 type PWSArea struct {
 	MCC string `json:"mcc,omitempty"`
 	MNC string `json:"mnc,omitempty"`
@@ -705,6 +707,8 @@ type PWSKey struct {
 }
 
 // PWSGNBStatus is the per-gNB broadcast/cancel completion state for one PWS key.
+//
+// oapi: none mgmt API PWS status (/amf/v1/pws/* on :9002), not SBI
 type PWSGNBStatus struct {
 	GNBAddr   string    `json:"gnb_addr"`
 	GNBName   string    `json:"gnb_name,omitempty"`
@@ -727,6 +731,8 @@ type PWSBroadcast struct {
 
 // PWSBroadcastStatus is a JSON-friendly, lock-free snapshot of a PWSBroadcast
 // for the management API status-poll endpoint.
+//
+// oapi: none mgmt API PWS status (/amf/v1/pws/* on :9002), not SBI
 type PWSBroadcastStatus struct {
 	MessageIdentifier uint16         `json:"message_identifier"`
 	SerialNumber      uint16         `json:"serial_number"`
@@ -765,7 +771,7 @@ func (s *Server) SendWriteReplaceWarning(ctx context.Context, params WriteReplac
 		PerGNB:       make(map[string]*PWSGNBStatus, len(gnbs)),
 	}
 	for _, g := range gnbs {
-		addr := g.Conn.RemoteAddr().String()
+		addr := g.remoteAddrString()
 		broadcast.PerGNB[addr] = &PWSGNBStatus{GNBAddr: addr, GNBName: g.Name}
 	}
 	s.pwsMu.Lock()
@@ -798,8 +804,8 @@ func (s *Server) SendWriteReplaceWarning(ctx context.Context, params WriteReplac
 
 	sent := 0
 	for _, g := range gnbs {
-		if _, err := writeNGAP(g.Conn, pdu); err != nil {
-			log.Warn("Write-Replace Warning write failed", "gnb", g.Name, "gnb_addr", g.Conn.RemoteAddr().String(), "error", err)
+		if _, err := g.writeNGAP(pdu); err != nil {
+			log.Warn("Write-Replace Warning write failed", "gnb", g.Name, "gnb_addr", g.remoteAddrString(), "error", err)
 			continue
 		}
 		sent++
@@ -856,8 +862,8 @@ func (s *Server) SendPWSCancel(ctx context.Context, messageIdentifier, serialNum
 
 	sent := 0
 	for _, g := range gnbs {
-		if _, err := writeNGAP(g.Conn, pdu); err != nil {
-			log.Warn("PWS Cancel write failed", "gnb", g.Name, "gnb_addr", g.Conn.RemoteAddr().String(), "error", err)
+		if _, err := g.writeNGAP(pdu); err != nil {
+			log.Warn("PWS Cancel write failed", "gnb", g.Name, "gnb_addr", g.remoteAddrString(), "error", err)
 			continue
 		}
 		sent++
@@ -876,7 +882,7 @@ func (s *Server) handleWriteReplaceWarningResponse(_ context.Context, gnb *GNBCo
 		return
 	}
 	key := PWSKey{MessageIdentifier: resp.MessageIdentifier, SerialNumber: resp.SerialNumber}
-	addr := gnb.Conn.RemoteAddr().String()
+	addr := gnb.remoteAddrString()
 
 	s.pwsMu.Lock()
 	broadcast, found := s.pws[key]
@@ -917,7 +923,7 @@ func (s *Server) handlePWSCancelResponse(_ context.Context, gnb *GNBContext, msg
 		return
 	}
 	key := PWSKey{MessageIdentifier: resp.MessageIdentifier, SerialNumber: resp.SerialNumber}
-	addr := gnb.Conn.RemoteAddr().String()
+	addr := gnb.remoteAddrString()
 
 	s.pwsMu.Lock()
 	broadcast, found := s.pws[key]

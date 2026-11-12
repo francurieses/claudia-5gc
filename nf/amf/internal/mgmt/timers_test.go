@@ -37,7 +37,8 @@ func TestTimerConfigGet(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &r); err != nil {
 		t.Fatal(err)
 	}
-	want := TimerValues{T3512Secs: 60, MobileReachableGuard: 120, MobileReachableSecs: 180, ImplicitDetachSecs: 60}
+	want := TimerValues{T3512Secs: 60, MobileReachableGuard: 120, MobileReachableSecs: 180, ImplicitDetachSecs: 60,
+		T3550Secs: 6, T3560Secs: 6, T3570Secs: 6} // TS 24.501 §10.2 Table 10.2.2 defaults
 	if r.Effective != want || r.Base != want || r.Persisted {
 		t.Fatalf("unexpected response %+v", r)
 	}
@@ -56,6 +57,12 @@ func TestTimerConfigPutCauses(t *testing.T) {
 		{"guard negative", `{"mobile_reachable_guard_secs":-1}`, "GUARD_OUT_OF_RANGE"},
 		{"implicit low", `{"implicit_detach_secs":59}`, "IMPLICIT_DETACH_OUT_OF_RANGE"},
 		{"implicit high", `{"implicit_detach_secs":86401}`, "IMPLICIT_DETACH_OUT_OF_RANGE"},
+		{"t3550 low", `{"t3550_secs":0}`, "T3550_OUT_OF_RANGE"},
+		{"t3550 high", `{"t3550_secs":61}`, "T3550_OUT_OF_RANGE"},
+		{"t3560 low", `{"t3560_secs":0}`, "T3560_OUT_OF_RANGE"},
+		{"t3560 high", `{"t3560_secs":61}`, "T3560_OUT_OF_RANGE"},
+		{"t3570 low", `{"t3570_secs":-5}`, "T3570_OUT_OF_RANGE"},
+		{"t3570 high", `{"t3570_secs":61}`, "T3570_OUT_OF_RANGE"},
 		{"all or nothing", `{"t3512_secs":120,"implicit_detach_secs":59}`, "IMPLICIT_DETACH_OUT_OF_RANGE"},
 		{"derived field", `{"mobile_reachable_secs":500}`, "READ_ONLY_FIELD"},
 		{"unknown field", `{"t3512":120}`, "UNKNOWN_FIELD"},
@@ -214,5 +221,32 @@ func TestTimerConfigCanonicalLog(t *testing.T) {
 		if want.cause != "" && m["cause"] != want.cause {
 			t.Fatalf("cause: %v", m["cause"])
 		}
+	}
+}
+
+// TestTimerConfigNASTimers: T3550/T3560/T3570 are readable, settable and reset
+// to the base (TS 24.501 §10.2 Table 10.2.2 default 6 s when unset).
+func TestTimerConfigNASTimers(t *testing.T) {
+	mux, st := newTimerMux()
+	rec := doTimer(mux, http.MethodPut, `{"t3550_secs":10,"t3560_secs":8,"t3570_secs":4}`)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	var r TimerConfigResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &r); err != nil {
+		t.Fatal(err)
+	}
+	if r.Effective.T3550Secs != 10 || r.Effective.T3560Secs != 8 || r.Effective.T3570Secs != 4 ||
+		r.Base.T3550Secs != 6 || r.Base.T3560Secs != 6 || r.Base.T3570Secs != 6 {
+		t.Fatalf("response %+v", r)
+	}
+	if v := st.Effective(); v.T3560().Seconds() != 8 || v.T3512Secs != 60 {
+		t.Fatalf("store %+v", v)
+	}
+	if rec := doTimer(mux, http.MethodPut, `{"reset":true}`); rec.Code != 200 {
+		t.Fatalf("reset status %d", rec.Code)
+	}
+	if v := st.Effective(); v.T3550().Seconds() != 6 || v.T3560().Seconds() != 6 || v.T3570().Seconds() != 6 {
+		t.Fatalf("after reset %+v", v)
 	}
 }

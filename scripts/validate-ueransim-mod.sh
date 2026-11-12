@@ -210,7 +210,7 @@ check_location() {
     hr; green "[location] Cell-ID positioning round-trip (TS 29.572 §5.2.2.2 / TS 38.413 §8.17)"
     local ROOT lmf_url r1 r2 cell lat1 lat2 since
     ROOT="$REPO_ROOT"
-    lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
+    lmf_url="https://localhost:8012/nlmf-loc/v1/determine-location"
 
     # The UE must be CM-CONNECTED for the AMF to trigger NGAP Location Reporting; ensure a session.
     ensure_internet_session >/dev/null
@@ -252,7 +252,7 @@ check_nrppa() {
     hr; green "[nrppa] E-CID positioning round-trip (TS 38.455 §8 / TS 38.413 §8.17.3)"
     local ROOT lmf_url r uncert pdl since
     ROOT="$REPO_ROOT"
-    lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
+    lmf_url="https://localhost:8012/nlmf-loc/v1/determine-location"
 
     # The UE must be CM-CONNECTED for the AMF to relay NRPPa to the gNB; ensure a session.
     ensure_internet_session >/dev/null
@@ -298,7 +298,7 @@ check_gnss() {
     hr; green "[gnss] A-GNSS positioning round-trip (TS 37.355 §6 / TS 24.501 §8.7.4 / TS 23.273 §6.2.10)"
     local ROOT lmf_url r uncert pdl since
     ROOT="$REPO_ROOT"
-    lmf_url="https://localhost:8012/nlmf-loc/v1/ue-contexts/$SUPI/provide-loc-info"
+    lmf_url="https://localhost:8012/nlmf-loc/v1/determine-location"
 
     # The UE must be CM-CONNECTED for the AMF to relay LPP over N1; ensure a session.
     ensure_internet_session >/dev/null

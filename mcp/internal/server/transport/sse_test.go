@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"io"
 	"log/slog"
 	"net/http"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/config"
 	"github.com/francurieses/claudia-5gc/mcp/internal/server"

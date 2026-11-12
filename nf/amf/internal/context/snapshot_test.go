@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/shared/nas"
 )
 
 func TestUEContextSnapshot(t *testing.T) {
@@ -80,5 +82,27 @@ func TestUESnapshotPDUSessionIDsJSONNumbers(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"pdu_session_ids":[1,2]`) {
 		t.Errorf("want numeric pdu_session_ids [1,2], got %s", b)
+	}
+}
+
+// TestUEContextSnapshot_Capability5GMM: the snapshot carries the hex value and
+// set-bit names; both are empty (bits as [] not null) when the UE sent no IE.
+// Ref: TS 24.501 §9.11.3.1
+func TestUEContextSnapshot_Capability5GMM(t *testing.T) {
+	none := (&UEContext{SUPI: "imsi-001010000000001"}).Snapshot()
+	b, _ := json.Marshal(none)
+	if !strings.Contains(string(b), `"capability_5gmm":""`) || !strings.Contains(string(b), `"capability_5gmm_bits":[]`) {
+		t.Errorf("absent capability JSON: %s", b)
+	}
+	c, err := nas.Decode5GMMCapability([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x04, 0x00, 0x10, 0x40, 0x08})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := (&UEContext{SUPI: "imsi-001010000000001", Capability5GMM: c}).Snapshot()
+	if got.Capability5GMM != "00000000000c0400104008" {
+		t.Errorf("hex = %q", got.Capability5GMM)
+	}
+	if len(got.Capability5GMMBits) == 0 {
+		t.Error("expected set bit names")
 	}
 }

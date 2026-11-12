@@ -26,6 +26,9 @@ type AMFInfo struct {
 	AMFID    uint
 }
 
+// amfEnvelope identifies the AMF in the gNB list answer.
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI
 type amfEnvelope struct {
 	Name     string        `json:"name"`
 	PLMN     ngap.PLMNJSON `json:"plmn"`
@@ -35,6 +38,9 @@ type amfEnvelope struct {
 	N2Addr   string        `json:"n2_addr"`
 }
 
+// gnbListResponse is the body of GET /amf/v1/ran/gnbs.
+//
+// oapi: none O&M API on the plain-HTTP mgmt port :9002, not SBI
 type gnbListResponse struct {
 	AMF         amfEnvelope        `json:"amf"`
 	GeneratedAt time.Time          `json:"generated_at"`

@@ -1,0 +1,5 @@
+status: Created
+Location: http://example.com/nnssaaf-nssaa/v1/slice-authentications/<AUTHCTXID>
+Content-Type: application/json
+
+{"gpsi":"msisdn-12025550100","snssai":{"sst":1,"sd":"000003"},"authCtxId":"<AUTHCTXID>","eapMessage":"AwcABA=="}

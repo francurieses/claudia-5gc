@@ -8,9 +8,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/francurieses/claudia-5gc/shared/capability"
 )
 
 // Config holds all NEF configuration.
@@ -60,6 +63,11 @@ type Config struct {
 		// Default: 0.0.0.0:9112
 		Address string `yaml:"address"`
 	} `yaml:"metrics"`
+
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	// Ref: TS 29.500 §6.6.2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 // Load reads the NEF configuration from CONFIG_PATH (or /etc/5gc/config.yaml).
@@ -82,6 +90,22 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("nef: config: read file: %w", err)
 	}
 	return cfg, nil
+}
+
+// APIRoot returns the NEF SBI apiRoot (scheme + FQDN + listen port) that peers
+// use to reach this NEF: the same FQDN the NRF NFProfile advertises
+// (nefsbi.BuildNFProfile) plus the port of SBI.Address, since the profile
+// carries no ipEndPoints. Returns "" when FQDN or the port is not configured.
+// Ref: TS 29.510 §6.1.6.2.2 (fqdn), TS 29.500 §6.1.1 (apiRoot)
+func (c *Config) APIRoot() string {
+	if c.SBI.FQDN == "" {
+		return ""
+	}
+	_, port, err := net.SplitHostPort(c.SBI.Address)
+	if err != nil || port == "" || port == "0" {
+		return ""
+	}
+	return "https://" + net.JoinHostPort(c.SBI.FQDN, port)
 }
 
 func defaults() *Config {

@@ -24,12 +24,13 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
+	nefsbi "github.com/francurieses/claudia-5gc/nf/nef/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/nef/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
-	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
 
 func main() {
@@ -54,6 +55,18 @@ func main() {
 	}
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
+
+	// ---- Release profile (REL19-2.1/2.7) --------------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	// ---- Tracing (OTel → Jaeger) ----------------------------------------------
 	// Ref: TS 29.500 §4.4 — SBA observability (OTel / Jaeger)
@@ -81,16 +94,10 @@ func main() {
 	// ---- mTLS HTTP/2 client (for outbound NRF, BSF, PCF calls) ---------------
 	// Build a TLS-capable client when cert+key are present (prod), else plain h2c
 	// (dev / functional-test mode). Ref: TS 29.500 §4.4.1 — SBA always mTLS.
-	var httpClient *http.Client
-	if cfg.SBI.TLS.CertFile != "" && cfg.SBI.TLS.KeyFile != "" {
-		httpClient, err = sbi.NewMTLSClient(cfg.SBI.TLS.CAFile, cfg.SBI.TLS.CertFile, cfg.SBI.TLS.KeyFile)
-	} else {
-		httpClient, err = sbi.NewHTTP2Client(cfg.SBI.TLS.CAFile)
-	}
+	httpClient, err := server.NewOutboundClient(cfg.SBI.TLS.CAFile, cfg.SBI.TLS.CertFile, cfg.SBI.TLS.KeyFile, logger)
 	if err != nil {
 		logger.Warn("building http2 client failed — some outbound calls may fail",
 			"error", err)
-		httpClient = http.DefaultClient
 	}
 
 	// ---- Construct BSF + PCF clients ------------------------------------------
@@ -101,6 +108,7 @@ func main() {
 		Client:  httpClient,
 		Logger:  logger,
 	}
+	bsfClient.WithFeatures(relProfile, logger)
 
 	// PCF client: map AF AsSessionWithQoS → Npcf_PolicyAuthorization.
 	// Target URI comes from the BSF-returned PcfBinding (not NRF discovery).
@@ -109,9 +117,11 @@ func main() {
 		Client: httpClient,
 		Logger: logger,
 	}
+	pcfClient.WithFeatures(relProfile, logger)
 
 	// ---- SBI server -----------------------------------------------------------
 	srv := server.New(cfg, logger, bsfClient, pcfClient)
+	srv.SetProfile(relProfile)
 
 	// ---- Signal + context -----------------------------------------------------
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -122,21 +132,7 @@ func main() {
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
-		profile := &nrf.NFProfile{
-			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "NEF",
-			NFStatus:     "REGISTERED",
-			FQDN:         cfg.SBI.FQDN,
-			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-nnef-afsessionwithqos",
-				ServiceName:       "nnef-afsessionwithqos",
-				Scheme:            "https",
-				NFServiceStatus:   "REGISTERED",
-				Versions: []nrf.NFServiceVersion{
-					{APIVersionInURI: "v1", APIFullVersion: "1.0.0"},
-				},
-			}},
-		}
+		profile := nefsbi.BuildNFProfile(cfg.NFInstanceID, cfg.SBI.FQDN, relProfile, nefsbi.AsSessionWithQoSCatalog())
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr,
@@ -147,7 +143,7 @@ func main() {
 			logger.Info("NEF registered in NRF",
 				"nf_type", "NEF",
 				"nf_instance_id", cfg.NFInstanceID,
-				"service", "nnef-afsessionwithqos",
+				"service", "3gpp-as-session-with-qos",
 				"spec_ref", "TS 29.510 §6.1.6.2.2",
 			)
 		}
@@ -165,7 +161,7 @@ func main() {
 	logger.Info("NEF ready",
 		"sbi_addr", cfg.SBI.Address,
 		"nf_instance_id", cfg.NFInstanceID,
-		"service", "nnef-afsessionwithqos",
+		"service", "3gpp-as-session-with-qos",
 		"spec_ref", "TS 23.501 §6.2.5",
 	)
 

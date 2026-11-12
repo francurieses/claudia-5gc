@@ -47,7 +47,7 @@ func main() {
 		logger.Error("tracing init failed", "error", err)
 	}
 	if tp != nil {
-		defer tp.Shutdown(context.Background())
+		defer func() { _ = tp.Shutdown(context.Background()) }()
 	}
 
 	var dnnNames []string
@@ -83,7 +83,7 @@ func main() {
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		go func() {
 			logger.Info("pprof listening", "addr", addr)
-			if err := http.ListenAndServe(addr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := (&http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logger.Error("pprof server error", "error", err)
 			}
 		}()
@@ -116,8 +116,8 @@ func main() {
 			logger.Warn("UPF: DNN has no tun_name, skipping N6 for this DNN", "dnn", dnn.Name)
 			continue
 		}
-		f, err := tun.Open(dnn.TunName)
-		if err != nil {
+		f, err := tun.Open(dnn.TunName) //nolint:staticcheck // SA4023: constant error only on the non-Linux stub (tun_other.go)
+		if err != nil {                 //nolint:staticcheck // SA4023: see above
 			logger.Error("TUN open failed — N6 forwarding disabled for DNN",
 				"dnn", dnn.Name, "tun", dnn.TunName, "error", err)
 			continue

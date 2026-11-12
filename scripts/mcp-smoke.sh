@@ -347,7 +347,7 @@ ok "aka_full_run derives the key hierarchy" aka_full_run \
   '(.kamf | length) == 64 and (.kausf | length) == 64 and (.xres_star | length) == 32'
 ok "suci_derive Profile A (TS 33.501 Annex C.4 key)" suci_derive \
   "{\"supi\":\"$SUPI\",\"home_network_public_key\":\"5a8d38864820197c3394b92613b20b91633cbd897119273bf8e4a6f4eec0a650\",\"protection_scheme\":\"ProfileA\"}" \
-  '.suci | startswith("suci-00101-0000-0-1-")'
+  '.suci | startswith("suci-0-001-01-0000-1-1-")'
 
 echo "[status]"
 ok "mcp_info: counts, mode and every upstream reachable" mcp_info '{}' \
@@ -363,7 +363,7 @@ ok "config_view: slices restart_required, slice_qos runtime" config_view '{}' \
   '.sections.slices.change == "restart_required" and .sections.slice_qos.change == "runtime" and (.sections.dnns.value | length) > 0'
 ok "pws_list" pws_list '{}' 'type == "array"'
 ok "alert_list" alert_list '{}' '.alerts | type == "array"'
-ok "ran_gnb_list: every gNB NG_READY" ran_gnb_list '{}' '(.gnbs | length) >= 1 and all(.gnbs[]; .state == "NG_READY")'
+ok "ran_gnb_list: at least one gNB, every connected gNB NG_READY (DISCONNECTED history is kept)" ran_gnb_list '{}' '(.gnbs | length) >= 1 and ([.gnbs[] | select(.state != "DISCONNECTED")] | length) >= 1 and all(.gnbs[] | select(.state != "DISCONNECTED"); .state == "NG_READY")'
 ok "nf_list summary rows" nf_list '{}' \
   '(.count == (.nfInstances | length)) and .count >= 11 and all(.nfInstances[]; .nf_type != null and .nf_status == "REGISTERED")'
 NF_ID=$(tjr '.nfInstances[0].instance_id')
@@ -398,7 +398,7 @@ alias_dep gmm_state_get ue_context_get
 alias_dep procedure_summary procedure_stats
 alias_dep pdu_session_qos_modify pdu_session_qos_set
 ok "ue_context_get $SUPI" ue_context_get "{\"supi\":\"$SUPI\"}" \
-  ".supi == \"$SUPI\" and .gmm_state == \"5GMM-REGISTERED\" and .cm_state != null and (.pdu_session_ids | index(1)) != null"
+  ".supi == \"$SUPI\" and .gmm_state == \"5GMM-REGISTERED\" and .cm_state != null and (.pdu_session_ids | index(1)) != null and (.capability_5gmm | type == \"string\") and (.capability_5gmm_bits | type == \"array\")"
 ok "gmm_state_get alias by GUTI (same fields, DEPRECATED description)" gmm_state_get "{\"guti\":\"$S1_GUTI\"}" \
   ".supi == \"$SUPI\" and .gmm_state == \"5GMM-REGISTERED\" and (.pdu_session_ids | type == \"array\")"
 call ue_diagnose "{\"supi\":\"$SUPI\"}"
@@ -409,7 +409,7 @@ chk ue_diagnose "ue_diagnose $SUPI: AMF context and SMF session listed" \
 ok "qos_policy_get $SUPI (no invented 5qi)" qos_policy_get "{\"supi\":\"$SUPI\"}" '(.is_override == true) or (has("5qi") | not)'
 ok "qos_policy_list: array" qos_policy_list '{}' 'type == "array"'
 ok "pdu_session_list: EXPECTED_UES ACTIVE sessions" pdu_session_list '{}' \
-  "(.count == $EXPECTED_UES) and all(.sessions[]; .sessionState == \"ACTIVE\" and .ueIp != null)"
+  "(.count == $EXPECTED_UES) and all(.sessions[]; .sessionState == \"ACTIVE\" and .ueIp != null and (.capability5gsm | type == \"string\") and (.capability5gsmBits | type == \"array\"))"
 ok "pdu_session_qos_get $SUPI PSI 1: 5QI 9, two QERs" pdu_session_qos_get "{\"supi\":\"$SUPI\",\"pdu_session_id\":1}" \
   '.found == true and .qosFlows[0].fiveQi == 9 and (.pfcpQers | length) == 2'
 if listed n4_session_get; then

@@ -5,7 +5,6 @@ go 1.26.2
 require (
 	github.com/cucumber/godog v0.15.0
 	github.com/free5gc/aper v1.1.1
-	github.com/free5gc/ngap v1.1.3
 	github.com/google/uuid v1.6.0
 	github.com/ishidawataru/sctp v0.0.0-20251114114122-19ddcbc6aae2
 	github.com/jackc/pgx/v5 v5.9.2

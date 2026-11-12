@@ -12,6 +12,9 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // RegisterRetryInitialBackoff is the delay before the first background retry
@@ -41,6 +44,11 @@ type Client struct {
 	http    *http.Client
 	baseURL string
 	logger  *slog.Logger
+
+	// profile gates the Nnrf_NFDiscovery supportedFeatures wire behaviour
+	// (nil = Rel-17, decision D2); discCat overrides the default catalog.
+	profile *capability.Profile
+	discCat *features.Catalog
 
 	// retryInitial / retryMax override the register retry backoff (tests
 	// only); zero means RegisterRetryInitialBackoff / RegisterRetryMaxBackoff.
@@ -76,6 +84,14 @@ type NFProfile struct {
 	// DNNList is the list of Data Network Names served by this NF (SMF/UPF).
 	// Ref: TS 29.510 §6.1.6.2.28 (SmfInfo)
 	DNNList []string `json:"dnnList,omitempty"`
+
+	// Extra holds the top-level NFProfile attributes this client does not
+	// model (e.g. attributes added in later releases), so a profile read from
+	// the NRF and written back is not truncated. Only top-level keys are
+	// kept; nested objects of modelled attributes (IPEndpoint,
+	// NFServiceVersion, SNSSAIEntry) are lossy.
+	// Ref: TS 29.500 §6.6.2; shared/jsoncompat.
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
 // SNSSAIEntry is a single S-NSSAI in an NF profile.
@@ -92,6 +108,15 @@ type NFService struct {
 	Scheme            string             `json:"scheme"`
 	NFServiceStatus   string             `json:"nfServiceStatus"`
 	IPEndpoints       []IPEndpoint       `json:"ipEndPoints,omitempty"`
+	// SupportedFeatures is the NF service's supported-feature bitmask
+	// (hex string, SupportedFeatures of TS 29.571 §5.2.2); parse it with
+	// features.Parse. Empty means "not advertised" and is omitted.
+	// Ref: TS 29.510 §6.1.6.2.3 (NFService), TS 29.571 §5.2.2.
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
+
+	// Extra holds the NFService attributes this client does not model; see
+	// NFProfile.Extra.
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
 // NFServiceVersion mirrors registry.NFServiceVersion.

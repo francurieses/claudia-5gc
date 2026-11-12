@@ -1,27 +1,62 @@
 #!/usr/bin/env bash
 # scripts/sync-openapi.sh
-# Downloads official OpenAPI YAML from 3GPP forge for Rel-17.
-# Upstream repo: https://forge.3gpp.org/rep/all/5G_APIs (branch Rel-17)
+# Fetches the official 3GPP OpenAPI YAMLs from the 3GPP forge into
+# specs/3gpp-openapi/<Rel-NN>/ (fetched reference, git-ignored, never committed).
+# Upstream repo: https://forge.3gpp.org/rep/all/5G_APIs
+# Upstream release branches are upper case (REL-17, REL-19, REL-20); the user-facing
+# argument and the local directory use the Rel-NN form.
 #
-# Usage: ./scripts/sync-openapi.sh [REL]   # REL defaults to: Rel-17
+# Usage: ./scripts/sync-openapi.sh [REL]
+#   REL     Rel-19 (default) | Rel-17 | any Rel-NN; case-insensitive, bare "19" accepted
+# Env:
+#   OPENAPI_BRANCH  override the forge branch (e.g. a Rel19-draft-TSG114 branch);
+#                   the destination directory still follows REL.
 
 set -euo pipefail
 
-REL="${1:-Rel-17}"
-DEST=$(cd "$(dirname "$0")/../specs/3gpp-openapi" && pwd)
+usage() {
+	echo "usage: $0 [REL]   (REL: Rel-19 (default), Rel-17, ... ; optional env OPENAPI_BRANCH)" >&2
+	exit 2
+}
+
+[ "$#" -le 1 ] || usage
+ARG="${1:-Rel-19}"
+if [[ "$ARG" =~ ^([Rr][Ee][Ll]-?)?([0-9]{2})$ ]]; then
+	NN="${BASH_REMATCH[2]}"
+else
+	echo "error: invalid release '$ARG'" >&2
+	usage
+fi
+REL="Rel-$NN"
+BRANCH="${OPENAPI_BRANCH:-REL-$NN}"
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DEST="$ROOT/specs/3gpp-openapi/$REL"
 TMP=$(mktemp -d)
-trap "rm -rf $TMP" EXIT
+trap 'rm -rf "$TMP"' EXIT
 
 REPO="https://forge.3gpp.org/rep/all/5G_APIs.git"
 
-echo "==> cloning $REPO ($REL)"
-git clone --depth 1 --branch "$REL" "$REPO" "$TMP/5G_APIs"
+echo "==> cloning $REPO (branch $BRANCH)"
+git clone --quiet --depth 1 --branch "$BRANCH" "$REPO" "$TMP/5G_APIs"
 
-echo "==> copying YAML files to $DEST"
+shopt -s nullglob
+files=("$TMP"/5G_APIs/*.yaml)
+if [ "${#files[@]}" -lt 1 ]; then
+	echo "error: no YAML files found on branch $BRANCH" >&2
+	exit 1
+fi
+
+echo "==> replacing YAML files in $DEST"
 mkdir -p "$DEST"
-cp "$TMP"/5G_APIs/*.yaml "$DEST/"
-cp "$TMP"/5G_APIs/README.md "$DEST/UPSTREAM-README.md" || true
+rm -f "$DEST"/*.yaml
+cp "${files[@]}" "$DEST/"
+cp "$TMP/5G_APIs/README.md" "$DEST/UPSTREAM-README.md" 2>/dev/null || true
+{
+	echo "repo=$REPO"
+	echo "branch=$BRANCH"
+	echo "commit=$(git -C "$TMP/5G_APIs" rev-parse HEAD)"
+	echo "fetched=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} >"$DEST/UPSTREAM-COMMIT"
 
-echo "==> committing reference (without automatic git add)"
-ls "$DEST" | wc -l | awk '{print $1 " YAMLs in specs/3gpp-openapi"}'
-echo "Remember to review and commit: cd $DEST && git add ."
+echo "${#files[@]} YAMLs in specs/3gpp-openapi/$REL (fetched reference, git-ignored; do not commit)"

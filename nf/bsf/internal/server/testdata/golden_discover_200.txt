@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"bindingId":"<UUID>","supi":"imsi-001010000000001","ipv4Addr":"10.60.0.1","dnn":"internet","snssai":{"sst":1,"sd":"000001"},"pcfFqdn":"pcf.5gc.mnc001.mcc001.3gppnetwork.org","pcfId":"<UUID>"}

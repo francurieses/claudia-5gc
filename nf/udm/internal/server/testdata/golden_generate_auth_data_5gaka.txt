@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"authType":"5G_AKA","autn":"<HEX>","hxresStar":"<HEX>","kausf":"<HEX>","rand":"<HEX>","supi":"imsi-001010000000001","xresStar":"<HEX>"}

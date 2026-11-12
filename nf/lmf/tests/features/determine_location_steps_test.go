@@ -275,7 +275,7 @@ func (c *lmfCtx) postLocInfo(ueContextID string, body any) error {
 	if err != nil {
 		return fmt.Errorf("postLocInfo: marshal body: %w", err)
 	}
-	url := c.ts.URL + "/nlmf-loc/v1/ue-contexts/" + ueContextID + "/provide-loc-info"
+	url := c.ts.URL + "/nlmf-loc/v1/determine-location"
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("postLocInfo: new request: %w", err)
@@ -515,6 +515,10 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Follows the same pattern as AMF steps_test.go → initAMFSBISteps / initNSSAASteps.
 	initEventSubscriptionSteps(sc, c)
 
+	// Deferred location (periodic / area events, EventNotify, CancelLocation).
+	// Ref: TS 29.572 §5.2.2.2.2, §5.2.2.4.2.
+	initDeferredLocationSteps(sc, c)
+
 	// Register NRPPa relay / E-CID positioning step definitions (LMF-004).
 	// Ref: TS 38.455 §8; TS 23.273 §6.2.9; TS 29.572 §5.2.2.2.
 	w := initNRPPARelaySteps(sc, c)
@@ -532,6 +536,7 @@ func TestFeatures(t *testing.T) {
 		ScenarioInitializer: InitializeScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
+			Strict:   true,
 			Paths:    []string{"./"},
 			TestingT: t,
 		},

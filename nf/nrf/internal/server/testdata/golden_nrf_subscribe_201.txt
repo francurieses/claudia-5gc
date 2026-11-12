@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: /nnrf-nfm/v1/subscriptions/<SUBSCRIPTION_ID>
+
+{"subscriptionId":"<SUBSCRIPTION_ID>"}

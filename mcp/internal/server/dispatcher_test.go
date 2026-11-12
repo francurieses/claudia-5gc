@@ -3,10 +3,11 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 	"io"
 	"log/slog"
 	"testing"
+
+	"github.com/francurieses/claudia-5gc/mcp/internal/guard"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/jsonrpc"
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"

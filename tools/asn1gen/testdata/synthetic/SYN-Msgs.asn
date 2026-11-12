@@ -1,0 +1,180 @@
+-- Project-authored synthetic ASN.1 used to test tools/asn1gen. Not 3GPP text.
+
+SYN-Msgs { itu-t (0) example (99) msgs (2) }
+
+DEFINITIONS AUTOMATIC TAGS ::=
+
+BEGIN
+
+IMPORTS
+	Criticality, ProtocolIE-ID, ProcedureCode
+FROM SYN-Base
+	ProtocolIE-Container{},
+	ProtocolIE-SingleContainer{}
+FROM SYN-Base;
+
+-- constants
+maxItems  INTEGER ::= 8
+id-Level  ProtocolIE-ID ::= 1
+id-Shape  ProtocolIE-ID ::= 2
+id-Blob   ProtocolIE-ID ::= 3
+id-Label  ProtocolIE-ID ::= 4
+id-Url    ProtocolIE-ID ::= 6
+id-ExtraLevel ProtocolExtensionID ::= 9
+id-HelloProc ProcedureCode ::= 0
+id-PingProc  ProcedureCode ::= 1
+
+-- primitive types
+Color    ::= ENUMERATED { red, green, blue, ..., teal }
+Plain    ::= ENUMERATED { one, two, three }
+Level    ::= INTEGER (0..255, ...)
+Period   ::= INTEGER (1..30|40|50, ...)
+Count    ::= INTEGER (0..maxItems)
+Fixed    ::= INTEGER (7)
+Big      ::= INTEGER (0..18446744073709551615)
+Free     ::= INTEGER
+Name     ::= PrintableString (SIZE(1..16, ...))
+Label    ::= UTF8String (SIZE(1..16, ...))
+Url      ::= VisibleString (SIZE(1..16, ...))
+Tag      ::= BIT STRING (SIZE(10))
+Blob     ::= OCTET STRING (SIZE(3..maxItems))
+Raw      ::= OCTET STRING
+Wrapped  ::= OCTET STRING (CONTAINING Pt)
+Alias    ::= Level
+
+-- constructed types
+Pt ::= SEQUENCE {
+	x             Level,
+	y             Level OPTIONAL,
+	mode          ENUMERATED {a, b, ...} OPTIONAL,
+	weight        INTEGER (0..10) DEFAULT 5,
+	iE-Extensions ProtocolExtensionContainer { {Pt-ExtIEs} } OPTIONAL,
+	...
+}
+
+Pt-ExtIEs SYN-EXT ::= {
+	{ ID id-ExtraLevel CRITICALITY ignore EXTENSION Level PRESENCE optional },
+	...
+}
+
+Shape ::= CHOICE {
+	dot       Pt,
+	name      Name,
+	raw       OCTET STRING (SIZE(2)),
+	tag       Tag,
+	empty     NULL,
+	choice-Extensions ProtocolIE-SingleContainer { {Shape-ExtIEs} }
+}
+
+Shape-ExtIEs SYN-IES ::= {
+	...
+}
+
+Pick ::= CHOICE {
+	level Level,
+	name  Name,
+	...
+}
+
+Items     ::= SEQUENCE (SIZE(1..maxItems)) OF Pt
+Levels    ::= SEQUENCE OF Level
+Pickers   ::= SEQUENCE (SIZE(1..4, ...)) OF Pick
+
+-- messages
+Hello ::= SEQUENCE {
+	protocolIEs ProtocolIE-Container { {HelloIEs} },
+	...
+}
+
+HelloIEs SYN-IES ::= {
+	{ ID id-Level CRITICALITY reject TYPE Level PRESENCE mandatory } |
+	{ ID id-Shape CRITICALITY ignore TYPE Shape PRESENCE optional } |
+	{ ID id-Blob  CRITICALITY ignore TYPE OCTET STRING PRESENCE optional } |
+	{ ID id-Label CRITICALITY ignore TYPE Label PRESENCE optional } |
+	{ ID id-Url CRITICALITY ignore TYPE Url PRESENCE optional },
+	...
+}
+
+HelloAck ::= SEQUENCE {
+	protocolIEs ProtocolIE-Container { {HelloAckIEs} },
+	...
+}
+
+HelloAckIEs SYN-IES ::= {
+	MoreAckIEs |
+	{ ID id-Level CRITICALITY ignore TYPE Pick PRESENCE optional },
+	...
+}
+
+MoreAckIEs SYN-IES ::= {
+	{ ID id-Shape CRITICALITY ignore TYPE Shape PRESENCE optional }
+}
+
+Ping ::= SEQUENCE {
+	privateIEs PrivateIE-Container { {PingIEs} },
+	...
+}
+
+PingIEs SYN-PRIVATE ::= {
+	...
+}
+
+-- PDU
+SYN-PDU ::= CHOICE {
+	initiatingMessage   InitiatingMessage,
+	successfulOutcome   SuccessfulOutcome,
+	...
+}
+
+InitiatingMessage ::= SEQUENCE {
+	procedureCode SYN-PROCEDURE.&procedureCode ({SYN-PROCEDURES}),
+	criticality   SYN-PROCEDURE.&criticality   ({SYN-PROCEDURES}{@procedureCode}),
+	value         SYN-PROCEDURE.&InitiatingMessage ({SYN-PROCEDURES}{@procedureCode})
+}
+
+SuccessfulOutcome ::= SEQUENCE {
+	procedureCode SYN-PROCEDURE.&procedureCode ({SYN-PROCEDURES}),
+	criticality   SYN-PROCEDURE.&criticality   ({SYN-PROCEDURES}{@procedureCode}),
+	value         SYN-PROCEDURE.&SuccessfulOutcome ({SYN-PROCEDURES}{@procedureCode})
+}
+
+SYN-PROCEDURE ::= CLASS {
+	&InitiatingMessage,
+	&SuccessfulOutcome  OPTIONAL,
+	&procedureCode      ProcedureCode UNIQUE,
+	&criticality        Criticality DEFAULT ignore
+}
+WITH SYNTAX {
+	INITIATING MESSAGE  &InitiatingMessage
+	[SUCCESSFUL OUTCOME &SuccessfulOutcome]
+	PROCEDURE CODE      &procedureCode
+	[CRITICALITY        &criticality]
+}
+
+SYN-PROCEDURES SYN-PROCEDURE ::= {
+	SYN-CLASS-1 | SYN-CLASS-2,
+	...
+}
+
+SYN-CLASS-1 SYN-PROCEDURE ::= {
+	hello
+}
+
+SYN-CLASS-2 SYN-PROCEDURE ::= {
+	ping
+}
+
+hello SYN-PROCEDURE ::= {
+	INITIATING MESSAGE  Hello
+	SUCCESSFUL OUTCOME  HelloAck
+	PROCEDURE CODE      id-HelloProc
+	CRITICALITY         reject
+}
+
+ping SYN-PROCEDURE ::= {
+	INITIATING MESSAGE  Ping
+	PROCEDURE CODE      id-PingProc
+	CRITICALITY         ignore
+}
+
+END

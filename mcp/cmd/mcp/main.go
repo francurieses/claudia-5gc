@@ -48,7 +48,7 @@ const nfName = "MCP"
 const mcpNFInstanceID = "6d63702d-0000-4000-8000-000000000010"
 
 // nefAFSessionScope is the OAuth2 scope of Nnef_AFsessionWithQoS (TS 29.522 §6.1).
-const nefAFSessionScope = "nnef-afsessionwithqos"
+const nefAFSessionScope = "3gpp-as-session-with-qos"
 
 // version is the MCP server release reported by `version`, the startup log and mcp_info.
 const version = "0.1.0"
@@ -216,7 +216,7 @@ func registerTools(reg *registry.Registry, cfg *config.Config, g *guard.Guard, l
 	portal := clients.NewPortal(cfg.PortalAddr, plainClient)
 	bsfClient := clients.NewBSF(cfg.BSFAddr, sbiClient)
 	smsfClient := clients.NewSMSF(cfg.SMSFAddr, sbiClient)
-	// The NEF needs an NRF access token (scope nnef-afsessionwithqos, TS 33.501 §13.4.1).
+	// The NEF needs an NRF access token (scope 3gpp-as-session-with-qos, TS 33.501 §13.4.1).
 	nefTokens := oauth2.NewTokenCache(sbiClient, strings.TrimRight(cfg.NRFAddr, "/")+"/oauth2/v1/token",
 		mcpNFInstanceID, nefAFSessionScope)
 	nefClient := clients.NewNEF(cfg.NEFAddr, sbiClient, nefTokens)
@@ -266,6 +266,7 @@ func registerTools(reg *registry.Registry, cfg *config.Config, g *guard.Guard, l
 			{Name: "bsf", Addr: cfg.BSFAddr, MTLS: true},
 			{Name: "nef", Addr: cfg.NEFAddr, MTLS: true},
 			{Name: "smsf", Addr: cfg.SMSFAddr, MTLS: true},
+			{Name: "sepp", Addr: cfg.SEPPAddr, MTLS: true},
 			{Name: "portal", Addr: cfg.PortalAddr},
 			{Name: "prometheus", Addr: cfg.EffectivePrometheusAddr()},
 			{Name: "loki", Addr: cfg.LokiAddr},

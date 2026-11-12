@@ -210,7 +210,7 @@ func TestSUCIDeriveProfileA(t *testing.T) {
 	if suciStr == "" {
 		t.Fatal("suci is empty")
 	}
-	if !startsWith(suciStr, "suci-00101-") {
+	if !startsWith(suciStr, "suci-0-001-01-0000-1-1-") {
 		t.Errorf("unexpected SUCI prefix: %s", suciStr)
 	}
 	if str(m, "scheme_output") == "" {

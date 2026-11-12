@@ -10,7 +10,7 @@
 //
 // All SBI endpoints are served over HTTP/2 + mTLS (TS 29.500 §4.4.1).
 // Northbound additionally requires an OAuth2 bearer token with scope
-// "nnef-afsessionwithqos" (TS 29.522 §6).
+// "3gpp-as-session-with-qos" (TS 29.522 §6).
 //
 // Ref: TS 29.522, TS 23.501 §6.2.5, TS 29.514, TS 29.521
 package server
@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,28 +37,40 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
+	nefsbi "github.com/francurieses/claudia-5gc/nf/nef/internal/sbi"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // requiredScope is the OAuth2 scope required on all northbound Nnef requests.
 // Ref: TS 29.522 §6
-const requiredScope = "nnef-afsessionwithqos"
+const requiredScope = "3gpp-as-session-with-qos"
 
 // AsSessionWithQoSSubscription is the resource created/returned by the NEF
 // for an AF's AsSessionWithQoS request. Stored in the subscription map.
 // Ref: TS 29.522 §5.14.2.1.2
+//
+// oapi: TS29122_AsSessionWithQoS.yaml#/components/schemas/AsSessionWithQoSSubscription
 type AsSessionWithQoSSubscription struct {
+	// Self is the resource URI (the Location header value), set under the rel19
+	// (spec-literal) profile only: it is the spec home of the subscriptionId and
+	// scsAsId path segments. Ref: TS 29.122 AsSessionWithQoSSubscription.self
+	Self string `json:"self,omitempty"`
 	// SubscriptionID is the NEF-minted unique identifier for this subscription.
-	SubscriptionID string `json:"subscriptionId,omitempty"`
-	// ScsAsId is the AF/SCS path segment identifier.
-	ScsAsId string `json:"scsAsId,omitempty"`
+	// Internal record field; under rel17 / no profile it is also sent as the
+	// project member "subscriptionId" (see MarshalJSON), under rel19 only via Self.
+	SubscriptionID string `json:"-"`
+	// ScsAsId is the AF/SCS path segment identifier. Same wire rule as SubscriptionID.
+	ScsAsId string `json:"-"`
 	// UeIpv4Addr is the UE IPv4 address — the BSF discovery key.
 	UeIpv4Addr string `json:"ueIpv4Addr,omitempty"`
 	// UeIpv6Addr is the UE IPv6 address (alternative to UeIpv4Addr).
 	UeIpv6Addr string `json:"ueIpv6Addr,omitempty"`
 	// AfAppId is the application identifier supplied by the AF.
+	// oapi-ext: the spec home exterAppId is gated by feature AppId, which the NEF does not offer (known deviation, nef/CLAUDE.md §12); afAppId is an AF-side input the NEF maps to the PCF afAppId.
 	AfAppId string `json:"afAppId,omitempty"`
 	// QosReference is the pre-provisioned QoS profile reference (mandatory).
 	// Ref: TS 29.522 §5.14.2.1.2
@@ -73,16 +86,82 @@ type AsSessionWithQoSSubscription struct {
 	Snssai *BindingSnssai `json:"snssai,omitempty"`
 	// FlowInfo describes the IP flow(s) the QoS applies to.
 	FlowInfo []FlowInfo `json:"flowInfo,omitempty"`
-	// SupportedFeatures is the negotiated optional features bitmask.
+	// SupportedFeatures is the wire representation of the features negotiated
+	// for this resource (TS 29.500 §6.6.2: the producer includes the
+	// intersection in the resource representation it returns). It is always
+	// overwritten by the server from features.Answer, never trusted from the AF.
+	// The typed negotiated Set lives in subscriptionRecord.negotiated.
 	SupportedFeatures string `json:"supportedFeatures,omitempty"`
 
 	// Internal fields — not serialised to the AF.
-	pcfBaseURI   string `json:"-"`
-	appSessionID string `json:"-"`
+	// specWire selects the rel19 representation (self instead of
+	// subscriptionId/scsAsId); set on the answer copy by wireFor.
+	specWire bool
+}
+
+// wireFor returns a copy that marshals in the spec-literal shape when
+// specLiteral (rel19 profile) is true and in the frozen rel17 shape otherwise.
+func (a AsSessionWithQoSSubscription) wireFor(specLiteral bool) AsSessionWithQoSSubscription {
+	a.specWire = specLiteral
+	return a
+}
+
+// UnmarshalJSON accepts both shapes: the project members subscriptionId /
+// scsAsId, or the identifiers taken from the last path segments of self
+// (".../{scsAsId}/subscriptions/{subscriptionId}"). Type errors keep their
+// field name, so features.IsTypeError still sees "supportedFeatures".
+func (a *AsSessionWithQoSSubscription) UnmarshalJSON(b []byte) error {
+	type plain AsSessionWithQoSSubscription
+	aux := struct {
+		*plain
+		SubscriptionID string `json:"subscriptionId"`
+		ScsAsId        string `json:"scsAsId"`
+	}{plain: (*plain)(a)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	a.SubscriptionID, a.ScsAsId = aux.SubscriptionID, aux.ScsAsId
+	if a.Self != "" {
+		seg := strings.Split(strings.TrimRight(a.Self, "/"), "/")
+		if n := len(seg); n >= 4 && seg[n-2] == "subscriptions" {
+			if a.SubscriptionID == "" {
+				a.SubscriptionID = seg[n-1]
+			}
+			if a.ScsAsId == "" {
+				a.ScsAsId = seg[n-3]
+			}
+		}
+	}
+	return nil
+}
+
+// MarshalJSON emits subscriptionId and scsAsId first (rel17 / no profile, byte
+// identical to the pre-change encoding) or omits them in favour of self (rel19).
+func (a AsSessionWithQoSSubscription) MarshalJSON() ([]byte, error) {
+	type plain AsSessionWithQoSSubscription
+	if a.specWire {
+		b, err := json.Marshal(plain(a))
+		if err != nil {
+			return nil, fmt.Errorf("nef: marshal AsSessionWithQoSSubscription: %w", err)
+		}
+		return b, nil
+	}
+	a.Self = ""
+	b, err := json.Marshal(struct {
+		SubscriptionID string `json:"subscriptionId,omitempty"`
+		ScsAsId        string `json:"scsAsId,omitempty"`
+		plain
+	}{a.SubscriptionID, a.ScsAsId, plain(a)})
+	if err != nil {
+		return nil, fmt.Errorf("nef: marshal AsSessionWithQoSSubscription: %w", err)
+	}
+	return b, nil
 }
 
 // FlowInfo describes a single IP flow within an AsSessionWithQoS subscription.
 // Ref: TS 29.522 §5.14.2.x
+//
+// oapi: TS29122_CommonData.yaml#/components/schemas/FlowInfo
 type FlowInfo struct {
 	FlowID           int      `json:"flowId"`
 	FlowDescriptions []string `json:"flowDescriptions,omitempty"`
@@ -94,6 +173,14 @@ type subscriptionRecord struct {
 	sub          AsSessionWithQoSSubscription
 	pcfBaseURI   string
 	appSessionID string
+	// negotiated is the typed supportedFeatures set of this resource. It is
+	// in-memory only (the store is never serialised), kept so later optional
+	// behaviour can be gated on it.
+	negotiated features.Set
+	// pcfNegotiated is the supportedFeatures set negotiated with the PCF for
+	// the Npcf_PolicyAuthorization app-session (TS 29.514 §5.8). In-memory
+	// only, never serialised.
+	pcfNegotiated features.Set
 }
 
 // Server is the NEF Nnef_AFsessionWithQoS SBI server.
@@ -106,6 +193,25 @@ type Server struct {
 
 	mu            sync.RWMutex
 	subscriptions map[string]*subscriptionRecord // key: subscriptionId
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// sessCat is the AsSessionWithQoS producer catalog.
+	sessCat *features.Catalog
+}
+
+// SetProfile wires the release profile used for supportedFeatures negotiation.
+// Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetCatalog replaces the AsSessionWithQoS catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetCatalog(c *features.Catalog) {
+	if c == nil {
+		c = nefsbi.AsSessionWithQoSCatalog()
+	}
+	s.sessCat = c
 }
 
 // New constructs the NEF SBI server with injected BSF and PCF clients.
@@ -118,6 +224,7 @@ func New(cfg *config.Config, logger *slog.Logger, bsfClient BSFClient, pcfClient
 		bsfClient:     bsfClient,
 		pcfClient:     pcfClient,
 		subscriptions: make(map[string]*subscriptionRecord),
+		sessCat:       nefsbi.AsSessionWithQoSCatalog(),
 	}
 
 	mux := http.NewServeMux()
@@ -125,6 +232,10 @@ func New(cfg *config.Config, logger *slog.Logger, bsfClient BSFClient, pcfClient
 	mux.HandleFunc("POST /3gpp-as-session-with-qos/v1/{scsAsId}/subscriptions", s.handleCreateSubscription)
 	mux.HandleFunc("GET /3gpp-as-session-with-qos/v1/{scsAsId}/subscriptions/{subscriptionId}", s.handleGetSubscription)
 	mux.HandleFunc("DELETE /3gpp-as-session-with-qos/v1/{scsAsId}/subscriptions/{subscriptionId}", s.handleDeleteSubscription)
+	// Npcf_PolicyAuthorization callbacks (NEF is the AF) - TS 29.514 §5.5.2.2
+	// Registered without a method so non-POST gets a 405 + Allow ProblemDetails.
+	mux.HandleFunc(pcfNotifyBasePath+"/notify", s.handlePCFEventNotify)
+	mux.HandleFunc(pcfNotifyBasePath+"/terminate", s.handlePCFTerminate)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.Handle("GET /metrics", promhttp.Handler())
 
@@ -180,7 +291,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		s.logger.Info("NEF SBI listening (mTLS + HTTP/2)",
 			"addr", s.cfg.SBI.Address,
-			"service", "nnef-afsessionwithqos",
+			"service", "3gpp-as-session-with-qos",
 			"spec_ref", "TS 29.522 §4.4.13",
 		)
 		if err := s.httpSrv.ListenAndServeTLS("", ""); !errors.Is(err, http.ErrServerClosed) {
@@ -193,7 +304,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.httpSrv.Handler = h2c.NewHandler(s.httpSrv.Handler, &http2.Server{})
 	s.logger.Info("NEF SBI listening (plain h2c — no TLS configured)",
 		"addr", s.cfg.SBI.Address,
-		"service", "nnef-afsessionwithqos",
+		"service", "3gpp-as-session-with-qos",
 	)
 	if err := s.httpSrv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("nef: server: listen: %w", err)
@@ -304,7 +415,19 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 
 	// ---- Decode request body ---------------------------------------------------
 	var sub AsSessionWithQoSSubscription
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+		if features.IsTypeError(err) {
+			s.rejectSupportedFeatures(ctx, w, "<non-string>", err)
+			return
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			log.Warn("create: request body too large", "result", "REJECT", "http_status", http.StatusRequestEntityTooLarge)
+			metrics.ProcedureTotal.WithLabelValues("NEF", "AsSessionWithQoSCreate", "REJECT").Inc()
+			s.problem(w, http.StatusRequestEntityTooLarge, "", "request body too large")
+			return
+		}
 		log.Warn("create: malformed JSON body",
 			"result", "REJECT", "cause", "MANDATORY_IE_INCORRECT", "error", err)
 		metrics.ProcedureTotal.WithLabelValues("NEF", "AsSessionWithQoSCreate", "REJECT").Inc()
@@ -312,6 +435,25 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 		return
 	}
 	sub.ScsAsId = scsAsId
+
+	// ---- supportedFeatures negotiation (producer) ------------------------------
+	// Must be schema-valid before any state is touched. The answer replaces
+	// whatever the AF sent: the representation carries the intersection, absent
+	// under rel17 when the request had none (decision D1).
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2; TS 29.122 §5.2.7.
+	if err := features.Validate(sub.SupportedFeatures); err != nil {
+		s.rejectSupportedFeatures(ctx, w, sub.SupportedFeatures, err)
+		return
+	}
+	sfPeer := sub.SupportedFeatures
+	sfAnswer, sfSet := features.Answer(s.sessCat, s.profile, sfPeer)
+	sub.SupportedFeatures = sfAnswer
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "NEF",
+		Interface: "Nnef", Direction: "IN", PeerNF: "AF",
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.sessCat.Supported(s.profile), Peer: sfPeer, PeerPresent: sfPeer != "", Negotiated: sfSet,
+	}, "scs_as_id", scsAsId)
 
 	// ---- Validate mandatory IEs -----------------------------------------------
 	// At least one UE address key is required: ueIpv4Addr, ueIpv6Addr, or macAddr.
@@ -332,6 +474,30 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING",
 			"qosReference is mandatory (TS 29.522 §5.14.2.1.2)")
 		return
+	}
+
+	// flowInfo is validated under the spec-literal profile only; rel17 keeps its
+	// historical acceptance. Ref: TS 29.122 FlowInfo (flowId unique, flowDescriptions 1..2).
+	if features.SpecLiteral(s.profile) {
+		if fe := validateFlowInfo(sub.FlowInfo); fe != nil {
+			log.Warn("create: invalid flowInfo",
+				"result", "REJECT", "cause", features.CauseInvalidMsgFormat, "error", fe,
+				"spec_ref", "TS 29.122 FlowInfo")
+			metrics.ProcedureTotal.WithLabelValues("NEF", "AsSessionWithQoSCreate", "REJECT").Inc()
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":        http.StatusBadRequest,
+				"cause":         features.CauseInvalidMsgFormat,
+				"detail":        fe.detail,
+				"invalidParams": []map[string]string{{"param": fe.param}},
+			})
+			return
+		}
+		if flowIDFallback(sub.FlowInfo) {
+			log.Info("create: flowInfo entry without flowId, numbering by position",
+				"spec_ref", "TS 29.122 FlowInfo", "result", "OK")
+		}
 	}
 
 	log = log.With("ue_ipv4", sub.UeIpv4Addr, "qos_reference", sub.QosReference)
@@ -388,25 +554,35 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 	// ---- PCF Policy Authorization Create --------------------------------------
 	// Ref: TS 29.514 §5.2.2.2
 	pcfReq := &AppSessionContextReqData{
-		AspId:        scsAsId,
-		AfAppId:      sub.AfAppId,
-		UeIpv4:       sub.UeIpv4Addr,
-		UeIpv6:       sub.UeIpv6Addr,
-		QosReference: sub.QosReference,
-		Dnn:          binding.Dnn,
-		SliceInfo:    binding.Snssai,
+		AspId:     scsAsId,
+		AfAppId:   sub.AfAppId,
+		UeIpv4:    sub.UeIpv4Addr,
+		UeIpv6:    sub.UeIpv6Addr,
+		Dnn:       binding.Dnn,
+		SliceInfo: binding.Snssai,
 	}
-	if len(sub.FlowInfo) > 0 {
-		pcfReq.MedComponents = map[string]MediaComponent{
-			"1": {
-				MedType: "DATA",
-			},
-		}
-		for _, fi := range sub.FlowInfo {
-			pcfReq.MedComponents["1"] = MediaComponent{
-				MedType: "DATA",
-				FDescs:  fi.FlowDescriptions,
-			}
+	if !features.SpecLiteral(s.profile) {
+		// rel17 / no profile: frozen top-level ascReqData.qosReference. Under
+		// rel19 the reference travels in medComponents[].qosReference.
+		pcfReq.QosReference = sub.QosReference
+		pcfReq.qosTopLevel = true
+	}
+	pcfReq.MedComponents = buildMedComponents(sub.FlowInfo, features.SpecLiteral(s.profile), sub.QosReference)
+	if features.SpecLiteral(s.profile) {
+		// notifUri is required by AppSessionContextReqData (TS 29.514 §5.6.2.3);
+		// legacy profiles keep the pre-REL19-3.5 bytes (no notifUri).
+		// The base is the NEF apiRoot (config.APIRoot: NRF-advertised FQDN +
+		// SBI listen port), never the client-controlled Host header. Without a
+		// configured endpoint notifUri is omitted (WARN) rather than failing
+		// the AF request.
+		if root := s.cfg.APIRoot(); root != "" {
+			pcfReq.NotifUri = root + pcfNotifyBasePath
+		} else {
+			log.Warn("create: NEF apiRoot not configured (sbi.fqdn/sbi.address), omitting ascReqData.notifUri",
+				"spec_ref", "TS 29.514 §5.6.2.3",
+				"result", "FAILURE",
+				"cause", "NOTIF_URI_UNAVAILABLE",
+			)
 		}
 	}
 
@@ -415,7 +591,7 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 		"direction", "OUT",
 		"spec_ref", "TS 29.514 §5.2.2.2",
 	)
-	appSessionID, err := s.pcfClient.CreateAppSession(ctx, pcfURI, pcfReq)
+	appSessionID, pcfSet, err := s.pcfClient.CreateAppSession(ctx, pcfURI, pcfReq)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "403") {
 			log.Warn("create: PCF rejected policy authorization",
@@ -445,21 +621,27 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 	subscriptionID := uuid.NewString()
 	sub.SubscriptionID = subscriptionID
 
-	s.mu.Lock()
-	s.subscriptions[subscriptionID] = &subscriptionRecord{
-		sub:          sub,
-		pcfBaseURI:   pcfURI,
-		appSessionID: appSessionID,
-	}
-	s.mu.Unlock()
-
-	// Build Location header.
+	// Build Location header (also the rel19 self link).
 	fqdn := s.cfg.SBI.FQDN
 	if fqdn == "" {
 		fqdn = r.Host
 	}
 	location := fmt.Sprintf("https://%s/3gpp-as-session-with-qos/v1/%s/subscriptions/%s",
 		fqdn, scsAsId, subscriptionID)
+	specLiteral := features.SpecLiteral(s.profile)
+	if specLiteral {
+		sub.Self = location
+	}
+
+	s.mu.Lock()
+	s.subscriptions[subscriptionID] = &subscriptionRecord{
+		sub:           sub,
+		pcfBaseURI:    pcfURI,
+		appSessionID:  appSessionID,
+		negotiated:    sfSet,
+		pcfNegotiated: pcfSet,
+	}
+	s.mu.Unlock()
 
 	log.Info("create: AsSessionWithQoS subscription created",
 		"subscription_id", subscriptionID,
@@ -475,7 +657,7 @@ func (s *Server) handleCreateSubscription(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Location", location)
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(sub)
+	_ = json.NewEncoder(w).Encode(sub.wireFor(specLiteral))
 }
 
 // ---- Get subscription (GET /…/{scsAsId}/subscriptions/{subscriptionId}) -------
@@ -524,14 +706,14 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 	metrics.ProcedureTotal.WithLabelValues("NEF", "AsSessionWithQoSGet", "OK").Inc()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(rec.sub)
+	_ = json.NewEncoder(w).Encode(rec.sub.wireFor(features.SpecLiteral(s.profile)))
 }
 
 // ---- Delete subscription (DELETE /…/{scsAsId}/subscriptions/{subscriptionId}) -
 
 // handleDeleteSubscription implements Nnef_AFsessionWithQoS_Delete.
 // DELETE /3gpp-as-session-with-qos/v1/{scsAsId}/subscriptions/{subscriptionId}
-// Ref: TS 29.522 §4.4.13.2.5 + TS 29.514 §5.2.2.4
+// Ref: TS 29.522 §4.4.13.2.5 + TS 29.514 §4.2.4.2
 func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request) {
 	scsAsId := r.PathValue("scsAsId")
 	subscriptionID := r.PathValue("subscriptionId")
@@ -573,12 +755,12 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 	}
 
 	// Relay deletion to the PCF.
-	// Ref: TS 29.514 §5.2.2.4
+	// Ref: TS 29.514 §4.2.4.2
 	log.Info("delete: relaying deletion to PCF",
 		"app_session_id", rec.appSessionID,
 		"interface", "Npcf",
 		"direction", "OUT",
-		"spec_ref", "TS 29.514 §5.2.2.4",
+		"spec_ref", "TS 29.514 §4.2.4.2",
 	)
 	if err := s.pcfClient.DeleteAppSession(ctx, rec.pcfBaseURI, rec.appSessionID); err != nil {
 		log.Warn("delete: PCF app-session delete failed (subscription already removed)",
@@ -594,7 +776,7 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 			"result", "OK",
 			"interface", "Npcf",
 			"direction", "IN",
-			"spec_ref", "TS 29.514 §5.2.2.4",
+			"spec_ref", "TS 29.514 §4.2.4.2",
 		)
 	}
 
@@ -609,6 +791,64 @@ func (s *Server) handleDeleteSubscription(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ---- Npcf_PolicyAuthorization callbacks ------------------------------------------
+
+// pcfNotifyBasePath is the NEF callback base advertised to the PCF as
+// ascReqData.notifUri; the PCF appends "/notify" and "/terminate" to the
+// notification URI it was given.
+// Ref: TS 29.514 §5.5.2.2 (callback URIs)
+const pcfNotifyBasePath = "/npcf-policyauthorization-notify/v1"
+
+// maxPCFNotifyBodyBytes bounds the PCF notification body read.
+const maxPCFNotifyBodyBytes = 1 << 20
+
+// handlePCFEventNotify accepts Npcf_PolicyAuthorization_Notify (events).
+// Ref: TS 29.514 §4.2.5.2
+func (s *Server) handlePCFEventNotify(w http.ResponseWriter, r *http.Request) {
+	s.handlePCFCallback(w, r, "PolicyAuthorizationNotify", "EventNotification", "TS 29.514 §4.2.5.2")
+}
+
+// handlePCFTerminate accepts the PCF request for termination of an app-session.
+// Ref: TS 29.514 §4.2.5.3
+func (s *Server) handlePCFTerminate(w http.ResponseWriter, r *http.Request) {
+	s.handlePCFCallback(w, r, "PolicyAuthorizationTerminate", "TerminationRequest", "TS 29.514 §4.2.5.3")
+}
+
+// handlePCFCallback acknowledges a PCF callback with 204. The body is read
+// under a hard size cap and logged by size only: the NEF takes no action on it
+// in the baseline. Oversized body -> 413, read error -> 400, non-POST -> 405,
+// all as application/problem+json.
+// Ref: TS 29.571 §5.2.4.1 (ProblemDetails)
+func (s *Server) handlePCFCallback(w http.ResponseWriter, r *http.Request, procedure, msgType, specRef string) {
+	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
+	log := logging.NewProcedureLogger(ctx, s.logger, procedure)
+	fields := []any{
+		"nf", "NEF", "interface", "Npcf", "direction", "IN",
+		"spec_ref", specRef, "message_type", msgType,
+		"correlation_id", logging.CorrelationID(ctx), "path", r.URL.Path,
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		log.Warn("pcf callback rejected", append(fields, "result", "REJECT", "cause", "METHOD_NOT_ALLOWED")...)
+		s.problem(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "only POST is allowed")
+		return
+	}
+	n, err := io.Copy(io.Discard, http.MaxBytesReader(w, r.Body, maxPCFNotifyBodyBytes))
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			log.Warn("pcf callback rejected", append(fields, "result", "REJECT", "cause", "BODY_TOO_LARGE")...)
+			s.problem(w, http.StatusRequestEntityTooLarge, "BODY_TOO_LARGE", "request body too large")
+			return
+		}
+		log.Warn("pcf callback rejected", append(fields, "result", "REJECT", "cause", "BODY_READ_ERROR", "error", err)...)
+		s.problem(w, http.StatusBadRequest, "BODY_READ_ERROR", "cannot read request body")
+		return
+	}
+	log.Info("pcf callback received", append(fields, "body_bytes", n, "result", "OK")...)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ---- Health -------------------------------------------------------------------
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -618,6 +858,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 // ---- helpers ------------------------------------------------------------------
+
+// rejectSupportedFeatures answers a schema-invalid supportedFeatures with 400
+// INVALID_MSG_FORMAT and invalidParams[{param: /supportedFeatures}] and logs
+// the REJECT negotiation record. Ref: TS 29.500 §5.2.7.2; TS 29.571 §5.2.4.6.
+func (s *Server) rejectSupportedFeatures(ctx context.Context, w http.ResponseWriter, shown string, cause error) {
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "NEF",
+		Interface: "Nnef", Direction: "IN", PeerNF: "AF",
+		SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseInvalidMsgFormat,
+		Local: s.sessCat.Supported(s.profile), Peer: shown, PeerPresent: true,
+	}, "error", cause)
+	metrics.ProcedureTotal.WithLabelValues("NEF", "AsSessionWithQoSCreate", "REJECT").Inc()
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusBadRequest,
+		"cause":  features.CauseInvalidMsgFormat,
+		"detail": "supportedFeatures is not a valid hexadecimal string",
+		"invalidParams": []map[string]string{
+			{"param": features.ParamSupportedFeatures},
+		},
+	})
+}
 
 // problem writes a 3GPP-style application/problem+json response.
 // Ref: TS 29.500 §5.2.4 (ProblemDetails), TS 29.571 §5.2.7

@@ -25,7 +25,7 @@
 //   - A recording fake PolicyAuthorizationClient (recordingPCFClient) that
 //     captures every CreateAppSession / DeleteAppSession call in memory.
 //     The feature assertions "the mock PCF received a POST ... with ueIpv4 X
-//     and qosReference Y" and "the mock PCF received a DELETE ..." are
+//     and qosReference Y" and "the mock PCF received a POST to .../delete" are
 //     satisfied by inspecting the recorder — no HTTP round-trip needed.
 //
 // Ref: TS 29.522 §4.4.13, TS 29.521 §5.2.2.4, TS 29.514 §5.2.2
@@ -51,6 +51,7 @@ import (
 	nefcfg "github.com/francurieses/claudia-5gc/nf/nef/internal/config"
 	nefserver "github.com/francurieses/claudia-5gc/nf/nef/internal/server"
 	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
+	sbifeatures "github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // ---- recording fake PCF client -----------------------------------------------
@@ -90,7 +91,7 @@ type recordingPCFClient struct {
 }
 
 // CreateAppSession implements server.PolicyAuthorizationClient.
-func (r *recordingPCFClient) CreateAppSession(_ context.Context, pcfBaseURI string, req *nefserver.AppSessionContextReqData) (string, error) {
+func (r *recordingPCFClient) CreateAppSession(_ context.Context, pcfBaseURI string, req *nefserver.AppSessionContextReqData) (string, sbifeatures.Set, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -112,7 +113,7 @@ func (r *recordingPCFClient) CreateAppSession(_ context.Context, pcfBaseURI stri
 		retID:      id,
 		retErr:     err,
 	})
-	return id, err
+	return id, sbifeatures.Set{}, err
 }
 
 // DeleteAppSession implements server.PolicyAuthorizationClient.
@@ -720,6 +721,9 @@ func (c *nefCtx) mockPCFReceivedPOSTWithUeAndQoS(path, ueIpv4, qosRef string) er
 	return nil
 }
 
+// mockPCFReceivedDELETE asserts the NEF invoked the Npcf_PolicyAuthorization
+// Delete custom operation (POST .../app-sessions/{id}/delete). The recording
+// fake stores the appSessionID directly. Ref: TS 29.514 §4.2.4.2, §5.3.3.4.2.
 func (c *nefCtx) mockPCFReceivedDELETE(pathWithID string) error {
 	if c.pcf == nil {
 		return fmt.Errorf("mockPCFReceivedDELETE: recording PCF client not initialised")
@@ -731,9 +735,9 @@ func (c *nefCtx) mockPCFReceivedDELETE(pathWithID string) error {
 		return fmt.Errorf("mock PCF did not receive any DeleteAppSession call (DELETE %s)", pathWithID)
 	}
 	rec := c.pcf.lastDelete()
-	// pathWithID is e.g. "/npcf-policyauthorization/v1/app-sessions/appsess-003"
+	// pathWithID is e.g. "/npcf-policyauthorization/v1/app-sessions/appsess-003/delete"
 	// The recording fake stores the appSessionID directly; extract it from the path.
-	parts := strings.Split(strings.TrimRight(pathWithID, "/"), "/")
+	parts := strings.Split(strings.TrimSuffix(strings.TrimRight(pathWithID, "/"), "/delete"), "/")
 	wantID := parts[len(parts)-1]
 	if rec.appSessionID != wantID {
 		return fmt.Errorf("mock PCF DELETE: appSessionID = %q, want %q", rec.appSessionID, wantID)
@@ -906,7 +910,7 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// --- Then — mock PCF assertions ---
 	sc.Step(`^the mock PCF received a POST to "([^"]+)" with ueIpv4 "([^"]+)" and qosReference "([^"]+)"$`,
 		c.mockPCFReceivedPOSTWithUeAndQoS)
-	sc.Step(`^the mock PCF received a DELETE to "([^"]+)"$`,
+	sc.Step(`^the mock PCF received a POST to "([^"]+/delete)"$`,
 		c.mockPCFReceivedDELETE)
 }
 

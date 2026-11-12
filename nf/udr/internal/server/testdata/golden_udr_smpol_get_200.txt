@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"supi":"imsi-001010000000001","smPolicySnssaiData":{"1-000001":{"snssai":{"sst":1,"sd":"000001"},"smPolicyDnnData":{"internet":{"dnn":"internet","5qi":7}}}}}

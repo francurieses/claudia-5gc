@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: /nsmsf-sms/v2/ue-contexts/imsi-001010000000001
+
+{"accessType":"3GPP_ACCESS","amfId":"amf-001","supi":"imsi-001010000000001"}

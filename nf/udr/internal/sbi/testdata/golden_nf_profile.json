@@ -1,0 +1,1 @@
+{"nfInstanceId":"00000000-0000-4008-8000-000000000001","nfType":"UDR","nfStatus":"REGISTERED","nfServices":[{"serviceInstanceId":"00000000-0000-4008-8000-000000000001-nudr-dr","serviceName":"nudr-dr","versions":[{"apiVersionInUri":"v2","apiFullVersion":"2.2.12"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

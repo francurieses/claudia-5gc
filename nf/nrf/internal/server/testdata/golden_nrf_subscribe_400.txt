@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: text/plain; charset=utf-8
+Location: 
+
+nfStatusNotificationUri required

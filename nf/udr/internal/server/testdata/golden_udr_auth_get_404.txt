@@ -1,0 +1,4 @@
+status: Not Found
+Content-Type: application/problem+json
+
+{"cause":"RESOURCE_URI_STRUCTURE_NOT_FOUND","detail":"udr: auth subscription not found: imsi-001019999999999","status":404}

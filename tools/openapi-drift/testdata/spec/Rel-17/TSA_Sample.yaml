@@ -1,0 +1,13 @@
+openapi: 3.0.0
+info:
+  version: 1.2.0
+  title: Sample
+servers:
+  - url: '{apiRoot}/nsample/v1'
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string

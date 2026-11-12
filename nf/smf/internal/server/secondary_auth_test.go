@@ -243,7 +243,7 @@ func TestSecondaryAuth_HappyPath_EAPSuccess(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected DNN IE (0x25) in the ACCEPT body: % X", body)
 	}
-	if !(eapOffset < qosFlowOffset && qosFlowOffset < dnnOffset) {
+	if eapOffset >= qosFlowOffset || qosFlowOffset >= dnnOffset {
 		t.Fatalf("IE order violation (TS 24.501 §8.3.2 Table 8.3.2.1.1): "+
 			"want EAP(0x78)@%d < QoSFlowDesc(0x79)@%d < DNN(0x25)@%d",
 			eapOffset, qosFlowOffset, dnnOffset)

@@ -252,7 +252,7 @@ func (x *ctlCtx) build() error {
 	x.g.guard = gd
 
 	tokens := oauth2.NewTokenCache(hc, x.mocks["NRF"].srv.URL+"/oauth2/v1/token",
-		"6d63702d-0000-4000-8000-000000000010", "nnef-afsessionwithqos")
+		"6d63702d-0000-4000-8000-000000000010", "3gpp-as-session-with-qos")
 	reg := registry.New()
 	if err := reg.RegisterAll(control.All(control.Deps{
 		AMF:    clients.NewAMF(x.mocks["AMF"].srv.URL, hc),

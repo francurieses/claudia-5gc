@@ -13,6 +13,8 @@ package store
 
 import (
 	"sync"
+
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Snssai represents an S-NSSAI (Single Network Slice Selection Assistance Information).
@@ -77,8 +79,13 @@ type PcfBinding struct {
 	RecoveryTime string `json:"recoveryTime,omitempty"`
 	// BindLevel is the binding granularity: "NF_SET" or "NF_INSTANCE". Optional.
 	BindLevel string `json:"bindLevel,omitempty"`
-	// SuppFeat is the negotiated supported features bitmask. Optional.
+	// SuppFeat is the negotiated supported features bitmask as put on the wire
+	// (TS 29.521 §5.8, attribute "suppFeat"). Optional.
 	SuppFeat string `json:"suppFeat,omitempty"`
+	// Features is the typed form of the features negotiated for this binding
+	// (TS 29.500 §6.6.2). It is never serialised: json:"-" keeps the resource
+	// representation unchanged.
+	Features features.Set `json:"-"`
 }
 
 // DiscoveryQuery holds the parsed query parameters for a GET /nbsf-management/v1/pcfBindings call.

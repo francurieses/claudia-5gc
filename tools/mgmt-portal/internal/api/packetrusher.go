@@ -3,8 +3,8 @@ package api
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	dockerclient "github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/docker"
+	"github.com/go-chi/chi/v5"
 )
 
 // packetrusherScenarios defines the two scenarios in display order.
@@ -85,7 +85,7 @@ func (d Deps) handlePacketRusherStatus(w http.ResponseWriter, r *http.Request) {
 			State:     "not_found",
 		}
 		if svc, ok := byName[sc.container]; ok {
-			st.State  = svc.State
+			st.State = svc.State
 			st.Status = svc.Status
 			st.Uptime = svc.Uptime
 		}

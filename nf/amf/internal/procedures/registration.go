@@ -15,16 +15,21 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
+	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
 const nfName = "AMF"
@@ -33,14 +38,32 @@ const nfName = "AMF"
 // presented a GUTI that cannot be resolved to a known SUPI. The NAS handler
 // must respond with an Identity Request (type = SUCI) and call
 // Phase1_AuthenticateWithSUCI once the UE's SUCI arrives.
-// Ref: TS 24.501 §5.5.1.2.2 step 1b
+// Ref: TS 24.501 §5.5.1.2.2 step 1b; TS 23.502 §4.2.2.2.2 step 6 (SUCI neither
+// provided nor retrievable from the old AMF: Identity Request is initiated).
 
-// ErrServiceAreaRestricted is returned by Phase3_ProcessSMCComplete when the
-// PCF service area restriction forbids the UE from registering in its current TA.
-// The NAS handler must respond with a Registration Reject (5GMM cause #73).
-// Ref: TS 23.501 §5.3.4, TS 24.501 §8.2.8.2 cause 0x49
-var ErrServiceAreaRestricted = errors.New("service area restriction: TAC not allowed (cause #73)")
 var ErrNeedSUCI = errors.New("UE presented GUTI not resolvable — need SUCI")
+
+// ErrUESecurityCapabilityUnacceptable is returned by Phase1_InitiateAuthentication
+// when the REGISTRATION REQUEST has no UE security capability IE, or one without a
+// 5GS encryption algorithm or a non-null 5GS integrity algorithm this AMF
+// implements. The caller answers REGISTRATION REJECT (UESecCapRejectCause).
+// Ref: TS 24.501 §5.5.1.2.8 i)
+var ErrUESecurityCapabilityUnacceptable = errors.New("UE security capability invalid or unacceptable")
+
+// ErrPEINotAccepted is returned by Phase1_InitiateAuthentication for an
+// emergency registration (type 4) identified by a PEI: the AMF supports no
+// emergency services. The caller answers REGISTRATION REJECT (PEINotAcceptedCause).
+// Ref: TS 24.501 §5.5.1.2.5
+var ErrPEINotAccepted = errors.New("emergency registration with PEI not accepted")
+
+// PEINotAcceptedCause is 5GMM cause #5 "PEI not accepted".
+// Ref: TS 24.501 Annex A.2 (cause #5), §5.5.1.2.5
+const PEINotAcceptedCause nas.Cause5GMM = 5
+
+// UESecCapRejectCause is the 5GMM cause of the REGISTRATION REJECT for an
+// unacceptable UE security capability: #23 "UE security capabilities mismatch".
+// TS 24.501 §5.5.1.2.8 i) NOTE 2 leaves the cause to the network implementation.
+const UESecCapRejectCause = nas.CauseUESecurityCapabilitiesMismatch
 
 // NRFClient discovers NFs from the NRF.
 type NRFClient interface {
@@ -97,11 +120,25 @@ type UDMClient interface {
 	DeregisterUECM(ctx context.Context, supi string) error
 }
 
+// UDMSDMSubscriber is the optional Nudm_SDM subscription capability of a
+// UDMClient (detected by type assertion, so existing UDMClient stubs keep
+// compiling). Ref: TS 29.503 §5.2.2.3 (Subscribe), §5.2.2.4 (Unsubscribe)
+type UDMSDMSubscriber interface {
+	// SubscribeAMData creates an SDM subscription to the SUPI's am-data and
+	// returns the subscription id.
+	SubscribeAMData(ctx context.Context, supi string) (subscriptionID string, err error)
+	// UnsubscribeSDM deletes the subscription.
+	UnsubscribeSDM(ctx context.Context, supi, subscriptionID string) error
+}
+
 // UDMAMSubscription is a subset of the access/mobility subscription data from UDM.
 type UDMAMSubscription struct {
 	AllowedNSSAI []amfctx.SNSSAISubscribed
 	AMBRUplink   uint64
 	AMBRDownlink uint64
+	// GPSI is the UE's GPSI from am-data "gpsis" (msisdn- form preferred), ""
+	// when the subscription carries none. Ref: TS 29.503 §6.1.6.2.4
+	GPSI string
 }
 
 // PCFClient calls PCF for UE-level policy (N15 interface, Npcf_UEPolicyControl).
@@ -123,7 +160,7 @@ type AMPolicyClient interface {
 	// CreateAMPolicyAssociation creates an AM policy association at UE registration.
 	// Returns the polAssoId, RFSP index (0 if not provided), and optional service area
 	// restriction (nil if PCF returned none = unrestricted).
-	// Ref: TS 29.507 §4.2.2.2
+	// Ref: TS 29.507 §4.2.2
 	CreateAMPolicyAssociation(ctx context.Context, supi, accessType, mcc, mnc string) (
 		polAssoID string, rfsp int, servAreaRes *amfctx.ServiceAreaRestriction, err error)
 	// DeleteAMPolicyAssociation releases the AM policy association at deregistration.
@@ -141,6 +178,7 @@ type RegistrationHandler struct {
 	pcf          PCFClient      // optional; when nil, no UE policy (URSP) N15 call is made
 	amPolicy     AMPolicyClient // optional; when nil, no AM policy association is created
 	nssaa        NSSAAClient    // optional; when nil, no slice-specific auth is run
+	nssaaSpec    bool           // rel19: real GPSI, PENDING on non-auth failure (REL19-3.5 slice E)
 	logger       *slog.Logger
 	nfInstanceID string
 	plmnMCC      string
@@ -178,6 +216,13 @@ type RegistrationHandler struct {
 	// (gmm-build.c sets this bit to 1 unless operator config sets no_ims).
 	// Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
 	imsVoPS3GPP bool
+	// nfsExt holds the operator-configured bits of the 5GS network feature
+	// support IE beyond IMS-VoPS-3GPP (REL19-5.5). Zero by default: the AMF
+	// sets no such bit today, so the IE stays at its legacy 2 octets.
+	nfsExt nas.NetworkFeatureSupport
+	// budgets are the per-step SBI timeouts (AUD-registration-20); zero value =
+	// DefaultBudgets. See budget.go.
+	budgets Budgets
 }
 
 // NewRegistrationHandler builds a handler wired to the AMF's NF clients.
@@ -270,6 +315,16 @@ func (h *RegistrationHandler) T3512() int {
 	return h.timers.T3512Secs()
 }
 
+// NASTimers returns the effective runtime timer values; the zero Values (every
+// accessor falling back to the TS 24.501 §10.2 defaults) when no store is set.
+// Read at use time so a PUT /amf/v1/config/timers takes effect on the next arming.
+func (h *RegistrationHandler) NASTimers() timercfg.Values {
+	if h.timers == nil {
+		return timercfg.Values{}
+	}
+	return h.timers.Effective()
+}
+
 // setT3512Value fills IEI 0x5E in ra from the effective T3512, loaded once, and
 // records the value sent on the UE (lowered-T3512 mitigation, TS 24.501 §5.3.7).
 func (h *RegistrationHandler) setT3512Value(ra *nas.RegistrationAccept, ue *amfctx.UEContext) {
@@ -297,6 +352,60 @@ func (h *RegistrationHandler) WithServedTACs(tacs []uint32) {
 // Ref: TS 24.501 §9.11.3.5, §8.2.7.1 (IEI 0x21)
 func (h *RegistrationHandler) WithIMSVoPS3GPP(supported bool) {
 	h.imsVoPS3GPP = supported
+}
+
+// FeatureNFSExtended gates the extended (octets 5 and 6) form of the 5GS
+// network feature support IE in the Registration Accept. Default off.
+// Ref: TS 24.501 §9.11.3.5 (octets 5-6 are Rel-16/17 and Rel-18/19 bits).
+const FeatureNFSExtended = "NAS-NFS-EXT"
+
+func init() {
+	capability.MustRegister(capability.Feature{
+		ID:         FeatureNFSExtended,
+		Title:      "5GS network feature support: octets 5-6 in Registration Accept",
+		Release:    capability.Rel18,
+		Normative:  false,
+		Visibility: "public",
+		SpecRef:    "TS 24.501 §9.11.3.5",
+		NFs:        []string{"AMF"},
+	})
+}
+
+// WithNetworkFeatureSupportBits sets the 5GS network feature support bits the
+// AMF advertises in addition to IMS-VoPS-3GPP (which stays controlled by
+// WithIMSVoPS3GPP). Bits in octets 5-6 reach the wire only when
+// FeatureNFSExtended is gated on; call once at start-up.
+// Ref: TS 24.501 §9.11.3.5
+func (h *RegistrationHandler) WithNetworkFeatureSupportBits(n nas.NetworkFeatureSupport) {
+	h.nfsExt = n
+}
+
+// networkFeatureSupport builds the IEI 0x21 content for a Registration Accept
+// (initial and mobility/periodic sites). Rules:
+//   - NCR, PIV, RPR, PR, UN-PER, LCS-UPP, SUPL, MLCSUP, EF5L and RSLP are set
+//     only if the operator enabled them AND the UE set the matching 5GMM
+//     capability bit in its REGISTRATION REQUEST (no capability IE -> none).
+//   - Bits introduced after Rel-17 (UN-PER, octet 6) additionally need
+//     FeatureNFSExtended gated on. Rel-16/17 bits of octet 5 are not part of
+//     that Rel-18 seam, so they are not dropped by it; the AMF sets none by
+//     default, so legacy (rel17 / nil profile) bytes stay the 2-octet form.
+//
+// Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.4, §9.11.3.5, §8.2.7.1
+func (h *RegistrationHandler) networkFeatureSupport(ctx context.Context, ue *amfctx.UEContext) []byte {
+	n := h.nfsExt
+	n.IMSVoPS3GPP = h.imsVoPS3GPP
+	var c *nas.FiveGMMCapability
+	if ue != nil {
+		c = ue.Capability5GMM
+	}
+	n = n.LimitToUECapability(c)
+	limit := nas.NFSLegacyOctets + 1 // octet 5: Rel-16/17 bits only
+	if capability.Gate(ctx, FeatureNFSExtended) {
+		limit = nas.NFSMaxOctets
+	} else {
+		n = n.DropAfterRel17()
+	}
+	return n.Encode(limit)
 }
 
 // buildTAIList builds the 5GS tracking area identity list for ue's
@@ -405,8 +514,41 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 		"message_type", "RegistrationRequest",
 	)
 
+	// A new authentication starts: reset the AUTHENTICATION FAILURE bookkeeping.
+	// Ref: TS 24.501 §5.4.1.3.7 c)-f)
+	ue.AuthViaGUTI = false
+	ue.AuthSynchFailures = 0
+	ue.AuthNgKSIFailures = 0
+
+	// A mobility/periodic update keeps its non-cleartext IEs in the NAS message
+	// container; when authentication runs on the cleartext IEs only (integrity
+	// of the request not verifiable, TS 24.501 §4.4.4.3 b)) the capability
+	// stored at the earlier registration is used. The UE checks the replayed
+	// capability in the SECURITY MODE COMMAND. Ref: TS 24.501 §4.4.6, §5.4.2.2
+	ueSecCap := in.RegRequest.UESecurityCapability
+	if ueSecCap == nil && len(ue.RawUESecCap) >= 2 &&
+		(in.RegRequest.RegistrationType == nas.RegistrationTypePeriodic ||
+			in.RegRequest.RegistrationType == nas.RegistrationTypeMobility) {
+		if stored, derr := nas.DecodeUESecurityCapability(ue.RawUESecCap); derr == nil {
+			stored.Raw = ue.RawUESecCap
+			ueSecCap = &stored
+		}
+	}
+
+	// TS 24.501 §5.5.1.2.8 i): reject a REGISTRATION REQUEST whose UE security
+	// capability is missing or offers nothing this AMF can select, before any
+	// AUSF call (NIA0/NEA0 would otherwise be selected for a non-emergency UE).
+	if !acceptableUESecurityCapability(ueSecCap) {
+		log.Warn("REGISTRATION REQUEST with invalid or unacceptable UE security capability",
+			"interface", "N1", "direction", "IN",
+			"result", "REJECT", "cause", int(UESecCapRejectCause),
+			"spec_ref", "TS 24.501 §5.5.1.2.8 i)")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		return nil, ErrUESecurityCapabilityUnacceptable
+	}
+
 	// Store UE security capabilities for later Security Mode Command
-	if sc := in.RegRequest.UESecurityCapability; sc != nil {
+	if sc := ueSecCap; sc != nil {
 		ue.UESecCapEA[0] = sc.EA0
 		ue.UESecCapEA[1] = sc.EA1
 		ue.UESecCapEA[2] = sc.EA2
@@ -418,6 +560,24 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 		ue.RawUESecCap = sc.Raw // verbatim bytes for exact SMC replay
 	}
 
+	// ER-NSSAI capability of the 5GMM capability IE: selects the Extended rejected
+	// NSSAI IE in the later REGISTRATION ACCEPT / CONFIGURATION UPDATE COMMAND /
+	// DEREGISTRATION REQUEST (rel19). Not persisted.
+	// Ref: TS 24.501 §5.5.1.2.2, §9.11.3.1
+	ue.ERNSSAISupported = in.RegRequest.ERNSSAISupported()
+	// Full 5GMM capability (all octets) for capability.PeerUE gating, REL19-5.4.
+	ue.Capability5GMM = in.RegRequest.Capability5GMM()
+	if ue.Capability5GMM != nil {
+		h.logger.InfoContext(ctx, "UE 5GMM capability decoded",
+			"procedure", "InitialRegistration",
+			"interface", "N1", "direction", "IN",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI,
+			"capability_5gmm", ue.Capability5GMM.RawHex(),
+			"capability_5gmm_bits", strings.Join(ue.Capability5GMM.SetBitNames(), ","),
+			"spec_ref", "TS 24.501 §5.5.1.2.2, §9.11.3.1",
+		)
+	}
+
 	// If the UE presented a GUTI, try to resolve it to a known SUPI.
 	// A GUTI issued by this AMF that is still in the context store can be
 	// passed to AUSF as SUPI (UDM knows it). If not found — e.g. after a
@@ -426,9 +586,16 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 	// Ref: TS 24.501 §5.5.1.2.2 step 1b; TS 23.502 §4.2.2.2.2 note on GUTI
 	if in.RegRequest.MobileIdentity.Type == nas.MobileIdentityGUTI {
 		if guti := in.RegRequest.MobileIdentity.GUTI; guti != nil {
+			// The 5G-TMSI is unique only within the allocating AMF: a 5G-GUTI of
+			// another PLMN / AMF Region / Set / Pointer is unknown here even when its
+			// 5G-TMSI collides with a local one. Ref: TS 23.003 §2.10.1
+			if !h.gutiAllocatedHere(guti) {
+				return nil, ErrNeedSUCI
+			}
 			if existing, ok := h.mgr.GetByTMSI(guti.TMSI); ok && existing.SUPI != "" {
 				// AMF recognises this GUTI — use the known SUPI for AUSF
 				suciOrGUTI = existing.SUPI
+				ue.AuthViaGUTI = true
 			} else {
 				return nil, ErrNeedSUCI
 			}
@@ -437,24 +604,70 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 		}
 	}
 
-	// Step 5: AMF selects AUSF via NRF discovery
-	// Ref: TS 23.502 §4.2.2.2.2 step 5
+	// Step 6: the AMF can only start authentication with a SUCI (or a 5G-GUTI
+	// resolved above). Any other identity (IMEI, IMEISV, 5G-S-TMSI, none, or a
+	// SUCI IE that failed to decode) must not reach the AUSF: initiate the
+	// Identity Request procedure instead.
+	// Ref: TS 23.502 §4.2.2.2.2 step 6; TS 24.501 §5.4.3.1
+	if mi := in.RegRequest.MobileIdentity; mi.Type == nas.MobileIdentitySUCI && mi.SUCI != nil {
+		// A SUCI that cannot be rendered as TS 29.571 §5.3.2 SupiOrSuci is a
+		// malformed mandatory 5GS mobile identity: REGISTRATION REJECT #96,
+		// never an Identity Request loop. Ref: TS 24.501 §5.5.1.2.8 b)
+		if _, serr := SUCIString(mi.SUCI); serr != nil {
+			log.Warn("registration SUCI not representable - rejecting",
+				"interface", "N1", "direction", "IN",
+				"result", "REJECT", "cause", int(UnusableSUCIRejectCause),
+				"error", serr, "spec_ref", UnusableSUCISpecRef,
+			)
+			return nil, &ErrRejectCause{Cause: UnusableSUCIRejectCause,
+				SpecRef: UnusableSUCISpecRef, Err: serr}
+		}
+	}
+	if !identityUsableForAuth(in.RegRequest.MobileIdentity) {
+		if in.RegRequest.RegistrationType == nas.RegistrationTypeEmergency {
+			switch in.RegRequest.MobileIdentity.Type {
+			case nas.MobileIdentityIMEI, nas.MobileIdentityIMEISV:
+				// Emergency services are not supported: a PEI identity cannot be
+				// accepted. Ref: TS 24.501 §5.5.1.2.5, Annex A.2 (cause #5)
+				log.Warn("emergency registration with PEI not accepted",
+					"interface", "N1", "direction", "IN",
+					"result", "REJECT", "cause", int(PEINotAcceptedCause),
+					"spec_ref", "TS 24.501 §5.5.1.2.5",
+				)
+				return nil, ErrPEINotAccepted
+			}
+		}
+		log.Info("registration identity is neither SUCI nor 5G-GUTI — requesting SUCI",
+			"interface", "N1", "direction", "OUT",
+			"identity_type", int(in.RegRequest.MobileIdentity.Type),
+			"cause", "need_suci",
+			"spec_ref", "TS 23.502 §4.2.2.2.2 step 6",
+		)
+		return nil, ErrNeedSUCI
+	}
+
+	// Step 8: AMF selects AUSF via NRF discovery
+	// Ref: TS 23.502 V19.9.0 §4.2.2.2.2 step 8
 	log.Info("discovering AUSF via NRF",
-		"spec_ref", "TS 23.502 §4.2.2.2.2 step 5",
+		"spec_ref", "TS 23.502 §4.2.2.2.2 step 8",
 	)
 
 	// Step 6-8: AUSF authentication initiation
 	// Ref: TS 23.502 §4.2.2.2.2 step 6-8 (Nausf_UEAuthentication_Authenticate)
-	ausfResp, err := h.ausf.InitiateAuth(ctx, suciOrGUTI, h.servingNetName)
+	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFInit)
+	ausfResp, err := h.ausf.InitiateAuth(aCtx, suciOrGUTI, h.servingNetName)
+	aCancel()
 	if err != nil {
 		log.Error("AUSF authentication initiation failed", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "AUSF initiate auth failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
-		return nil, fmt.Errorf("ausf: initiate auth: %w", err)
+		return nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
+			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: initiate auth: %w", err)}
 	}
 	ue.AuthCtxID = ausfResp.AuthCtxID
 	ue.PendingRAND = ausfResp.RAND
+	ue.PendingAUTN = ausfResp.AUTN
 
 	log.Info("5G SE AV received from AUSF, sending Authentication Request to UE",
 		"auth_ctx_id", ausfResp.AuthCtxID,
@@ -490,6 +703,7 @@ func (h *RegistrationHandler) Phase1_AuthenticateWithSUCI(
 	defer span.End()
 
 	ue.SUCI = suci
+	ue.AuthViaGUTI = false // identification done: the challenge now runs on the SUCI
 	span.SetAttributes(
 		attribute.Int64("amf_ue_ngap_id", ue.AMFUENGAPId),
 		attribute.String("suci", suci),
@@ -507,16 +721,20 @@ func (h *RegistrationHandler) Phase1_AuthenticateWithSUCI(
 		"message_type", "IdentityResponse",
 	)
 
-	ausfResp, err := h.ausf.InitiateAuth(ctx, suci, h.servingNetName)
+	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFInit)
+	ausfResp, err := h.ausf.InitiateAuth(aCtx, suci, h.servingNetName)
+	aCancel()
 	if err != nil {
 		log.Error("AUSF authentication initiation failed", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "AUSF initiate auth failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
-		return nil, fmt.Errorf("ausf: initiate auth: %w", err)
+		return nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
+			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: initiate auth: %w", err)}
 	}
 	ue.AuthCtxID = ausfResp.AuthCtxID
 	ue.PendingRAND = ausfResp.RAND
+	ue.PendingAUTN = ausfResp.AUTN
 
 	log.Info("5G SE AV received — sending Authentication Request",
 		"auth_ctx_id", ausfResp.AuthCtxID,
@@ -561,7 +779,9 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 		"direction", "OUT",
 	)
 
-	ausfResp, err := h.ausf.ResyncAuth(ctx, suciOrSUPI, h.servingNetName, ue.PendingRAND, auts)
+	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFConfirm)
+	ausfResp, err := h.ausf.ResyncAuth(aCtx, suciOrSUPI, h.servingNetName, ue.PendingRAND, auts)
+	aCancel()
 	if err != nil {
 		log.Error("AUSF resync failed", "error", err)
 		span.RecordError(err)
@@ -571,6 +791,7 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 
 	ue.AuthCtxID = ausfResp.AuthCtxID
 	ue.PendingRAND = ausfResp.RAND
+	ue.PendingAUTN = ausfResp.AUTN
 
 	log.Info("resync AV received — sending new Authentication Request",
 		"auth_ctx_id", ausfResp.AuthCtxID,
@@ -587,6 +808,26 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 		RAND:  ausfResp.RAND,
 		AUTN:  ausfResp.AUTN,
 	}, nil
+}
+
+// RepeatChallengeWithNewNGKSI handles the first AUTHENTICATION FAILURE #71
+// "ngKSI already in use": it selects a new ngKSI (different from the rejected
+// one and from the current native security context) and returns the same 5G
+// authentication challenge (RAND, AUTN) to re-send. No AUSF call.
+// Ref: TS 24.501 §5.4.1.3.7 e)
+func (h *RegistrationHandler) RepeatChallengeWithNewNGKSI(ue *amfctx.UEContext) *nas.AuthenticationRequest {
+	next := allocateFreshNGKSI(ue.PendingNGKSI)
+	if ue.SecurityCtx.Active && next == ue.SecurityCtx.NGKSI {
+		next = allocateFreshNGKSI(next)
+	}
+	ue.PendingNGKSI = next
+	metrics.NASMessagesTotal.WithLabelValues(nfName, "AuthenticationRequest", "OUT", "OK").Inc()
+	return &nas.AuthenticationRequest{
+		NGKSI: nas.NGKSI{KeySetIdentifier: next, Type: 0},
+		ABBA:  h.abba,
+		RAND:  ue.PendingRAND,
+		AUTN:  ue.PendingAUTN,
+	}
 }
 
 // Phase2_ProcessAuthResponse handles the UE's Authentication Response (RES*).
@@ -621,12 +862,17 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	if len(authResp.RES) == 0 {
 		metrics.NASMessagesTotal.WithLabelValues(nfName, "AuthenticationResponse", "IN", "FAILURE").Inc()
 		span.SetStatus(codes.Error, "missing RES*")
-		return nil, nil, fmt.Errorf("amf: auth response missing RES*")
+		// A missing RES* is an invalid RES: same outcome as a RES* the AUSF rejects
+		// (AUTHENTICATION REJECT for a SUCI, identification for a 5G-GUTI).
+		// Ref: TS 24.501 §5.4.1.3.5
+		return nil, nil, fmt.Errorf("amf: auth response missing RES*: %w", ErrAuthenticationRejected)
 	}
 
 	// Step 11: forward RES* to AUSF for verification
 	// Ref: TS 23.502 §4.2.2.2.2 step 11
-	confirmResp, err := h.ausf.ConfirmAuth(ctx, ue.AuthCtxID, hex.EncodeToString(authResp.RES))
+	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFConfirm)
+	confirmResp, err := h.ausf.ConfirmAuth(aCtx, ue.AuthCtxID, hex.EncodeToString(authResp.RES))
+	aCancel()
 	if err != nil {
 		log.Error("RES* verification failed at AUSF",
 			"result", "REJECT",
@@ -635,7 +881,13 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "RES* verification failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
-		return nil, nil, fmt.Errorf("ausf: confirm auth: %w", err)
+		if errors.Is(err, ErrAuthenticationRejected) {
+			// RES* rejected: the NAS layer chooses AUTHENTICATION REJECT or the
+			// identification procedure. Ref: TS 24.501 §5.4.1.3.5
+			return nil, nil, fmt.Errorf("ausf: confirm auth: %w", err)
+		}
+		return nil, nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
+			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: confirm auth: %w", err)}
 	}
 
 	// Atomically bind the SUPI to this new context. SetSUPI returns any prior context
@@ -654,6 +906,10 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	supiForKDF := strings.TrimPrefix(ue.SUPI, "imsi-")
 	kseaf := kdf.KSEAF(confirmResp.KAUSF, h.servingNetName)
 	kamf := kdf.KAMF(kseaf, supiForKDF, [2]byte(h.abba))
+	// A new context is taken into use only once the SECURITY MODE COMPLETE is
+	// verified; the one in use before is kept for a SECURITY MODE REJECT / abort.
+	// Ref: TS 24.501 §5.4.2.5
+	ue.BeginSecurityCtxChange()
 	ue.SecurityCtx.KAMF = kamf
 
 	// Select NAS security algorithms
@@ -766,39 +1022,96 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		"message_type", "SecurityModeComplete",
 	)
 
-	// Step 15: register with UDM (Nudm_UECM_Registration)
-	// Ref: TS 23.502 §4.2.2.2.2 step 15
-	if err := h.udm.RegisterAMF(ctx, ue.SUPI, h.nfInstanceID, h.servingNetName); err != nil {
-		log.Warn("UDM AMF registration failed (non-fatal)", "error", err)
-		span.RecordError(err)
+	bud := h.budget()
+	// p3ctx bounds every SBI step of Phase3 below T3510 (budget.go); the AMF's
+	// own state handling keeps using ctx.
+	p3ctx, p3cancel := context.WithTimeout(ctx, bud.Phase3)
+	defer p3cancel()
+	emergency := ue.RegistrationType == byte(nas.RegistrationTypeEmergency)
+
+	// Step 14a: register with UDM (Nudm_UECM_Registration). A failure rejects the
+	// registration with a cause derived from the SBI error; Nudm_SDM_Get is never
+	// reached after it. For an Emergency Registration the AMF ignores an
+	// unsuccessful UDM response. Ref: TS 23.502 §4.2.2.2.2 step 14a
+	uecmCtx, uecmCancel := stepCtx(p3ctx, bud.UECM)
+	uecmErr := h.udm.RegisterAMF(uecmCtx, ue.SUPI, h.nfInstanceID, h.servingNetName)
+	uecmCancel()
+	if uecmErr != nil {
+		span.RecordError(uecmErr)
+		if emergency {
+			log.Warn("UDM AMF registration failed - ignored for an emergency registration",
+				"error", uecmErr, "interface", "Nudm", "direction", "IN",
+				"spec_ref", "TS 23.502 §4.2.2.2.2 step 14a")
+		} else {
+			cause, ref := RejectCauseForUDMError(uecmErr)
+			log.Error("UDM AMF registration failed - rejecting registration",
+				"error", uecmErr, "interface", "Nudm", "direction", "IN",
+				"result", "REJECT", "cause", int(cause), "spec_ref", ref)
+			span.SetStatus(codes.Error, "UDM UECM registration failed")
+			metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
+			return nil, &ErrRejectCause{Cause: cause, SpecRef: ref,
+				Err: fmt.Errorf("udm: uecm registration: %w", uecmErr)}
+		}
 	}
 
-	// Step 16: get subscription data from UDM (Nudm_SDM_Get)
-	// Ref: TS 23.502 §4.2.2.2.2 step 16
-	amSub, err := h.udm.GetAMSubscriptionData(ctx, ue.SUPI)
+	// Step 14b: get subscription data from UDM (Nudm_SDM_Get)
+	// Ref: TS 23.502 §4.2.2.2.2 step 14b
+	sdmCtx, sdmCancel := stepCtx(p3ctx, bud.SDMGet)
+	amSub, err := h.udm.GetAMSubscriptionData(sdmCtx, ue.SUPI)
+	sdmCancel()
 	if err != nil {
 		log.Error("UDM AM subscription data fetch failed", "error", err)
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "UDM AM subscription fetch failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
-		return nil, fmt.Errorf("udm: get AM subscription: %w", err)
+		h.rollbackUDMRegistration(ctx, ue, uecmErr == nil)
+		return nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
+			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("udm: get AM subscription: %w", err)}
 	}
+
+	// Step 14b (cont.): Nudm_SDM_Subscribe after the AM-data Get; non-fatal.
+	// Ref: TS 23.502 §4.2.2.2.2 step 14b, TS 29.503 §5.2.2.3
+	if sub, ok := h.udm.(UDMSDMSubscriber); ok {
+		subCtx, subCancel := stepCtx(p3ctx, bud.SDMSubscribe)
+		subID, subErr := sub.SubscribeAMData(subCtx, ue.SUPI)
+		subCancel()
+		if subErr != nil {
+			log.Warn("UDM SDM subscribe failed (non-fatal)", "error", subErr,
+				"interface", "Nudm", "direction", "OUT", "result", "FAILURE",
+				"spec_ref", "TS 29.503 §5.2.2.3")
+		} else if subID != "" {
+			ue.SetSDMSubscriptionID(subID)
+			log.Info("UDM SDM subscription created",
+				"subscription_id", subID, "interface", "Nudm", "direction", "OUT",
+				"spec_ref", "TS 29.503 §5.2.2.3")
+		}
+	}
+
+	// Optional peers (NSSF slice selection, PCF AM policy, PCF UE policy) are
+	// independent of each other: run them in parallel under one short budget and
+	// apply the results below in a fixed order (no UE-context writes from the
+	// goroutines). Each failure/timeout degrades as before (non-fatal).
+	// Ref: TS 23.502 §4.2.9, §4.2.2.2.2 steps 14c, 17b
+	if p3ctx.Err() != nil {
+		log.Warn("Phase3 budget already spent - optional peers run with a cancelled context and will degrade",
+			"cause", p3ctx.Err().Error(), "result", "FAILURE", "budget_ms", bud.Phase3.Milliseconds(),
+			"spec_ref", "TS 24.501 §10.2 Table 10.2.1 (T3510)")
+	}
+	opt := h.runOptionalPeers(p3ctx, bud.Optional, ue.SUPI, ue.RequestedNSSAI)
 	// Compute AllowedNSSAI: prefer NSSF delegation if configured; fall back to
-	// local UDM-subscription filter. NSSF failure is non-fatal — fallback keeps
-	// the registration on track. Ref: TS 23.502 §4.2.9
+	// local UDM-subscription filter. NSSF failure is non-fatal. Ref: TS 23.502 §4.2.9
 	if h.nssf != nil {
-		nssfAllowed, err := h.nssf.NSSelection(ctx, "AMF", h.nfInstanceID, ue.RequestedNSSAI)
-		if err != nil {
+		if opt.nssfErr != nil {
 			log.Warn("NSSF NSSelection failed — falling back to local UDM filter",
-				"error", err,
+				"error", opt.nssfErr,
 				"spec_ref", "TS 23.502 §4.2.9",
 			)
 			ue.AllowedNSSAI = filterAllowedNSSAI(ue.RequestedNSSAI, amSub.AllowedNSSAI)
 		} else {
 			// Intersect NSSF result with UDM subscription to enforce subscription limits.
-			ue.AllowedNSSAI = filterAllowedNSSAI(nssfAllowed, amSub.AllowedNSSAI)
+			ue.AllowedNSSAI = filterAllowedNSSAI(opt.nssfAllowed, amSub.AllowedNSSAI)
 			log.Info("NSSF NSSelection completed",
-				"nssf_allowed_count", len(nssfAllowed),
+				"nssf_allowed_count", len(opt.nssfAllowed),
 				"final_count", len(ue.AllowedNSSAI),
 				"spec_ref", "TS 29.531 §5.2.2.2",
 			)
@@ -806,24 +1119,43 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 	} else {
 		ue.AllowedNSSAI = filterAllowedNSSAI(ue.RequestedNSSAI, amSub.AllowedNSSAI)
 	}
-	if len(ue.AllowedNSSAI) == 0 && len(ue.RequestedNSSAI) > 0 {
-		// TODO: send RegistrationReject cause 36 "No network slices available"
-		// Ref: TS 24.501 §5.5.1.2.4, cause #36
-		log.Warn("NSSAI intersection empty — no requested slices are subscribed",
-			"cause", "NSSAI_NOT_ALLOWED",
-			"requested_count", len(ue.RequestedNSSAI),
-		)
-	}
+	ue.AllowedNSSAI = h.limitAllowedNSSAI(ctx, ue, ue.AllowedNSSAI)
+	ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), amSub.AllowedNSSAI...)
 	// Withhold slices subject to NSSAA from the initial Allowed NSSAI; they are
 	// granted only after slice-level EAP auth succeeds (run after RegistrationComplete).
 	// No-op when NSSAA is unconfigured or no slice is flagged. Ref: TS 23.502 §4.2.9.2.
 	h.SplitPendingNSSAA(ue)
+	// No allowed slice and none pending NSSAA: REGISTRATION REJECT #62, never an
+	// Accept with an empty Allowed NSSAI (min length 4, §9.11.3.37).
+	// Ref: TS 24.501 §5.5.1.2.5; TS 23.502 §4.2.2.2.2 step 21
+	if len(ue.AllowedNSSAI) == 0 && len(ue.PendingNSSAA) == 0 &&
+		ue.NSSAAInProgress == nil && len(ue.NSSAAPendingStatus) == 0 {
+		rejected := rejectedNSSAIForRegistration(ue)
+		log.Warn("no network slices available — rejecting registration",
+			"procedure", "InitialRegistration",
+			"interface", "N1",
+			"direction", "OUT",
+			"message_type", "RegistrationReject",
+			"result", "REJECT",
+			"cause", int(nas.CauseNoNetworkSlicesAvailable),
+			"requested_count", len(ue.RequestedNSSAI),
+			"spec_ref", "TS 24.501 §5.5.1.2.5",
+		)
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		h.releasePolicyAssociations(ctx, opt)
+		h.rollbackUDMRegistration(ctx, ue, uecmErr == nil)
+		return nil, &NoNetworkSlicesError{Rejected: rejected}
+	}
 	ue.SubscribedAMBR.UL = amSub.AMBRUplink
 	ue.SubscribedAMBR.DL = amSub.AMBRDownlink
+	ue.GPSI = amSub.GPSI
 
 	// Assign new 5G-GUTI
+	// The UE is NOT 5GMM-REGISTERED yet: the AMF enters 5GMM-REGISTERED only once the
+	// REGISTRATION ACCEPT is sent (no new 5G-GUTI) or the REGISTRATION COMPLETE
+	// arrives (T3550 running). The NAS layer drives the transition.
+	// Ref: TS 24.501 §5.5.1.2.4
 	guti := h.mgr.AssignGUTI(ctx, ue)
-	ue.TransitionTo(amfctx.GMMRegistered)
 
 	metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "OK").Inc()
 	metrics.NASMessagesTotal.WithLabelValues(nfName, "RegistrationAccept", "OUT", "OK").Inc()
@@ -836,7 +1168,7 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		"interface", "N1",
 		"direction", "OUT",
 		"message_type", "RegistrationAccept",
-		"spec_ref", "TS 23.502 §4.2.2.2.2 step 20",
+		"spec_ref", "TS 23.502 §4.2.2.2.2 step 21",
 	)
 
 	// Operator default RFSP — always set before the PCF call so the IE is
@@ -845,46 +1177,42 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 	// Ref: TS 38.413 §9.3.1.27 (IndexToRFSP, range 1-256), TS 23.501 §5.3.4.2
 	ue.RFSP = h.defaultRFSP
 
-	// Step 14c (optional): create AM Policy Association with PCF (Npcf_AMPolicyControl).
-	// PCF may return servAreaRes (Service Area Restriction); if so, enforce it:
-	// reject the registration with 5GMM cause #73 if the UE's TAC is not allowed.
-	// Non-fatal when PCF is unavailable — operator default RFSP is used instead.
-	// Ref: TS 23.502 §4.2.2.2.2 step 14c; TS 23.501 §5.3.4; TS 29.507 §4.2.2.2
+	// Step 14c (optional): AM Policy Association with PCF (Npcf_AMPolicyControl),
+	// created in the parallel group above. PCF may return servAreaRes (Service
+	// Area Restriction); if so, enforce it: reject the registration with 5GMM
+	// cause #73 if the UE's TAC is not allowed. Non-fatal when PCF is
+	// unavailable - operator default RFSP is used instead.
+	// Ref: TS 23.502 §4.2.2.2.2 step 14c; TS 23.501 §5.3.4; TS 29.507 §4.2.2
 	if h.amPolicy != nil {
-		amPolID, rfsp, servAreaRes, amPolErr := h.amPolicy.CreateAMPolicyAssociation(
-			ctx, ue.SUPI, "3GPP_ACCESS", h.plmnMCC, h.plmnMNC)
-		if amPolErr != nil {
+		if opt.amErr != nil {
 			log.Warn("PCF AM policy association failed — using operator default RFSP",
-				"error", amPolErr,
+				"error", opt.amErr,
 				"rfsp_default", ue.RFSP,
 				"interface", "N15",
-				"spec_ref", "TS 29.507 §4.2.2.2")
+				"spec_ref", "TS 29.507 §4.2.2")
 		} else {
-			ue.AMPolicyAssocID = amPolID
-			if rfsp > 0 {
-				ue.RFSP = rfsp // PCF-provided value takes precedence
+			ue.AMPolicyAssocID = opt.amID
+			if opt.amRFSP > 0 {
+				ue.RFSP = opt.amRFSP // PCF-provided value takes precedence
 			}
-			ue.ServAreaRes = servAreaRes
+			ue.SetServiceAreaRestriction(opt.amSAR)
 			log.Info("PCF AM policy association created",
-				"am_pol_asso_id", amPolID,
+				"am_pol_asso_id", opt.amID,
 				"rfsp", ue.RFSP,
-				"rfsp_source", rfspSource(rfsp, h.defaultRFSP),
-				"has_serv_area_res", servAreaRes != nil,
+				"rfsp_source", rfspSource(opt.amRFSP, h.defaultRFSP),
+				"has_serv_area_res", opt.amSAR != nil,
 				"interface", "N15", "direction", "OUT",
-				"spec_ref", "TS 29.507 §4.2.2.2")
+				"spec_ref", "TS 29.507 §4.2.2")
 		}
 
-		// Enforce service area restriction (TS 23.501 §5.3.4, TS 24.501 §8.2.8.2).
-		// cause 0x49 = 73 = "Serving network not authorized"
-		if ue.ServAreaRes != nil && !h.isAllowedTA(ue.TAI.TAC, ue.ServAreaRes) {
-			log.Warn("UE TAC not allowed by PCF service area restriction — rejecting",
+		// A UE in a Non-Allowed Area is still allowed to register (TS 23.501 §3.1,
+		// §5.3.4.1.1); the restriction is conveyed in the Service area list IE of
+		// REGISTRATION ACCEPT and enforced on Service Request / UL NAS TRANSPORT.
+		if ue.InNonAllowedArea() {
+			log.Info("UE in a Non-Allowed Area - registration accepted with service area list",
 				"tac", fmt.Sprintf("%06X", ue.TAI.TAC),
-				"restriction_type", ue.ServAreaRes.RestrictionType,
-				"cause", "73",
-				"spec_ref", "TS 23.501 §5.3.4, TS 24.501 §8.2.8.2",
-			)
-			metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
-			return nil, ErrServiceAreaRestricted
+				"restriction_type", restrictionType(ue),
+				"spec_ref", "TS 23.501 §5.3.4.1.1, TS 24.501 §5.3.5")
 		}
 	}
 
@@ -894,26 +1222,24 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		"spec_ref", "TS 38.413 §9.3.1.27",
 	)
 
-	// Step 17b (optional): fetch URSP policy from PCF (N15 interface).
-	// Non-fatal: if PCF is unavailable, registration proceeds without policy delivery.
-	// URSP is NOT placed in Registration Accept — the UE policy container is delivered
-	// via the UE policy delivery service over DL NAS TRANSPORT (payload container type
-	// 0x05) immediately after RegistrationComplete (handleRegistrationComplete). The
-	// container is staged in PendingPolicyContainer here.
+	// Step 17b (optional): URSP policy from PCF (N15), fetched in the parallel
+	// group above. Non-fatal: if PCF is unavailable, registration proceeds
+	// without policy delivery. URSP is NOT placed in Registration Accept - the UE
+	// policy container is delivered over DL NAS TRANSPORT (payload container type
+	// 0x05) after RegistrationComplete (handleRegistrationComplete) and staged in
+	// PendingPolicyContainer here.
 	// Ref: TS 23.502 §4.2.2.2.2 step 17b, §4.2.4.3; TS 24.501 Annex D; TS 29.525 §4.2.2.2
 	if h.pcf != nil {
-		servingPlmn := h.plmnMCC + h.plmnMNC
-		polAssoID, container, pcfErr := h.pcf.CreateUEPolicyAssociation(ctx, ue.SUPI, servingPlmn)
-		if pcfErr != nil {
+		if opt.ueErr != nil {
 			log.Warn("PCF N15 CreateUEPolicyAssociation failed (non-fatal)",
-				"error", pcfErr, "interface", "N15",
+				"error", opt.ueErr, "interface", "N15",
 				"spec_ref", "TS 29.525 §4.2.2.2")
-		} else if len(container) > 0 {
-			ue.PolicyAssociationID = polAssoID
-			ue.PendingPolicyContainer = container
+		} else if len(opt.ueContainer) > 0 {
+			ue.PolicyAssociationID = opt.uePolID
+			ue.PendingPolicyContainer = opt.ueContainer
 			log.Info("PCF N15 policy association created — UE policy delivery queued for post-registration",
-				"pol_asso_id", polAssoID,
-				"policy_container_bytes", len(container),
+				"pol_asso_id", opt.uePolID,
+				"policy_container_bytes", len(opt.ueContainer),
 				"interface", "N15", "direction", "OUT",
 				"spec_ref", "TS 29.525 §4.2.2.2")
 		}
@@ -939,30 +1265,140 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
 		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
+		// IEI 0x27: Service area list, absent without a PCF service area
+		// restriction (legacy bytes unchanged). Ref: TS 24.501 §5.3.5
+		ServiceAreaList: h.buildServiceAreaList(ue),
 		// IEI 0x21: 5GS network feature support (IMS VoPS-3GPP bit only).
 		// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
-		NetworkFeatureSupport: nas.NewNetworkFeatureSupport(h.imsVoPS3GPP),
+		NetworkFeatureSupport: h.networkFeatureSupport(ctx, ue),
 		// URSP intentionally omitted — delivered via DL NAS TRANSPORT after registration.
 	}
 	// IEI 0x5E: T3512 Periodic Registration Timer (GPRS Timer 3 encoding).
 	// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1
 	h.setT3512Value(ra, ue)
+	h.applyNSSAAAcceptIEs(ra, ue)
+	if len(ue.AllowedNSSAI) == 0 {
+		// NSSAA-only case: the Allowed NSSAI IE is omitted (min length 4).
+		// Ref: TS 24.501 §5.5.1.2.4, §9.11.3.37
+		ra.AllowedNSSAI = nil
+	}
 	return ra, nil
 }
 
+// NoNetworkSlicesError is returned by Phase3_ProcessSMCComplete when the Allowed
+// NSSAI is empty and no S-NSSAI is pending NSSAA: the NAS handler answers with
+// REGISTRATION REJECT 5GMM cause #62 carrying Rejected.
+// Ref: TS 24.501 §5.5.1.2.5
+type NoNetworkSlicesError struct {
+	// Rejected lists every S-NSSAI of the Requested NSSAI with its cause value.
+	Rejected []nas.RejectedSNSSAI
+}
+
+// Error implements error.
+func (e *NoNetworkSlicesError) Error() string {
+	return "no network slices available (cause #62)"
+}
+
+// rejectedNSSAIForRegistration lists every requested S-NSSAI (at most
+// nas.MaxRejectedSNSSAIs) with cause 2 when it failed NSSAA, else "not
+// available in the current PLMN" (not subscribed).
+// Ref: TS 24.501 §5.5.1.2.5, Table 9.11.3.46.1
+func rejectedNSSAIForRegistration(ue *amfctx.UEContext) []nas.RejectedSNSSAI {
+	var out []nas.RejectedSNSSAI
+	for _, r := range ue.RequestedNSSAI {
+		if len(out) == nas.MaxRejectedSNSSAIs {
+			break
+		}
+		cause := nas.RejectedCauseNotAvailableInPLMN
+		if hasSubscribed(ue.RejectedNSSAI, r) {
+			cause = nas.RejectedCauseNSSAAFailedOrRevoked
+		}
+		out = append(out, nas.RejectedSNSSAI{Cause: cause, SNSSAI: toNASSNSSAI(r)})
+	}
+	return out
+}
+
 // ---- helpers ------------------------------------------------------------
+
+// UnusableSUCIRejectCause is the 5GMM cause of the REGISTRATION REJECT for a
+// 5GS mobile identity (SUCI) that is malformed or not representable: #96
+// "Invalid mandatory information". Ref: TS 24.501 §5.5.1.2.8 b), Annex A.2
+const UnusableSUCIRejectCause = nas.CauseInvalidMandatoryInformation
+
+// UnusableSUCISpecRef is the clause behind UnusableSUCIRejectCause.
+const UnusableSUCISpecRef = "TS 24.501 §5.5.1.2.8 b)"
+
+// identityUsableForAuth reports whether the Registration Request identity is a
+// decoded SUCI or 5G-GUTI, the only identities from which the AMF can start
+// authentication. Ref: TS 23.502 §4.2.2.2.2 step 6
+func identityUsableForAuth(mi nas.MobileIdentity) bool {
+	switch mi.Type {
+	case nas.MobileIdentitySUCI:
+		if mi.SUCI == nil {
+			return false
+		}
+		_, err := SUCIString(mi.SUCI)
+		return err == nil
+	case nas.MobileIdentityGUTI:
+		return mi.GUTI != nil
+	}
+	return false
+}
+
+// SUCIString renders a NAS SUCI mobile identity in the standard SUCI text form
+// of TS 29.571 §5.3.2 (SupiOrSuci), TS 29.509 §6.1.6.2.2 supiOrSuci:
+// suci-<type>-<mcc>-<mnc>-<routing>-<scheme>-<key id>-<output>. The null
+// scheme output is the MSIN digits (BCD-decoded), Profile A/B output is
+// lowercase hex (TS 23.003 §2.2B, TS 24.501 §9.11.3.4). An identity that is
+// not representable (NAI format, bad BCD, key id 0 for a non-null scheme, ...)
+// returns an error and must not be sent to the AUSF.
+func SUCIString(s *nas.SUCIMobileIdentity) (string, error) {
+	if s == nil {
+		return "", fmt.Errorf("amf: suci string: nil SUCI")
+	}
+	if s.SUPIFormat != types.SUPITypeIMSI {
+		return "", fmt.Errorf("amf: suci string: SUPI format %d (NAI) not representable as IMSI SUCI", s.SUPIFormat)
+	}
+	c := types.SUCI{
+		SUPIType:         types.SUPITypeIMSI,
+		MCC:              s.MCC,
+		MNC:              s.MNC,
+		RoutingIndicator: s.RoutingIndicator,
+		ProtectionScheme: s.ProtectionSchemeID,
+	}
+	if s.ProtectionSchemeID == types.SUCISchemeNull {
+		msin, err := types.NullSchemeMSIN(s.SchemeOutput)
+		if err != nil {
+			return "", fmt.Errorf("amf: suci string: %w", err)
+		}
+		c.SchemeOutput = msin
+	} else {
+		c.HNPublicKeyID = s.HomeNetworkPublicKeyID
+		c.SchemeOutput = hex.EncodeToString(s.SchemeOutput)
+	}
+	out := c.String()
+	if _, err := types.ParseSUCI(out); err != nil {
+		// The parse error quotes the rendered SUCI; do not propagate it, a
+		// concealed scheme output must not reach logs.
+		return "", fmt.Errorf("amf: suci string: rendered SUCI violates the TS 29.571 §5.3.2 pattern")
+	}
+	return out, nil
+}
 
 func extractIdentity(rr *nas.RegistrationRequest) string {
 	mi := rr.MobileIdentity
 	switch mi.Type {
 	case nas.MobileIdentitySUCI:
 		if mi.SUCI != nil {
-			return fmt.Sprintf("suci-%s%s-%s-0-%d-%s",
-				mi.SUCI.MCC, mi.SUCI.MNC,
-				mi.SUCI.RoutingIndicator,
-				mi.SUCI.ProtectionSchemeID,
-				hex.EncodeToString(mi.SUCI.SchemeOutput),
-			)
+			suci, err := SUCIString(mi.SUCI)
+			if err == nil {
+				return suci
+			}
+			// Phase1 rejects the registration; keep the cause visible.
+			slog.Warn("registration SUCI not representable",
+				"nf", "AMF", "procedure", "InitialRegistration",
+				"interface", "N1", "direction", "IN", "error", err,
+				"spec_ref", "TS 29.571 §5.3.2")
 		}
 	case nas.MobileIdentityGUTI:
 		if mi.GUTI != nil {
@@ -975,6 +1411,27 @@ func extractIdentity(rr *nas.RegistrationRequest) string {
 		}
 	}
 	return "unknown"
+}
+
+// gutiAllocatedHere reports whether the 5G-GUTI's GUAMI (MCC, MNC, AMF Region
+// ID, AMF Set ID, AMF Pointer) is this AMF's: only then can its 5G-TMSI be
+// resolved locally. Ref: TS 23.003 §2.10.1
+func (h *RegistrationHandler) gutiAllocatedHere(g *nas.GUTIMobileIdentity) bool {
+	id := h.mgr.AMFID
+	return g.MCC == id.MCC && g.MNC == id.MNC && g.AMFRegionID == id.AMFRegionID &&
+		g.AMFSetID == id.AMFSetID && g.AMFID == id.AMFID
+}
+
+// acceptableUESecurityCapability reports whether the UE security capability IE
+// is present and offers at least one 5GS encryption algorithm (NEA0..NEA2) and
+// one non-null 5GS integrity algorithm (NIA1, NIA2) that selectSecurityAlgorithms
+// can choose. NIA0 alone is not acceptable outside emergency services.
+// Ref: TS 24.501 §5.5.1.2.8 i); TS 33.501 §5.5.2
+func acceptableUESecurityCapability(sc *nas.UESecurityCapability) bool {
+	if sc == nil {
+		return false
+	}
+	return (sc.EA0 || sc.EA1 || sc.EA2) && (sc.IA1 || sc.IA2)
 }
 
 // selectSecurityAlgorithms chooses NAS security algorithms based on UE capability
@@ -1017,7 +1474,9 @@ func (h *RegistrationHandler) selectSecurityAlgorithms(ue *amfctx.UEContext) (ci
 // its subscribed slices. If requested is empty, all subscribed slices are allowed
 // (backward compatibility when UE sends no RequestedNSSAI IE).
 // A requested entry with SD=="" is treated as a wildcard matching any SD with
-// the same SST. Ref: TS 23.502 §4.2.2.2.2, TS 24.501 §5.5.1.2.4
+// the same SST. The result is not limited to MaxAllowedNSSAI; the registration
+// path applies limitAllowedNSSAI once after the filter.
+// Ref: TS 23.502 §4.2.2.2.2, TS 24.501 §5.5.1.2.4
 func filterAllowedNSSAI(requested, subscribed []amfctx.SNSSAISubscribed) []amfctx.SNSSAISubscribed {
 	if len(requested) == 0 {
 		return subscribed
@@ -1037,9 +1496,45 @@ func filterAllowedNSSAI(requested, subscribed []amfctx.SNSSAISubscribed) []amfct
 	return result
 }
 
+// MaxAllowedNSSAI is the maximum number of S-NSSAIs in an Allowed NSSAI.
+// Ref: TS 24.501 §4.6.2.2, §9.11.3.37 (at most 8 S-NSSAIs); TS 38.413
+// maxnoofAllowedS-NSSAIs = 8.
+const MaxAllowedNSSAI = 8
+
+// capAllowedNSSAI truncates an Allowed NSSAI to MaxAllowedNSSAI entries. It
+// returns a copy when it truncates, so the result never aliases the input.
+func capAllowedNSSAI(in []amfctx.SNSSAISubscribed) []amfctx.SNSSAISubscribed {
+	if len(in) <= MaxAllowedNSSAI {
+		return in
+	}
+	return append([]amfctx.SNSSAISubscribed(nil), in[:MaxAllowedNSSAI]...)
+}
+
+// limitAllowedNSSAI applies the MaxAllowedNSSAI limit to the UE's Allowed NSSAI
+// and logs the dropped excess once. The Registration Accept path has no
+// per-slice rejected-NSSAI mechanism for the excess.
+// Ref: TS 24.501 §4.6.2.2
+func (h *RegistrationHandler) limitAllowedNSSAI(ctx context.Context, ue *amfctx.UEContext,
+	in []amfctx.SNSSAISubscribed) []amfctx.SNSSAISubscribed {
+	if len(in) <= MaxAllowedNSSAI {
+		return in
+	}
+	logging.NewProcedureLogger(ctx, h.logger, "InitialRegistration").WarnContext(ctx,
+		"allowed NSSAI exceeds maximum — dropping excess S-NSSAIs",
+		"nf", nfName,
+		"amf_ue_ngap_id", ue.AMFUENGAPId,
+		"supi", ue.SUPI,
+		"cause", "allowed_nssai_over_limit",
+		"count", len(in),
+		"max", MaxAllowedNSSAI,
+		"spec_ref", "TS 24.501 §4.6.2.2",
+	)
+	return capAllowedNSSAI(in)
+}
+
 func buildAllowedNSSAI(subs []amfctx.SNSSAISubscribed) nas.NSSAI {
 	var n nas.NSSAI
-	for _, s := range subs {
+	for _, s := range capAllowedNSSAI(subs) {
 		sdUint := uint32(0xFFFFFF)
 		if s.SD != "" && len(s.SD) == 6 {
 			b, err := hex.DecodeString(s.SD)
@@ -1064,8 +1559,8 @@ func buildAllowedNSSAI(subs []amfctx.SNSSAISubscribed) nas.NSSAI {
 func (h *RegistrationHandler) BuildRegistrationUpdateAccept(
 	ctx context.Context, ue *amfctx.UEContext) (*nas.RegistrationAccept, error) {
 
+	// 5GMM state is handled by the NAS layer (T3550 / REGISTRATION COMPLETE).
 	guti := h.mgr.AssignGUTI(ctx, ue)
-	ue.TransitionTo(amfctx.GMMRegistered)
 
 	metrics.ProcedureTotal.WithLabelValues(nfName, "RegistrationUpdate", "OK").Inc()
 	metrics.NASMessagesTotal.WithLabelValues(nfName, "RegistrationAccept", "OUT", "OK").Inc()
@@ -1088,23 +1583,56 @@ func (h *RegistrationHandler) BuildRegistrationUpdateAccept(
 		// Ref: TS 24.501 §9.11.3.9, §5.5.1.2.4
 		TAIList:      h.buildTAIList(ue),
 		AllowedNSSAI: &allowedNSSAI,
+		// IEI 0x27: Service area list (nil without SAR). Ref: TS 24.501 §5.3.5
+		ServiceAreaList: h.buildServiceAreaList(ue),
 		// IEI 0x21: 5GS network feature support — same as Initial Registration.
 		// Ref: TS 24.501 §8.2.7.1 Table 8.2.7.1.1, §9.11.3.5
-		NetworkFeatureSupport: nas.NewNetworkFeatureSupport(h.imsVoPS3GPP),
+		NetworkFeatureSupport: h.networkFeatureSupport(ctx, ue),
 	}
 	h.setT3512Value(ra, ue)
+	h.applyNSSAAAcceptIEs(ra, ue)
 	return ra, nil
 }
 
 // DeregisterUECM removes the AMF registration from UDM after UE deregistration.
 // Ref: TS 23.502 §4.2.2.3.2 step 3, TS 29.503 §5.3.2.4
 func (h *RegistrationHandler) DeregisterUECM(ctx context.Context, supi string) error {
+	if h.udm == nil {
+		h.logger.Warn("UDM client not configured - UECM de-registration skipped",
+			"procedure", "Deregistration", "supi", supi,
+			"spec_ref", "TS 23.502 §4.2.2.3.2 step 3, TS 29.503 §5.3.2.4")
+		return nil
+	}
+	h.unsubscribeSDM(ctx, supi)
 	return h.udm.DeregisterUECM(ctx, supi)
+}
+
+// unsubscribeSDM deletes the UE's Nudm_SDM subscription (created at
+// registration) where the AMF deregisters from the UDM. Best-effort: logged,
+// never fails the deregistration. Ref: TS 29.503 §5.2.2.4
+func (h *RegistrationHandler) unsubscribeSDM(ctx context.Context, supi string) {
+	sub, ok := h.udm.(UDMSDMSubscriber)
+	if !ok || h.mgr == nil {
+		return
+	}
+	ue, found := h.mgr.GetBySUPI(supi)
+	if !found {
+		return
+	}
+	id := ue.TakeSDMSubscriptionID()
+	if id == "" {
+		return
+	}
+	if err := sub.UnsubscribeSDM(ctx, supi, id); err != nil {
+		h.logger.Warn("UDM SDM unsubscribe failed (non-fatal)", "procedure", "Deregistration",
+			"interface", "Nudm", "direction", "OUT", "supi", supi, "subscription_id", id,
+			"result", "FAILURE", "error", err, "spec_ref", "TS 29.503 §5.2.2.4")
+	}
 }
 
 // ReleaseAMPolicy releases the AM policy association at PCF.
 // Non-fatal: caller logs and continues on error.
-// Ref: TS 29.507 §4.2.2.4, TS 23.502 §4.2.2.3.2 step 3
+// Ref: TS 29.507 §4.2.5, TS 23.502 §4.2.2.3.2 step 3
 func (h *RegistrationHandler) ReleaseAMPolicy(ctx context.Context, polAssoID string) error {
 	if h.amPolicy == nil {
 		return nil
@@ -1114,7 +1642,7 @@ func (h *RegistrationHandler) ReleaseAMPolicy(ctx context.Context, polAssoID str
 
 // ReleasePCFPolicy releases the UE policy association at PCF (URSP/Npcf_UEPolicyControl).
 // Non-fatal: caller logs and continues on error.
-// Ref: TS 29.525 §4.2.2.3, TS 23.502 §4.2.2.3.2 step 3
+// Ref: TS 29.525 §4.2.5, TS 23.502 §4.2.2.3.2 step 3
 func (h *RegistrationHandler) ReleasePCFPolicy(ctx context.Context, polAssoID string) error {
 	if h.pcf == nil {
 		return nil
@@ -1128,37 +1656,23 @@ func (h *RegistrationHandler) RemoveUEContext(ctx context.Context, ue *amfctx.UE
 	h.mgr.Remove(ctx, ue)
 }
 
+// ConfirmGUTI marks the UE's new 5G-GUTI as in use (REGISTRATION COMPLETE):
+// the previous 5G-TMSI no longer resolves. Ref: TS 24.501 §5.5.1.3.8 a) 1) i)
+func (h *RegistrationHandler) ConfirmGUTI(ue *amfctx.UEContext) {
+	h.mgr.ConfirmGUTI(ue)
+}
+
 // PersistUE writes the UE context to PostgreSQL. No-op when no store is configured.
 func (h *RegistrationHandler) PersistUE(ctx context.Context, ue *amfctx.UEContext) {
 	h.mgr.PersistUE(ctx, ue)
 }
 
-// isAllowedTA returns true when the UE's TAC is permitted by the PCF service area restriction.
-// Empty allowed-area list is treated as unrestricted.
-// Ref: TS 23.501 §5.3.4, TS 29.507 §6.1.1.2.5
+// isAllowedTA returns true when the UE's TAC is permitted by the PCF service area
+// restriction. It delegates to ServiceAreaRestriction.AllowsTAC, the single
+// implementation (ALLOWED_AREAS with a non-nil empty list = allowed nowhere).
+// Ref: TS 23.501 §5.3.4.1, TS 29.507 §6.1.1.2.5
 func (h *RegistrationHandler) isAllowedTA(tac uint32, sar *amfctx.ServiceAreaRestriction) bool {
-	tacHex := fmt.Sprintf("%06x", tac)
-	switch sar.RestrictionType {
-	case "ALLOWED_AREAS":
-		if len(sar.AllowedTACs) == 0 {
-			return true // empty = unrestricted
-		}
-		for _, allowed := range sar.AllowedTACs {
-			if strings.EqualFold(allowed, tacHex) {
-				return true
-			}
-		}
-		return false
-	case "NOT_ALLOWED_AREAS":
-		for _, blocked := range sar.NotAllowedTACs {
-			if strings.EqualFold(blocked, tacHex) {
-				return false
-			}
-		}
-		return true
-	default:
-		return true // unknown restriction type — treat as unrestricted
-	}
+	return sar.AllowsTAC(tac)
 }
 
 func zeroPad(s string, n int) string {
@@ -1166,4 +1680,117 @@ func zeroPad(s string, n int) string {
 		s = "0" + s
 	}
 	return s
+}
+
+// optionalPeerResults is the outcome of the parallel optional-peer group; the
+// goroutines write only their own fields, the caller applies them after Wait.
+type optionalPeerResults struct {
+	nssfAllowed []amfctx.SNSSAISubscribed
+	nssfErr     error
+
+	amID   string
+	amRFSP int
+	amSAR  *amfctx.ServiceAreaRestriction
+	amErr  error
+
+	uePolID     string
+	ueContainer []byte
+	ueErr       error
+}
+
+// runOptionalPeers calls the configured optional peers (NSSF, PCF AM policy, PCF
+// UE policy) concurrently, each under the same budget derived from ctx, and
+// returns once all have answered or timed out. Inputs are copied before the
+// goroutines start so none touches the UE context.
+// Ref: TS 23.502 §4.2.9, §4.2.2.2.2 steps 14c, 17b
+func (h *RegistrationHandler) runOptionalPeers(ctx context.Context, budget time.Duration,
+	supi string, requested []amfctx.SNSSAISubscribed) *optionalPeerResults {
+	res := &optionalPeerResults{}
+	requested = append([]amfctx.SNSSAISubscribed(nil), requested...)
+	pctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	var wg sync.WaitGroup
+	if h.nssf != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res.nssfAllowed, res.nssfErr = h.nssf.NSSelection(pctx, "AMF", h.nfInstanceID, requested)
+		}()
+	}
+	if h.amPolicy != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res.amID, res.amRFSP, res.amSAR, res.amErr = h.amPolicy.CreateAMPolicyAssociation(
+				pctx, supi, "3GPP_ACCESS", h.plmnMCC, h.plmnMNC)
+		}()
+	}
+	if h.pcf != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res.uePolID, res.ueContainer, res.ueErr = h.pcf.CreateUEPolicyAssociation(pctx, supi, h.plmnMCC+h.plmnMNC)
+		}()
+	}
+	wg.Wait()
+	return res
+}
+
+// rollbackUDMRegistration undoes the UDM side effects of a Phase3 that is then
+// rejected: the SDM subscription (id stored on the UE) is deleted and, when the
+// Nudm_UECM registration succeeded, the AMF deregisters from the UDM, so no
+// subscription/registration is left for a UE that never became registered.
+// Best-effort, detached from the caller context. Ref: TS 23.502 §4.2.2.2.2
+// step 14, TS 29.503 §5.2.2.4, §5.3.2.4.
+func (h *RegistrationHandler) rollbackUDMRegistration(ctx context.Context, ue *amfctx.UEContext, uecmOK bool) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.budget().UECM+h.budget().SDMSubscribe)
+	defer cancel()
+	log := h.logger.With("procedure", "InitialRegistration", "supi", ue.SUPI,
+		"interface", "Nudm", "direction", "OUT", "spec_ref", "TS 23.502 §4.2.2.2.2 step 14")
+	if sub, ok := h.udm.(UDMSDMSubscriber); ok {
+		if id := ue.TakeSDMSubscriptionID(); id != "" {
+			if err := sub.UnsubscribeSDM(rctx, ue.SUPI, id); err != nil {
+				log.Warn("UDM SDM unsubscribe failed on rejected registration",
+					"subscription_id", id, "result", "FAILURE", "error", err.Error())
+			}
+		}
+	}
+	if !uecmOK {
+		return
+	}
+	if err := h.udm.DeregisterUECM(rctx, ue.SUPI); err != nil {
+		log.Warn("UDM UECM deregistration failed on rejected registration",
+			"result", "FAILURE", "error", err.Error())
+	}
+}
+
+// releasePolicyAssociations best-effort deletes the PCF associations created by
+// the parallel group when the registration is then rejected (they would leak:
+// no UE context survives to release them). Detached from the caller context.
+func (h *RegistrationHandler) releasePolicyAssociations(ctx context.Context, r *optionalPeerResults) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.budget().Optional)
+	defer cancel()
+	if h.amPolicy != nil && r.amErr == nil && r.amID != "" {
+		if err := h.amPolicy.DeleteAMPolicyAssociation(rctx, r.amID); err != nil {
+			h.logger.Warn("PCF AM policy release failed on rejected registration",
+				"procedure", "InitialRegistration", "interface", "N15", "direction", "OUT",
+				"result", "FAILURE", "error", err.Error(), "spec_ref", "TS 29.507 §4.2.5")
+		}
+	}
+	if h.pcf != nil && r.ueErr == nil && r.uePolID != "" {
+		if err := h.pcf.DeleteUEPolicyAssociation(rctx, r.uePolID); err != nil {
+			h.logger.Warn("PCF UE policy release failed on rejected registration",
+				"procedure", "InitialRegistration", "interface", "N15", "direction", "OUT",
+				"result", "FAILURE", "error", err.Error(), "spec_ref", "TS 29.525 §4.2.5")
+		}
+	}
+}
+
+// restrictionType returns the UE's service area restriction type for logging.
+func restrictionType(ue *amfctx.UEContext) string {
+	sar, _ := ue.ServiceAreaSnapshot()
+	if sar == nil {
+		return ""
+	}
+	return sar.RestrictionType
 }

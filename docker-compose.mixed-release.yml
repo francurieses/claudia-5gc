@@ -1,0 +1,34 @@
+# docker-compose.mixed-release.yml - REL19-10.2 override for `make mixed-release-e2e`.
+#
+# Runs AMF, SMF and PCF under different release profiles (shared/capability) so the
+# Rel-19 <-> Rel-17 interworking can be exercised on one stack. Used ONLY with the base file:
+#   docker compose --profile core -f docker-compose.yml -f docker-compose.mixed-release.yml \
+#       up -d --no-deps amf smf pcf
+# (scripts/mixed-release-e2e.sh does this; it restores the defaults on exit.)
+#
+# NF_RELEASE_PROFILE overrides the `release:` block of the NF config (shared/capability
+# NewProfile). Compose merges `environment:` and `volumes:` of the base service, so only the
+# differing keys are declared here. Defaults match the first direction of the script
+# (Rel-19 AMF, Rel-17 SMF/PCF); the script exports the variables for the reverse direction.
+#
+# SSLKEYLOGFILE makes the outbound SBI clients (shared/sbi OpenKeyLogWriter) write TLS 1.3
+# secrets to ./pcaps/mixed-keys, so the SBI pcap of core-pcap can be decrypted. DEV ONLY.
+services:
+  amf:
+    environment:
+      NF_RELEASE_PROFILE: "${MIXED_AMF_PROFILE:-rel19}"
+      SSLKEYLOGFILE: "/keylog/amf-${MIXED_TAG:-run}.keys"
+    volumes:
+      - ./pcaps/mixed-keys:/keylog
+  smf:
+    environment:
+      NF_RELEASE_PROFILE: "${MIXED_CORE_PROFILE:-rel17}"
+      SSLKEYLOGFILE: "/keylog/smf-${MIXED_TAG:-run}.keys"
+    volumes:
+      - ./pcaps/mixed-keys:/keylog
+  pcf:
+    environment:
+      NF_RELEASE_PROFILE: "${MIXED_CORE_PROFILE:-rel17}"
+      SSLKEYLOGFILE: "/keylog/pcf-${MIXED_TAG:-run}.keys"
+    volumes:
+      - ./pcaps/mixed-keys:/keylog

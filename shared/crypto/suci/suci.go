@@ -220,6 +220,9 @@ func EncryptProfileA(msin string, homeNetPubKey [32]byte, schemeID byte) (SUCI, 
 // The hardcoded "0" in position 4 is the SUPI type (0 = IMSI). MCC is always
 // 3 digits; MNC is 2 or 3 digits, giving a combined field of length 5 or 6.
 // Ref: TS 23.003 §2.7.2, TS 24.501 §9.11.3.4
+//
+// Deprecated: legacy project-private format, no longer produced; use
+// types.ParseSUCI (shared/types) for the standard TS 29.571 §5.3.2 form.
 func ParseSUCIString(s string) (SUCI, error) {
 	if !strings.HasPrefix(s, "suci-") {
 		return SUCI{}, fmt.Errorf("suci: not a SUCI: %q", s)

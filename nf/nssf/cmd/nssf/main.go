@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/config"
+	nssfsbi "github.com/francurieses/claudia-5gc/nf/nssf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/server"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -39,12 +41,24 @@ func main() {
 	logger = logger.With("nf", "NSSF", "nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
 
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
+
 	tp, err := tracing.Init(context.Background(), "NSSF", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
 	if err != nil {
 		logger.Error("tracing init failed", "error", err)
 	}
 	if tp != nil {
-		defer tp.Shutdown(context.Background())
+		defer func() { _ = tp.Shutdown(context.Background()) }()
 	}
 
 	logger.Info("NSSF starting", "instance_id", cfg.NFInstanceID)
@@ -64,6 +78,7 @@ func main() {
 	}()
 
 	sbiSrv := server.New(cfg, logger)
+	sbiSrv.SetProfile(relProfile)
 
 	go func() {
 		if err := sbiSrv.Start(ctx); err != nil {
@@ -91,19 +106,7 @@ func main() {
 			if len(snssais) == 0 {
 				snssais = []nrf.SNSSAIEntry{{SST: 1, SD: "000001"}}
 			}
-			profile := &nrf.NFProfile{
-				NFInstanceID: cfg.NFInstanceID,
-				NFType:       "NSSF",
-				NFStatus:     "REGISTERED",
-				SNSSAIs:      snssais,
-				NFServices: []nrf.NFService{{
-					ServiceInstanceID: cfg.NFInstanceID + "-nnssf-nsselection",
-					ServiceName:       "nnssf-nsselection",
-					Scheme:            "https",
-					NFServiceStatus:   "REGISTERED",
-					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v2", APIFullVersion: "2.0.0"}},
-				}},
-			}
+			profile := nssfsbi.BuildNFProfile(cfg.NFInstanceID, snssais, relProfile, nssfsbi.NnssfNSSelectionCatalog())
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,

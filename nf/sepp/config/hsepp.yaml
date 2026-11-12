@@ -1,0 +1,35 @@
+# hSEPP — home PLMN 001/02 (profile: roaming). Same image as vSEPP, different config.
+nf_instance_id: "00000000-0000-4014-8000-000000000002"
+
+plmn:
+  mcc: "001"
+  mnc: "02"
+
+sbi:
+  address: "0.0.0.0:8014"
+  fqdn: "sepp.5gc.mnc002.mcc001.3gppnetwork.org"
+  tls:
+    cert_file: /etc/5gc/pki/sepp.crt
+    key_file: /etc/5gc/pki/sepp.key
+    ca_file: /etc/5gc/pki/ca.crt
+
+# N32 listener (N32-c handshake + N32-f forwarding between SEPPs). Used from REL19-9.4/9.5.
+n32:
+  address: "0.0.0.0:8443"
+  # Roaming partners accepted on N32-c (TS 29.573 §5.2.2). vSEPP (PLMN 001/01) <-> hSEPP (001/02).
+  roaming_partners:
+    - {mcc: "001", mnc: "01"}
+  # N32-c initiator targets (run at startup with retry/backoff).
+  peers:
+    - plmn: {mcc: "001", mnc: "01"}
+      fqdn: "sepp.5gc.mnc001.mcc001.3gppnetwork.org"
+      address: "sepp.5gc.mnc001.mcc001.3gppnetwork.org:8443"
+
+peers:
+  nrf: "hnrf:8000"
+
+metrics:
+  address: "0.0.0.0:9115"
+
+# release:
+#   profile: rel19

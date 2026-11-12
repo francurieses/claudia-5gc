@@ -40,6 +40,8 @@ type BSFClient interface {
 // PcfBindingRequest is the subset of TS 29.521 §6.2.6 PcfBinding sent by the PCF
 // when registering a new binding. BindingID is not set by the requester; it is
 // assigned and returned by the BSF.
+//
+// oapi: TS29521_Nbsf_Management.yaml#/components/schemas/PcfBinding
 type PcfBindingRequest struct {
 	// Supi is the UE Subscription Permanent Identifier. Optional.
 	Supi string `json:"supi,omitempty"`
@@ -65,6 +67,8 @@ type PcfBindingRequest struct {
 // used within a PcfBindingRequest. Mirrors store.Snssai but lives in the server package
 // to avoid an import cycle.
 // Ref: TS 29.571 §5.4.4
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/Snssai
 type PcfBindingSnssai struct {
 	Sst int    `json:"sst"`
 	Sd  string `json:"sd,omitempty"`

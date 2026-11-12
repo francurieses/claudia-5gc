@@ -8,9 +8,9 @@ package ngap
 import (
 	"testing"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 )
 
 // TestBuildLocationReportingControl verifies that BuildLocationReportingControl

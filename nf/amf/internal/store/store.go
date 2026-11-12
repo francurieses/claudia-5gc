@@ -4,7 +4,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
+
+	"github.com/francurieses/claudia-5gc/shared/jsoncompat"
 )
 
 // gmmStateRegistered mirrors context.GMMRegistered (iota = 1).
@@ -48,13 +52,17 @@ type Cache interface {
 // ---- Serialisable record types ------------------------------------------
 
 // UERecord is the serialisable form of a UEContext stored in PostgreSQL.
+//
+// oapi: none PostgreSQL context_json record, not an SBI body
 type UERecord struct {
-	SUPI             string             `json:"supi"`
-	GUTI             *GUTIRecord        `json:"guti,omitempty"`
-	GMMState         int                `json:"gmm_state"`
-	CMState          int                `json:"cm_state"`
-	SecurityCtx      SecurityRecord     `json:"security_ctx"`
-	RawUESecCap      []byte             `json:"raw_ue_sec_cap,omitempty"`
+	SUPI        string         `json:"supi"`
+	GUTI        *GUTIRecord    `json:"guti,omitempty"`
+	GMMState    int            `json:"gmm_state"`
+	CMState     int            `json:"cm_state"`
+	SecurityCtx SecurityRecord `json:"security_ctx"`
+	RawUESecCap []byte         `json:"raw_ue_sec_cap,omitempty"`
+	// Capability5GMM holds the 5GMM capability IE value octets (TS 24.501 §9.11.3.1).
+	Capability5GMM   []byte             `json:"capability_5gmm,omitempty"`
 	AllowedNSSAI     []SNSSAIRecord     `json:"allowed_nssai"`
 	RequestedNSSAI   []SNSSAIRecord     `json:"requested_nssai,omitempty"`
 	SubscribedAMBRUL uint64             `json:"subscribed_ambr_ul"`
@@ -62,9 +70,35 @@ type UERecord struct {
 	PDUSessions      []PDUSessionRecord `json:"pdu_sessions"`
 	RegistrationTime time.Time          `json:"registration_time"`
 	LastActivity     time.Time          `json:"last_activity"`
+	// SchemaVersion is the record schema (see UERecordSchemaVersion); 0 = legacy.
+	SchemaVersion int `json:"schema_version,omitempty"`
+	// Extra holds top-level keys written by a newer release so a
+	// load→save cycle keeps them (TS 29.500 §6.6.2; shared/jsoncompat).
+	Extra map[string]json.RawMessage `json:"-"`
+}
+
+// UERecordSchemaVersion is the schema version this build writes.
+const UERecordSchemaVersion = 1
+
+type ueRecordAlias UERecord
+
+// UnmarshalJSON decodes the record and keeps unknown keys in Extra.
+func (r *UERecord) UnmarshalJSON(b []byte) error {
+	if err := jsoncompat.Unmarshal(b, (*ueRecordAlias)(r), &r.Extra); err != nil {
+		return fmt.Errorf("amf store: decode UERecord: %w", err)
+	}
+	return nil
+}
+
+// MarshalJSON encodes the record with schema_version and the preserved Extra.
+func (r UERecord) MarshalJSON() ([]byte, error) {
+	r.SchemaVersion = jsoncompat.NextVersion(r.SchemaVersion, UERecordSchemaVersion)
+	return jsoncompat.Marshal(ueRecordAlias(r), r.Extra)
 }
 
 // GUTIRecord is the serialisable 5G-GUTI.
+//
+// oapi: none PostgreSQL context_json record, not an SBI body
 type GUTIRecord struct {
 	MCC         string `json:"mcc"`
 	MNC         string `json:"mnc"`
@@ -75,6 +109,8 @@ type GUTIRecord struct {
 }
 
 // SecurityRecord is the serialisable NAS security context (TS 33.501 §6.7).
+//
+// oapi: none PostgreSQL context_json record, not an SBI body
 type SecurityRecord struct {
 	NGKSI          byte   `json:"ngksi"`
 	IntegrityAlgID byte   `json:"integrity_alg_id"`
@@ -88,6 +124,8 @@ type SecurityRecord struct {
 }
 
 // SNSSAIRecord is a serialisable S-NSSAI.
+//
+// oapi: none PostgreSQL context_json record, not an SBI body
 type SNSSAIRecord struct {
 	SST uint8  `json:"sst"`
 	SD  string `json:"sd,omitempty"`
@@ -95,6 +133,8 @@ type SNSSAIRecord struct {
 }
 
 // PDUSessionRecord is a serialisable PDU session entry.
+//
+// oapi: none PostgreSQL context_json record, not an SBI body
 type PDUSessionRecord struct {
 	PDUSessionID   uint8        `json:"pdu_session_id"`
 	SMFInstanceID  string       `json:"smf_instance_id"`

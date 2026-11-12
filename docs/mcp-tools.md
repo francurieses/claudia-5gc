@@ -46,7 +46,7 @@ Risk: **READ** changes nothing · **MUTATING** changes a stored setting · **DIS
 | Tool | Risk | Purpose |
 |---|---|---|
 | `milenage_run` | READ | Run MILENAGE f1 to f5* for K, OPc, RAND, SQN and AMF. |
-| `suci_derive` | READ | Derive a SUCI from a SUPI and the home-network public key (Profile A or B). |
+| `suci_derive` | READ | Derive a SUCI (standard TS 29.571 §5.3.2 string) from a SUPI and the home-network public key (Profile A or B). |
 | `xres_star_compute` | READ | Compute XRES* from an authentication vector. |
 | `res_star_verify` | READ | Verify RES* against XRES* and HRES*. |
 | `kdf_compute` | READ | Run one 3GPP key derivation function (TS 33.220 Annex B). |
@@ -65,7 +65,7 @@ Risk: **READ** changes nothing · **MUTATING** changes a stored setting · **DIS
 | Tool | Risk | Purpose |
 |---|---|---|
 | `ue_list` | READ | List UE contexts with SUPI, GUTI, 5GMM and CM state. Filters: gmm_state, cm_state (case-insensitive, optional `5GMM-`/`CM-` prefix). `pdu_session_ids` is a list of integers; PSIs outside 1-15 go to `pdu_session_ids_invalid`; a zero registration time is null. |
-| `ue_context_get` | READ | Full UE context by SUPI or by 5G-GUTI (as ue_list shows it). |
+| `ue_context_get` | READ | Full UE context by SUPI or by 5G-GUTI (as ue_list shows it). Carries `capability_5gmm` (IE value octets, hex) and `capability_5gmm_bits` (set-bit names); `""` and `[]` when the UE sent no IE (TS 24.501 §9.11.3.1). The 5GSM equivalent (`capability5gsm`, `capability5gsmBits`, TS 24.501 §9.11.4.1) is on each `pdu_session_list` session, because only the SMF keeps it. |
 | `ran_gnb_list` | READ | gNBs connected over N2 and recently disconnected (TS 38.413 §8.7.1). |
 
 ### Traces (Jaeger)
@@ -143,7 +143,7 @@ Risk: **READ** changes nothing · **MUTATING** changes a stored setting · **DIS
 | `pws_cancel` | DISRUPTIVE | Cancel a PWS broadcast (PWS Cancel, TS 38.413 §8.9.2). |
 | `ue_an_release_nw` | DISRUPTIVE | Network-initiated AN release of a CM-CONNECTED UE (TS 23.502 §4.2.6 step 2): the AMF sends a UE Context Release Command (cause misc/om-intervention) and the UE goes CM-IDLE while staying RM-REGISTERED; its PDU sessions are deactivated, not released. Refuses a CM-IDLE UE. Use `ue_page` to bring it back. |
 | `ue_location_get` | DISRUPTIVE | Locate a UE through the portal and the LMF (NGAP Location Reporting, TS 23.273 §6.10.1, TS 38.413 §8.12): reports whether the UE is reachable and its position. The UE must be known to the AMF. |
-| `af_qos_session_create` | DISRUPTIVE | Create an AF session with required QoS at the NEF (Nnef_AFsessionWithQoS, TS 29.522 §4.4.13) for a UE IPv4 address. The dry-run checks the address against the SMF sessions. The server first gets an OAuth2 token (client credentials, scope `nnef-afsessionwithqos`) from the NRF. |
+| `af_qos_session_create` | DISRUPTIVE | Create an AF session with required QoS at the NEF (Nnef_AFsessionWithQoS, TS 29.522 §4.4.13) for a UE IPv4 address. The dry-run checks the address against the SMF sessions. The server first gets an OAuth2 token (client credentials, scope `3gpp-as-session-with-qos`) from the NRF. |
 | `af_qos_session_get` | READ | Read one AF session with required QoS from the NEF (TS 29.522 §4.4.13). |
 | `af_qos_session_delete` | DISRUPTIVE | Delete an AF session with required QoS at the NEF (TS 29.522 §4.4.13). |
 | `pws_resend` | DISRUPTIVE | Re-send an existing PWS broadcast to the gNBs (Write-Replace Warning, TS 38.413 §8.9.1) through the portal. |
@@ -161,7 +161,7 @@ Risk: **READ** changes nothing · **MUTATING** changes a stored setting · **DIS
 | `nf_service_control` | ADMIN | Start, stop or restart an NF container. Needs access_mode lab, allow_service_control: true and an admin token. Protected services need force. |
 | `mcp_audit_log` | READ | Newest audit entries of state-changing calls: tool, risk, role, session, outcome and input hash. Stateless HTTP calls are labelled session `http:<ip>` with a `remote_addr` field. |
 | `nf_log_level` | MUTATING | Read (no level) or set an NF's log level for a TTL (default 900 s, max 3600 s). The NF reverts to its startup level when the TTL ends. |
-| `amf_timer_config` | MUTATING | Read (no arguments) or set the AMF runtime timers: T3512 (`t3512_secs`, 60-86400 s, exactly representable in GPRS timer 3), `mobile_reachable_guard_secs` (0-3600, 0 is lab-only; mobile reachable = T3512 + guard) and `implicit_detach_secs` (60-86400). `reset:true` restores the YAML values. Runtime only (lost on AMF restart); a UE learns the new T3512 in its next Registration Accept. The read is READ-class and callable in read-only mode but not listed there. |
+| `amf_timer_config` | MUTATING | Read (no arguments) or set the AMF runtime timers: T3512 (`t3512_secs`, 60-86400 s, exactly representable in GPRS timer 3), `mobile_reachable_guard_secs` (0-3600, 0 is lab-only; mobile reachable = T3512 + guard) `implicit_detach_secs` (60-86400) and the NAS timers `t3550_secs`, `t3560_secs`, `t3570_secs` (1-60 s, default 6). `reset:true` restores the YAML values. Runtime only (lost on AMF restart); a UE learns the new T3512 in its next Registration Accept. The read is READ-class and callable in read-only mode but not listed there. |
 | `subscriber_profile_update` | DISRUPTIVE | Change `ambr_ul`/`ambr_dl` (BitRate strings such as "100 Mbps") and/or `slices` of one subscriber. Keys and identity cannot be changed here. The portal deregisters the UE, which must re-register. The dry-run shows the redacted record. |
 | `subscriber_provision` | ADMIN | Create a NEW subscriber (`supi`, `k`, `opc`, optional `sqn`, `amf`, `profile`); an existing SUPI is refused. Keys are never echoed, logged or kept in the audit log. Needs access_mode lab and an admin token. |
 | `subscriber_delete` | ADMIN | Delete a subscriber from the UDR; an unknown SUPI is refused. A UE registered now keeps its AMF context until its next authentication. Needs access_mode lab and an admin token. |

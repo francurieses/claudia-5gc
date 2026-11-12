@@ -22,19 +22,20 @@ import (
 var pcapSidecars = map[string]string{
 	"core": "core-pcap",
 	// Control-plane
-	"nrf":  "nrf-pcap",
-	"amf":  "amf-pcap",
-	"ausf": "ausf-pcap",
-	"udm":  "udm-pcap",
-	"udr":  "udr-pcap",
-	"smf":  "smf-pcap",
-	"pcf":  "pcf-pcap",
-	"upf":  "upf-pcap",
-	"nssf": "nssf-pcap",
-	"smsf": "smsf-pcap",
-	"bsf":  "bsf-pcap",
-	"nef":  "nef-pcap",
-	"lmf":  "lmf-pcap",
+	"nrf":   "nrf-pcap",
+	"amf":   "amf-pcap",
+	"ausf":  "ausf-pcap",
+	"udm":   "udm-pcap",
+	"udr":   "udr-pcap",
+	"smf":   "smf-pcap",
+	"pcf":   "pcf-pcap",
+	"upf":   "upf-pcap",
+	"nssf":  "nssf-pcap",
+	"smsf":  "smsf-pcap",
+	"bsf":   "bsf-pcap",
+	"nef":   "nef-pcap",
+	"lmf":   "lmf-pcap",
+	"vsepp": "vsepp-pcap",
 }
 
 // PCAPStatus describes the state of a PCAP sidecar.

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
+	"github.com/francurieses/claudia-5gc/shared/dbmigrate"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -36,20 +38,7 @@ func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 }
 
 func (p *Postgres) migrate(ctx context.Context) error {
-	entries, err := migrationsFS.ReadDir("migrations")
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		sql, err := migrationsFS.ReadFile("migrations/" + e.Name())
-		if err != nil {
-			return err
-		}
-		if _, err := p.pool.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("migration %s: %w", e.Name(), err)
-		}
-	}
-	return nil
+	return dbmigrate.Run(ctx, dbmigrate.PgxDB{Pool: p.pool}, "udr", migrationsFS, "migrations", slog.Default())
 }
 
 // Close shuts down the connection pool.
@@ -126,6 +115,27 @@ func (p *Postgres) UpdateSQN(supi, sqn string) error {
 
 // ---- AccessAndMobilitySubscriptionData ----------------------------------
 
+// setGPSIsIfEmptySQL is a single conditional UPDATE: it touches only the gpsis
+// column and only while the stored list is empty, so a concurrent portal write
+// to any column is never lost. "Empty" includes SQL NULL and the JSON scalar
+// null that PutAMSubscription writes for a nil slice; the CASE guarantees
+// jsonb_array_length is only evaluated on arrays (it errors on scalars).
+const setGPSIsIfEmptySQL = `UPDATE subscription_am SET gpsis = $1 WHERE supi = $2 AND (CASE WHEN jsonb_typeof(gpsis) = 'array' THEN jsonb_array_length(gpsis) = 0 ELSE true END)`
+
+// SetGPSIsIfEmpty implements Store. The SQL is not covered by an integration
+// test (no database in unit tests); the text is pinned by a unit test.
+func (p *Postgres) SetGPSIsIfEmpty(supi string, gpsis []string) (bool, error) {
+	b, err := json.Marshal(gpsis)
+	if err != nil {
+		return false, fmt.Errorf("udr: SetGPSIsIfEmpty: marshal: %w", err)
+	}
+	tag, err := p.pool.Exec(context.Background(), setGPSIsIfEmptySQL, b, supi)
+	if err != nil {
+		return false, fmt.Errorf("udr: SetGPSIsIfEmpty: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (p *Postgres) GetAMSubscription(supi string) (*AccessAndMobilitySubscriptionData, error) {
 	ctx := context.Background()
 	row := p.pool.QueryRow(ctx, `
@@ -157,7 +167,13 @@ func (p *Postgres) GetAMSubscription(supi string) (*AccessAndMobilitySubscriptio
 
 func (p *Postgres) PutAMSubscription(sub *AccessAndMobilitySubscriptionData) error {
 	ctx := context.Background()
-	gpsis, err := json.Marshal(sub.GPSIS)
+	// A nil slice would marshal to the JSON scalar null; store [] to match the
+	// column default so jsonb array functions keep working.
+	g := sub.GPSIS
+	if g == nil {
+		g = []string{}
+	}
+	gpsis, err := json.Marshal(g)
 	if err != nil {
 		return err
 	}

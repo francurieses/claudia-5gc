@@ -15,10 +15,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Sentinel errors returned by AMFLocationClient. The server maps them to the
@@ -40,7 +42,9 @@ var ErrLocationFailure = errors.New("lmf: amf client: location failure")
 // RequestLocInfo is the Namf_Location request body sent by the LMF to the AMF.
 // Field names and json tags MUST match nf/amf/internal/sbi/types.go RequestLocInfo.
 //
-// Ref: TS 29.518 §5.2.2.6; TS 23.273 §7.2.
+// Ref: TS 29.518 §5.5.2.4; TS 23.273 §7.2.
+//
+// oapi: TS29518_Namf_Location.yaml#/components/schemas/RequestLocInfo
 type RequestLocInfo struct {
 	// Req5gsLoc requests the current 5GS location (TAI + NRCGI of serving cell).
 	// Set to true for the Cell-ID positioning MVP.
@@ -48,20 +52,32 @@ type RequestLocInfo struct {
 	// ReqCurrentLoc requests a fresh measurement (triggers NGAP LocationReportingControl).
 	ReqCurrentLoc bool `json:"reqCurrentLoc,omitempty"`
 	// SupportedGADShapes is the list of GAD shapes the consumer can decode.
+	// oapi-ext: RequestLocInfo (Namf_Location ProvideLocationInfo) has no GAD-shape attribute; the spec home is lcsSupportedGADShapes on RequestPosInfo, which belongs to the different ProvidePositioningInfo operation (TS 29.518 §6.4.6.2.2) the LMF does not call. The Rel-19 AMF and a third-party AMF ignore this member (TS 29.500 §6.6.2), so it is harmless on the wire and kept for the rel17 bytes.
 	SupportedGADShapes []string `json:"supportedGADShapes,omitempty"`
 }
 
-// LocationData is the Namf_Location response body returned by the AMF to the LMF,
-// and also the Nlmf_Location response body returned by the LMF to the LCS consumer.
-// Field names and json tags MUST match nf/amf/internal/sbi/types.go LocationData.
+// LocationData is the Nlmf_Location LocationData: the DetermineLocation 200
+// body returned by the LMF to the LCS consumer and the per-sample payload of
+// event notifications. It is a PRODUCER type only: its JSON tags are the Nlmf
+// wire contract and are NOT coupled to the AMF's Namf_Location answer. The AMF
+// answer is decoded by decodeAMFLocation (legacy LocationData shape and
+// TS 29.518 ProvideLocInfo) and the result is carried inside the LMF as a
+// LocationData value (its NRCellId / Tai / LocationEstimate fields), which is
+// the internal position record the positioning methods fill in.
 //
-// Ref: TS 29.518 §5.2.2.6; TS 29.572 §6.1.6.2.2.
+// Ref: TS 29.572 §6.1.6.2.2.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/LocationData
 type LocationData struct {
 	// LocationEstimate holds the GAD POINT shape (lat/lon). Placeholder 0,0 when absent.
 	LocationEstimate *GeographicArea `json:"locationEstimate,omitempty"`
 	// NRCellId is the serving NR cell rendered as a hex string (36-bit cell id).
-	NRCellId string `json:"nrCellId,omitempty"`
+	// Internal record field: on the Nlmf wire it is "nrCellId" under rel17 / no
+	// profile (legacyLocationData) and the spec attribute ncgi.nrCellId under
+	// rel19 (see MarshalJSON, wireFor).
+	NRCellId string `json:"-"`
 	// Tai is the Tracking Area Identity of the serving cell.
+	// oapi-ext: LocationData has no TAI attribute (only ncgi/ecgi, TS 29.572 Table 6.1.6.2.3-1); the TAC is kept as an additive hint for LCS clients, ignorable per TS 29.500 §6.6.2.
 	Tai *TaiLoc `json:"tai,omitempty"`
 	// AgeOfLocationEstimate is minutes since the estimate (0 = fresh report).
 	AgeOfLocationEstimate int `json:"ageOfLocationEstimate"`
@@ -70,10 +86,223 @@ type LocationData struct {
 	// Absent or empty indicates Cell-ID positioning (LMF-001).
 	// Ref: TS 29.572 §6.1.6.2.2 (positioningDataList).
 	PositioningDataList []string `json:"positioningDataList,omitempty"`
+	// SupportedFeatures is the Nlmf_Location feature set negotiated for this
+	// DetermineLocation exchange (TS 29.572 §6.1.6.2.2 LocationData, §6.1.9;
+	// TS 29.500 §6.6.2). Set by the DetermineLocation handler only; empty
+	// (omitted) when read from the AMF and in EventSubscription notifications.
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
+
+	// specWire selects the TS 29.572 wire shape (ncgi instead of nrCellId).
+	// Set by wireFor on the answer copy only; never part of the record.
+	specWire bool
+}
+
+// legacyLocationData is the Rel-17-profile Nlmf LocationData wire shape (and
+// the shape of the legacy /subscriptions notification envelope): the frozen
+// bytes carry nrCellId at the top level.
+//
+// oapi: none legacy Rel-17-profile wire shape of LocationData (nrCellId at top level), see LocationData
+type legacyLocationData struct {
+	LocationEstimate      *GeographicArea `json:"locationEstimate,omitempty"`
+	NRCellId              string          `json:"nrCellId,omitempty"`
+	Tai                   *TaiLoc         `json:"tai,omitempty"`
+	AgeOfLocationEstimate int             `json:"ageOfLocationEstimate"`
+	PositioningDataList   []string        `json:"positioningDataList,omitempty"`
+	SupportedFeatures     string          `json:"supportedFeatures,omitempty"`
+}
+
+// wireFor returns a copy of l that marshals in the TS 29.572 shape when
+// specLiteral (rel19 profile) is true, and in the frozen legacy shape otherwise.
+func (l LocationData) wireFor(specLiteral bool) LocationData {
+	l.specWire = specLiteral
+	return l
+}
+
+// MarshalJSON emits the legacy shape unless wireFor selected the spec shape. In
+// the spec shape the serving cell is ncgi {plmnId, nrCellId}; ncgi needs a
+// PLMN, so it is omitted when the record has no TAI.
+// Ref: TS 29.572 §6.1.6.2.3 (LocationData.ncgi), TS 29.571 §5.4.4.6 (Ncgi).
+func (l LocationData) MarshalJSON() ([]byte, error) {
+	if !l.specWire {
+		b, err := json.Marshal(legacyLocationData{
+			LocationEstimate: l.LocationEstimate, NRCellId: l.NRCellId, Tai: l.Tai,
+			AgeOfLocationEstimate: l.AgeOfLocationEstimate,
+			PositioningDataList:   l.PositioningDataList, SupportedFeatures: l.SupportedFeatures,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("lmf: marshal LocationData: %w", err)
+		}
+		return b, nil
+	}
+	type plain LocationData
+	out := struct {
+		plain
+		Ncgi *ncgiArea `json:"ncgi,omitempty"`
+	}{plain: plain(l)}
+	if l.NRCellId != "" && l.Tai != nil {
+		out.Ncgi = &ncgiArea{PlmnId: l.Tai.PlmnId, NrCellId: l.NRCellId}
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("lmf: marshal LocationData: %w", err)
+	}
+	return b, nil
+}
+
+// UnmarshalJSON decodes both wire shapes: the legacy top-level nrCellId and the
+// spec ncgi.nrCellId (the spec attribute wins when both are present).
+func (l *LocationData) UnmarshalJSON(b []byte) error {
+	type plain LocationData
+	aux := struct {
+		*plain
+		NRCellId string    `json:"nrCellId"`
+		Ncgi     *ncgiArea `json:"ncgi"`
+	}{plain: (*plain)(l)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return fmt.Errorf("lmf: decode LocationData: %w", err)
+	}
+	l.NRCellId = aux.NRCellId
+	if aux.Ncgi != nil && aux.Ncgi.NrCellId != "" {
+		l.NRCellId = aux.Ncgi.NrCellId
+	}
+	return nil
+}
+
+// ---- Namf_Location answer: consumer-side wire types ---------------------------
+//
+// The AMF answers ProvideLocationInfo with the TS 29.518 ProvideLocInfo data
+// type under its rel19 profile and with the frozen legacy shape under rel17.
+// The LMF consumer decodes BOTH whatever its own profile (TS 29.500 §6.6.2
+// tolerant-reader rule); spec fields win when present.
+
+// ProvideLocInfo is the TS 29.518 ProvideLocationInfo response (consumer view).
+// Ref: TS 29.518 §6.4.6.2.6 (ProvideLocInfo).
+//
+// oapi: TS29518_Namf_Location.yaml#/components/schemas/ProvideLocInfo
+type ProvideLocInfo struct {
+	CurrentLoc bool `json:"currentLoc,omitempty"`
+	// Location carries nrLocation (serving TAI + NCGI).
+	Location json.RawMessage `json:"location,omitempty"`
+	// GeoInfo is the AMF-provided geographical area, when any. Kept raw: it is
+	// a oneOf of GAD shapes and only the POINT shape is consumed, parsed on
+	// demand so an unexpected shape cannot fail the whole answer.
+	GeoInfo json.RawMessage `json:"geoInfo,omitempty"`
+	// LocationAge is the age of the location in minutes.
+	LocationAge *int `json:"locationAge,omitempty"`
+}
+
+// userLocation is the TS 29.571 UserLocation; only nrLocation is consumed.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/UserLocation
+type userLocation struct {
+	NrLocation *nrLocation `json:"nrLocation,omitempty"`
+}
+
+// nrLocation is the TS 29.571 NrLocation.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/NrLocation
+type nrLocation struct {
+	Tai                      *TaiLoc `json:"tai,omitempty"`
+	Ncgi                     *ncgi   `json:"ncgi,omitempty"`
+	AgeOfLocationInformation *int    `json:"ageOfLocationInformation,omitempty"`
+}
+
+// ncgi is the TS 29.571 Ncgi.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/Ncgi
+type ncgi struct {
+	PlmnId   PlmnID `json:"plmnId"`
+	NrCellId string `json:"nrCellId"`
+}
+
+// geoInfoPoint is the POINT variant of the TS 29.572 GeographicArea.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/Point
+type geoInfoPoint struct {
+	Shape string  `json:"shape"`
+	Point *LatLon `json:"point,omitempty"`
+}
+
+// legacyAMFLocationData is the Rel-17-profile Namf_Location answer of this
+// project's AMF (nf/amf/internal/sbi LocationData).
+//
+// oapi: none legacy Rel-17-profile wire shape of ProvideLocInfo, see ProvideLocInfo
+type legacyAMFLocationData struct {
+	LocationEstimate      *GeographicArea `json:"locationEstimate,omitempty"`
+	NRCellId              string          `json:"nrCellId,omitempty"`
+	Tai                   *TaiLoc         `json:"tai,omitempty"`
+	AgeOfLocationEstimate int             `json:"ageOfLocationEstimate"`
+}
+
+// decodeAMFLocation decodes a Namf_Location 200 body in either the legacy
+// shape or the TS 29.518 ProvideLocInfo shape and maps it to the internal
+// LocationData value. Spec attributes (location.nrLocation, geoInfo,
+// locationAge) take precedence over the legacy ones when present; unknown
+// attributes are ignored.
+//
+// The two views are decoded independently and leniently: a type clash in one
+// view (for example a string where the other shape has an object) makes that
+// view contribute nothing instead of failing the other one. A body that is
+// not a JSON object, or that yields no NR cell id, no TAI and no location
+// estimate, is an error: the caller reports it as a location failure.
+//
+// Ref: TS 29.518 §5.5.2.4, §6.4.6.2.6; TS 29.571 NrLocation schema.
+func decodeAMFLocation(body []byte) (*LocationData, error) {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return nil, fmt.Errorf("lmf: amf client: decode location: %w", err)
+	}
+
+	var legacy legacyAMFLocationData
+	legacyErr := json.Unmarshal(body, &legacy)
+	if legacyErr != nil {
+		legacy = legacyAMFLocationData{} // discard partial fill of a clashing view
+	}
+	var spec ProvideLocInfo
+	specErr := json.Unmarshal(body, &spec)
+	if specErr != nil {
+		spec = ProvideLocInfo{}
+	}
+	if legacyErr != nil && specErr != nil {
+		return nil, fmt.Errorf("lmf: amf client: decode location: neither shape matches: legacy: %w; ProvideLocInfo: %w", legacyErr, specErr)
+	}
+
+	loc := &LocationData{
+		LocationEstimate:      legacy.LocationEstimate,
+		NRCellId:              legacy.NRCellId,
+		Tai:                   legacy.Tai,
+		AgeOfLocationEstimate: legacy.AgeOfLocationEstimate,
+	}
+	var ul userLocation
+	if len(spec.Location) > 0 && json.Unmarshal(spec.Location, &ul) == nil && ul.NrLocation != nil {
+		nr := ul.NrLocation
+		if nr.Tai != nil {
+			loc.Tai = nr.Tai
+		}
+		if nr.Ncgi != nil && nr.Ncgi.NrCellId != "" {
+			loc.NRCellId = nr.Ncgi.NrCellId
+		}
+		if nr.AgeOfLocationInformation != nil {
+			loc.AgeOfLocationEstimate = *nr.AgeOfLocationInformation
+		}
+	}
+	var gi geoInfoPoint
+	if len(spec.GeoInfo) > 0 && json.Unmarshal(spec.GeoInfo, &gi) == nil && gi.Shape == "POINT" && gi.Point != nil {
+		loc.LocationEstimate = &GeographicArea{Shape: "POINT", Point: gi.Point}
+	}
+	if spec.LocationAge != nil {
+		loc.AgeOfLocationEstimate = *spec.LocationAge
+	}
+	if loc.NRCellId == "" && loc.Tai == nil && loc.LocationEstimate == nil {
+		return nil, errors.New("lmf: amf client: decode location: answer carries no cell id, TAI or location estimate")
+	}
+	return loc, nil
 }
 
 // GeographicArea holds a minimal GAD POINT shape.
 // Ref: TS 29.572 §6.1.6.2.x; TS 29.571 §5.4.4.x.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/PointUncertaintyCircle
 type GeographicArea struct {
 	// Shape is the GAD shape identifier, e.g. "POINT".
 	Shape string `json:"shape"`
@@ -85,6 +314,8 @@ type GeographicArea struct {
 }
 
 // LatLon is a WGS84 coordinate pair.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/GeographicalCoordinates
 type LatLon struct {
 	Lat float64 `json:"lat"`
 	Lon float64 `json:"lon"`
@@ -92,6 +323,8 @@ type LatLon struct {
 
 // TaiLoc is the Tracking Area Identity carried in LocationData.
 // Ref: TS 29.571 §5.4.4.3; TS 38.413 §9.3.1.x.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/Tai
 type TaiLoc struct {
 	PlmnId PlmnID `json:"plmnId"`
 	// Tac is a 3-byte hex string, e.g. "000001".
@@ -100,6 +333,8 @@ type TaiLoc struct {
 
 // PlmnID identifies a PLMN.
 // Ref: TS 29.571 §5.4.4.3.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/PlmnId
 type PlmnID struct {
 	MCC string `json:"mcc"`
 	MNC string `json:"mnc"`
@@ -108,6 +343,8 @@ type PlmnID struct {
 // amfProblem is the ProblemDetails body returned by the AMF on 4xx/5xx errors.
 // Used to extract the cause string for propagation to the LCS client.
 // Ref: TS 29.571 §5.2.4.1.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/ProblemDetails
 type amfProblem struct {
 	Cause  string `json:"cause"`
 	Detail string `json:"detail"`
@@ -116,14 +353,14 @@ type amfProblem struct {
 
 // AMFLocationClient is the LMF's interface to the AMF for Namf_Location calls.
 //
-// Ref: TS 29.518 §5.2.2.6 (Namf_Location_ProvideLocationInfo consumer)
+// Ref: TS 29.518 §5.5.2.4 (Namf_Location_ProvideLocationInfo consumer)
 type AMFLocationClient interface {
 	// ProvideLocationInfo calls POST /namf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info
 	// on the AMF. Returns (LocationData, "", nil) on success. Returns
 	// (nil, "CONTEXT_NOT_FOUND", ErrUEContextNotFound) on AMF 404. Returns
 	// (nil, cause, ErrLocationFailure) on any other error (5xx, network, timeout).
 	//
-	// Ref: TS 29.518 §5.2.2.6
+	// Ref: TS 29.518 §5.5.2.4
 	ProvideLocationInfo(ctx context.Context, ueContextID string) (*LocationData, string, error)
 }
 
@@ -146,7 +383,7 @@ type HTTPAMFLocationClient struct {
 //   - 404 → (nil, "CONTEXT_NOT_FOUND", ErrUEContextNotFound)
 //   - other → (nil, cause-from-body-or-"LOCATION_FAILURE", ErrLocationFailure)
 //
-// Ref: TS 29.518 §5.2.2.6; TS 23.273 §7.2.
+// Ref: TS 29.518 §5.5.2.4; TS 23.273 §7.2.
 func (c *HTTPAMFLocationClient) ProvideLocationInfo(ctx context.Context, ueContextID string) (*LocationData, string, error) {
 	url := c.BaseURL + "/namf-loc/v1/ue-contexts/" + ueContextID + "/provide-loc-info"
 
@@ -180,11 +417,18 @@ func (c *HTTPAMFLocationClient) ProvideLocationInfo(ctx context.Context, ueConte
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		var loc LocationData
-		if err := json.NewDecoder(resp.Body).Decode(&loc); err != nil {
+		raw, err := io.ReadAll(io.LimitReader(resp.Body, features.MaxRequestBodyBytes+1))
+		if err != nil {
+			return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: amf client: read response: %w", err)
+		}
+		if len(raw) > features.MaxRequestBodyBytes {
+			return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: amf client: response body exceeds %d bytes", features.MaxRequestBodyBytes)
+		}
+		loc, err := decodeAMFLocation(raw)
+		if err != nil {
 			return nil, "LOCATION_FAILURE", fmt.Errorf("lmf: amf client: decode response: %w", err)
 		}
-		return &loc, "", nil
+		return loc, "", nil
 
 	case http.StatusNotFound:
 		// AMF has no UE context for this identifier.
@@ -221,6 +465,8 @@ func extractCause(resp *http.Response) string {
 // dlNRPPaReqBody is the JSON request body for POST .../dl-nrppa-info.
 // Field names MUST match nf/amf/internal/sbi/types.go DLNRPPaInfoReq.
 // Ref: TS 29.518 §5.2.2.6 (Namf_Location NRPPa relay extension).
+//
+// oapi: none project extension of Namf_Location (dl-nrppa-info / dl-lpp-info relay; 3GPP equivalent: Namf_Communication N1N2MessageTransfer with NrppaInformation / N1 class LPP), no YAML path
 type dlNRPPaReqBody struct {
 	// NrppaPdu is the base64-encoded opaque NRPPa PDU to relay to the gNB.
 	NrppaPdu string `json:"nrppaPdu"`
@@ -230,6 +476,8 @@ type dlNRPPaReqBody struct {
 
 // dlNRPPaRspBody is the JSON response body for a successful POST .../dl-nrppa-info.
 // Field names MUST match nf/amf/internal/sbi/types.go DLNRPPaInfoRsp.
+//
+// oapi: none project extension of Namf_Location (dl-nrppa-info / dl-lpp-info relay; 3GPP equivalent: Namf_Communication N1N2MessageTransfer with NrppaInformation / N1 class LPP), no YAML path
 type dlNRPPaRspBody struct {
 	// NrppaPdu is the base64-encoded UL NRPPa PDU received from the gNB.
 	NrppaPdu string `json:"nrppaPdu"`
@@ -322,6 +570,8 @@ func (c *HTTPAMFLocationClient) SendDLNRPPa(ctx context.Context, ueContextID str
 // dlLPPReqBody is the JSON request body for POST .../dl-lpp-info.
 // Field names MUST match nf/amf/internal/sbi/types.go DLLPPInfoReq.
 // Ref: TS 29.518 §5.2.2.6 (Namf_Location LPP relay extension); TS 24.501 §8.7.4.
+//
+// oapi: none project extension of Namf_Location (dl-nrppa-info / dl-lpp-info relay; 3GPP equivalent: Namf_Communication N1N2MessageTransfer with NrppaInformation / N1 class LPP), no YAML path
 type dlLPPReqBody struct {
 	// LppPdu is the base64-encoded opaque LPP PDU to relay to the UE.
 	LppPdu string `json:"lppPdu"`
@@ -336,6 +586,8 @@ type dlLPPReqBody struct {
 
 // dlLPPRspBody is the JSON response body for a successful POST .../dl-lpp-info.
 // Field names MUST match nf/amf/internal/sbi/types.go DLLPPInfoRsp.
+//
+// oapi: none project extension of Namf_Location (dl-nrppa-info / dl-lpp-info relay; 3GPP equivalent: Namf_Communication N1N2MessageTransfer with NrppaInformation / N1 class LPP), no YAML path
 type dlLPPRspBody struct {
 	// LppPdu is the base64-encoded UL LPP PDU received from the UE.
 	LppPdu string `json:"lppPdu"`

@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"subscriptionId":"<SUBID>","scsAsId":"af-1","ueIpv4Addr":"10.60.0.1","afAppId":"app-1","qosReference":"qos-1","dnn":"internet"}

@@ -19,8 +19,21 @@ import (
 	"net/http"
 )
 
+// EventNotifier is the optional NotificationClient capability that delivers a
+// TS 29.572 EventNotify callback (EventNotifyData) to an hgmlcCallBackURI. It
+// is a separate interface so the legacy NotificationClient (and the test
+// doubles implementing it) stays unchanged.
+//
+// Ref: TS 29.572 §5.2.2.2 / TS29572_Nlmf_Location.yaml callback EventNotify.
+type EventNotifier interface {
+	// PostEventNotify sends n to uri; success is a 2xx answer (204 expected).
+	PostEventNotify(ctx context.Context, uri string, n EventNotifyData) error
+}
+
 // NotificationItem is one entry in a LocationNotification.
 // Ref: TS 29.572 §6.1.6.2.4.
+//
+// oapi: none project-specific LMF location notification envelope (3GPP equivalent: TS 29.572 DetermineLocation periodic/area event + EventNotifyData), no YAML path
 type NotificationItem struct {
 	// LocationData is the per-sample positioning result.
 	LocationData LocationData `json:"locationData"`
@@ -31,6 +44,8 @@ type NotificationItem struct {
 
 // AreaEventInfo carries the AOI crossing event type.
 // Ref: TS 29.572 §6.1.6.2.4.
+//
+// oapi: none project-specific LMF location notification envelope (3GPP equivalent: TS 29.572 DetermineLocation periodic/area event + EventNotifyData), no YAML path
 type AreaEventInfo struct {
 	// Event is "AREA_ENTERING" or "AREA_LEAVING".
 	Event string `json:"event"`
@@ -38,6 +53,8 @@ type AreaEventInfo struct {
 
 // LocationNotification is the body POSTed to the consumer's notificationUri.
 // Ref: TS 29.572 §6.1.6.2.4.
+//
+// oapi: none project-specific LMF location notification envelope (3GPP equivalent: TS 29.572 DetermineLocation periodic/area event + EventNotifyData), no YAML path
 type LocationNotification struct {
 	// SubId correlates this notification to its subscription resource.
 	SubId string `json:"subId"`
@@ -66,7 +83,20 @@ type HTTPNotificationClient struct {
 //
 // Ref: TS 29.572 §6.1.6.2.4; TS 29.500 §4.4.1 (mTLS HTTP/2).
 func (c *HTTPNotificationClient) PostNotification(ctx context.Context, uri string, n LocationNotification) error {
-	body, err := json.Marshal(n)
+	return c.postJSON(ctx, uri, n)
+}
+
+// PostEventNotify implements EventNotifier: it POSTs the EventNotifyData to the
+// hgmlcCallBackURI over the same mTLS client; any non-2xx answer is an error.
+//
+// Ref: TS 29.572 callback EventNotify (204 expected); TS 29.500 §4.4.1.
+func (c *HTTPNotificationClient) PostEventNotify(ctx context.Context, uri string, n EventNotifyData) error {
+	return c.postJSON(ctx, uri, n)
+}
+
+// postJSON serialises v to JSON and POSTs it to uri, treating non-2xx as error.
+func (c *HTTPNotificationClient) postJSON(ctx context.Context, uri string, v any) error {
+	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("lmf: notification client: marshal: %w", err)
 	}
@@ -84,4 +114,25 @@ func (c *HTTPNotificationClient) PostNotification(ctx context.Context, uri strin
 		return fmt.Errorf("lmf: notification client: server returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// EventNotifyData is the body POSTed to the hgmlcCallBackURI of a deferred
+// location session (the Event Notify callback; EventNotifyDataExt without
+// addEventNotifyDatas is wire-identical).
+//
+// Ref: TS 29.572 §6.1.6.2 (EventNotifyData); TS29572_Nlmf_Location.yaml callback EventNotify.
+//
+// oapi: TS29572_Nlmf_Location.yaml#/components/schemas/EventNotifyData
+type EventNotifyData struct {
+	// ReportedEventType is mandatory (ReportedEventType enum).
+	ReportedEventType string `json:"reportedEventType"`
+	Supi              string `json:"supi,omitempty"`
+	Gpsi              string `json:"gpsi,omitempty"`
+	HgmlcCallBackURI  string `json:"hgmlcCallBackURI,omitempty"`
+	// LdrReference is mandatory and correlates the report to the request.
+	LdrReference                string          `json:"ldrReference"`
+	LocationEstimate            *GeographicArea `json:"locationEstimate,omitempty"`
+	AgeOfLocationEstimate       *int            `json:"ageOfLocationEstimate,omitempty"`
+	TimestampOfLocationEstimate string          `json:"timestampOfLocationEstimate,omitempty"`
+	TerminationCause            string          `json:"terminationCause,omitempty"`
 }

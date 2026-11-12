@@ -51,8 +51,12 @@ integrity:
   IA3: false
 ciphering:
   EA1: false
-  EA2: true
+  EA2: false
   EA3: false
 integrityMaxRate:
   uplink: 'full'
   downlink: 'full'
+# Opt-in Rel-18/19 capability bits (patch 0080, TS 24.501 §9.11.3.1 / §9.11.4.1). "octet.bit" with
+# octet 3 = first value octet. Absent = stock wire bytes (5GMM 0x00, 5GSM 0x00). Example (uncomment to enable):
+#mmCapabilityBits: ['8.3', '8.4', '9.3', '11.5', '12.7', '13.4']
+#smCapabilityBits: ['4.6', '4.7', '4.8', '5.2']

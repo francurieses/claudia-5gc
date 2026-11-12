@@ -140,8 +140,6 @@ func WrapPDUSessionEstablishmentRejectBody(pduSessionID, pti, cause5GSM uint8, e
 // secondary DN-AAA authentication fails or the DN-AAA is unreachable/times
 // out (TS 23.502 §4.3.2.3).
 //
-// Note: this package already has a same-valued constant
-// Cause5GSMReactivationRequested = 0x1D with a stale/misleading name (dead
-// code — grep shows no callers); that pre-existing naming issue is out of
-// scope here and left untouched. The value 0x1D = 29 is correct for both.
+// (Cause5GSMReactivationRequested was formerly mis-declared as 0x1D; it is
+// now #39 = 0x27 in cause.go.)
 const Cause5GSMUserAuthOrAuthorizationFailed uint8 = 0x1D // 29

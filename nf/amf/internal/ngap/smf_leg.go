@@ -21,8 +21,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	"github.com/free5gc/ngap/ngapType"
 
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"

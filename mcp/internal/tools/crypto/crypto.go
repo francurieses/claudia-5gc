@@ -21,6 +21,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/crypto/milenage"
 	"github.com/francurieses/claudia-5gc/shared/crypto/suci"
+	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
 // All returns the six Group E tools ready for registration.
@@ -272,12 +273,15 @@ func (t suciDeriveTool) Invoke(ctx context.Context, in json.RawMessage) (any, er
 		s.MNC = mnc
 		s.RoutingIndicator = "0000"
 
-		suciStr := fmt.Sprintf("suci-%s%s-%s-0-%d-%s",
-			mcc, mnc,
-			s.RoutingIndicator,
-			int(s.ProtectionScheme),
-			hex.EncodeToString(s.SchemeOutput),
-		)
+		suciStr := types.SUCI{
+			SUPIType:         types.SUPITypeIMSI,
+			MCC:              mcc,
+			MNC:              mnc,
+			RoutingIndicator: s.RoutingIndicator,
+			ProtectionScheme: uint8(s.ProtectionScheme),
+			HNPublicKeyID:    keyID,
+			SchemeOutput:     hex.EncodeToString(s.SchemeOutput),
+		}.String()
 		return map[string]any{
 			"suci":          suciStr,
 			"scheme_output": hex.EncodeToString(s.SchemeOutput),

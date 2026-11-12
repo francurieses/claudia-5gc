@@ -11,7 +11,7 @@ TS 24.526 §5.2/§5.3 (matching the Wireshark NAS-5GS dissector).
 Usage:
   # From PCF N15 JSON (pipe the API response):
   docker exec amf curl -sk --http2-prior-knowledge \\
-    -X POST https://pcf:8006/npcf-ue-policy-control/v1/ue-policies \\
+    -X POST https://pcf:8006/npcf-ue-policy-control/v1/policies \\
     -H 'Content-Type: application/json' \\
     -d '{"supi":"imsi-001010000000001","servingPlmn":"00101"}' | \\
     python3 scripts/decode-ursp.py
@@ -29,6 +29,7 @@ import sys
 import json
 import struct
 import base64
+import binascii
 import argparse
 
 # ---- Type code tables ---------------------------------------------------
@@ -275,16 +276,49 @@ def decode_container(raw: bytes) -> dict:
 
 # ---- Input sources -------------------------------------------------------
 
-def container_from_n15_response(text: str) -> bytes | None:
+class InputError(ValueError):
+    """Malformed input: reported as "ERROR: <reason>" on stderr, exit status 1."""
+
+
+def b64_bytes(text: str, what: str) -> bytes:
+    """Strict base64 decode (alphabet and padding validated)."""
+    try:
+        return base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InputError(f"{what} is not valid base64: {exc}") from exc
+
+
+def container_from_n15_response(text: str) -> bytes:
+    """Extract the UE policy container from a PCF N15 PolicyAssociation body.
+
+    TS 29.525 §5.6.2.2: the container is the base64 (TS 29.571 Bytes) "uePolicy"
+    attribute. The legacy "uePolicySections" map (pre Rel-17 OpenAPI alignment)
+    is read only as a fallback. Raises InputError on malformed JSON, a non-object
+    body, invalid base64 or when no container is present.
+    """
     try:
         data = json.loads(text)
-        for _, section in data.get("uePolicySections", {}).items():
-            content = section.get("uePolicySectionContent", "")
-            if content:
-                return base64.b64decode(content)
-    except Exception:
-        pass
-    return None
+    except json.JSONDecodeError as exc:
+        raise InputError(f"malformed JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise InputError(f"JSON body must be an object, got {type(data).__name__}")
+    content = data.get("uePolicy", "")
+    if content:
+        if not isinstance(content, str):
+            raise InputError("uePolicy must be a base64 string")
+        return b64_bytes(content, "uePolicy")
+    sections = data.get("uePolicySections", {})
+    if not isinstance(sections, dict):
+        raise InputError("uePolicySections must be an object")
+    for name, section in sections.items():
+        if not isinstance(section, dict):
+            raise InputError(f"uePolicySections[{name!r}] must be an object")
+        content = section.get("uePolicySectionContent", "")
+        if content:
+            if not isinstance(content, str):
+                raise InputError(f"uePolicySections[{name!r}].uePolicySectionContent must be a base64 string")
+            return b64_bytes(content, f"uePolicySections[{name!r}].uePolicySectionContent")
+    raise InputError("no uePolicy (or legacy uePolicySections) content in the PCF response")
 
 
 # ---- Printer -------------------------------------------------------------
@@ -313,6 +347,22 @@ def print_container(d: dict) -> None:
 
 # ---- Main ----------------------------------------------------------------
 
+def read_input(args) -> bytes:
+    if args.b64:
+        return b64_bytes(args.b64.strip(), "--b64 value")
+    if args.hex:
+        try:
+            return bytes.fromhex(args.hex.replace(" ", "").replace(":", ""))
+        except ValueError as exc:
+            raise InputError(f"--hex value is not valid hex: {exc}") from exc
+    text = sys.stdin.read()
+    if text.lstrip()[:1] in ("{", "["):
+        return container_from_n15_response(text)
+    if not text.strip():
+        raise InputError("empty input: provide PCF N15 JSON on stdin, or use --b64 / --hex")
+    return b64_bytes(text.strip(), "stdin")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Decode a UE policy container (MANAGE UE POLICY COMMAND)")
     group = parser.add_mutually_exclusive_group()
@@ -321,21 +371,19 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
-    if args.b64:
-        raw = base64.b64decode(args.b64)
-    elif args.hex:
-        raw = bytes.fromhex(args.hex.replace(" ", "").replace(":", ""))
-    else:
-        text = sys.stdin.read()
-        raw = container_from_n15_response(text)
-        if raw is None:
-            try:
-                raw = base64.b64decode(text.strip())
-            except Exception:
-                print("ERROR: provide PCF N15 JSON on stdin, or use --b64 / --hex", file=sys.stderr)
-                sys.exit(1)
+    try:
+        raw = read_input(args)
+        decoded = decode_container(raw)
+    except InputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except (IndexError, struct.error) as exc:
+        print(f"ERROR: truncated or malformed container: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-    decoded = decode_container(raw)
+    if "error" in decoded:
+        print(f"ERROR: {decoded['error']}", file=sys.stderr)
+        sys.exit(1)
     if args.json:
         print(json.dumps(decoded, indent=2, default=lambda o: o.hex() if isinstance(o, bytes) else o))
     else:

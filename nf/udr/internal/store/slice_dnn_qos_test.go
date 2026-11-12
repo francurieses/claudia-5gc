@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -132,7 +133,7 @@ func TestPutEditedAndRevert(t *testing.T) {
 	if _, changed, _ = st.RevertSliceDNNQoS(ctx, 1, "000001", "internet"); changed {
 		t.Error("revert of non-edited row must be a no-op")
 	}
-	if _, _, err = st.RevertSliceDNNQoS(ctx, 9, "ffffff", "nonexistent"); err != ErrNotFound {
+	if _, _, err = st.RevertSliceDNNQoS(ctx, 9, "ffffff", "nonexistent"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("missing key: got %v, want ErrNotFound", err)
 	}
 	if q, err := st.GetSliceDNNQoS(ctx, 9, "ffffff", "x"); q != nil || err != nil {

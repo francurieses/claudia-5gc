@@ -216,11 +216,11 @@ for supi in $MS_SUPIS; do
     fi
 done
 
-# T5b: no NSSAI_NOT_ALLOWED for the multi-slice UEs (T8's imsi-...0401 is expected to get it).
+# T5b: no NSSAI_NOT_ALLOWED / REGISTRATION REJECT #62 for the multi-slice UEs (T8's imsi-...0401 is expected to get it).
 spurious=""
 for supi in $MS_SUPIS; do
     l=$(text_lines "\"supi\":\"$supi\"" "$AMF_LOGS")
-    if text_has 'NSSAI_NOT_ALLOWED' "$l"; then spurious="$spurious $supi"; fi
+    if text_has 'NSSAI_NOT_ALLOWED|"message_type":"RegistrationReject".*"cause":62' "$l"; then spurious="$spurious $supi"; fi
 done
 if [ -z "$spurious" ]; then
     pass "No spurious NSSAI_NOT_ALLOWED for the multi-slice UEs in AMF logs"
@@ -295,7 +295,8 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 section "T8 · Isolation — unauthorized slice rejected"
 # ─────────────────────────────────────────────────────────────────────────────
-# imsi-...0401 (internet-only subscription) requesting gold slice → NSSAI_NOT_ALLOWED.
+# imsi-...0401 (internet-only subscription) requesting gold slice → REGISTRATION REJECT #62
+# with Rejected NSSAI (TS 24.501 §5.5.1.2.5; AMF-030 / AUD-registration-02).
 # Runs a throw-away UE container (detached, named, always removed) on the N2 network.
 
 UNAUTH_SUPI="imsi-001010000000401"
@@ -323,14 +324,16 @@ else
     trap - EXIT
 
     unauth_lines=$(text_lines "\"supi\":\"$UNAUTH_SUPI\"" "$(container_logs amf)")
-    if text_has 'NSSAI_NOT_ALLOWED' "$unauth_lines"; then
-        pass "AMF rejected unauthorized slice for $UNAUTH_SUPI (NSSAI_NOT_ALLOWED logged)"
+    if text_has '"message_type":"RegistrationReject".*"cause":62' "$unauth_lines"; then
+        pass "AMF rejected unauthorized slice for $UNAUTH_SUPI (REGISTRATION REJECT #62)"
+    elif text_has 'NSSAI_NOT_ALLOWED' "$unauth_lines"; then
+        fail "AMF logged NSSAI_NOT_ALLOWED for $UNAUTH_SUPI but sent no REGISTRATION REJECT #62"
     else
-        skip "NSSAI_NOT_ALLOWED not found in AMF logs for $UNAUTH_SUPI — may require manual retry"
+        skip "REGISTRATION REJECT #62 not found in AMF logs for $UNAUTH_SUPI — may require manual retry"
         echo "    Manual: docker run --rm --network $N2_NET --cap-add NET_ADMIN \\"
         echo "      -v $REPO_ROOT/config/ueransim/ue-unauth.yaml:/ueransim/config/ue-unauth.yaml:ro \\"
         echo "      $UE_IMAGE nr-ue -c /ueransim/config/ue-unauth.yaml"
-        echo "    Then: docker logs amf 2>&1 | grep $UNAUTH_SUPI | grep NSSAI_NOT_ALLOWED"
+        echo "    Then: docker logs amf 2>&1 | grep $UNAUTH_SUPI | grep RegistrationReject"
     fi
 fi
 

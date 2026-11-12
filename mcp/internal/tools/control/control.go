@@ -105,7 +105,7 @@ func (t deregisterTool) Plan(ctx context.Context, in json.RawMessage) (any, erro
 	}
 	return map[string]any{
 		"supi":   a.SUPI,
-		"ue":     json.RawMessage(ue),
+		"ue":     ue,
 		"effect": "UE is deregistered; all its PDU sessions are released; it must re-register",
 	}, nil
 }
@@ -176,7 +176,7 @@ func (t releaseSessionTool) Plan(ctx context.Context, in json.RawMessage) (any, 
 	return map[string]any{
 		"supi":           a.SUPI,
 		"pdu_session_id": a.PDUSessionID,
-		"session":        json.RawMessage(sess),
+		"session":        sess,
 		"effect":         "PDU session released: UPF tunnel removed (N4), UE sent PDU Session Release Command",
 	}, nil
 }
@@ -227,7 +227,7 @@ func (t policyPushTool) Plan(ctx context.Context, in json.RawMessage) (any, erro
 	}
 	return map[string]any{
 		"supi":   a.SUPI,
-		"ue":     json.RawMessage(ue),
+		"ue":     ue,
 		"effect": "UE Configuration Update carrying the URSP; deferred if the UE is CM-IDLE",
 	}, nil
 }
@@ -463,7 +463,7 @@ func (pwsBroadcastTool) InputSchema() json.RawMessage {
 func (pwsBroadcastTool) OutputSchema() json.RawMessage { return schema(`{"type":"object"}`) }
 
 func (t pwsBroadcastTool) Plan(_ context.Context, in json.RawMessage) (any, error) {
-	return map[string]any{"request": json.RawMessage(in),
+	return map[string]any{"request": in,
 		"effect": "warning message broadcast to every gNB of the AMF's PWS area until cancelled"}, nil
 }
 
@@ -478,7 +478,7 @@ func (t pwsBroadcastTool) Invoke(ctx context.Context, in json.RawMessage) (any, 
 	if a.MessageIdentifier == nil || a.SerialNumber == nil {
 		return nil, mcperr.New(mcperr.CodeInvalidParams, "messageIdentifier and serialNumber are required", nil)
 	}
-	out, status, err := t.d.Portal.Post(ctx, "/pws/broadcast", json.RawMessage(in))
+	out, status, err := t.d.Portal.Post(ctx, "/pws/broadcast", in)
 	if err != nil {
 		return nil, mcperr.ToolError(fmt.Errorf("pws_broadcast: %w", err), nil)
 	}
@@ -504,7 +504,7 @@ func (pwsCancelTool) InputSchema() json.RawMessage {
 func (pwsCancelTool) OutputSchema() json.RawMessage { return schema(`{"type":"object"}`) }
 
 func (t pwsCancelTool) Plan(_ context.Context, in json.RawMessage) (any, error) {
-	return map[string]any{"request": json.RawMessage(in), "effect": "the broadcast stops at every gNB"}, nil
+	return map[string]any{"request": in, "effect": "the broadcast stops at every gNB"}, nil
 }
 
 func (t pwsCancelTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {
@@ -518,7 +518,7 @@ func (t pwsCancelTool) Invoke(ctx context.Context, in json.RawMessage) (any, err
 	if a.MessageIdentifier == nil || a.SerialNumber == nil {
 		return nil, mcperr.New(mcperr.CodeInvalidParams, "messageIdentifier and serialNumber are required", nil)
 	}
-	out, status, err := t.d.Portal.Post(ctx, "/pws/cancel", json.RawMessage(in))
+	out, status, err := t.d.Portal.Post(ctx, "/pws/cancel", in)
 	if err != nil {
 		return nil, mcperr.ToolError(fmt.Errorf("pws_cancel: %w", err), nil)
 	}

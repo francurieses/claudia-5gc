@@ -11,6 +11,8 @@ import (
 	"os"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/francurieses/claudia-5gc/shared/capability"
 )
 
 // Config holds all BSF configuration.
@@ -49,6 +51,11 @@ type Config struct {
 		// Default: 0.0.0.0:9111
 		Address string `yaml:"address"`
 	} `yaml:"metrics"`
+
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	// Ref: TS 29.500 §6.6.2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 // Load reads the BSF configuration from CONFIG_PATH (or /etc/5gc/config.yaml).

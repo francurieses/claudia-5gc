@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,8 +17,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"gopkg.in/yaml.v3"
 
+	ausfsbi "github.com/francurieses/claudia-5gc/nf/ausf/internal/sbi"
 	ausfsrv "github.com/francurieses/claudia-5gc/nf/ausf/internal/server"
 	"github.com/francurieses/claudia-5gc/shared/aka"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
@@ -47,6 +50,18 @@ func main() {
 	}
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
 	slog.SetDefault(logger)
+
+	// ---- Release profile (REL19-2.1/2.7) ----------------------------------
+	// Gates the wire behaviour of supportedFeatures negotiation: rel17 (the
+	// default, also when the release: block is absent) is byte-identical to
+	// the pre-negotiation baseline. Ref: TS 29.500 §6.6.2.
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("loading release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("release profile loaded", "release_profile", relProfile.Name())
 
 	udmAddr := cfg.Peers.UDM
 	sbiAddr := cfg.SBI.Address
@@ -94,6 +109,7 @@ func main() {
 	serverCfg := ausfsrv.Config{
 		NFInstanceID:       cfg.NFInstanceID,
 		SBIAddress:         sbiAddr,
+		SBIAuthority:       cfg.SBI.Authority,
 		ServingNetworkName: snName,
 	}
 	serverCfg.TLS.CertFile = cfg.SBI.TLS.CertFile
@@ -119,6 +135,7 @@ func main() {
 		logger.Error("building SBI server", "error", err)
 		os.Exit(1)
 	}
+	srv.SetProfile(relProfile)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -127,18 +144,7 @@ func main() {
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
-		profile := &nrf.NFProfile{
-			NFInstanceID: cfg.NFInstanceID,
-			NFType:       "AUSF",
-			NFStatus:     "REGISTERED",
-			NFServices: []nrf.NFService{{
-				ServiceInstanceID: cfg.NFInstanceID + "-nausf-auth",
-				ServiceName:       "nausf-auth",
-				Scheme:            "https",
-				NFServiceStatus:   "REGISTERED",
-				Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-			}},
-		}
+		profile := ausfsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, ausfsbi.NausfUEAuthenticationCatalog())
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr, "error", err,
@@ -179,6 +185,11 @@ func (c *HTTPUDMClient) GenerateAuthData(ctx context.Context, supi string, req *
 		"servingNetworkName": req.ServingNetworkName,
 		"ausfInstanceId":     req.AUSFInstanceID,
 	}
+	// Empty under rel17 / no profile: the attribute is omitted and the body
+	// stays byte-identical (decision D2). Ref: TS 29.500 §6.6.2.
+	if req.SupportedFeatures != "" {
+		payload["supportedFeatures"] = req.SupportedFeatures
+	}
 	if req.ResynchronizationInfo != nil {
 		payload["resynchronizationInfo"] = map[string]string{
 			"rand": req.ResynchronizationInfo.RAND,
@@ -196,7 +207,16 @@ func (c *HTTPUDMClient) GenerateAuthData(ctx context.Context, supi string, req *
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("udm: status %d", resp.StatusCode)
+		ue := &ausfsrv.UDMError{Status: resp.StatusCode}
+		var pd struct {
+			Cause         string              `json:"cause"`
+			Detail        string              `json:"detail"`
+			InvalidParams []map[string]string `json:"invalidParams"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&pd) == nil {
+			ue.Cause, ue.Detail, ue.InvalidParams = pd.Cause, pd.Detail, pd.InvalidParams
+		}
+		return nil, ue
 	}
 	var result ausfsrv.UDMAuthDataResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -227,7 +247,10 @@ type Config struct {
 	} `yaml:"plmn"`
 	SBI struct {
 		Address string `yaml:"address"`
-		TLS     struct {
+		// Authority is the host[:port] peers reach this AUSF at; used for absolute
+		// Location URIs (TS 29.501 §4.4.1). Optional.
+		Authority string `yaml:"authority"`
+		TLS       struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
 			CAFile   string `yaml:"ca_file"`
@@ -240,6 +263,9 @@ type Config struct {
 	Metrics struct {
 		Address string `yaml:"address"`
 	} `yaml:"metrics"`
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 func loadConfig() (*Config, error) {

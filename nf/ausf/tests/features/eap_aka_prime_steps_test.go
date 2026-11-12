@@ -230,8 +230,9 @@ func TestEAPAKAPrimeFeatures(t *testing.T) {
 		},
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"."},
+			Paths:    []string{"eap_aka_prime.feature"},
 			TestingT: t,
+			Strict:   true,
 		},
 	}
 	if suite.Run() != 0 {

@@ -40,6 +40,9 @@ bsf_addr: "https://bsf:8010"
 # af_qos_session_*: NEF Nnef_AFsessionWithQoS SBI (mTLS + NRF bearer token). Env: NEF_ADDR.
 nef_addr: "https://nef:8011"
 
+# mcp_info/core_health: vSEPP SBI (mTLS, REL19-9.7). Env: SEPP_ADDR.
+sepp_addr: "https://vsepp:8014"
+
 # sms_send_mt: SMSF internal MT-SMS trigger (mTLS). Env: SMSF_ADDR.
 smsf_addr: "https://smsf:8009"
 

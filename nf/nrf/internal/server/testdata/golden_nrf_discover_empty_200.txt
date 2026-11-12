@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"nfInstances":[],"numNfInstComplete":0,"searchId":"<ULID>","validityPeriod":3600}

@@ -31,3 +31,8 @@ scrape_configs:
         labels: {nf: NEF}
       - targets: [lmf:9113]
         labels: {nf: LMF}
+      - targets: [vsepp:9115]
+        labels: {nf: SEPP, role: vsepp}
+      # hsepp runs in the roaming profile only; a down target is expected without it.
+      - targets: [hsepp:9115]
+        labels: {nf: SEPP, role: hsepp}

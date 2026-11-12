@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+[{"singleNssai":{"sst":1,"sd":"000001"},"dnnConfigurations":{"internet":{"pduSessionTypes":{"defaultSessionType":"IPV4","allowedSessionTypes":["IPV4"]},"5gQosProfile":{"5qi":9,"arp":{"priorityLevel":8,"preemptCap":"NOT_PREEMPT","preemptVuln":"NOT_PREEMPTABLE"},"priorityLevel":90},"sessionAmbr":{"uplink":"100 Mbps","downlink":"100 Mbps"}}}}]

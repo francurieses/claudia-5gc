@@ -9,6 +9,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -91,19 +92,21 @@ type upfMsg struct {
 	seq  uint32
 	seid uint64
 	rts  time.Time // zero when the message carries none
+	raw  []byte    // Association Setup Request wire bytes
 }
 
 // fakeUPF is a scriptable PFCP peer on a loopback UDP socket.
 type fakeUPF struct {
 	conn *net.UDPConn
 
-	mu         sync.Mutex
-	rts        time.Time // RTS in Heartbeat Responses
-	assocRTS   time.Time // RTS in Association Setup Responses (zero = omitted)
-	assocCause uint8
-	dropAssoc  int    // answer nothing to the next N Association Setup Requests
-	hbMode     string // ok | drop | nonrts
-	got        []upfMsg
+	mu          sync.Mutex
+	rts         time.Time // RTS in Heartbeat Responses
+	assocRTS    time.Time // RTS in Association Setup Responses (zero = omitted)
+	assocCause  uint8
+	assocUPFeat []byte // UP Function Features payload in Association Setup Responses (nil = omitted)
+	dropAssoc   int    // answer nothing to the next N Association Setup Requests
+	hbMode      string // ok | drop | nonrts
+	got         []upfMsg
 }
 
 func newFakeUPF(t *testing.T, rts time.Time) *fakeUPF {
@@ -143,6 +146,7 @@ func (f *fakeUPF) loop() {
 			if m.RecoveryTimeStamp != nil {
 				rec.rts, _ = m.RecoveryTimeStamp.RecoveryTimeStamp()
 			}
+			rec.raw = append([]byte(nil), buf[:n]...)
 			if f.dropAssoc > 0 {
 				f.dropAssoc--
 				break
@@ -150,6 +154,9 @@ func (f *fakeUPF) loop() {
 			ies := []*pfcpie.IE{pfcpie.NewNodeID("", "", "upf"), pfcpie.NewCause(f.assocCause)}
 			if !f.assocRTS.IsZero() {
 				ies = append(ies, pfcpie.NewRecoveryTimeStamp(f.assocRTS))
+			}
+			if f.assocUPFeat != nil {
+				ies = append(ies, pfcpie.New(pfcpie.UPFunctionFeatures, f.assocUPFeat))
 			}
 			reply = pfcpmsg.NewAssociationSetupResponse(m.Sequence(), ies...)
 		case *pfcpmsg.HeartbeatRequest:
@@ -1046,5 +1053,96 @@ func TestMarkSessionActiveKeepsReleasing(t *testing.T) {
 				t.Fatalf("ok=%v state=%q, want ok=%v state=%q", got, sess.State, tc.ok, tc.want)
 			}
 		})
+	}
+}
+
+// After an SMF restart the sessions persisted by the previous run are released
+// towards the UE via the AMF, once, after the first Association Setup.
+// Ref: TS 23.527 §4.3, TS 29.244 §6.2.6.
+func TestPFCPNode_RestartReleasesOrphanedSessionsOnce(t *testing.T) {
+	e := newNodeEnv(t, time.Now().UTC().Truncate(time.Second), http.StatusNoContent)
+	e.s.orphanedByRestart = []restartOrphan{{supi: "imsi-001010000000001", psi: 1}, {supi: "imsi-001010000000002", psi: 5}}
+	e.startSupervisor(t)
+	e.waitState(t, assocAssociated)
+	for _, p := range []string{
+		"/amf/v1/ue-contexts/imsi-001010000000001/pdu-sessions/1",
+		"/amf/v1/ue-contexts/imsi-001010000000002/pdu-sessions/5",
+	} {
+		eventually(t, 5*time.Second, "AMF release "+p, func() bool { return e.amf.count(p) == 1 })
+	}
+	time.Sleep(300 * time.Millisecond) // heartbeats continue; no repeat
+	if n := e.amf.count(""); n != 2 {
+		t.Errorf("AMF release calls = %d, want exactly 2", n)
+	}
+}
+
+// ---- REL19-6.2: peer UP Function Features (TS 29.244 §6.2.6, §8.2.25) ------
+
+func TestPFCPNode_AssocSetupStoresPeerUPFeatures(t *testing.T) {
+	// Octet 5 bit 1 (UPFunctionFeatures table) is not asserted by name; octets
+	// beyond the known table must survive in the raw copy.
+	ext := []byte{0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xA5, 0xFF}
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"two octets", []byte{0x01, 0x00}},
+		{"extended ten octets", ext},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newNodeEnv(t, rtsT0, http.StatusAccepted)
+			in := append([]byte(nil), tc.raw...)
+			e.upf.set(func() { e.upf.assocUPFeat = append([]byte(nil), in...) })
+			if !e.s.runAssociationSetup(t.Context()) {
+				t.Fatal("association setup failed")
+			}
+			for i := range in { // mutate the source buffer: stored copy must not alias
+				in[i] ^= 0xFF
+			}
+			a := e.s.PFCPAssociation()
+			if !bytes.Equal(a.PeerUPFeaturesRaw, tc.raw) {
+				t.Fatalf("raw = %x, want %x", a.PeerUPFeaturesRaw, tc.raw)
+			}
+			if len(a.PeerUPFeatures) == 0 {
+				t.Errorf("no decoded feature names for %x", tc.raw)
+			}
+			if !e.logs.has(map[string]any{"procedure": "PfcpAssociationSetup", "peer_up_features_hex": hex.EncodeToString(tc.raw), "peer_up_features_octets": float64(len(tc.raw))}) {
+				t.Error("peer UP features not logged")
+			}
+		})
+	}
+}
+
+func TestPFCPNode_AssocSetupWithoutUPFeaturesIsOK(t *testing.T) {
+	e := newNodeEnv(t, rtsT0, http.StatusAccepted)
+	e.s.assoc.mu.Lock()
+	e.s.assoc.peerUPFeaturesRaw = []byte{0x01, 0x00} // stale value from a prior association
+	e.s.assoc.mu.Unlock()
+	if !e.s.runAssociationSetup(t.Context()) {
+		t.Fatal("association setup failed")
+	}
+	a := e.s.PFCPAssociation()
+	if a.State != assocAssociated || len(a.PeerUPFeaturesRaw) != 0 || len(a.PeerUPFeatures) != 0 {
+		t.Errorf("state=%s raw=%x names=%v, want ASSOCIATED/empty", a.State, a.PeerUPFeaturesRaw, a.PeerUPFeatures)
+	}
+}
+
+func TestPFCPNode_AssocSetupRequestBytesUnchanged(t *testing.T) {
+	e := newNodeEnv(t, rtsT0, http.StatusAccepted)
+	if !e.s.runAssociationSetup(t.Context()) {
+		t.Fatal("association setup failed")
+	}
+	reqs := e.upf.msgs(pfcpmsg.MsgTypeAssociationSetupRequest)
+	if len(reqs) == 0 {
+		t.Fatal("no Association Setup Request seen")
+	}
+	want := pfcpmsg.NewAssociationSetupRequest(reqs[0].seq,
+		pfcpie.NewNodeID("", "", "smf"), pfcpie.NewRecoveryTimeStamp(e.s.RecoveryTimeStamp()))
+	wb := make([]byte, want.MarshalLen())
+	if err := want.MarshalTo(wb); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reqs[0].raw, wb) {
+		t.Errorf("request = %x, want only NodeID+RTS: %x", reqs[0].raw, wb)
 	}
 }

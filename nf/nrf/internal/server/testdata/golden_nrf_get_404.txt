@@ -1,0 +1,5 @@
+status: Not Found
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"RESOURCE_URI_STRUCTURE_NOT_FOUND","detail":"unknown nfInstanceId","status":404}

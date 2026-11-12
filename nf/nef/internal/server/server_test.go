@@ -25,12 +25,13 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/nef/internal/config"
 	oauth2pkg "github.com/francurieses/claudia-5gc/shared/oauth2"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // ---- test constants ----------------------------------------------------------
 
 const testSecret = "5gc-dev-secret"
-const testScope = "nnef-afsessionwithqos"
+const testScope = "3gpp-as-session-with-qos"
 
 // ---- mock clients ------------------------------------------------------------
 
@@ -58,16 +59,18 @@ type mockPCFClient struct {
 	lastDeleteBaseURI   string
 	lastDeleteSessionID string
 	deleteCallCount     int
+	createNegotiated    features.Set // returned as the negotiated Npcf set
 	CreateFunc          func(ctx context.Context, pcfBaseURI string, req *AppSessionContextReqData) (string, error)
 	DeleteFunc          func(ctx context.Context, pcfBaseURI, appSessionID string) error
 }
 
-func (m *mockPCFClient) CreateAppSession(ctx context.Context, pcfBaseURI string, req *AppSessionContextReqData) (string, error) {
+func (m *mockPCFClient) CreateAppSession(ctx context.Context, pcfBaseURI string, req *AppSessionContextReqData) (string, features.Set, error) {
 	m.mu.Lock()
 	m.lastCreateReq = req
 	m.lastCreateBaseURI = pcfBaseURI
 	m.mu.Unlock()
-	return m.CreateFunc(ctx, pcfBaseURI, req)
+	id, err := m.CreateFunc(ctx, pcfBaseURI, req)
+	return id, m.createNegotiated, err
 }
 
 func (m *mockPCFClient) DeleteAppSession(ctx context.Context, pcfBaseURI, appSessionID string) error {
@@ -457,7 +460,7 @@ func TestGetUnknownSubscription(t *testing.T) {
 // subscription returns 204 and that the mock PCF's DeleteAppSession was called
 // with the correct appSessionId.
 //
-// Ref: TS 29.522 §4.4.13.2.5 (Delete), TS 29.514 §5.2.2.4
+// Ref: TS 29.522 §4.4.13.2.5 (Delete), TS 29.514 §4.2.4.2
 func TestDeleteExistingSubscription(t *testing.T) {
 	pcf := defaultPCF()
 	_, ts := newTestServer(t, defaultBSF(), pcf)

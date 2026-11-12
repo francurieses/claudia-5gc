@@ -3,6 +3,7 @@ package nas
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/francurieses/claudia-5gc/mcp/internal/mcperr"
@@ -21,7 +22,8 @@ func args(t *testing.T, m map[string]any) json.RawMessage {
 // asMCPErr asserts err is an *mcperr.Error with the expected code.
 func asMCPErr(t *testing.T, err error, wantCode int) *mcperr.Error {
 	t.Helper()
-	e, ok := err.(*mcperr.Error)
+	var e *mcperr.Error
+	ok := errors.As(err, &e)
 	if !ok {
 		t.Fatalf("want *mcperr.Error, got %T (%v)", err, err)
 	}

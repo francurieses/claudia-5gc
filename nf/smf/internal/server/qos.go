@@ -137,6 +137,8 @@ func ValidFiveQI(v int) bool {
 // ---- /nsmf-management/v1 handlers -----------------------------------------
 
 // sessionView is the JSON shape returned by the management session endpoints.
+//
+// oapi: none SMF management endpoint (/nsmf-management), not a 3GPP SBI body
 type sessionView struct {
 	SmContextRef string `json:"smContextRef"`
 	SUPI         string `json:"supi"`
@@ -156,6 +158,11 @@ type sessionView struct {
 	SEID        uint64 `json:"seid"`
 	State       string `json:"sessionState"`
 	CreatedAt   string `json:"createdAt,omitempty"`
+	// Capability5GSM is the 5GSM capability IE value octets (hex) from the PDU
+	// Session Establishment Request and Capability5GSMBits the set-bit names;
+	// "" and [] when the UE did not send the IE. Ref: TS 24.501 §9.11.4.1
+	Capability5GSM     string   `json:"capability5gsm"`
+	Capability5GSMBits []string `json:"capability5gsmBits"`
 }
 
 func (s *Server) sessionToView(ref string, sess *Session) sessionView {
@@ -177,6 +184,11 @@ func (s *Server) sessionToView(ref string, sess *Session) sessionView {
 		UPFTeid:      sess.ULTEID,
 		SEID:         sess.SEID,
 		State:        sess.State,
+	}
+	v.Capability5GSM = sess.Capability5GSM.RawHex()
+	v.Capability5GSMBits = sess.Capability5GSM.SetBitNames()
+	if v.Capability5GSMBits == nil {
+		v.Capability5GSMBits = []string{}
 	}
 	v.SNSSAI.SST = sess.SliceID.SST
 	v.SNSSAI.SD = sess.SliceID.SD

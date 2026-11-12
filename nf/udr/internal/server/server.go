@@ -13,6 +13,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -20,7 +21,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -29,7 +29,10 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/qos"
 	"github.com/francurieses/claudia-5gc/nf/udr/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
+	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
 // TLSConfig holds TLS configuration for the server.
@@ -50,6 +53,12 @@ type Server struct {
 	// SetSliceQoSSeed, SetKnownDNNs); both are optional.
 	operatorSeed map[store.SliceKey]store.AMBR
 	knownDNNs    map[string]struct{}
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17. cat is the
+	// Nudr_DataRepository producer catalog; nil = the default.
+	profile *capability.Profile
+	cat     *features.Catalog
 }
 
 func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
@@ -68,11 +77,13 @@ func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 	}, nil
 }
 
-// New builds the UDR server.
+// New builds the UDR server. logger must already carry the "nf" attribute (as
+// the process logger of cmd/udr does): slog's JSON handler does not
+// de-duplicate keys, so New does not add it a second time.
 func New(addr string, tlsCfg TLSConfig, st store.Store, logger *slog.Logger) (*Server, error) {
 	s := &Server{
 		store:  st,
-		logger: logger.With("nf", "UDR"),
+		logger: logger,
 		addr:   addr,
 	}
 	mux := http.NewServeMux()
@@ -182,12 +193,19 @@ func (s *Server) handleGetAuthSub(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetAuthSubscription", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySupportedFeatures, peerUDM)
+	if !ok {
+		return
+	}
 	sub, err := s.store.GetAuthSubscription(supi)
 	if err != nil {
 		log.Warn("not found", "error", err)
 		s.problem(w, http.StatusNotFound, "RESOURCE_URI_STRUCTURE_NOT_FOUND", err.Error())
 		return
 	}
+	// AuthenticationSubscription has no supportedFeatures attribute (TS 29.505
+	// Rel-17 YAML): the value is validated and logged, nothing is answered.
+	s.logOK(w, r, neg)
 	log.Info("auth subscription returned", "direction", "OUT")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(authSubToJSON(sub))
@@ -199,6 +217,10 @@ func (s *Server) handlePatchAuthSub(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "PatchAuthSubscription", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySupportedFeatures, peerUDM)
+	if !ok {
+		return
+	}
 	var patch struct {
 		SequenceNumber *struct {
 			SQN string `json:"sqn"`
@@ -216,6 +238,7 @@ func (s *Server) handlePatchAuthSub(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Info("SQN updated", "direction", "IN")
 	}
+	s.logOK(w, r, neg)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -225,15 +248,38 @@ func (s *Server) handleGetAMData(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetAMData", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySupportedFeatures, peerUDM)
+	if !ok {
+		return
+	}
 	sub, err := s.store.GetAMSubscription(supi)
 	if err != nil {
 		log.Warn("AM subscription not found", "error", err)
 		s.problem(w, http.StatusNotFound, "RESOURCE_URI_STRUCTURE_NOT_FOUND", err.Error())
 		return
 	}
+	s.logOK(w, r, neg)
 	log.Info("AM subscription returned", "direction", "OUT")
+	resp := amSubToJSON(sub)
+	// AccessAndMobilitySubscriptionData.gpsis (TS 29.503 §6.1.6.2.4, schema
+	// served by TS 29.505): spec-literal Rel-19 profile only (AMF-020); the
+	// legacy profile keeps the pre-existing bytes even when GPSIs are stored.
+	if features.SpecLiteral(s.profile) {
+		if gpsis := s.validGPSIs(log, supi, sub.GPSIS); len(gpsis) > 0 {
+			resp["gpsis"] = gpsis
+		}
+	}
+	// AccessAndMobilitySubscriptionData.supportedFeatures (TS 29.503 §6.1.6.2.4,
+	// served by TS 29.505): the negotiated set, absent under rel17 when the
+	// request had none (decision D1). The data type points at the Nudm_SDM
+	// table (TS 29.503 §6.1.8) while the query parameter negotiates the
+	// Nudr_DataRepository table (TS 29.504 §6.1.8); the UDR implements no bit
+	// of either, so the value is the empty intersection ("0") in practice.
+	if neg.answer != "" {
+		resp[attrSupportedFeatures] = neg.answer
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(amSubToJSON(sub))
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // GET sm-data — session management subscription data with subscribed default QoS
@@ -242,6 +288,10 @@ func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetSMData", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySupportedFeatures, peerUDM)
+	if !ok {
+		return
+	}
 	subs, err := s.store.GetSMSubscriptions(supi)
 	if err != nil {
 		log.Error("GetSMSubscriptions failed", "error", err)
@@ -254,6 +304,9 @@ func (s *Server) handleGetSMData(w http.ResponseWriter, r *http.Request) {
 			"no SM subscription for "+supi)
 		return
 	}
+	// SmSubsData has no top-level supportedFeatures attribute (TS 29.505
+	// Rel-17 YAML): validated and logged, nothing is answered.
+	s.logOK(w, r, neg)
 	log.Info("SM subscription returned", "direction", "OUT", "slice_count", len(subs))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(subs)
@@ -281,7 +334,23 @@ func (s *Server) handlePutSMData(w http.ResponseWriter, r *http.Request) {
 // PUT amf-3gpp-access — UDM UECM AMF registration context
 func (s *Server) handlePutAMFContext(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
+	// The registration body is not stored (pre-existing); it is only read for
+	// Amf3GppAccessRegistration.supportedFeatures. An empty body carries no
+	// attribute and is accepted as before; an unreadable or oversize one is
+	// refused (400 / 413) rather than silently skipping the validation.
+	body, err := readBody(w, r)
+	if err != nil {
+		s.bodyReadFailed(w, r, "PutAMFContext", features.CauseInvalidMsgFormat, err)
+		return
+	}
+	neg, ok := s.bodyFeatures(w, r, body, attrSupportedFeatures, peerUDM)
+	if !ok {
+		return
+	}
+	s.logOK(w, r, neg)
 	s.procedureLog(r, "PutAMFContext", supi).Info("AMF context registered", "direction", "IN")
+	// The 201 has no body here, so there is nothing to answer in (the spec 201
+	// carries the registration); the negotiation is validated and logged.
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -292,6 +361,10 @@ func (s *Server) handleGetUEPolicySet(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetUEPolicySet", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySuppFeat, peerPCF)
+	if !ok {
+		return
+	}
 	sub, err := s.store.GetPolicySubscription(supi)
 	if err != nil {
 		log.Error("GetPolicySubscription failed", "error", err)
@@ -303,9 +376,12 @@ func (s *Server) handleGetUEPolicySet(w http.ResponseWriter, r *http.Request) {
 			"no policy subscription for "+supi)
 		return
 	}
+	s.logOK(w, r, neg)
 	log.Info("UE policy set returned", "direction", "OUT", "rule_count", len(sub.Rules))
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(sub)
+	// UePolicySet.suppFeat (TS 29.519 §5.4.2.4): the negotiated set, absent
+	// under rel17 when the request had none (decision D1).
+	_ = json.NewEncoder(w).Encode(uePolicySetResponse{PolicySubscription: sub, SuppFeat: neg.answer})
 }
 
 // PUT /nudr-dr/v2/policy-data/{supi}/ue-policy-set
@@ -313,9 +389,18 @@ func (s *Server) handlePutUEPolicySet(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "PutUEPolicySet", supi)
 
+	body, err := readBody(w, r)
+	if err != nil {
+		s.bodyReadFailed(w, r, "PutUEPolicySet", "MANDATORY_IE_INCORRECT", err)
+		return
+	}
 	var sub store.PolicySubscription
-	if err := json.NewDecoder(r.Body).Decode(&sub); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&sub); err != nil {
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
+		return
+	}
+	neg, ok := s.bodyFeatures(w, r, body, attrSuppFeat, peerPCF)
+	if !ok {
 		return
 	}
 	sub.SUPI = supi
@@ -324,6 +409,9 @@ func (s *Server) handlePutUEPolicySet(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
 		return
 	}
+	// UePolicySet.suppFeat is the consumer's set here; the 204 has no body to
+	// answer in, so the negotiation is validated and logged only.
+	s.logOK(w, r, neg)
 	log.Info("UE policy set stored", "direction", "IN", "rule_count", len(sub.Rules))
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -389,6 +477,10 @@ func (s *Server) handleGetSmPolicyData(w http.ResponseWriter, r *http.Request) {
 	supi := r.PathValue("supi")
 	log := s.procedureLog(r, "GetSmPolicyData", supi)
 
+	neg, ok := s.queryFeatures(w, r, querySuppFeat, peerPCF)
+	if !ok {
+		return
+	}
 	data, err := s.store.GetSmPolicyData(supi)
 	if err != nil {
 		log.Error("GetSmPolicyData failed", "error", err)
@@ -399,9 +491,12 @@ func (s *Server) handleGetSmPolicyData(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusNotFound, "DATA_NOT_FOUND", "no SM policy data for "+supi)
 		return
 	}
+	s.logOK(w, r, neg)
 	log.Info("SM policy data returned", "direction", "OUT", "slice_count", len(data.SmPolicySnssaiData))
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(data)
+	// SmPolicyData.suppFeat (TS 29.519 §5.4.2.5): the negotiated set, absent
+	// under rel17 when the request had none (decision D1).
+	_ = json.NewEncoder(w).Encode(smPolicyDataResponse{SmPolicyData: data, SuppFeat: neg.answer})
 }
 
 // PUT /nudr-dr/v2/policy-data/{supi}/sm-data — replace SM policy data
@@ -535,6 +630,17 @@ func authSubToJSON(s *store.AuthenticationSubscription) map[string]any {
 	}
 }
 
+// validGPSIs keeps the stored GPSIs that match the Gpsi schema pattern
+// (TS 29.571 §5.3.2); each rejected entry is logged and skipped.
+func (s *Server) validGPSIs(log *slog.Logger, supi string, stored []string) []string {
+	valid, rejected := types.FilterGpsis(stored)
+	for _, g := range rejected {
+		log.Warn("stored GPSI does not match the Gpsi pattern, skipped",
+			"result", "REJECT", "cause", "INVALID_GPSI", "gpsi", g, "spec_ref", "TS 29.571 §5.3.2")
+	}
+	return valid
+}
+
 func amSubToJSON(s *store.AccessAndMobilitySubscriptionData) map[string]any {
 	snssais := make([]map[string]any, 0)
 	for _, n := range s.NSSAI.SNSSAIs {
@@ -556,15 +662,6 @@ func amSubToJSON(s *store.AccessAndMobilitySubscriptionData) map[string]any {
 			"downlink": fmt.Sprintf("%d Kbps", s.SubscribedUEAMBRDownlink),
 		},
 	}
-}
-
-// supiPath extracts the SUPI from a path like /.../{supi}/...
-func supiPath(path string) string {
-	parts := strings.Split(path, "/")
-	if len(parts) > 4 {
-		return parts[4]
-	}
-	return ""
 }
 
 // bitRateKbpsPattern is the TS 29.571 §5.5.2 BitRate regex (space mandatory).

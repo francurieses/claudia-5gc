@@ -53,3 +53,8 @@ location_subscription:
   default_reporting_interval_s: 10    # periodic default when caller omits reportingInterval
   max_duration_s: 3600                # cap on subscription lifetime (1 hour)
   notification_retry: 1               # one retry on 5xx before dropping
+
+# Release profile (default rel19; rel17 = frozen legacy baseline). rel19 enables spec-literal
+# SBI supportedFeatures negotiation (TS 29.500 §6.6.2). NF_RELEASE_PROFILE overrides.
+# release:
+#   profile: rel17

@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"locationEstimate":{"shape":"POINT","point":{"lat":40.416775,"lon":-3.70379}},"nrCellId":"000000010","tai":{"plmnId":{"mcc":"001","mnc":"01"},"tac":"0001"},"ageOfLocationEstimate":0}

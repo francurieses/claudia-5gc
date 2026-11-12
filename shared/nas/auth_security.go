@@ -88,8 +88,11 @@ func DecodeAuthenticationRequest(b []byte) (*AuthenticationRequest, error) {
 			l := int(hi)<<8 | int(lo)
 			ar.EAPMessage, _ = rdr.ReadBytes(l)
 		default:
-			l, _ := rdr.ReadByte()
-			_, _ = rdr.ReadBytes(int(l))
+			// Unknown IE: table / TS 24.007 §11.2.4 skip; an incorrect IE is
+			// treated as not present. Ref: TS 24.501 §7.6.1, §7.7.1
+			if err := rdr.skipIE(IEMsgAuthenticationRequest); err != nil {
+				return ar, nil
+			}
 		}
 	}
 	return ar, nil
@@ -124,8 +127,9 @@ func DecodeAuthenticationResponse(b []byte) (*AuthenticationResponse, error) {
 			l := int(hi)<<8 | int(lo)
 			ar.EAPMessage, _ = rdr.ReadBytes(l)
 		default:
-			l, _ := rdr.ReadByte()
-			_, _ = rdr.ReadBytes(int(l))
+			if err := rdr.skipIE(IEMsgAuthenticationResponse); err != nil {
+				return ar, nil
+			}
 		}
 	}
 	return ar, nil
@@ -324,9 +328,10 @@ func DecodeSecurityModeCommand(b []byte) (*SecurityModeCommand, error) {
 			l := int(hi)<<8 | int(lo)
 			smc.NASMessageContainer, _ = rdr.ReadBytes(l)
 		default:
-			if iei < 0x80 {
-				l, _ := rdr.ReadByte()
-				_, _ = rdr.ReadBytes(int(l))
+			// Selected EPS NAS security algorithms (TV), EAP, ABBA, ... and
+			// unknown IEs: table / TS 24.007 §11.2.4 skip.
+			if err := rdr.skipIE(IEMsgSecurityModeCommand); err != nil {
+				return smc, nil
 			}
 		}
 	}
@@ -383,9 +388,10 @@ func DecodeSecurityModeComplete(b []byte) (*SecurityModeComplete, error) {
 			l := int(hi)<<8 | int(lo)
 			smc.NASMessageContainer, _ = rdr.ReadBytes(l)
 		default:
-			if iei < 0x80 {
-				l, _ := rdr.ReadByte()
-				_, _ = rdr.ReadBytes(int(l))
+			// Selected EPS NAS security algorithms (TV), EAP, ABBA, ... and
+			// unknown IEs: table / TS 24.007 §11.2.4 skip.
+			if err := rdr.skipIE(IEMsgSecurityModeComplete); err != nil {
+				return smc, nil
 			}
 		}
 	}

@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/francurieses/claudia-5gc/tools/mgmt-portal/internal/config"
+	"github.com/go-chi/chi/v5"
 )
 
 type addSliceRequest struct {

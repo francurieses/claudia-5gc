@@ -6,6 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 )
 
@@ -58,6 +59,10 @@ type Config struct {
 	// receiver and the Usage Reporting Rule installed at establishment.
 	// Ref: TS 29.244 §5.2.2.4, §7.5.2.4, §7.5.5.
 	N4 N4Config `yaml:"n4"`
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// Rel-19 wire behaviour such as SBI supportedFeatures negotiation.
+	// Ref: TS 29.500 §6.6.2; dev/REL19_PROGRAM.md decisions D1/D2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 // N4Config holds PFCP (N4) usage-reporting configuration.
@@ -172,7 +177,7 @@ func Load() (*Config, error) {
 		}
 	}
 
-	data, err := os.ReadFile(cfgPath)
+	data, err := os.ReadFile(cfgPath) //nolint:gosec // operator-supplied config path (flag/env), not request-derived
 	if err == nil {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("config: parse YAML: %w", err)

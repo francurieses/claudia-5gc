@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/free5gc/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 )
 
 // failedAck admits PSI 1 and reports PSIs 2 (known), 11 (unknown to the AMF) as target-failed.

@@ -122,8 +122,10 @@ Not implemented: N37 (NEF – UDR), N40 (CHF), N9 (I-UPF), SCP, UDSF.
 | Auth for SBI | OAuth2 client_credentials, NRF as AS | TS 33.501 §13.4.1 |
 | Service discovery | NRF (no DNS-SD) | TS 23.501 §6.3.1 |
 | Internal NF storage | Per-NF state in process (PostgreSQL / Redis backed); UDR for subscriber data; charging not implemented | Avoid sharing state between NF instances |
-| Codecs (NGAP/NAS) | Reuse `github.com/free5gc/aper` (Apache-2.0) | Avoid reimplementing ASN.1 PER |
+| Codecs (NGAP/NAS) | NGAP/NRPPa: in-repo `shared/ngap` / `shared/nrppa` on `github.com/free5gc/aper` (Apache-2.0); NAS: `shared/nas` | Avoid reimplementing ASN.1 PER |
 | UPF data plane | Userspace Go datapath: per-DNN TUN (`upfgtpN`) + iptables MASQUERADE; Rust + eBPF/XDP later | Pragmatic MVP, scale later |
+| Release / capability layer | Each NF carries a release profile (`rel19` default, `rel17` frozen legacy); Rel-18/19 behaviour is gated per feature and per peer (SBI `supportedFeatures`, NAS capability bits, gNB release inferred at NG Setup). Legacy peers get byte-identical messages | Rel-19 baseline with Rel-15/16/17 RAN/UE compatibility; mixed-release NFs coexist (TS 29.500 §6.6.2) |
+| Roaming | SEPP (N32-c / N32-f) between PLMNs, `vsepp` + `hsepp` | TS 23.501 §4.2.4, TS 29.573 |
 | Kubernetes vs Compose | Compose | Fewer moving parts during development |
 | Service mesh | None | SBA already has NRF; mesh breaks SBI tracing |
 
@@ -155,6 +157,7 @@ management port `GET :9002/amf/v1/ran/gnbs` (plain HTTP, read-only). Commands: [
 | n3-net | 172.30.3.0/24 | GTP-U between gNB and UPF | UPF, gNB simulators |
 | n6-net | 172.30.6.0/24 + `fd00:6::/64` | UPF egress for the `internet` DNN | UPF |
 | n6-ims-net | 172.30.7.0/24 + `fd00:7::/64` | UPF egress for the `ims` DNN | UPF |
+| n32-net (`5gc-n32`) | 172.30.5.0/24 | N32 inter-PLMN interconnect (roaming); FQDN aliases `sepp.5gc.mnc00{1,2}.mcc001.3gppnetwork.org` | vsepp, hsepp |
 | obs-net | (Docker-assigned) | Observability | Loki, Prometheus, Grafana, Jaeger, NFs |
 
 `perf` profile (opt-in benchmarking, headline figures in [`performance/summary.md`](performance/summary.md)): `iperf3-dn` 172.30.6.50 and `gtpu-bench-dn` 172.30.6.51 on n6-net; `gtpu-bench` 172.30.3.20 on n3-net + n4-net; `iperf3-upf-local` shares the UPF network namespace (10.60.0.254). iperf3 ports: 5201-5216 (`iperf3-dn`), 5301-5316 (`iperf3-upf-local`); none are published to the host.
@@ -205,3 +208,5 @@ Three pillars, all wired from Day 0:
 3. **Traces** — OpenTelemetry to Jaeger via OTLP. Per-procedure trace, spans per SBI call and per N1/N2/N4 message.
 
 Plus PCAP per NF via tcpdump sidecar. Wireshark dissects NGAP, NAS-5GS, PFCP, GTP-U, and HTTP/2 SBI natively.
+
+> **SEPP (wired, REL19-9.6/9.7).** Roaming edge proxy for N32-c / N32-f; see `docs/procedures/n32-roaming-interconnect.md`. Compose: `vsepp` (profile `core`; host SBI 8014, N32 8443, metrics 9115), `hsepp` (profile `roaming`; 8114 / 8543 / 9215), `hnrf` (profile `roaming`; SBI 8100, metrics 9200, PLMN 001/02, in-memory registry), PCAP sidecars `vsepp-pcap` / `hsepp-pcap`. Prometheus scrapes `vsepp:9115` / `hsepp:9115`. E2E: `make sepp-e2e`. The MCP target list and `scripts/services-restart-check.sh` cover `vsepp`.

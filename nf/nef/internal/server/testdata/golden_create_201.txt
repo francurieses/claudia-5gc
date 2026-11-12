@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: https://nef.5gc.test/3gpp-as-session-with-qos/v1/af-1/subscriptions/<SUBID>
+
+{"subscriptionId":"<SUBID>","scsAsId":"af-1","ueIpv4Addr":"10.60.0.1","afAppId":"app-1","qosReference":"qos-1","dnn":"internet"}

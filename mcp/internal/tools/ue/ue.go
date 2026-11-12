@@ -108,7 +108,10 @@ func (getTool) Name() string        { return "ue_context_get" }
 func (getTool) Risk() registry.Risk { return registry.ReadOnly }
 func (getTool) Description() string {
 	return "Retrieve the full UE context for a SUPI, or for a 5G-GUTI (the guti string exactly as ue_list " +
-		"shows it): identifiers, 5GMM/CM state, PDU sessions and timestamps. Per 3GPP TS 23.502."
+		"shows it): identifiers, 5GMM/CM state, PDU sessions, timestamps and the UE's 5GMM capability " +
+		"(capability_5gmm hex IE value octets, capability_5gmm_bits names of the set bits; \"\" and [] when the UE " +
+		"sent no IE). The 5GSM capability lives in the SMF session view (pdu_session_list capability5gsm / " +
+		"capability5gsmBits). Per 3GPP TS 23.502, TS 24.501 §9.11.3.1."
 }
 func (getTool) InputSchema() json.RawMessage {
 	return schema(`{"type":"object","properties":{
@@ -116,7 +119,9 @@ func (getTool) InputSchema() json.RawMessage {
 "guti":{"type":"string","description":"5G-GUTI as reported by ue_list, e.g. mcc=001 mnc=01 amf=01 set=1 id=01 tmsi=00000001"}}}`)
 }
 func (getTool) OutputSchema() json.RawMessage {
-	return schema(`{"type":"object"}`)
+	return schema(`{"type":"object","properties":{
+"capability_5gmm":{"type":"string","description":"5GMM capability IE value octets, hex; empty when the UE sent no IE"},
+"capability_5gmm_bits":{"type":"array","items":{"type":"string"},"description":"names of the set 5GMM capability bits (TS 24.501 §9.11.3.1)"}}}`)
 }
 
 func (t getTool) Invoke(ctx context.Context, in json.RawMessage) (any, error) {

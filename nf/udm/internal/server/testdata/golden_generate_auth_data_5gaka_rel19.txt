@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"authType":"5G_AKA","supportedFeatures":"0","authenticationVector":{"avType":"5G_HE_AKA","rand":"<HEX>","autn":"<HEX>","xresStar":"<HEX>","kausf":"<HEX>"},"supi":"imsi-001010000000001"}

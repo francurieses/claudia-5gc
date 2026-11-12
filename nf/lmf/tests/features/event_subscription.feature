@@ -1,4 +1,4 @@
-Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / §5.2.2.5)
+Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / §5.2.2.4.2)
   As an LCS consumer (internal NF or AF)
   I want to manage location event subscriptions with the LMF
   So that I receive pushed LocationNotification callbacks for periodic or area-of-interest events
@@ -7,7 +7,7 @@ Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / �
   # spec_ref: TS 29.572 §5.2.3.2  (EventSubscription Create  — POST /subscriptions → 201)
   # spec_ref: TS 29.572 §5.2.3.3  (EventSubscription Get     — GET  /subscriptions/{subId} → 200)
   # spec_ref: TS 29.572 §5.2.3.4  (EventSubscription Delete  — DELETE /subscriptions/{subId} → 204)
-  # spec_ref: TS 29.572 §5.2.2.5  (CancelLocation one-shot  — POST …/cancel-loc → 204)
+  # spec_ref: TS 29.572 §5.2.2.4.2  (CancelLocation one-shot  — POST …/cancel-location → 204)
   # spec_ref: TS 29.572 §6.1.6.2.4 (LocationNotification body schema)
   # spec_ref: TS 23.273 §7.2 step B2 (deferred location subscription use case)
   # spec_ref: TS 29.571 §5.2       (common SBI types — subscriptions and notifications)
@@ -15,7 +15,7 @@ Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / �
   # endpoint: POST /nlmf-loc/v1/subscriptions → 201 + Location header
   # endpoint: GET  /nlmf-loc/v1/subscriptions/{subId} → 200 subscription resource
   # endpoint: DELETE /nlmf-loc/v1/subscriptions/{subId} → 204
-  # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/cancel-loc → 204
+  # endpoint: POST /nlmf-loc/v1/cancel-location → 204
 
   Background:
     Given a clean LMF instance is running on SBI port 8012
@@ -103,7 +103,7 @@ Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / �
 
   # ---------------------------------------------------------------------------
   # Scenario 6 — DELETE subscription (cancel): 204 and no further notifications
-  # TS 29.572 §5.2.3.4 / §5.2.2.5 — DELETE → 204; goroutine stopped; sink is silent
+  # TS 29.572 §5.2.3.4 / §5.2.2.4.2 — DELETE → 204; goroutine stopped; sink is silent
   # After delete the sink must receive no further notifications within 2 × interval
   # ---------------------------------------------------------------------------
   Scenario: Cancelling a subscription with DELETE stops further notifications
@@ -115,8 +115,8 @@ Feature: Nlmf_Location EventSubscription + CancelLocation (TS 29.572 §5.2.3 / �
     And the mock sink receives no further LocationNotification within 5 seconds after the delete
 
   # ---------------------------------------------------------------------------
-  # Scenario 7 — One-shot CancelLocation: POST …/cancel-loc returns 204
-  # TS 29.572 §5.2.2.5 — abort an in-progress DetermineLocation request context
+  # Scenario 7 — One-shot CancelLocation: POST …/cancel-location returns 204
+  # TS 29.572 §5.2.2.4.2 — abort an in-progress DetermineLocation request context
   # CancelLocation for a UE with no in-progress one-shot is a 204 idempotent no-op
   # ---------------------------------------------------------------------------
   Scenario: One-shot CancelLocation for a UE with no in-progress request returns 204 idempotent no-op

@@ -7,9 +7,10 @@ sbi:
   # fqdn is reported as pcfFqdn in PcfBinding registrations with the BSF so that
   # NEF/AF consumers can reach this PCF by name. Ref: TS 29.521 §6.2.6.
   fqdn: "pcf"
-  cert_file: /etc/5gc/pki/pcf.crt
-  key_file: /etc/5gc/pki/pcf.key
-  ca_file: /etc/5gc/pki/ca.crt
+  tls:
+    cert_file: /etc/5gc/pki/pcf.crt
+    key_file: /etc/5gc/pki/pcf.key
+    ca_file: /etc/5gc/pki/ca.crt
 
 peers:
   nrf: "nrf:8000"
@@ -58,3 +59,8 @@ default_ursp:
             sd: "000001"
           dnn: "internet"
           pdu_session_type: 1
+
+# Release profile (default rel19; rel17 = frozen legacy baseline). rel19 enables spec-literal
+# SBI supportedFeatures negotiation (TS 29.500 §6.6.2). NF_RELEASE_PROFILE overrides.
+# release:
+#   profile: rel17

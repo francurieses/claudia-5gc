@@ -97,6 +97,18 @@ gNB handles NGAP Write-Replace Warning Request (ProcCode 51) and PWS Cancel Requ
 UCS2 + language prefix) and answers with BroadcastCompletedAreaList / BroadcastCancelledAreaList
 (TS 38.413 §8.9). Enables live PWS end to end.
 
+### Patch 0080 — Opt-in 5GMM / 5GSM capability bits (UE)
+The UE can advertise Rel-18/19 capability bits in the 5GMM capability IE (IEI 0x10, Registration
+Request, TS 24.501 §9.11.3.1) and the 5GSM capability IE (IEI 0x28, PDU Session Establishment
+Request, §9.11.4.1). Configure in the UE yaml with lists of `"octet.bit"` positions (spec numbering:
+octet 3 is the first value octet, bit 1 the least significant), e.g.
+`mmCapabilityBits: ['8.3', '8.4', '9.3', '11.5', '12.7', '13.4']` and
+`smCapabilityBits: ['4.6', '4.7', '4.8', '5.2']` (octet 3..15, bit 1..8; names in
+`shared/nas/capability_ie.go`). The configured bits are OR-ed over the stock bits, so a UE without the
+keys sends the unchanged one-octet `10 01 00` / `28 01 00`. The AMF/SMF only see the 5GMM IE inside the
+ciphered NAS message container of Security Mode Complete (TS 24.501 §4.4.6); the 5GSM IE is inside UL
+NAS Transport.
+
 ---
 
 ## Command Reference

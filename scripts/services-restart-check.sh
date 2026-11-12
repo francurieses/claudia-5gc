@@ -83,9 +83,9 @@ PING_TARGET="${PING_TARGET:-172.30.3.100}"
 AMF_MGMT="http://localhost:9002"
 
 # Canonical order: stateless SBA NFs, NRF, SMF, UPF, AMF, infra/obs, portal last.
-ALL_SERVICES="ausf udm udr pcf nssf bsf nef lmf smsf nrf smf upf amf redis postgres prometheus loki promtail grafana jaeger mcp mgmt-portal"
+ALL_SERVICES="ausf udm udr pcf nssf bsf nef lmf smsf vsepp nrf smf upf amf redis postgres prometheus loki promtail grafana jaeger mcp mgmt-portal"
 # NFs that register with the NRF (UPF does not; NRF is the registry).
-NRF_CLIENT_NFS="amf ausf udm udr smf pcf nssf bsf nef lmf smsf"
+NRF_CLIENT_NFS="amf ausf udm udr smf pcf nssf bsf nef lmf smsf vsepp"
 
 if [ -t 1 ]; then
     RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
@@ -121,6 +121,7 @@ nf_type_of() {
     case "$1" in
         nrf|amf|smf|upf|udm|udr|ausf|pcf|nssf|bsf|nef|lmf|smsf)
             tr '[:lower:]' '[:upper:]' <<<"$1" ;;
+        vsepp) echo SEPP ;;
         *) echo "" ;;
     esac
 }
@@ -139,6 +140,7 @@ nf_id_of() {
         bsf)  echo 00000000-0000-4010-8000-000000000002 ;;
         nef)  echo 00000000-0000-4011-8000-000000000001 ;;
         lmf)  echo 00000000-0000-4012-8000-000000000001 ;;
+        vsepp) echo 00000000-0000-4014-8000-000000000001 ;;
         *) echo "" ;;
     esac
 }
@@ -148,7 +150,7 @@ metrics_port_of() {
         nrf) echo 9100 ;; amf) echo 9101 ;; ausf) echo 9102 ;; udm) echo 9103 ;;
         udr) echo 9104 ;; smf) echo 9105 ;; pcf) echo 9106 ;; upf) echo 9107 ;;
         nssf) echo 9109 ;; smsf) echo 9110 ;; bsf) echo 9111 ;; nef) echo 9112 ;;
-        lmf) echo 9113 ;; *) echo "" ;;
+        lmf) echo 9113 ;; vsepp) echo 9115 ;; *) echo "" ;;
     esac
 }
 PROM_JOB="5gc-nfs"

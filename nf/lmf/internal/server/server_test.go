@@ -76,7 +76,7 @@ func postLocInfo(t *testing.T, ts *httptest.Server, ueContextID string, body any
 	} else {
 		reqBody = bytes.NewReader([]byte(`{}`))
 	}
-	url := ts.URL + "/nlmf-loc/v1/ue-contexts/" + ueContextID + "/provide-loc-info"
+	url := ts.URL + "/nlmf-loc/v1/determine-location"
 	req, err := http.NewRequest(http.MethodPost, url, reqBody)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
@@ -269,7 +269,7 @@ func TestDetermineLocation_MissingUEIdentity(t *testing.T) {
 	defer ts.Close()
 
 	// Send a body with neither supi nor gpsi (empty object).
-	url := ts.URL + "/nlmf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info"
+	url := ts.URL + "/nlmf-loc/v1/determine-location"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
 	if err != nil {
 		t.Fatalf("new request: %v", err)

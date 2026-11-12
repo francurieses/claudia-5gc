@@ -34,9 +34,12 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/francurieses/claudia-5gc/nf/bsf/internal/config"
+	bsfsbi "github.com/francurieses/claudia-5gc/nf/bsf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/bsf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Server is the BSF Nbsf_Management SBI server.
@@ -45,6 +48,44 @@ type Server struct {
 	logger  *slog.Logger
 	store   *store.Store
 	httpSrv *http.Server
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// cat is the Nbsf_Management producer catalog.
+	cat *features.Catalog
+}
+
+// Attribute / parameter names of the Nbsf_Management supported-features value.
+// Ref: TS 29.521 §5.8; PcfBinding.suppFeat and the discovery query "supp-feat"
+// (specs/3gpp-openapi TS29521_Nbsf_Management.yaml).
+const (
+	// attrSuppFeat is the JSON attribute name of the features value.
+	attrSuppFeat = "suppFeat"
+	// paramSuppFeat is the invalidParams "param" for a bad suppFeat: a JSON
+	// Pointer to the attribute (TS 29.571 §5.2.4.6).
+	paramSuppFeat = "/" + attrSuppFeat
+	// querySuppFeat is the optional discovery query parameter.
+	querySuppFeat = "supp-feat"
+	// causeMandatoryQueryParamMissing is the ProblemDetails cause for a missing
+	// mandatory query parameter. Ref: TS 29.500 §5.2.7.2 Table 5.2.7.2-1.
+	causeMandatoryQueryParamMissing = "MANDATORY_QUERY_PARAM_MISSING"
+	// paramQuerySuppFeat is the invalidParams "param" for a bad query value
+	// ("query <name>", TS 29.571 §5.2.4.6).
+	paramQuerySuppFeat = "query " + querySuppFeat
+)
+
+// SetProfile wires the release profile used for supportedFeatures negotiation.
+// Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetCatalog replaces the Nbsf_Management catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetCatalog(c *features.Catalog) {
+	if c == nil {
+		c = bsfsbi.NbsfManagementCatalog()
+	}
+	s.cat = c
 }
 
 // New constructs the BSF SBI server. Call Start or Handler() to serve requests.
@@ -53,6 +94,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		cfg:    cfg,
 		logger: logger,
 		store:  store.New(),
+		cat:    bsfsbi.NbsfManagementCatalog(),
 	}
 
 	mux := http.NewServeMux()
@@ -178,8 +220,19 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"spec_ref", "TS 29.521 §5.2.2.2",
 	)
 
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "PCF")
 	var binding store.PcfBinding
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&binding); err != nil {
+		if features.IsTypeErrorOn(err, attrSuppFeat) {
+			s.rejectSuppFeat(ctx, w, peerNF, "<non-string>", err)
+			return
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(log, w)
+			return
+		}
 		// A malformed request body is MANDATORY_IE_INCORRECT, not _MISSING.
 		// Ref: TS 29.500 §5.2.7.2 (ProblemDetails cause for a syntactically invalid body).
 		log.Warn("register: malformed JSON body",
@@ -188,6 +241,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", "invalid JSON body")
 		return
 	}
+
+	// suppFeat must be schema-valid before any state is touched.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	if err := features.Validate(binding.SuppFeat); err != nil {
+		s.rejectSuppFeat(ctx, w, peerNF, binding.SuppFeat, err)
+		return
+	}
+	// Producer side (decision D1): the intersection, absent under rel17 when
+	// the request had none, "0" under rel19. The consumer's value is replaced
+	// by the negotiated one on the stored resource.
+	// Ref: TS 29.521 §5.8; TS 29.500 §6.6.2.
+	peerSuppFeat := binding.SuppFeat
+	suppAnswer, suppSet := features.Answer(s.cat, s.profile, peerSuppFeat)
+	binding.SuppFeat, binding.Features = suppAnswer, suppSet
 
 	// Validate mandatory IEs: dnn and snssai are always required.
 	// Ref: TS 29.521 §5.2.2.2 — dnn (M), snssai (M), plus at least one IP/MAC key.
@@ -250,6 +317,15 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Request accepted: record the negotiation (TS 29.500 §6.6.2).
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "BSF",
+		Interface: "Nbsf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.cat.Supported(s.profile), Peer: peerSuppFeat,
+		PeerPresent: peerSuppFeat != "", Negotiated: suppSet,
+	})
+
 	// Build the Location header.
 	// apiRoot = https://<bsfFqdn or bsfAddr>/nbsf-management/v1
 	fqdn := s.cfg.SBI.FQDN
@@ -311,7 +387,7 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 // ---- Discovery (GET /nbsf-management/v1/pcfBindings) --------------------------
 
 // handleDiscover implements Nbsf_Management_Discovery.
-// GET /nbsf-management/v1/pcfBindings?ipv4Addr=…
+// GET /nbsf-management/v1/pcfBindings?ipv4Addr=… (200 match, 204 no match)
 // Ref: TS 29.521 §5.2.2.4
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
@@ -324,14 +400,33 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	q := parseDiscoveryQuery(r)
 
-	// At least one binding-identifying parameter is required.
-	// Ref: TS 29.521 §5.2.2.4.4
+	// At least one binding-identifying parameter is required; a missing query
+	// parameter is MANDATORY_QUERY_PARAM_MISSING (not an IE of a body).
+	// Ref: TS 29.521 §5.2.2.4.4; TS 29.500 §5.2.7.2 (Table 5.2.7.2-1)
 	if !q.HasAnyParam() {
 		log.Warn("discover: no query parameter supplied",
-			"result", "REJECT", "cause", "MANDATORY_IE_MISSING")
+			"result", "REJECT", "cause", causeMandatoryQueryParamMissing)
 		metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingDiscovery", "REJECT").Inc()
-		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING",
+		s.problem(w, http.StatusBadRequest, causeMandatoryQueryParamMissing,
 			"at least one binding-identifying query parameter is required (TS 29.521 §5.2.2.4)")
+		return
+	}
+
+	// Optional "supp-feat" query parameter ("may include", TS 29.500 §6.6.2):
+	// a non-hex value is OPTIONAL_QUERY_PARAM_INCORRECT. Absent = no
+	// negotiation on this GET.
+	peerSuppFeat := r.URL.Query().Get(querySuppFeat)
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "NEF")
+	if err := features.Validate(peerSuppFeat); err != nil {
+		features.LogNegotiation(ctx, s.logger, features.Negotiation{
+			NF:        "BSF",
+			Interface: "Nbsf", Direction: "IN", PeerNF: peerNF,
+			SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseOptionalQueryParamIncorrect,
+			Local: s.cat.Supported(s.profile), Peer: peerSuppFeat, PeerPresent: true,
+		}, "error", err)
+		metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingDiscovery", "REJECT").Inc()
+		s.problemInvalidParam(w, features.CauseOptionalQueryParamIncorrect, paramQuerySuppFeat,
+			"supp-feat is not a valid hexadecimal string")
 		return
 	}
 
@@ -343,11 +438,12 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	binding, found := s.store.FindByQuery(q)
 	if !found {
+		// No match is not an error: 204 No Content, empty body.
+		// Ref: TS 29.521 §4.2.4.2; Rel-17 YAML GetPCFBindings response '204'.
 		log.Info("discover: no binding found",
-			"result", "REJECT")
-		metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingDiscovery", "REJECT").Inc()
-		s.problem(w, http.StatusNotFound, "",
-			"no PCF binding matches the given query parameters (TS 29.521 §5.2.2.4.4)")
+			"result", "OK", "status", http.StatusNoContent)
+		metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingDiscovery", "OK").Inc()
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
@@ -358,6 +454,22 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		"result", "OK",
 	)
 	metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingDiscovery", "OK").Inc()
+
+	// The GET response carries suppFeat when the query carried supp-feat
+	// (TS 29.521 §5.6.2 PcfBinding.suppFeat): the BSF catalog intersected with
+	// the consumer's value. Otherwise the stored (negotiated) value is
+	// returned as is.
+	if peerSuppFeat != "" {
+		ans, set := features.Answer(s.cat, s.profile, peerSuppFeat)
+		binding.SuppFeat, binding.Features = ans, set
+		features.LogNegotiation(ctx, s.logger, features.Negotiation{
+			NF:        "BSF",
+			Interface: "Nbsf", Direction: "IN", PeerNF: peerNF,
+			SpecRef: features.SpecRef, Result: "OK",
+			Local: s.cat.Supported(s.profile), Peer: peerSuppFeat,
+			PeerPresent: true, Negotiated: set,
+		})
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -389,6 +501,52 @@ func (s *Server) problem(w http.ResponseWriter, status int, cause, detail string
 		body["cause"] = cause
 	}
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// rejectSuppFeat answers a schema-invalid suppFeat with 400 INVALID_MSG_FORMAT
+// and invalidParams[{param: /suppFeat}] and logs the REJECT negotiation record.
+// Ref: TS 29.500 §5.2.7.2; TS 29.571 §5.2.4.6.
+func (s *Server) rejectSuppFeat(ctx context.Context, w http.ResponseWriter, peerNF, shown string, cause error) {
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "BSF",
+		Interface: "Nbsf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseInvalidMsgFormat,
+		Local: s.cat.Supported(s.profile), Peer: shown, PeerPresent: true,
+	}, "error", cause)
+	metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingRegister", "REJECT").Inc()
+	s.problemInvalidParam(w, features.CauseInvalidMsgFormat, paramSuppFeat,
+		"suppFeat is not a valid hexadecimal string")
+}
+
+// problemInvalidParam writes a 400 ProblemDetails with one invalidParams entry.
+// Ref: TS 29.571 §5.2.4.1 (ProblemDetails), §5.2.4.6 (InvalidParam).
+func (s *Server) problemInvalidParam(w http.ResponseWriter, cause, param, detail string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusBadRequest,
+		"cause":  cause,
+		"detail": detail,
+		"invalidParams": []map[string]string{
+			{"param": param},
+		},
+	})
+}
+
+// payloadTooLarge answers a body over features.MaxRequestBodyBytes with 413 and
+// a ProblemDetails without a cause (no 413 cause is defined), after logging one
+// REJECT record and counting it.
+// Ref: TS 29.500 §5.2.7.1; TS 29.571 §5.2.4.1.
+func payloadTooLarge(log *slog.Logger, w http.ResponseWriter) {
+	log.Warn("request body too large",
+		"result", "REJECT", "cause", "PAYLOAD_TOO_LARGE")
+	metrics.ProcedureTotal.WithLabelValues("BSF", "PcfBindingRegister", "REJECT").Inc()
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusRequestEntityTooLarge,
+		"detail": "request body too large",
+	})
 }
 
 // parseDiscoveryQuery extracts Nbsf_Management_Discovery query parameters from r.

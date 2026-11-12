@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 )
 
@@ -33,6 +34,11 @@ type Config struct {
 	OAuth2Secret string `yaml:"oauth2_secret"`
 
 	Metrics Metrics `yaml:"metrics"`
+
+	// Release selects the release profile (rel17 default, rel19) that gates
+	// supportedFeatures wire behaviour; NF_RELEASE_PROFILE overrides.
+	// Ref: TS 29.500 §6.6.2.
+	Release capability.ReleaseConfig `yaml:"release"`
 }
 
 type PLMN struct {

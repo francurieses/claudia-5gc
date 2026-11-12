@@ -1,0 +1,50 @@
+openapi: 3.0.0
+info:
+  version: 1.4.0
+  title: Sample
+servers:
+  - url: '{apiRoot}/nd/v1'
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [id, opt, mand]
+      properties:
+        id: {type: string}
+        opt: {type: string}
+        newOpt: {type: string}
+        mand: {type: string}
+        newName: {type: boolean}
+        kind:
+          type: string
+          enum: [A, B, C]
+        cause:
+          anyOf:
+            - type: string
+              enum: [X, Y]
+            - type: string
+        child:
+          $ref: '#/components/schemas/Child'
+    Child:
+      type: object
+      properties:
+        a: {type: string}
+        b: {type: string}
+    Unused:
+      type: object
+      properties:
+        u: {type: string}
+        v: {type: string}
+    Mut:
+      type: object
+      properties:
+        r: {type: string}
+        t: {type: string}
+        e:
+          type: string
+          enum: [P]
+    Broken:
+      allOf:
+        - $ref: '#/components/schemas/Nowhere'
+    Added:
+      type: object

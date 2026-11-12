@@ -42,8 +42,8 @@ import (
 	"strconv"
 
 	"github.com/cucumber/godog"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	amfngap "github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"

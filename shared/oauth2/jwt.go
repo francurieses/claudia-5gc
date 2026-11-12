@@ -67,11 +67,11 @@ func ValidateToken(secret []byte, tokenStr string) (*Claims, error) {
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errMalformedToken, err)
+		return nil, fmt.Errorf("%w: %w", errMalformedToken, err)
 	}
 	var c Claims
 	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, fmt.Errorf("%w: %v", errMalformedToken, err)
+		return nil, fmt.Errorf("%w: %w", errMalformedToken, err)
 	}
 	if time.Now().Unix() > c.ExpiresAt {
 		return nil, errTokenExpired

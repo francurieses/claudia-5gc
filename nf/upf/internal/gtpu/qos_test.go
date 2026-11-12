@@ -46,8 +46,7 @@ func delta(t *testing.T, s *Server, r pfcp.DropReason, f func()) float64 {
 func TestUplinkPolicedBeforeURRAndTUN(t *testing.T) {
 	s, sess, _ := qosServer(t, 8000, 8000, pfcp.QoSConfig{}) // depth 10000 B
 	pkt := benchGTPU(sess.ULTEID, benchInnerUDP(sess.UEIP, 1000))
-	var drops float64
-	drops = delta(t, s, pfcp.DropMBRExceeded, func() {
+	drops := delta(t, s, pfcp.DropMBRExceeded, func() {
 		for i := 0; i < 15; i++ {
 			s.handlePacket(pkt)
 		}

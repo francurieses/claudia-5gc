@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/francurieses/claudia-5gc/shared/logging"

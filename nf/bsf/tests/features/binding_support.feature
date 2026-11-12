@@ -30,24 +30,24 @@ Feature: Nbsf_Management — PCF Binding Register / Deregister / Discovery (TS 2
 
   # ---------------------------------------------------------------------------
   # Scenario 3 — Discovery with no matching binding (AC 3, error path)
-  # TS 29.521 §5.2.2.4.4 — no match → 404
+  # TS 29.521 §5.2.2.4.4 — no match → 204 No Content (TS 29.521 §4.2.4.2)
   # ---------------------------------------------------------------------------
-  Scenario: Discovery for an IP with no registered binding returns 404
+  Scenario: Discovery for an IP with no registered binding returns 204
     Given no PcfBinding is registered for ipv4Addr "10.60.0.99"
     When the consumer sends a Discovery request with query ipv4Addr "10.60.0.99"
-    Then the BSF responds with status 404
+    Then the BSF responds with status 204 No Content
 
   # ---------------------------------------------------------------------------
-  # Scenario 4 — Deregister removes the binding; subsequent discovery returns 404 (AC 2)
+  # Scenario 4 — Deregister removes the binding; subsequent discovery returns 204 (AC 2)
   # TS 29.521 §5.2.2.3 — DELETE /nbsf-management/v1/pcfBindings/{bindingId} → 204
   # ---------------------------------------------------------------------------
-  Scenario: PCF deregisters a binding and subsequent discovery for that IP returns 404
+  Scenario: PCF deregisters a binding and subsequent discovery for that IP returns 204
     Given a PcfBinding is registered for supi "imsi-001010000000001" dnn "internet" snssai sst 1 sd "000001" ipv4Addr "10.60.0.3" and pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org"
     And the binding ID for ipv4Addr "10.60.0.3" has been stored
     When the PCF sends a Deregister request for the stored binding ID
     Then the BSF responds with status 204 No Content
     When the consumer sends a Discovery request with query ipv4Addr "10.60.0.3"
-    Then the BSF responds with status 404
+    Then the BSF responds with status 204 No Content
 
   # ---------------------------------------------------------------------------
   # Scenario 5 — Register with missing mandatory IE → 400 MANDATORY_IE_MISSING (AC 1 spec deviation)
@@ -84,13 +84,13 @@ Feature: Nbsf_Management — PCF Binding Register / Deregister / Discovery (TS 2
     And the response body contains a PcfBinding with ipv4Addr "10.60.0.7" and pcfFqdn "pcf.5gc.mnc001.mcc001.3gppnetwork.org"
 
   # ---------------------------------------------------------------------------
-  # Scenario 8 — Discovery with no query parameter → 400 MANDATORY_IE_MISSING
+  # Scenario 8 — Discovery with no query parameter → 400 MANDATORY_QUERY_PARAM_MISSING
   # TS 29.521 §5.2.2.4.4 — at least one binding-identifying parameter is required
   # ---------------------------------------------------------------------------
-  Scenario: Discovery with no query parameter returns 400 MANDATORY_IE_MISSING
+  Scenario: Discovery with no query parameter returns 400 MANDATORY_QUERY_PARAM_MISSING
     When the consumer sends a Discovery request with no query parameters
     Then the BSF responds with status 400
-    And the cause is "MANDATORY_IE_MISSING"
+    And the cause is "MANDATORY_QUERY_PARAM_MISSING"
 
   # ---------------------------------------------------------------------------
   # Scenario 9 — Deregister an unknown bindingId → 404

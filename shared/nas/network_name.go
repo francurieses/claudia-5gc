@@ -99,7 +99,7 @@ func packGSM7(septets []byte) (packed []byte, spareBits byte) {
 		bitPos := i * 7
 		octet := bitPos / 8
 		shift := bitPos % 8
-		packed[octet] |= byte(s<<shift) & 0xFF
+		packed[octet] |= s << shift
 		// A septet straddling an octet boundary spills its high bits into the
 		// next octet.
 		if shift > 1 {

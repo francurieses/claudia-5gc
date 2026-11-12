@@ -1,0 +1,13 @@
+POST /nsmsf-sms/v2/ue-contexts/imsi-001010000000001/sendsms
+Content-Type: multipart/related; boundary=GOLDENBOUNDARY; type="application/json"
+
+--GOLDENBOUNDARY\r\n
+Content-Type: application/json\r\n
+\r\n
+{"smsPayload":{"contentId":"smsPayload"},"smsRecordId":"rec-1"}\r\n
+--GOLDENBOUNDARY\r\n
+Content-Id: smsPayload\r\n
+Content-Type: application/vnd.3gpp.sms\r\n
+\r\n
+\r\n
+--GOLDENBOUNDARY--\r\n

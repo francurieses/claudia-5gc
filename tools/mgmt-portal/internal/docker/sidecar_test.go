@@ -55,7 +55,7 @@ func TestRestartNetnsSidecars(t *testing.T) {
 			name:   "sidecar joined by container id is restarted",
 			target: "amf",
 			containers: map[string]types.ContainerJSON{
-				"amf":      ctr(nfID, "amf", "5gc-rel17_sbi"),
+				"amf":      ctr(nfID, "amf", "5gc-sbi"),
 				"amf-pcap": ctr("ffff", "amf-pcap", "container:"+nfID),
 			},
 			wantRestart: []string{"amf-pcap"},

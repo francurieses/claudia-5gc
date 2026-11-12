@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"OPTIONAL_QUERY_PARAM_INCORRECT","detail":"supported-features is not a valid SupportedFeatures hex string","invalidParams":[{"param":"query supported-features","reason":"features: validate: invalid supportedFeatures: non-hex character 'z' at offset 0"}],"status":400}

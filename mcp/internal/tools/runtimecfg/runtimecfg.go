@@ -180,7 +180,7 @@ func (t sliceAMBRTool) Plan(ctx context.Context, in json.RawMessage) (any, error
 		"sst": a.SST, "sd": a.SD, "dnn": a.DNN,
 		"requested":         map[string]any{"uplink": a.Uplink, "downlink": a.Downlink, "revert": a.Revert},
 		"apply_to_active":   a.Apply,
-		"current_slice_qos": json.RawMessage(current),
+		"current_slice_qos": current,
 	}, nil
 }
 
@@ -271,7 +271,7 @@ func (t rfspTool) Plan(ctx context.Context, in json.RawMessage) (any, error) {
 	}
 	return map[string]any{
 		"supi": supi, "rfsp": rfsp, "clear": clear,
-		"current_override": json.RawMessage(current),
+		"current_override": current,
 		"effect":           "the UE is deregistered so it re-registers with the new RFSP index",
 	}, nil
 }
@@ -345,12 +345,13 @@ func (t ursTemplateTool) Plan(ctx context.Context, in json.RawMessage) (any, err
 	}
 	tpl, err := t.d.Portal.Get(ctx, "/policy-templates/"+url.PathEscape(id), nil)
 	if err != nil {
-		if mapped, ok := clients.StoreErr(err).(*mcperr.Error); ok {
+		var mapped *mcperr.Error
+		if ok := errors.As(clients.StoreErr(err), &mapped); ok {
 			return nil, mapped
 		}
 		return nil, mcperr.ToolError(fmt.Errorf("ursp_template_apply plan: %w", err), nil)
 	}
-	return map[string]any{"template_id": id, "supi": supi, "template": json.RawMessage(tpl),
+	return map[string]any{"template_id": id, "supi": supi, "template": tpl,
 		"effect": "subscriber policy replaced; UE Configuration Update carries the URSP"}, nil
 }
 

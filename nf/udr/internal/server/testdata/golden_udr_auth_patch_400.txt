@@ -1,0 +1,4 @@
+status: Bad Request
+Content-Type: application/problem+json
+
+{"cause":"MANDATORY_IE_INCORRECT","detail":"unexpected EOF","status":400}

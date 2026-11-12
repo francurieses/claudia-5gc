@@ -1,0 +1,8 @@
+GET /nudr-dr/v2/subscription-data/imsi-001010000000001/001/provisioned-data/am-data
+Content-Type: 
+Accept: 
+
+
+
+--- result
+{"SNSSAIs":[{"SST":1,"SD":"000001","DNN":"internet","SubjectToNSSAA":false},{"SST":2,"SD":"000002","DNN":"","SubjectToNSSAA":true}],"AMBRUplink":100000,"AMBRDownlink":100000}

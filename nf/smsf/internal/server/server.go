@@ -2,7 +2,7 @@
 //
 // Endpoints (3GPP TS 29.540 v17):
 //
-//	POST   /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}            Nsmsf_SMService_Activate
+//	PUT    /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}            Nsmsf_SMService_Activate
 //	DELETE /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}            Nsmsf_SMService_Deactivate
 //	POST   /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}/sendsms    Nsmsf_SMService_UplinkSMS
 //	POST   /nsmsf-sms-internal/v1/ue-contexts/{supi}/mt-sms  Internal MT SMS trigger
@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -34,7 +36,12 @@ import (
 
 	"github.com/francurieses/claudia-5gc/nf/smsf/internal/config"
 	smsfctx "github.com/francurieses/claudia-5gc/nf/smsf/internal/context"
+	smsfsbi "github.com/francurieses/claudia-5gc/nf/smsf/internal/sbi"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // AMFClient is the interface for delivering MT SMS to the AMF via
@@ -61,6 +68,25 @@ type Server struct {
 	amfClient AMFClient
 	udmClient UDMClient
 	httpSrv   *http.Server
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// cat is the Nsmsf_SMService producer catalog.
+	cat *features.Catalog
+}
+
+// SetProfile wires the release profile used for supportedFeatures negotiation.
+// Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetCatalog replaces the Nsmsf_SMService catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetCatalog(c *features.Catalog) {
+	if c == nil {
+		c = smsfsbi.NsmsfSMServiceCatalog()
+	}
+	s.cat = c
 }
 
 // New constructs the SMSF SBI server. The server is not started until Start or
@@ -70,11 +96,12 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		cfg:    cfg,
 		logger: logger,
 		store:  smsfctx.NewStore(),
+		cat:    smsfsbi.NsmsfSMServiceCatalog(),
 	}
 
 	mux := http.NewServeMux()
 	// Nsmsf_SMService routes (TS 29.540 §5.2)
-	mux.HandleFunc("POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}", s.handleActivate)
+	mux.HandleFunc("PUT /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}", s.handleActivate)
 	mux.HandleFunc("DELETE /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}", s.handleDeactivate)
 	mux.HandleFunc("POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}/sendsms", s.handleUplinkSMS)
 	// Internal MT SMS trigger endpoint (not in 3GPP TS 29.540 — internal convenience).
@@ -200,19 +227,26 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 
 // ---- Activate --------------------------------------------------------------
 
-// activateRequest is the body of POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}.
+// activateRequest is the body of PUT /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}.
 // Ref: TS 29.540 §6.1.6.2.2 (UeSmsContextData)
+//
+// oapi: TS29540_Nsmsf_SMService.yaml#/components/schemas/UeSmsContextData
 type activateRequest struct {
-	Supi           string `json:"supi"`
-	Gpsi           string `json:"gpsi,omitempty"`
-	Pei            string `json:"pei,omitempty"`
-	AmfID          string `json:"amfId"`
-	AccessType     string `json:"accessType"`
+	Supi       string `json:"supi"`
+	Gpsi       string `json:"gpsi,omitempty"`
+	Pei        string `json:"pei,omitempty"`
+	AmfID      string `json:"amfId"`
+	AccessType string `json:"accessType"`
+	// AmfCallbackURI is where the SMSF delivers MT SMS (N1N2MessageTransfer).
+	// oapi-ext: UeSmsContextData carries no AMF endpoint (amfId only, TS 29.540 §6.1.6.2.2); a spec SMSF resolves the AMF through NRF discovery with amfId. Sent by this project's AMF; a third-party AMF omits it.
 	AmfCallbackURI string `json:"amfCallbackUri,omitempty"`
+	// SupportedFeatures: TS 29.540 §6.1.6.2.2 (UeSmsContextData), negotiated
+	// per TS 29.500 §6.6.2 against Table 6.1.8-1.
+	SupportedFeatures string `json:"supportedFeatures,omitempty"`
 }
 
 // handleActivate implements Nsmsf_SMService_Activate.
-// POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}
+// PUT /nsmsf-sms/v2/ue-contexts/{supiOrGpsi} (OpenAPI operationId SMServiceActivation)
 // Ref: TS 29.540 §5.2.2
 func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	supiOrGpsi := r.PathValue("supiOrGpsi")
@@ -225,13 +259,34 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		"supi", supiOrGpsi,
 	)
 
+	peerNF := features.PeerNFTypeFromUserAgent(r.UserAgent(), "AMF")
 	var req activateRequest
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if features.IsTypeError(err) {
+			s.rejectSupportedFeatures(ctx, w, peerNF, "<non-string>", err)
+			return
+		}
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(log, w, "SmsActivate")
+			return
+		}
 		log.Warn("Activate: malformed request body",
 			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
 		return
 	}
+
+	// supportedFeatures must be schema-valid before any state is touched.
+	// Ref: TS 29.500 §5.2.7.2, §6.6.2.
+	if err := features.Validate(req.SupportedFeatures); err != nil {
+		s.rejectSupportedFeatures(ctx, w, peerNF, req.SupportedFeatures, err)
+		return
+	}
+	// Producer side (decision D1): the intersection, absent under rel17 when
+	// the request had none, "0" under rel19.
+	sfAnswer, sfSet := features.Answer(s.cat, s.profile, req.SupportedFeatures)
 
 	// Validate mandatory IEs (TS 29.540 §6.1.6.2.2)
 	// supi in body is mandatory when supiOrGpsi path param is not a SUPI.
@@ -258,6 +313,7 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		AccessType:     req.AccessType,
 		AmfCallbackURI: req.AmfCallbackURI,
 		State:          smsfctx.StateActive,
+		Features:       sfSet,
 	}
 	s.store.Set(supiOrGpsi, uectx)
 	// Also store under the explicit SUPI if the path key is different.
@@ -287,6 +343,15 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 			"supi", req.Supi)
 	}
 
+	// Request accepted: record the negotiation (TS 29.500 §6.6.2).
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "SMSF",
+		Interface: "Nsmsf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: s.cat.Supported(s.profile), Peer: req.SupportedFeatures,
+		PeerPresent: req.SupportedFeatures != "", Negotiated: sfSet,
+	})
+
 	log.Info("SMS context activated",
 		"supi", req.Supi,
 		"access_type", req.AccessType,
@@ -299,10 +364,53 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location",
 		"/nsmsf-sms/v2/ue-contexts/"+supiOrGpsi)
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	rsp := map[string]any{
 		"supi":       req.Supi,
 		"accessType": req.AccessType,
 		"amfId":      req.AmfID,
+	}
+	if sfAnswer != "" {
+		rsp["supportedFeatures"] = sfAnswer
+	}
+	_ = json.NewEncoder(w).Encode(rsp)
+}
+
+// rejectSupportedFeatures answers a schema-invalid supportedFeatures with 400
+// INVALID_MSG_FORMAT and invalidParams[{param: /supportedFeatures}] and logs
+// the REJECT negotiation record. Ref: TS 29.500 §5.2.7.2; TS 29.571 §5.2.4.6.
+func (s *Server) rejectSupportedFeatures(ctx context.Context, w http.ResponseWriter, peerNF, shown string, cause error) {
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "SMSF",
+		Interface: "Nsmsf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseInvalidMsgFormat,
+		Local: s.cat.Supported(s.profile), Peer: shown, PeerPresent: true,
+	}, "error", cause)
+	metrics.ProcedureTotal.WithLabelValues("SMSF", "SmsActivate", "REJECT").Inc()
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusBadRequest,
+		"cause":  features.CauseInvalidMsgFormat,
+		"detail": "supportedFeatures is not a valid hexadecimal string",
+		"invalidParams": []map[string]string{
+			{"param": features.ParamSupportedFeatures},
+		},
+	})
+}
+
+// payloadTooLarge answers a body over features.MaxRequestBodyBytes with 413 and
+// a ProblemDetails without a cause (no 413 cause is defined), after logging one
+// REJECT record and counting it under the given procedure label.
+// Ref: TS 29.500 §5.2.7.1; TS 29.571 §5.2.4.1.
+func payloadTooLarge(log *slog.Logger, w http.ResponseWriter, procedure string) {
+	log.Warn("request body too large",
+		"result", "REJECT", "cause", "PAYLOAD_TOO_LARGE")
+	metrics.ProcedureTotal.WithLabelValues("SMSF", procedure, "REJECT").Inc()
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusRequestEntityTooLarge)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusRequestEntityTooLarge,
+		"detail": "request body too large",
 	})
 }
 
@@ -337,14 +445,85 @@ func (s *Server) handleDeactivate(w http.ResponseWriter, r *http.Request) {
 
 // ---- UplinkSMS (MO SMS) ----------------------------------------------------
 
-// uplinkSMSRequest is the body of POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}/sendsms.
-// Ref: TS 29.540 §6.1.6.2 (SmsRecordData)
+// uplinkSMSRequest is the legacy Rel-17-profile JSON body of
+// POST /nsmsf-sms/v2/ue-contexts/{supiOrGpsi}/sendsms (smsPayload inline base64).
+// Still accepted whatever the SMSF profile.
+//
+// oapi: none legacy Rel-17-profile wire shape of SmsRecordData, see uplinkSMSRecordData
 type uplinkSMSRequest struct {
 	// SmsPayload is the base64-encoded SM-CP/RP payload extracted from the NAS
 	// Payload Container (Payload Container Type = SMS, 0x02).
-	// Ref: TS 29.540 §6.1.6.2.3 — SmsRecordData.smsPayload (RefToBinaryData)
 	SmsPayload  string `json:"smsPayload"`
 	SmsRecordId string `json:"smsRecordId"`
+}
+
+// uplinkSMSRecordData is the JSON root part of the spec-literal multipart/related
+// UplinkSMS request: smsPayload is a RefToBinaryData naming the binary part.
+// Ref: TS 29.540 §6.1.6.2.3 (SmsRecordData), TS 29.571 §5.2.2 (RefToBinaryData)
+//
+// oapi: TS29540_Nsmsf_SMService.yaml#/components/schemas/SmsRecordData
+type uplinkSMSRecordData struct {
+	SmsRecordId string          `json:"smsRecordId"`
+	SmsPayload  refToBinaryData `json:"smsPayload"`
+}
+
+// refToBinaryData references a binary body part by its Content-Id.
+//
+// oapi: TS29571_CommonData.yaml#/components/schemas/RefToBinaryData
+type refToBinaryData struct {
+	ContentId string `json:"contentId"`
+}
+
+// errUplinkMultipart is a client-visible multipart/related decoding error
+// carrying the ProblemDetails cause and the offending attribute pointer.
+type errUplinkMultipart struct {
+	cause  string // TS 29.500 Table 5.2.7.2-1 application error cause
+	param  string // invalidParams[].param, empty when none applies
+	detail string
+}
+
+func (e *errUplinkMultipart) Error() string { return e.detail }
+
+// parseUplinkMultipart extracts (smsRecordId, base64 payload) from a
+// multipart/related UplinkSMS request: the JSON root part (the part named by the
+// "start" parameter, else the first) and the binary part whose Content-Id
+// equals smsPayload.contentId. Body-read errors (*http.MaxBytesError) and
+// oversized parts (sbi.ErrRelatedPartTooLarge) are returned for a 413.
+// Causes follow TS 29.500 Table 5.2.7.2-1: malformed message / bad JSON root ->
+// INVALID_MSG_FORMAT; missing contentId -> MANDATORY_IE_MISSING; unmatched
+// contentId or empty binary part -> MANDATORY_IE_INCORRECT.
+// Ref: TS 29.540 §5.2.4, TS 29.500 §5.4, §5.2.7.2
+func parseUplinkMultipart(contentType string, body io.Reader) (recordID, payloadB64 string, err error) {
+	parts, derr := sbi.DecodeRelated(contentType, body)
+	if derr != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(derr, &mbe) || errors.Is(derr, sbi.ErrRelatedPartTooLarge) {
+			return "", "", derr
+		}
+		return "", "", &errUplinkMultipart{cause: features.CauseInvalidMsgFormat, detail: "invalid multipart/related body: " + derr.Error()}
+	}
+	if len(parts) == 0 {
+		return "", "", &errUplinkMultipart{cause: features.CauseInvalidMsgFormat, detail: "multipart/related body has no parts"}
+	}
+	if mt, _, perr := mime.ParseMediaType(parts[0].ContentType); perr != nil || mt != "application/json" {
+		return "", "", &errUplinkMultipart{cause: features.CauseInvalidMsgFormat, detail: "root part Content-Type is not application/json"}
+	}
+	var rec uplinkSMSRecordData
+	if jerr := json.Unmarshal(parts[0].Body, &rec); jerr != nil {
+		return "", "", &errUplinkMultipart{cause: features.CauseInvalidMsgFormat, detail: "invalid JSON root part"}
+	}
+	if rec.SmsPayload.ContentId == "" {
+		return "", "", &errUplinkMultipart{cause: "MANDATORY_IE_MISSING", param: "/smsPayload/contentId", detail: "smsPayload.contentId missing"}
+	}
+	for _, p := range parts[1:] {
+		if p.ContentID == rec.SmsPayload.ContentId {
+			if len(p.Body) == 0 {
+				return "", "", &errUplinkMultipart{cause: "MANDATORY_IE_INCORRECT", param: "/smsPayload/contentId", detail: "SMS binary part is empty"}
+			}
+			return rec.SmsRecordId, base64.StdEncoding.EncodeToString(p.Body), nil
+		}
+	}
+	return "", "", &errUplinkMultipart{cause: "MANDATORY_IE_INCORRECT", param: "/smsPayload/contentId", detail: "no body part with Content-Id " + rec.SmsPayload.ContentId}
 }
 
 // handleUplinkSMS implements Nsmsf_SMService_UplinkSMS.
@@ -372,8 +551,37 @@ func (s *Server) handleUplinkSMS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The request is either the spec-literal multipart/related (JSON root part
+	// + binary part, accepted whatever the SMSF profile) or the legacy JSON body.
+	// Ref: TS 29.540 §5.2.4, TS 29.500 §5.4
 	var req uplinkSMSRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	if sbi.IsRelated(r.Header.Get("Content-Type")) {
+		id, payload, err := parseUplinkMultipart(r.Header.Get("Content-Type"), r.Body)
+		if err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) || errors.Is(err, sbi.ErrRelatedPartTooLarge) {
+				payloadTooLarge(log, w, "UplinkSMS")
+				return
+			}
+			cause, param := features.CauseInvalidMsgFormat, ""
+			var me *errUplinkMultipart
+			if errors.As(err, &me) {
+				cause, param = me.cause, me.param
+			}
+			log.Warn("UplinkSMS: malformed multipart body",
+				"result", "REJECT", "cause", cause, "error", err,
+				"spec_ref", "TS 29.500 §5.2.7.2")
+			s.problemParams(w, http.StatusBadRequest, cause, err.Error(), param)
+			return
+		}
+		req = uplinkSMSRequest{SmsRecordId: id, SmsPayload: payload}
+	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			payloadTooLarge(log, w, "UplinkSMS")
+			return
+		}
 		log.Warn("UplinkSMS: malformed body",
 			"result", "REJECT", "cause", "MANDATORY_IE_MISSING", "error", err)
 		s.problem(w, http.StatusBadRequest, "MANDATORY_IE_MISSING", "invalid JSON body")
@@ -553,6 +761,18 @@ func (s *Server) problem(w http.ResponseWriter, status int, cause, detail string
 		"cause":  cause,
 		"detail": detail,
 	})
+}
+
+// problemParams is problem with an optional invalidParams entry (param is a
+// JSON pointer; empty omits the list). Ref: TS 29.571 §5.2.4.1
+func (s *Server) problemParams(w http.ResponseWriter, status int, cause, detail, param string) {
+	body := map[string]any{"status": status, "cause": cause, "detail": detail}
+	if param != "" {
+		body["invalidParams"] = []map[string]string{{"param": param}}
+	}
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // decodeBase64Payload decodes a base64-encoded SMS payload string.

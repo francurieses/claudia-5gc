@@ -277,6 +277,12 @@ export interface RanGnbsResponse {
 }
 
 export const getDeployment = () => request<Deployment>('GET', '/deployment')
+export interface ReleaseInfo {
+  profile: 'rel19' | 'rel17' | 'mixed' | 'unknown'
+  /** Per-NF release profile (NF name -> profile); NFs that are stopped/missing are absent. */
+  nfs: Record<string, string>
+}
+export const getRelease = () => request<ReleaseInfo>('GET', '/release')
 export const getRanGnbs = () => request<RanGnbsResponse>('GET', '/ran/gnbs')
 
 // ---- Metrics -------------------------------------------------------------

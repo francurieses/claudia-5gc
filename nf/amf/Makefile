@@ -12,7 +12,8 @@ test:
 
 test-functional:
 	@if [ -d tests/features ]; then \
-		cd $(ROOT) && go test -tags=functional ./nf/$(NF)/tests/features/... ; \
+		cd $(ROOT) && go test -tags=functional ./nf/$(NF)/tests/features/... && \
+		go test -tags=functional ./nf/$(NF)/cmd/amf/ -run 'TestFeatureNegotiationConsumer|TestNSSAAE2E' ; \
 	else \
 		echo "no features dir"; \
 	fi

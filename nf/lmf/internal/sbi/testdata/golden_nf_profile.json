@@ -1,0 +1,1 @@
+{"nfInstanceId":"11111111-2222-3333-4444-555555555555","nfType":"LMF","nfStatus":"REGISTERED","fqdn":"lmf.5gc.mnc001.mcc001.3gppnetwork.org","nfServices":[{"serviceInstanceId":"11111111-2222-3333-4444-555555555555-nlmf-loc","serviceName":"nlmf-loc","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.2.7"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

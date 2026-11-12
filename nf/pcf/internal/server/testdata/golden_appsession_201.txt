@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: https://example.com/npcf-policyauthorization/v1/app-sessions/<UUID>
+
+{"ascReqData":{"aspId":"af-test","ueIpv4":"10.60.0.1","qosReference":"qos-gold","dnn":"internet"}}

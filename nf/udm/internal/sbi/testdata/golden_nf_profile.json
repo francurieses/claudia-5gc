@@ -1,0 +1,1 @@
+{"nfInstanceId":"11111111-2222-3333-4444-555555555555","nfType":"UDM","nfStatus":"REGISTERED","nfServices":[{"serviceInstanceId":"11111111-2222-3333-4444-555555555555-nudm-ueau","serviceName":"nudm-ueau","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.2.2"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

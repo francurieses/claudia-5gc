@@ -17,13 +17,14 @@ package features_test
 import (
 	"context"
 	"fmt"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"regexp"
 	"strconv"
 
 	"github.com/cucumber/godog"
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	amfngap "github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
@@ -76,7 +77,7 @@ func (w *icsWorld) buildICS() error {
 	w.raw = amfngap.BuildInitialContextSetupRequest(
 		1, 1, nasStub, k, 0xE000, 0xE000, "001", "01",
 		w.region, w.setID, w.ptr, w.allowed,
-		int64(w.kbpsUL)*1000, int64(w.kbpsDL)*1000, w.rfsp, w.sessions)
+		int64(w.kbpsUL)*1000, int64(w.kbpsDL)*1000, w.rfsp, w.sessions, capability.PeerRAN{})
 	if len(w.raw) == 0 {
 		return fmt.Errorf("BuildInitialContextSetupRequest returned empty PDU")
 	}
@@ -91,7 +92,7 @@ func (w *icsWorld) buildPDUSessionSetup() error {
 		ambr = amfngap.NewUEAMBRFromKbps(w.kbpsUL, w.kbpsDL)
 	}
 	w.raw = amfngap.BuildPDUSessionResourceSetupRequest(
-		1, 1, w.psID, nasStub, []byte{0xAA, 0xBB}, w.psSST, w.psSD, ambr)
+		1, 1, w.psID, nasStub, []byte{0xAA, 0xBB}, w.psSST, w.psSD, ambr, capability.PeerRAN{})
 	if len(w.raw) == 0 {
 		return fmt.Errorf("BuildPDUSessionResourceSetupRequest returned empty PDU")
 	}
@@ -432,22 +433,8 @@ func initICSSteps(sc *godog.ScenarioContext) {
 		return nil
 	})
 
-	// ICS Failure scenario: needs the real Server handler (gNB SCTP conn for the
-	// UE Context Release Command, no test seam) — pending, never a false pass.
-	sc.Step(`^UE "([^"]+)" is in 5GMM-REGISTERED state after an ICS Request was sent$`, icsPending1)
-	sc.Step(`^the gNB answers with INITIAL CONTEXT SETUP FAILURE with protocol cause "([^"]+)"$`, icsPending1)
-	sc.Step(`^the UE transitions to 5GMM-DEREGISTERED and is flagged for removal$`, icsPending0)
-	sc.Step(`^the AMF sends a UE CONTEXT RELEASE COMMAND with radioNetwork cause "([^"]+)"$`, icsPending1)
-	sc.Step(`^the failure is logged with result "([^"]+)" and spec_ref "([^"]+)"$`, icsPending2)
-}
-
-func icsPending0() error       { return godog.ErrPending }
-func icsPending1(string) error { return godog.ErrPending }
-func icsPending2(result, specRef string) error {
-	if xnActive() {
-		return xnFailureLogged(result, specRef)
-	}
-	return godog.ErrPending
+	// ICS Failure scenarios (AMF-034): real Server handler, see ics_failure_steps_test.go.
+	initICSFailureSteps(sc)
 }
 
 func (w *icsWorld) checkProc(code int, wantReject bool) error {

@@ -57,7 +57,7 @@ func NewGlobalGNBForTest(mcc, mnc string, id uint32, bitLen uint8) GlobalRANNode
 // (so a test can assert PPID 60), and remoteAddr is the association key stored in
 // UEContext.GNBAddr. Production code does not call it.
 func (g *GNBContext) SetTransportForTest(remoteAddr string, write func(pdu []byte, info *sctp.SndRcvInfo) (int, error)) {
-	g.testAddr = remoteAddr
+	g.addr = remoteAddr
 	g.sctpWrite = write
 }
 

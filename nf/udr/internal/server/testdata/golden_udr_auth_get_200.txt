@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"algorithmId":"milenage","authenticationManagementField":"b9b9","authenticationMethod":"5G_AKA","encOpcKey":"cd63cb71954a9f4e48a5994e37a02baf","encPermanentKey":"465b5ce8b199b49faa5f0a2ee238a6bc","sequenceNumber":{"sqn":"000000000020","sqnScheme":"NON_TIME_BASED"}}

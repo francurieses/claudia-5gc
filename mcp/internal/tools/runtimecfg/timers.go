@@ -30,6 +30,12 @@ const (
 	// de-registration timer, which is network dependent (TS 24.501 §5.3.7).
 	minImplicitDetachSecs = 60
 	maxImplicitDetachSecs = 86400
+	// minNASProcTimerSecs and maxNASProcTimerSecs bound T3550 (REGISTRATION ACCEPT),
+	// T3560 (AUTHENTICATION REQUEST / SECURITY MODE COMMAND) and T3570 (IDENTITY
+	// REQUEST). The TS default is 6 s (TS 24.501 §10.2 Table 10.2.2); the range is
+	// the AMF's lab limit.
+	minNASProcTimerSecs = 1
+	maxNASProcTimerSecs = 60
 )
 
 // timerAppliesTo says when a change takes effect (TS 24.501 §5.3.7).
@@ -82,7 +88,8 @@ func (timerConfigTool) Name() string        { return "amf_timer_config" }
 func (timerConfigTool) Risk() registry.Risk { return registry.Mutating }
 
 // timerValueKeys are the keys that make a call a change.
-var timerValueKeys = []string{"t3512_secs", "mobile_reachable_guard_secs", "implicit_detach_secs"}
+var timerValueKeys = []string{"t3512_secs", "mobile_reachable_guard_secs", "implicit_detach_secs",
+	"t3550_secs", "t3560_secs", "t3570_secs"}
 
 // RiskFor: without values and reset the call is a GET (ReadOnly); with any value
 // key, or reset:true, it is a PUT (Mutating). A value key present but malformed
@@ -114,6 +121,9 @@ func (timerConfigTool) Description() string {
 		"the mobile reachable timer from max(T3512 sent to the UE, effective T3512) so a UE that holds the older, " +
 		"longer T3512 is not implicitly de-registered early. " +
 		"mobile_reachable_guard_secs 0 is a lab-only setting: TS 24.501 §5.3.7 says the mobile reachable timer is longer than T3512, keep the guard >= 1 in operation. " +
+		"t3550_secs, t3560_secs and t3570_secs (1-60 s, TS default 6 s) set the retransmission timers of the REGISTRATION ACCEPT, " +
+		"the AUTHENTICATION REQUEST / SECURITY MODE COMMAND and the IDENTITY REQUEST (4 retransmissions, abort on the 5th expiry); " +
+		"they apply to the next message armed. " +
 		"Spec: TS 24.501 §5.3.7; T3512 is in §10.2 Table 10.2.1, the AMF-side mobile reachable and implicit de-registration timers are in Table 10.2.2; TS 23.501 §5.4.1.1."
 }
 
@@ -122,6 +132,9 @@ func (timerConfigTool) InputSchema() json.RawMessage {
 "t3512_secs":{"type":"integer","minimum":60,"maximum":86400,"description":"T3512 in seconds; must be exactly representable in GPRS timer 3 (e.g. 120, 600, 1800, 3600)"},
 "mobile_reachable_guard_secs":{"type":"integer","minimum":0,"maximum":3600,"description":"guard added to T3512 to get the mobile reachable timer"},
 "implicit_detach_secs":{"type":"integer","minimum":60,"maximum":86400,"description":"implicit de-registration timer"},
+"t3550_secs":{"type":"integer","minimum":1,"maximum":60,"description":"T3550, REGISTRATION ACCEPT supervision (TS default 6 s)"},
+"t3560_secs":{"type":"integer","minimum":1,"maximum":60,"description":"T3560, AUTHENTICATION REQUEST / SECURITY MODE COMMAND supervision (TS default 6 s)"},
+"t3570_secs":{"type":"integer","minimum":1,"maximum":60,"description":"T3570, IDENTITY REQUEST supervision (TS default 6 s)"},
 "reset":{"type":"boolean","description":"restore the YAML base values; cannot be combined with values"}},
 "additionalProperties":false}`)
 }
@@ -142,6 +155,8 @@ func timerBounds(key string) (lo, hi int) {
 		return minT3512Secs, maxT3512Secs
 	case "mobile_reachable_guard_secs":
 		return minGuardSecs, maxGuardSecs
+	case "t3550_secs", "t3560_secs", "t3570_secs":
+		return minNASProcTimerSecs, maxNASProcTimerSecs
 	default:
 		return minImplicitDetachSecs, maxImplicitDetachSecs
 	}
@@ -162,7 +177,8 @@ func parseTimerArgs(in json.RawMessage) (timerRequest, *mcperr.Error) {
 			if err := json.Unmarshal(raw, &req.reset); err != nil {
 				return req, mcperr.Newf(mcperr.CodeInvalidParams, nil, "reset must be a boolean")
 			}
-		case "t3512_secs", "mobile_reachable_guard_secs", "implicit_detach_secs":
+		case "t3512_secs", "mobile_reachable_guard_secs", "implicit_detach_secs",
+			"t3550_secs", "t3560_secs", "t3570_secs":
 			v, err := strconv.Atoi(strings.TrimSpace(string(raw)))
 			if err != nil {
 				return req, mcperr.Newf(mcperr.CodeInvalidParams, nil, "%s must be an integer number of seconds", k)
@@ -175,7 +191,7 @@ func parseTimerArgs(in json.RawMessage) (timerRequest, *mcperr.Error) {
 			req.values[k] = v
 		default:
 			return req, mcperr.Newf(mcperr.CodeInvalidParams, nil,
-				"unknown argument %q: allowed are t3512_secs, mobile_reachable_guard_secs, implicit_detach_secs, reset", k)
+				"unknown argument %q: allowed are t3512_secs, mobile_reachable_guard_secs, implicit_detach_secs, t3550_secs, t3560_secs, t3570_secs, reset", k)
 		}
 	}
 	if req.reset && len(req.values) > 0 {

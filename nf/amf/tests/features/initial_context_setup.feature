@@ -181,10 +181,21 @@ Feature: Initial Context Setup — UE-AMBR conditional presence (TS 38.413 §8.3
 
   # --- gNB failure outcome (TS 38.413 §8.3.1.3) -----------------------------------------------
 
+  # AMF-034 (AUD-registration-05): the outcome depends on the procedure that sent the ICS.
   @error @ics-failure
-  Scenario: INITIAL CONTEXT SETUP FAILURE releases the UE context and de-registers the UE
-    Given UE "imsi-001010000000001" is in 5GMM-REGISTERED state after an ICS Request was sent
+  Scenario: INITIAL CONTEXT SETUP FAILURE of a not-yet-completed initial registration releases the UE context without leaking PDU sessions
+    Given UE "imsi-001010000000001" completed no registration yet and holds PDU sessions 5 and 6 after an initial registration ICS Request was sent
     When the gNB answers with INITIAL CONTEXT SETUP FAILURE with protocol cause "abstract-syntax-error-falsely-constructed-message"
     Then the UE transitions to 5GMM-DEREGISTERED and is flagged for removal
     And the AMF sends a UE CONTEXT RELEASE COMMAND with radioNetwork cause "release-due-to-5gc-generated-reason"
-    And the failure is logged with result "FAILURE" and spec_ref "TS 38.413 §8.3.1.3"
+    And every PDU session of the UE is released at the SMF
+    And the ICS failure is logged with result "FAILURE" and spec_ref containing "TS 38.413 §8.3.1.3"
+
+  @error @ics-failure
+  Scenario: INITIAL CONTEXT SETUP FAILURE of a Service Request keeps the registered UE and releases only N2
+    Given UE "imsi-001010000000001" is in 5GMM-REGISTERED state and holds PDU sessions 5 and 6 after a Service Request ICS Request was sent
+    When the gNB answers with INITIAL CONTEXT SETUP FAILURE with protocol cause "abstract-syntax-error-falsely-constructed-message" listing failed PDU session 5
+    Then the UE stays in 5GMM-REGISTERED state and is not flagged for removal
+    And the AMF sends a UE CONTEXT RELEASE COMMAND with radioNetwork cause "release-due-to-5gc-generated-reason"
+    And the Unsuccessful Transfer of PDU session 5 is relayed to the SMF as PDU_RES_SETUP_FAIL and both sessions are kept
+    And the ICS failure is logged with result "FAILURE" and spec_ref containing "TS 38.413 §8.3.1.3"

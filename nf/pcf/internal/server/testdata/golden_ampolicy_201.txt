@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: https://example.com/npcf-am-policy-control/v1/policies/<ULID>
+
+{"rfsp":1}

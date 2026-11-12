@@ -25,7 +25,7 @@
 //   - The After hook calls srv.Shutdown() to cancel all subscription goroutines
 //     before the next scenario starts, preventing goroutine leaks.
 //
-// Ref: TS 29.572 §5.2.3, §5.2.2.5, §6.1.6.2.4, §6.1.6.2.2.
+// Ref: TS 29.572 §5.2.3, §5.2.2.4.2, §6.1.6.2.4, §6.1.6.2.2.
 // Ref: TS 23.273 §7.2 step B2 (deferred location subscription).
 // Ref: TS 29.571 §5.2 (subscription resource schema).
 package features_test
@@ -304,9 +304,9 @@ func (w *subWorld) doDelete(subId string, c *lmfCtx) error {
 	return nil
 }
 
-// doCancelLocation sends POST /nlmf-loc/v1/ue-contexts/{id}/cancel-loc.
+// doCancelLocation sends POST /nlmf-loc/v1/cancel-location.
 func (w *subWorld) doCancelLocation(ueContextId string, c *lmfCtx) error {
-	url := w.ts.URL + "/nlmf-loc/v1/ue-contexts/" + ueContextId + "/cancel-loc"
+	url := w.ts.URL + "/nlmf-loc/v1/cancel-location"
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, nil)
 	if err != nil {
 		return fmt.Errorf("doCancelLocation: new request: %w", err)

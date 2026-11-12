@@ -9,8 +9,8 @@ import (
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 )
 
 // TestBuildUEContextReleaseCommand_NAS verifies that a Release Command with NAS cause

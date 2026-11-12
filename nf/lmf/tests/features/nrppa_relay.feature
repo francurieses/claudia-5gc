@@ -15,7 +15,7 @@ Feature: Nlmf_Location DetermineLocation — NRPPa Relay and E-CID Positioning (
   # spec_ref: TS 29.572 §6.1.6.2.2  (LocationData schema: locationEstimate, accuracy, nrCellId, tai, positioningDataList)
   # spec_ref: TS 29.518 §5.2.2.6    (Namf_Location producer — dl-nrppa-info dispatch + ul-nrppa-info relay)
   # spec_ref: TS 29.571 §5.2.7      (ProblemDetails / cause strings)
-  # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/provide-loc-info → 200 LocationData (reused — Cell-ID fallback path)
+  # endpoint: POST /nlmf-loc/v1/determine-location → 200 LocationData (reused — Cell-ID fallback path)
   # endpoint: POST /nlmf-loc/v1/ue-contexts/{ueContextId}/ul-nrppa-info   → 202 Accepted (new — AMF→LMF UL NRPPa relay receive)
   # endpoint: POST /namf-loc/v1/ue-contexts/{ueContextId}/dl-nrppa-info   → 202 Accepted (new — LMF→AMF DL NRPPa dispatch)
 

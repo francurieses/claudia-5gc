@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"allowedNssaiList":[{"allowedSnssaiList":[{"sst":1,"sd":"000001"}],"accessType":"3GPP_ACCESS"}]}

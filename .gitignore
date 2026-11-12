@@ -20,6 +20,11 @@ pki/*.cnf
 # ca.crt is public and needed to verify NF connections
 !pki/ca.crt
 
+# Local environment files — only the example is committed
+.env
+.env.*
+!.env.example
+
 # PCAPs
 pcaps/
 .claude/skills/3gpp-pcap-validator/.venv/
@@ -50,7 +55,11 @@ dev/SESSION_LOG.md
 tools/ueransim/.fork/
 graphify-out/
 
-# 3GPP OpenAPI: YAML specs committed (frozen Rel-17); generated Go code is not
+# 3GPP OpenAPI: YAMLs are fetched reference (make sync-openapi), never committed; only the
+# directory README is tracked. Generated Go code is not committed either.
+specs/3gpp-openapi/*/
+specs/3gpp-openapi/*.yaml
+specs/3gpp-openapi/UPSTREAM-README.md
 **/generated/
 
 # MCP local config has machine-specific absolute paths — copy from local.yaml.example
@@ -63,3 +72,9 @@ go*.windows-amd64.zip
 
 # PORTAL-001 scripts/services-restart-check.sh default output
 services-restart-results.md
+
+# NGAP ASN.1 modules: extracted locally by scripts/extract-asn1.sh, never committed (REL19 plan R3 fallback)
+specs/asn1/
+
+# PacketRusher image: build-time copy of shared codecs (scripts/packetrusher-vendor.sh)
+docker/packetrusher/claudia-vendor/

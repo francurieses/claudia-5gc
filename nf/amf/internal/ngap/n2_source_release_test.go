@@ -23,9 +23,9 @@ func newReleaseServer(t *testing.T, released *atomic.Int32) *Server {
 
 func newReleaseGNB(addr string) *GNBContext {
 	return &GNBContext{
-		testAddr: addr,
-		UEs:      map[int64]*amfctx.UEContext{},
-		IdleUEs:  map[int64]*amfctx.UEContext{},
+		addr:    addr,
+		UEs:     map[int64]*amfctx.UEContext{},
+		IdleUEs: map[int64]*amfctx.UEContext{},
 	}
 }
 
@@ -84,6 +84,8 @@ func TestReleaseComplete_NormalANRelease_GoesIdle(t *testing.T) {
 	var released atomic.Int32
 	s := newReleaseServer(t, &released)
 	ue := s.mgr.AllocateUEContext(3)
+	// A registered UE: a never-registered context is removed instead (AUD-registration-26).
+	ue.TransitionTo(amfctx.GMMRegistered)
 	ue.CMState = amfctx.CMConnected
 	ue.GNBAddr = "10.0.0.1:38412"
 	g := newReleaseGNB("10.0.0.1:38412")

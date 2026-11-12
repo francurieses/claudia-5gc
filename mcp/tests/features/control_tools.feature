@@ -100,11 +100,11 @@ Feature: MCP control tools for AN release, location, AF QoS sessions, PWS resend
 
   Scenario: af_qos_session_create with confirm true obtains a bearer token then POSTs the subscription to the NEF
     Given the SMF mock holds sessions with ueIp "10.60.0.1" and "10.60.0.2"
-    And the NRF mock issues an access token "tok-abc" for scope "nnef-afsessionwithqos" on POST "/oauth2/v1/token"
+    And the NRF mock issues an access token "tok-abc" for scope "3gpp-as-session-with-qos" on POST "/oauth2/v1/token"
     And the NEF mock answers POST "/3gpp-as-session-with-qos/v1/as-1/subscriptions" with 201 and subscription id "sub-1"
     When I call "af_qos_session_create" with arguments {"scs_as_id":"as-1","ue_ipv4":"10.60.0.1","qos_reference":"qos-gbr-1","confirm":true}
     Then the call succeeds
-    And the NRF mock received a client_credentials token request for scope "nnef-afsessionwithqos"
+    And the NRF mock received a client_credentials token request for scope "3gpp-as-session-with-qos"
     And the NEF mock received exactly 1 POST to "/3gpp-as-session-with-qos/v1/as-1/subscriptions" with header "Authorization" equal to "Bearer tok-abc"
     And the result field "subscription_id" is "sub-1"
     And the result field "accepted" is true
@@ -116,7 +116,7 @@ Feature: MCP control tools for AN release, location, AF QoS sessions, PWS resend
     And the NEF mock received 0 requests
 
   Scenario: af_qos_session_delete with confirm true deletes the subscription and a later get returns 404
-    Given the NRF mock issues an access token "tok-abc" for scope "nnef-afsessionwithqos" on POST "/oauth2/v1/token"
+    Given the NRF mock issues an access token "tok-abc" for scope "3gpp-as-session-with-qos" on POST "/oauth2/v1/token"
     And the NEF mock holds subscription "sub-1" for scsAsId "as-1"
     When I call "af_qos_session_delete" with arguments {"scs_as_id":"as-1","subscription_id":"sub-1","confirm":true}
     Then the call succeeds

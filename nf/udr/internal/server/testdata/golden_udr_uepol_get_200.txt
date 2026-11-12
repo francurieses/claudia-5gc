@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"id":"","supi":"imsi-001010000000001","precedence":10,"rules":[]}

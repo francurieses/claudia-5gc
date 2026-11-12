@@ -1,0 +1,4 @@
+POST /nsmsf-sms/v2/ue-contexts/imsi-001010000000001/sendsms
+Content-Type: application/json
+
+{"smsPayload":"AQIDBA==","smsRecordId":"rec-1"}

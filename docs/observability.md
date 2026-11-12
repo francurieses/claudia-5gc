@@ -49,6 +49,10 @@ Every NF writes structured JSON to stdout. Mandatory fields: `nf`, `procedure`, 
 (`IN` / `OUT`) and `spec_ref` (the 3GPP clause). Optional: `supi`, `guti`, `pdu_session_id`,
 `seid`, `result`, `cause`, `duration_ms`. Set the level with `LOG_LEVEL`.
 
+Release fields: at startup each NF logs `release_profile` (`rel17` or `rel19`). Under `rel19`, every SBI
+`supportedFeatures` negotiation logs one `procedure=FeatureNegotiation` line with `peer_nf_type`,
+`features_local`, `features_peer` (`absent` when the peer sent none) and `features_negotiated`.
+
 ```bash
 docker logs amf | grep InitialRegistration
 make logs                      # follow all NFs

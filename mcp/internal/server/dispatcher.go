@@ -22,7 +22,7 @@ const protocolVersion = "2024-11-05"
 
 // serverName / serverVersion identify this implementation in the initialize result.
 const (
-	serverName    = "5gc-rel17-mcp"
+	serverName    = "claudia-5gc-mcp"
 	serverVersion = "0.1.0"
 )
 

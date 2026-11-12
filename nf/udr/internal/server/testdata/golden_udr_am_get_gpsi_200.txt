@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"nssai":{"defaultSingleNssais":[{"sd":"000001","sst":1}]},"subscribedUeAmbr":{"downlink":"100000 Kbps","uplink":"100000 Kbps"}}

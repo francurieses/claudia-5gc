@@ -22,6 +22,7 @@ func TestRegistrationTimeSet(t *testing.T) {
 	ue := &amfctx.UEContext{SUPI: "imsi-001010000000001"}
 
 	before := time.Now()
+	ue.SetRegStage(amfctx.RegStageAcceptSent) // a REGISTRATION ACCEPT is awaiting the Complete
 	if err := h.handleRegistrationComplete(context.Background(), ue); err != nil {
 		t.Fatalf("handleRegistrationComplete: %v", err)
 	}
@@ -32,6 +33,7 @@ func TestRegistrationTimeSet(t *testing.T) {
 
 	// A re-registration refreshes the timestamp.
 	time.Sleep(2 * time.Millisecond)
+	ue.SetRegStage(amfctx.RegStageAcceptSent)
 	if err := h.handleRegistrationComplete(context.Background(), ue); err != nil {
 		t.Fatalf("second handleRegistrationComplete: %v", err)
 	}

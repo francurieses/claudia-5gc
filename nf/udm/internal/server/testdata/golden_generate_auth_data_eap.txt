@@ -1,0 +1,4 @@
+status: OK
+Content-Type: application/json
+
+{"authType":"EAP_AKA_PRIME","autn":"<HEX>","ckPrime":"<HEX>","ikPrime":"<HEX>","rand":"<HEX>","supi":"imsi-001010000000001","xres":"<HEX>"}

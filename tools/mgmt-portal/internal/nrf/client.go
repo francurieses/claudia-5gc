@@ -10,12 +10,12 @@ import (
 
 // NFProfile is a partial view of a 3GPP NF profile.
 type NFProfile struct {
-	NfInstanceID string   `json:"nfInstanceId"`
-	NfType       string   `json:"nfType"`
-	NfStatus     string   `json:"nfStatus"`
-	HeartBeatTimer int    `json:"heartBeatTimer"`
-	IPv4Addresses []string `json:"ipv4Addresses"`
-	SNSSAIs      []SNSSAI `json:"sNssais,omitempty"`
+	NfInstanceID   string   `json:"nfInstanceId"`
+	NfType         string   `json:"nfType"`
+	NfStatus       string   `json:"nfStatus"`
+	HeartBeatTimer int      `json:"heartBeatTimer"`
+	IPv4Addresses  []string `json:"ipv4Addresses"`
+	SNSSAIs        []SNSSAI `json:"sNssais,omitempty"`
 }
 
 // SNSSAI is an S-NSSAI as returned by NRF.

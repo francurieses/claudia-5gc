@@ -1,0 +1,9 @@
+openapi: 3.0.0
+info:
+  version: 1.0.0
+  title: Common
+components:
+  schemas:
+    Supi:
+      type: string
+      pattern: '^imsi-[0-9]+$'

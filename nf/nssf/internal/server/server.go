@@ -20,21 +20,55 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/config"
+	nssfsbi "github.com/francurieses/claudia-5gc/nf/nssf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/nssf/internal/slice"
+	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
 )
 
 // Server is the NSSF SBI server.
 type Server struct {
-	cfg    *config.Config
-	logger *slog.Logger
-	policy *slice.Store
+	cfg     *config.Config
+	logger  *slog.Logger
+	policy  *slice.Store
 	httpSrv *http.Server
+
+	// profile gates the supportedFeatures wire behaviour (decisions D1/D2,
+	// dev/REL19_PROGRAM.md §2); nil behaves as rel17.
+	profile *capability.Profile
+	// cat is the Nnssf_NSSelection producer catalog; nil = the default.
+	cat *features.Catalog
+}
+
+// querySupportedFeatures is the optional query parameter in which the consumer
+// indicates its features (TS 29.531 §6.1.8; "supported-features" in
+// TS29531_Nnssf_NSSelection.yaml).
+const querySupportedFeatures = "supported-features"
+
+// SetProfile wires the release profile used for supportedFeatures negotiation.
+// Must be called before Start(). Ref: TS 29.500 §6.6.2.
+func (s *Server) SetProfile(p *capability.Profile) { s.profile = p }
+
+// SetCatalog replaces the Nnssf_NSSelection catalog (tests inject catalogs with
+// Implemented entries); nil restores the default. Must be called before Start().
+func (s *Server) SetCatalog(c *features.Catalog) { s.cat = c }
+
+// catalog returns the catalog in use (the default when none was injected, so a
+// Server built as a struct literal in tests behaves like New).
+func (s *Server) catalog() *features.Catalog {
+	if s.cat == nil {
+		return nssfsbi.NnssfNSSelectionCatalog()
+	}
+	return s.cat
 }
 
 // New constructs a new NSSF server.
@@ -61,8 +95,9 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 	handler := http.Handler(mux)
 
 	s.httpSrv = &http.Server{
-		Addr:    cfg.SBI.Address,
-		Handler: h2c.NewHandler(handler, &http2.Server{}),
+		Addr:              cfg.SBI.Address,
+		Handler:           h2c.NewHandler(handler, &http2.Server{}),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return s
 }
@@ -142,11 +177,46 @@ func (s *Server) handleNSSelection(w http.ResponseWriter, r *http.Request) {
 		requested = []slice.SliceID{{SST: sst, SD: q.Get("requested-nssai.sd")}}
 	}
 
+	// Optional supported-features query parameter (TS 29.531 §6.1.8; "may
+	// include", TS 29.500 §6.6.2): a non-hex value is
+	// OPTIONAL_QUERY_PARAM_INCORRECT, param "query supported-features"
+	// (TS 29.500 Table 5.2.7.2-1, TS 29.571 §5.2.4.6).
+	ctx := logging.WithCorrelationID(r.Context(), r.Header.Get("X-Correlation-Id"))
+	cat := s.catalog()
+	// nf-type is peer-controlled: log it only when it looks like an NFType.
+	peerNF := nfType
+	if !features.ValidNFType(peerNF) {
+		peerNF = "UNKNOWN"
+	}
+	peerSF, peerSFPresent := q.Get(querySupportedFeatures), q.Has(querySupportedFeatures)
+	if err := features.Validate(peerSF); err != nil {
+		features.LogNegotiation(ctx, s.logger, features.Negotiation{
+			NF:        "NSSF",
+			Interface: "Nnssf", Direction: "IN", PeerNF: peerNF,
+			SpecRef: features.SpecRefInvalid, Result: "REJECT", Cause: features.CauseOptionalQueryParamIncorrect,
+			Local: cat.Supported(s.profile), Peer: peerSF, PeerPresent: true,
+		}, "error", err)
+		metrics.ProcedureTotal.WithLabelValues("NSSF", "NSSelection", "REJECT").Inc()
+		problemInvalidParam(w, features.CauseOptionalQueryParamIncorrect, features.ParamQuerySupportedFeatures,
+			"supported-features is not a valid hexadecimal string")
+		return
+	}
+	// Producer side (decision D1): the intersection, absent under rel17 when
+	// the request had none, "0" under rel19. An empty value counts as absent.
+	sfAnswer, sfSet := features.Answer(cat, s.profile, peerSF)
+	features.LogNegotiation(ctx, s.logger, features.Negotiation{
+		NF:        "NSSF",
+		Interface: "Nnssf", Direction: "IN", PeerNF: peerNF,
+		SpecRef: features.SpecRef, Result: "OK",
+		Local: cat.Supported(s.profile), Peer: peerSF,
+		PeerPresent: peerSFPresent && peerSF != "", Negotiated: sfSet,
+	})
+
 	allowed := s.policy.SelectForRegistration(requested)
 
 	s.logger.Info("NSSelection",
 		"procedure", "NSSelection",
-		"nf_type", nfType,
+		"nf_type", peerNF,
 		"nf_id", nfID,
 		"requested_count", len(requested),
 		"allowed_count", len(allowed),
@@ -180,6 +250,11 @@ func (s *Server) handleNSSelection(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	// AuthorizedNetworkSliceInfo.supportedFeatures: TS 29.531 §6.1.8.
+	if sfAnswer != "" {
+		resp["supportedFeatures"] = sfAnswer
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
@@ -197,5 +272,20 @@ func problem(w http.ResponseWriter, status int, cause, detail string) {
 		"status": status,
 		"cause":  cause,
 		"detail": detail,
+	})
+}
+
+// problemInvalidParam writes a 400 ProblemDetails with one invalidParams entry.
+// Ref: TS 29.571 §5.2.4.1 (ProblemDetails), §5.2.4.6 (InvalidParam).
+func problemInvalidParam(w http.ResponseWriter, cause, param, detail string) {
+	w.Header().Set("Content-Type", "application/problem+json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status": http.StatusBadRequest,
+		"cause":  cause,
+		"detail": detail,
+		"invalidParams": []map[string]string{
+			{"param": param},
+		},
 	})
 }

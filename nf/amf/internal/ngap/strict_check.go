@@ -8,8 +8,8 @@ package ngap
 import (
 	"fmt"
 
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 )
 
 // CheckICSConditionalPresence decodes an INITIAL CONTEXT SETUP REQUEST and returns

@@ -5,15 +5,36 @@ package nas
 
 import "fmt"
 
-// ServiceTypeSignalling is the service type value for NAS signalling.
-// Ref: TS 24.501 §9.11.3.50
+// Service type values (TS 24.501 §9.11.3.50, Table 9.11.3.50.1, V19.8.0).
+// ServiceTypeHighPriorityAccess was previously 0x07; the table assigns 0101
+// (0x05) and marks 0111 as unused ("shall be interpreted as signalling").
 const (
-	ServiceTypeSignalling         = 0x00
-	ServiceTypeData               = 0x01
-	ServiceTypeMobileTerminated   = 0x02
-	ServiceTypeEmergencyServices  = 0x03
-	ServiceTypeHighPriorityAccess = 0x07
+	ServiceTypeSignalling                = 0x00 // signalling
+	ServiceTypeData                      = 0x01 // data
+	ServiceTypeMobileTerminated          = 0x02 // mobile terminated services
+	ServiceTypeEmergencyServices         = 0x03 // emergency services
+	ServiceTypeEmergencyServicesFallback = 0x04 // emergency services fallback
+	ServiceTypeHighPriorityAccess        = 0x05 // high priority access
+	ServiceTypeElevatedSignalling        = 0x06 // elevated signalling
 )
+
+// InterpretServiceType returns the service type the network shall act on for
+// a received service type value, and whether the value is defined or has a
+// spec-mandated interpretation. Table 9.11.3.50.1: 0111 and 1000 are unused
+// and "shall be interpreted as signalling, if received by the network"; 1001,
+// 1010 and 1011 are unused and "shall be interpreted as data"; "All other
+// values are reserved" (ok=false, value returned unchanged).
+func InterpretServiceType(v byte) (byte, bool) {
+	switch {
+	case v <= ServiceTypeElevatedSignalling:
+		return v, true
+	case v == 0x07 || v == 0x08:
+		return ServiceTypeSignalling, true
+	case v >= 0x09 && v <= 0x0B:
+		return ServiceTypeData, true
+	}
+	return v, false
+}
 
 // ServiceRequest is the decoded body of a 5GMM Service Request (0x4C).
 // Ref: TS 24.501 §8.2.16.1.1 Table 8.2.16.1.1-1
@@ -109,6 +130,17 @@ func DecodeServiceRequest(b []byte) (*ServiceRequest, error) {
 			continue
 		}
 
+		if iei != IEIUplinkDataStatus && iei != IEIPDUSessionStatus {
+			// Allowed PDU session status, UE request type, Paging restriction
+			// and unknown IEs: skipped by table / TS 24.007 §11.2.4. A
+			// syntactically incorrect IE is treated as not present and stops
+			// optional-IE parsing. Ref: TS 24.501 §7.6.1, §7.7.1
+			if err := rdr.skipIE(IEMsgServiceRequest); err != nil {
+				break
+			}
+			continue
+		}
+
 		length, err := rdr.ReadByte()
 		if err != nil {
 			break
@@ -193,6 +225,9 @@ type ServiceAccept struct {
 	// when the SERVICE REQUEST carried an Uplink data status IE (§5.6.1.4.1).
 	// Mask layout as in PSIMask.
 	PDUSessionReactivationResult *uint16
+	// PDUSessionReactivationResultErrorCause — IEI 0x72, TLV-E (TS 24.501
+	// §9.11.3.43), after IEI 0x26. nil/empty = IE absent.
+	PDUSessionReactivationResultErrorCause []PDUSessionErrorCause
 }
 
 // EncodeServiceAccept encodes the Service Accept body (the octets after the
@@ -211,6 +246,7 @@ func EncodeServiceAccept(a *ServiceAccept) ([]byte, error) {
 		v := *a.PDUSessionReactivationResult
 		b = append(b, IEIPDUSessionReactivationResult, 0x02, byte(v>>8), byte(v))
 	}
+	b = append(b, EncodePDUSessionReactivationResultErrorCause(a.PDUSessionReactivationResultErrorCause)...)
 	return b, nil
 }
 
@@ -226,23 +262,34 @@ func DecodeServiceAccept(b []byte) (*ServiceAccept, error) {
 		if err != nil {
 			break
 		}
-		var n int
-		switch iei {
-		case 0x72, 0x78: // TLV-E: reactivation result error cause, EAP message
-			hi, err1 := rdr.ReadByte()
-			lo, err2 := rdr.ReadByte()
-			if err1 != nil || err2 != nil {
-				return a, fmt.Errorf("nas: ServiceAccept: truncated TLV-E length (IEI 0x%02X)", iei)
-			}
-			n = int(hi)<<8 | int(lo)
-		default:
-			l, err := rdr.ReadByte()
+		if iei == IEIPDUSessionReactivationResultErrorCause {
+			lb, err := rdr.ReadBytes(2)
 			if err != nil {
-				return a, fmt.Errorf("nas: ServiceAccept: truncated length (IEI 0x%02X)", iei)
+				return a, fmt.Errorf("nas: ServiceAccept: truncated length (IEI 0x72)")
 			}
-			n = int(l)
+			val, err := rdr.ReadBytes(int(lb[0])<<8 | int(lb[1]))
+			if err != nil {
+				return a, fmt.Errorf("nas: ServiceAccept: truncated IE 0x72: %w", err)
+			}
+			if list, err := DecodePDUSessionReactivationResultErrorCause(val); err == nil {
+				a.PDUSessionReactivationResultErrorCause = list
+			}
+			continue
 		}
-		val, err := rdr.ReadBytes(n)
+		if iei != IEIPDUSessionStatus && iei != IEIPDUSessionReactivationResult {
+			// Reactivation result error cause (TLV-E), EAP message (TLV-E),
+			// T3448 and every unknown IE: skipped by table / TS 24.007
+			// §11.2.4 so a TLV-E IE never shifts the following IEs.
+			if err := rdr.skipIE(IEMsgServiceAccept); err != nil {
+				return a, fmt.Errorf("nas: ServiceAccept: %w", err)
+			}
+			continue
+		}
+		l, err := rdr.ReadByte()
+		if err != nil {
+			return a, fmt.Errorf("nas: ServiceAccept: truncated length (IEI 0x%02X)", iei)
+		}
+		val, err := rdr.ReadBytes(int(l))
 		if err != nil {
 			return a, fmt.Errorf("nas: ServiceAccept: truncated IE 0x%02X: %w", iei, err)
 		}
@@ -271,4 +318,29 @@ type ServiceReject struct {
 // EncodeServiceReject encodes a Service Reject body (1 byte: cause).
 func EncodeServiceReject(r *ServiceReject) ([]byte, error) {
 	return []byte{r.Cause5GMM}, nil
+}
+
+// PSIsFromStatusBytes converts the value octets of a PDU session status /
+// uplink data status / PDU session reactivation result IE (wire order: octet 3
+// bit1=PSI0..bit8=PSI7, octet 4 PSI8..15; further octets spare) into the sorted
+// PSIs flagged (PSI 0 is spare and omitted). Ref: TS 24.501 §9.11.3.44, §9.11.3.57
+func PSIsFromStatusBytes(v []byte) []uint8 {
+	var out []uint8
+	for psi := uint8(1); psi <= 15; psi++ {
+		oct := psi / 8
+		if int(oct) < len(v) && v[oct]>>(psi%8)&1 == 1 {
+			out = append(out, psi)
+		}
+	}
+	return out
+}
+
+// StatusMaskFromBytes converts status IE value octets into the uint16 layout
+// used by DecodeServiceRequest / PSIInStatus (first octet in the high byte).
+// Returns 0 when fewer than 2 octets are present.
+func StatusMaskFromBytes(v []byte) uint16 {
+	if len(v) < 2 {
+		return 0
+	}
+	return uint16(v[0])<<8 | uint16(v[1])
 }

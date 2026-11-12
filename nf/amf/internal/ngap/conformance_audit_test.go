@@ -8,9 +8,11 @@ package ngap
 import (
 	"testing"
 
+	"github.com/francurieses/claudia-5gc/shared/capability"
+
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 	"github.com/free5gc/aper"
-	libngap "github.com/free5gc/ngap"
-	"github.com/free5gc/ngap/ngapType"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 )
@@ -28,6 +30,7 @@ func TestBuildInitialContextSetupRequest_SubscribedAMBR(t *testing.T) {
 		ulBps, dlBps, 1,
 		// UE-AMBR is C-ifPDUsessionResourceSetup: needs a PDU session list to be present.
 		[]PDUSessionSetupItemCxtReq{{PDUSessionID: 5, SST: 1, SD: []byte{0, 0, 1}, Transfer: []byte{0x01}}},
+		capability.PeerRAN{},
 	)
 	pdu, err := libngap.Decoder(raw)
 	if err != nil {

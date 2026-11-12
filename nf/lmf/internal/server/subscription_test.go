@@ -13,9 +13,9 @@
 //  5. Duration expiry: short-lived subscription self-removes from registry.
 //  6. Error paths: missing notificationUri → 400; unknown subId on GET/DELETE → 404.
 //  7. AOI ray-casting state machine via handlers (endpoint-level test).
-//  8. CancelLocation (cancel-loc) returns 204 idempotent.
+//  8. CancelLocation (cancel-location) returns 204 idempotent.
 //
-// Ref: TS 29.572 §5.2.3 (EventSubscription), §5.2.2.5 (CancelLocation),
+// Ref: TS 29.572 §5.2.3 (EventSubscription), §5.2.2.4.2 (CancelLocation),
 //
 //	§6.1.6.2.4 (LocationNotification).
 package server
@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -758,17 +759,17 @@ func TestAOISubscription_EnterTriggersNotification(t *testing.T) {
 	deleteSub(t, ts, created.SubId)
 }
 
-// ---- Test 8: CancelLocation (cancel-loc) idempotent 204 ----------------------
+// ---- Test 8: CancelLocation (cancel-location) idempotent 204 ----------------------
 
-// TestCancelLocation_Idempotent verifies that POST .../cancel-loc for a UE with
+// TestCancelLocation_Idempotent verifies that POST .../cancel-location for a UE with
 // no in-progress DetermineLocation returns 204 (idempotent no-op).
-// Ref: TS 29.572 §5.2.2.5.
+// Ref: TS 29.572 §5.2.2.4.2.
 func TestCancelLocation_Idempotent(t *testing.T) {
 	ts := newSubTestServer(t, goodAMF(), &captureNotifClient{})
 	defer ts.Close()
 
 	req, err := http.NewRequest(http.MethodPost,
-		ts.URL+"/nlmf-loc/v1/ue-contexts/imsi-001010000000001/cancel-loc", nil)
+		ts.URL+"/nlmf-loc/v1/cancel-location", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -828,4 +829,25 @@ func TestCreateSubscription_AOI_ValidPolygon(t *testing.T) {
 	}
 
 	deleteSub(t, ts, created.SubId)
+}
+
+// TestLegacyRoutesRemoved verifies the pre-alignment non-YAML routes are gone;
+// the Nlmf_Location paths are /determine-location and /cancel-location.
+// Ref: TS29572_Nlmf_Location.yaml (Rel-17), TS 29.572 §5.2.2.
+func TestLegacyRoutesRemoved(t *testing.T) {
+	ts := newSubTestServer(t, goodAMF(), &captureNotifClient{})
+	defer ts.Close()
+	for _, p := range []string{
+		"/nlmf-loc/v1/ue-contexts/imsi-001010000000001/provide-loc-info",
+		"/nlmf-loc/v1/ue-contexts/imsi-001010000000001/cancel-loc",
+	} {
+		resp, err := ts.Client().Post(ts.URL+p, "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("post %s: %v", p, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s: expected 404, got %d", p, resp.StatusCode)
+		}
+	}
 }

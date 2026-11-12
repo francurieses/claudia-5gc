@@ -1,0 +1,5 @@
+POST /npcf-policyauthorization/v1/app-sessions/as-1/delete
+Content-Type: 
+Accept: application/json
+Content-Length: 0
+

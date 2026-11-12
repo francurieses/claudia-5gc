@@ -1,0 +1,15 @@
+status: Created
+Content-Type: application/json
+Location: /nudm-sdm/v2/imsi-001010000000001/sdm-subscriptions/<ID>
+
+{"nfInstanceId":"amf-1","callbackReference":"CALLBACK","monitoredResourceUris":["https://udm/nudm-sdm/v2/imsi-001010000000001/am-data"],"subscriptionId":"<ID>","supportedFeatures":"0"}
+
+--- trigger ---
+status: No Content
+Content-Type: 
+Location: 
+
+
+--- notification ---
+application/json
+{"notifyItems":[{"resourceId":"https://udm/nudm-sdm/v2/imsi-001010000000001/am-data","changes":[{"op":"REPLACE","path":"","newValue":null}]}],"subscriptionId":"<ID>"}

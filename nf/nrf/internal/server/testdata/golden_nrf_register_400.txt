@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"MANDATORY_IE_INCORRECT","detail":"invalid character 'n' looking for beginning of object key string","status":400}

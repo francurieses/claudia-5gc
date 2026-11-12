@@ -15,6 +15,11 @@ RUN go mod download
 
 # Shared packages and MCP source (MCP imports shared/, not the other NFs).
 COPY shared/ ./shared/
+# Private-edition sources (dev/rel19/PLAN.md §1.2): the glob copies private/ when it
+# exists (private repo) and matches nothing in the public snapshot, which strips both
+# private/ and the *_private.go bridges, so one Dockerfile builds both editions.
+# Build stage only: nothing from private/ is copied into the runtime image beyond the binary.
+COPY privat[e]/ ./private/
 COPY mcp/ ./mcp/
 
 # BUILD_COMMIT is stamped into mcp_info (build_commit).

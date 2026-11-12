@@ -19,7 +19,7 @@ type TokenSource interface {
 }
 
 // NEF wraps the Nnef_AFsessionWithQoS service (TS 29.522 §4.4.13, §5.14). The NEF
-// SBI enforces mTLS and an OAuth2 bearer token (scope nnef-afsessionwithqos).
+// SBI enforces mTLS and an OAuth2 bearer token (scope 3gpp-as-session-with-qos).
 type NEF struct {
 	baseURL string
 	http    *http.Client

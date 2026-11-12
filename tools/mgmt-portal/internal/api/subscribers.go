@@ -72,6 +72,10 @@ func (d Deps) handleCreateSubscriber(w http.ResponseWriter, r *http.Request) {
 	if sub.Slices == nil {
 		sub.Slices = []store.SNSSAI{}
 	}
+	if err := store.ValidateGPSIs(sub.GPSIs); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	if err := d.Store.UpsertSubscriber(r.Context(), sub, false); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -100,6 +104,10 @@ func (d Deps) handleUpdateSubscriber(w http.ResponseWriter, r *http.Request) {
 	}
 	if sub.Slices == nil {
 		sub.Slices = []store.SNSSAI{}
+	}
+	if err := store.ValidateGPSIs(sub.GPSIs); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	// preserveSQN: the SQN advances on every authentication; writing back the

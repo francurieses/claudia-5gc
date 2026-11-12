@@ -1,0 +1,1 @@
+{"nfInstanceId":"11111111-2222-3333-4444-555555555555","nfType":"SMSF","nfStatus":"REGISTERED","nfServices":[{"serviceInstanceId":"11111111-2222-3333-4444-555555555555-nsmsf-sms","serviceName":"nsmsf-sms","versions":[{"apiVersionInUri":"v2","apiFullVersion":"2.2.1"}],"scheme":"https","nfServiceStatus":"REGISTERED"}]}

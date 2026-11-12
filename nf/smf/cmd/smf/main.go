@@ -14,6 +14,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/server"
 	"github.com/francurieses/claudia-5gc/nf/smf/internal/store"
+	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/nrf"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -45,10 +46,19 @@ func main() {
 		logger.Error("tracing init failed", "error", err)
 	}
 	if tp != nil {
-		defer tp.Shutdown(context.Background())
+		defer func() { _ = tp.Shutdown(context.Background()) }()
 	}
 
 	logger.Info("SMF starting", "instance_id", cfg.NFInstanceID)
+
+	// ---- Release profile (gates Rel-19 wire behaviour) --------------------
+	relProfile, err := capability.NewProfile(cfg.Release, nil)
+	if err != nil {
+		logger.Error("SMF: invalid release profile", "error", err)
+		os.Exit(1)
+	}
+	capability.SetDefault(relProfile)
+	logger.Info("SMF release profile", "release_profile", relProfile.Name())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -78,7 +88,7 @@ func main() {
 		}
 	}
 
-	sbiSrv, err := server.New(cfg, logger, smfStore)
+	sbiSrv, err := server.New(cfg, logger, smfStore, server.WithProfile(relProfile))
 	if err != nil {
 		logger.Error("SBI server creation failed", "error", err)
 		os.Exit(1)
@@ -121,35 +131,7 @@ func main() {
 		} else {
 			nrfAddr := "https://" + cfg.Peers.NRF
 			nrfClient := nrf.New(nrfAddr, httpClient, logger)
-			var snssais []nrf.SNSSAIEntry
-			for _, s := range cfg.SNSSAIs {
-				snssais = append(snssais, nrf.SNSSAIEntry{SST: s.SST, SD: s.SD})
-			}
-			if len(snssais) == 0 {
-				snssais = []nrf.SNSSAIEntry{{SST: 1, SD: "000001"}}
-			}
-			// Advertise all configured DNNs to NRF (TS 29.510 §6.1.6.2.28).
-			var dnnList []string
-			for _, d := range cfg.DNNs {
-				dnnList = append(dnnList, d.Name)
-			}
-			if len(dnnList) == 0 {
-				dnnList = []string{"internet"}
-			}
-			profile := &nrf.NFProfile{
-				NFInstanceID: cfg.NFInstanceID,
-				NFType:       "SMF",
-				NFStatus:     "REGISTERED",
-				SNSSAIs:      snssais,
-				DNNList:      dnnList,
-				NFServices: []nrf.NFService{{
-					ServiceInstanceID: cfg.NFInstanceID + "-nsmf-pdusession",
-					ServiceName:       "nsmf-pdusession",
-					Scheme:            "https",
-					NFServiceStatus:   "REGISTERED",
-					Versions:          []nrf.NFServiceVersion{{APIVersionInURI: "v1", APIFullVersion: "1.0.0"}},
-				}},
-			}
+			profile := server.BuildNFProfile(cfg, relProfile)
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,
@@ -164,6 +146,7 @@ func main() {
 	<-sigCh
 	logger.Info("shutdown signal received")
 	cancel()
+	sbiSrv.WaitShutdown(5 * time.Second) // session cleanup (PFCP deletions) finishes before exit
 
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
