@@ -14,7 +14,7 @@ ENV CGO_ENABLED=0
 RUN go build -ldflags="-s -w" -o /out/upf ./nf/upf/cmd/upf
 
 # alpine provides iproute2 (ip) and iptables needed for TUN + NAT setup
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache iproute2 iptables
 COPY --from=build /out/upf /bin/upf
 EXPOSE 8805/udp 2152/udp 9107
