@@ -35,6 +35,10 @@ type PLMN struct {
 type SNSSAIEntry struct {
 	SST int    `yaml:"sst"`
 	SD  string `yaml:"sd"`
+	// DNN is the slice's default/seed DNN, used by the UDR dev subscriber
+	// seed to key sm-data DnnConfiguration (TS 29.503 §6.1.6.2.9).
+	// Empty means "internet". Other NFs ignore it.
+	DNN string `yaml:"dnn,omitempty"`
 }
 
 // DNNEntry defines operator-wide DNN → subnet configuration.

@@ -24,6 +24,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/pfcpx"
 )
 
 // pfcpReceiveBufferSize bounds a single inbound PFCP UDP datagram. PFCP
@@ -110,7 +111,7 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 			continue
 		}
 
-		msg, err := pfcpmsg.Parse(buf[:n])
+		msg, err := pfcpx.ParseMessage(buf[:n])
 		if err != nil {
 			s.logger.Warn("SMF: PFCP receiver parse error",
 				"interface", "N4", "direction", "IN",
@@ -138,12 +139,28 @@ func (s *Server) StartPFCPReceiver(ctx context.Context) error {
 // Response back to raddr on the receiver socket. Never panics: any parse
 // anomaly is logged and answered best-effort. Ref: TS 29.244 §7.5.5, §7.5.9.
 func (s *Server) handleSessionReport(ctx context.Context, conn *net.UDPConn, raddr *net.UDPAddr, req *pfcpmsg.SessionReportRequest) {
-	cause, _ := s.consumeSessionReport(ctx, req)
-
-	resp := pfcpmsg.NewSessionReportResponse(
-		0, 0, req.SEID(), req.Sequence(), 0,
-		pfcpie.NewCause(cause),
+	var (
+		cause     uint8
+		offending uint16
+		post      func()
 	)
+	if isDLDR(req) {
+		cause, offending, post = s.consumeDownlinkDataReport(ctx, req)
+	} else {
+		cause, _, post = s.consumeSessionReportDeferred(ctx, req)
+	}
+
+	respSEID := req.SEID()
+	ies := []*pfcpie.IE{pfcpie.NewCause(cause)}
+	if isDLDR(req) {
+		switch cause {
+		case pfcpie.CauseSessionContextNotFound:
+			respSEID = 0 // unknown session: header SEID 0, TS 29.244 §7.2.2.4.2
+		case pfcpie.CauseConditionalIEMissing:
+			ies = append(ies, pfcpie.NewOffendingIE(offending)) // TS 29.244 §7.2.3.2
+		}
+	}
+	resp := pfcpmsg.NewSessionReportResponse(0, 0, respSEID, req.Sequence(), 0, ies...)
 
 	b := make([]byte, resp.MarshalLen())
 	if err := resp.MarshalTo(b); err != nil {
@@ -156,6 +173,11 @@ func (s *Server) handleSessionReport(ctx context.Context, conn *net.UDPConn, rad
 		s.logger.Warn("SMF: PFCP Session Report Response send failed",
 			"interface", "N4", "direction", "OUT",
 			"error", fmt.Errorf("smf: usage report: %w", err), "seid", req.SEID(), "remote", raddr)
+		return
+	}
+	// Response first, then the N1N2MessageTransfer (TS 23.502 §4.2.3.3 step 2b before 3a).
+	if post != nil {
+		post()
 	}
 }
 
@@ -167,6 +189,21 @@ func (s *Server) handleSessionReport(ctx context.Context, conn *net.UDPConn, rad
 // exercise one Usage Report per request; multiple reports are each logged
 // individually). Ref: TS 29.244 §5.2.2.4, §7.5.5, §7.5.8.
 func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionReportRequest) (uint8, UsageSummary) {
+	cause, summary, post := s.consumeSessionReportDeferred(ctx, req)
+	if post != nil {
+		post()
+	}
+	return cause, summary
+}
+
+// consumeSessionReportDeferred is consumeSessionReport for callers that must send the PFCP
+// response before the follow-up work: for a DLDR it returns the paging step as post (run it
+// after the Session Report Response, TS 23.502 §4.2.3.3 step 2b/3a); post is nil otherwise.
+func (s *Server) consumeSessionReportDeferred(ctx context.Context, req *pfcpmsg.SessionReportRequest) (uint8, UsageSummary, func()) {
+	if isDLDR(req) {
+		cause, _, post := s.consumeDownlinkDataReport(ctx, req)
+		return cause, UsageSummary{SEID: req.SEID()}, post
+	}
 	seid := req.SEID()
 	logger := logging.NewProcedureLogger(ctx, s.logger, "UsageReporting")
 
@@ -176,7 +213,7 @@ func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionR
 			"interface", "N4", "direction", "IN",
 			"spec_ref", "TS 29.244 §5.2.2.4",
 			"seid", seid, "result", "REJECT", "cause", "SessionContextNotFound")
-		return pfcpie.CauseSessionContextNotFound, UsageSummary{SEID: seid}
+		return pfcpie.CauseSessionContextNotFound, UsageSummary{SEID: seid}, nil
 	}
 
 	var summary UsageSummary
@@ -210,7 +247,7 @@ func (s *Server) consumeSessionReport(ctx context.Context, req *pfcpmsg.SessionR
 		// TS 32.255) would be triggered from the consumed volume/duration.
 	}
 
-	return pfcpie.CauseRequestAccepted, summary
+	return pfcpie.CauseRequestAccepted, summary, nil
 }
 
 // parseUsageReport decodes a single Usage Report IE (TS 29.244 §7.5.8) into a

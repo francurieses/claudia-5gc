@@ -508,3 +508,34 @@ func bcd(c byte) byte {
 	}
 	return 0
 }
+
+// optionalNSSAI decodes the value of an optional NSSAI IE. A faulty one is treated as not present
+// (TS 24.501 §7.6.1, §7.7.1). A well-formed empty one stays present: the Allowed and Configured
+// NSSAI encoders emit an empty IE for a non-nil empty NSSAI (the frozen Rel-17 "empty Allowed
+// NSSAI" CUC relies on it), so presence must survive a decode (CI-003).
+func optionalNSSAI(b []byte) *NSSAI {
+	n, err := DecodeNSSAI(b)
+	if err != nil {
+		return nil
+	}
+	return &n
+}
+
+// optionalNonEmptyNSSAI is optionalNSSAI for an IE whose encoder omits an empty NSSAI (Pending
+// NSSAI): an empty one is treated as not present.
+func optionalNonEmptyNSSAI(b []byte) *NSSAI {
+	if n := optionalNSSAI(b); n != nil && len(n.SNSSAIs) > 0 {
+		return n
+	}
+	return nil
+}
+
+// optionalGUTI decodes the value of an optional 5G-GUTI IE. A faulty one, or a mobile identity that
+// is not a 5G-GUTI, is treated as not present (TS 24.501 §7.6.1, §7.7.1; §9.11.3.4).
+func optionalGUTI(b []byte) *MobileIdentity {
+	mi, err := DecodeMobileIdentity(b)
+	if err != nil || mi == nil || mi.GUTI == nil {
+		return nil
+	}
+	return mi
+}

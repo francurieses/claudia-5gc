@@ -104,7 +104,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 		LocalPLMN:              n32c.PlmnId{Mcc: cfg.PLMN.MCC, Mnc: cfg.PLMN.MNC},
 		LocalFQDN:              cfg.SBI.FQDN,
 		Partners:               partners,
-		Profile:                capability.ProfileFrom(nil),
+		Profile:                capability.ProfileFrom(context.Background()),
 		TargetAPIRootSupported: cfg.N32.TargetAPIRootSupported,
 		Logger:                 logger,
 	})

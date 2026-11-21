@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,8 @@ type udmCtx struct {
 	lastBody       []byte
 	subscriptionID string
 	client         *http.Client
+	udrSrv         *httptest.Server // TLS UDR mock for the am-data scenarios
+	logBuf         *syncBuffer      // JSON slog records of the am-data UDM
 }
 
 // ---- stub UDR ---------------------------------------------------------------
@@ -99,6 +102,10 @@ func (c *udmCtx) startUDM(ctx context.Context, _ *godog.Scenario) (context.Conte
 func (c *udmCtx) stopUDM(_ context.Context, _ *godog.Scenario, _ error) (context.Context, error) {
 	if c.callbackSrv != nil {
 		c.callbackSrv.Close()
+	}
+	if c.udrSrv != nil {
+		c.udrSrv.Close()
+		c.udrSrv = nil
 	}
 	return context.Background(), nil
 }
@@ -304,6 +311,12 @@ func InitializeScenario(ctx *godog.ScenarioContext) {
 		return c.amfSubscribesWithoutCallbackReference("imsi-001010000000001")
 	})
 	ctx.Step(`^the cause is "([^"]*)"$`, c.causeIs)
+	ctx.Step(`^the UDR am-data for "([^"]*)" has subscribedUeAmbr uplink "([^"]*)" and downlink "([^"]*)"$`, c.udrAMDataHasAmbr)
+	ctx.Step(`^the UDR am-data for "([^"]*)" has no subscribedUeAmbr$`, c.udrAMDataHasNoAmbr)
+	ctx.Step(`^the UDR returns 404 for am-data of "([^"]*)"$`, c.udrReturns404)
+	ctx.Step(`^AMF sends GET am-data for "([^"]*)"$`, c.amfGetsAMData)
+	ctx.Step(`^the am-data subscribedUeAmbr (uplink|downlink) is "([^"]*)"$`, c.amDataAmbrIs)
+	ctx.Step(`^the UDM logs a WARN with cause "([^"]*)" for direction "([^"]*)"$`, c.udmLogsWarn)
 }
 
 func TestFeatures(t *testing.T) {
@@ -311,11 +324,128 @@ func TestFeatures(t *testing.T) {
 		ScenarioInitializer: InitializeScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"nudm_sdm_subscribe.feature"},
+			Paths:    []string{"nudm_sdm_subscribe.feature", "nudm_sdm_get_am_data.feature"},
 			TestingT: t,
 		},
 	}
 	if suite.Run() != 0 {
 		t.Fatal("godog scenarios failed")
 	}
+}
+
+// ---- Nudm_SDM Get AM data, subscribed UE-AMBR (UDM-002) ---------------------
+
+// syncBuffer is a mutex-guarded bytes.Buffer usable as an slog sink.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// startAMDataUDM replaces the scenario UDM by one backed by the real Nudr
+// client against a TLS UDR mock answering am-data with status and body.
+func (c *udmCtx) startAMDataUDM(status int, body string) error {
+	c.udrSrv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	c.logBuf = &syncBuffer{}
+	logger := slog.New(slog.NewJSONHandler(c.logBuf, nil))
+	addr := strings.TrimPrefix(c.udrSrv.URL, "https://")
+	udr := udmsrv.NewHTTPUDRClient(addr, c.udrSrv.Client()).WithFeatures(nil, logger)
+	srv, err := udmsrv.New("127.0.0.1:0", "5G:mnc001.mcc001.3gppnetwork.org", udmsrv.TLSConfig{}, udr, logger)
+	if err != nil {
+		return fmt.Errorf("start UDM: %w", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	go func() { _ = srv.ServeH2C(ln) }()
+	c.srv = srv
+	c.baseURL = "http://" + ln.Addr().String()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := c.client.Get(c.baseURL + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+		}
+		runtime.Gosched()
+	}
+	return fmt.Errorf("UDM did not become healthy")
+}
+
+func (c *udmCtx) udrAMDataHasAmbr(_, ul, dl string) error {
+	body, _ := json.Marshal(map[string]any{
+		"nssai":            map[string]any{"defaultSingleNssais": []map[string]any{{"sst": 1}}},
+		"subscribedUeAmbr": map[string]string{"uplink": ul, "downlink": dl},
+	})
+	return c.startAMDataUDM(http.StatusOK, string(body))
+}
+
+func (c *udmCtx) udrAMDataHasNoAmbr(_ string) error {
+	return c.startAMDataUDM(http.StatusOK, `{"nssai":{"defaultSingleNssais":[{"sst":1}]}}`)
+}
+
+func (c *udmCtx) udrReturns404(_ string) error {
+	return c.startAMDataUDM(http.StatusNotFound,
+		`{"status":404,"cause":"USER_NOT_FOUND","title":"Not Found"}`)
+}
+
+func (c *udmCtx) amfGetsAMData(supi string) error {
+	resp, err := c.client.Get(c.baseURL + "/nudm-sdm/v2/" + supi + "/am-data")
+	if err != nil {
+		return err
+	}
+	c.lastBody, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	c.lastResp = resp
+	return nil
+}
+
+func (c *udmCtx) amDataAmbrIs(dir, want string) error {
+	var parsed struct {
+		SubscribedUeAmbr map[string]string `json:"subscribedUeAmbr"`
+	}
+	if err := json.Unmarshal(c.lastBody, &parsed); err != nil {
+		return fmt.Errorf("am-data not JSON: %w (%s)", err, c.lastBody)
+	}
+	if got := parsed.SubscribedUeAmbr[dir]; got != want {
+		return fmt.Errorf("subscribedUeAmbr %s = %q, want %q", dir, got, want)
+	}
+	return nil
+}
+
+func (c *udmCtx) udmLogsWarn(cause, dir string) error {
+	if c.logBuf == nil {
+		return fmt.Errorf("no am-data UDM log capture")
+	}
+	for _, line := range strings.Split(c.logBuf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["level"] == "WARN" && rec["cause"] == cause && rec["ambr_direction"] == dir {
+			return nil
+		}
+	}
+	return fmt.Errorf("no WARN record with cause %q and ambr_direction %q in logs:\n%s", cause, dir, c.logBuf.String())
 }

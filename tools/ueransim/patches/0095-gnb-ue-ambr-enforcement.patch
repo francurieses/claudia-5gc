@@ -1,0 +1,197 @@
+diff --git a/src/gnb/gtp/task.cpp b/src/gnb/gtp/task.cpp
+index dc2f41b..004c765 100644
+--- a/src/gnb/gtp/task.cpp
++++ b/src/gnb/gtp/task.cpp
+@@ -74,6 +74,10 @@ void GtpTask::onLoop()
+             handleSessionRelease(w.ueId, w.psi);
+             break;
+         }
++        case NmGnbNgapToGtp::SESSION_AMBR_UPDATE: {
++            handleSessionAmbrUpdate(w.ueId, w.psi, w.sessionAmbr);
++            break;
++        }
+         }
+         break;
+     }
+@@ -125,6 +129,20 @@ void GtpTask::handleSessionCreate(PduSessionResource *session)
+     updateAmbrForSession(sessionInd);
+ }
+ 
++// 5GC patch 0095: apply a Session-AMBR changed by NGAP PDU Session Resource Modify. TS 38.413 §8.2.3.2, §9.3.4.3;
++// UERANSIM also polices Session-AMBR at the gNB; normatively the UPF enforces it (TS 23.501 §5.7.2.6).
++void GtpTask::handleSessionAmbrUpdate(int ueId, int psi, const AggregateMaximumBitRate &sessionAmbr)
++{
++    uint64_t sessionInd = MakeSessionResInd(ueId, psi);
++    if (!m_pduSessions.count(sessionInd))
++    {
++        m_logger->err("Session-AMBR update ignored, PDU session[%d] of UE[%d] not found", psi, ueId);
++        return;
++    }
++    m_pduSessions[sessionInd]->sessionAmbr = sessionAmbr;
++    updateAmbrForSession(sessionInd);
++}
++
+ void GtpTask::handleSessionRelease(int ueId, int psi)
+ {
+     if (!m_ueContexts.count(ueId))
+diff --git a/src/gnb/gtp/task.hpp b/src/gnb/gtp/task.hpp
+index 6111b9b..19f25b4 100644
+--- a/src/gnb/gtp/task.hpp
++++ b/src/gnb/gtp/task.hpp
+@@ -50,6 +50,7 @@ class GtpTask : public NtsTask
+     void handleUdpReceive(const udp::NwUdpServerReceive &msg);
+     void handleUeContextUpdate(const GtpUeContextUpdate &msg);
+     void handleSessionCreate(PduSessionResource *session);
++    void handleSessionAmbrUpdate(int ueId, int psi, const AggregateMaximumBitRate &sessionAmbr);
+     void handleSessionRelease(int ueId, int psi);
+     void handleUeContextDelete(int ueId);
+     void handleUplinkData(int ueId, int psi, OctetString &&data);
+diff --git a/src/gnb/ngap/context.cpp b/src/gnb/ngap/context.cpp
+index cdd221f..d9b2fd4 100644
+--- a/src/gnb/ngap/context.cpp
++++ b/src/gnb/ngap/context.cpp
+@@ -32,6 +32,7 @@
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyListModReq.h>
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyListModRes.h>
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyRequest.h>
++#include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyRequestTransfer.h>
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyResponse.h>
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceModifyResponseTransfer.h>
+ #include <asn/ngap/ASN_NGAP_PDUSessionResourceSetupItemCxtReq.h>
+@@ -71,17 +72,21 @@ void NgapTask::receiveInitialContextSetup(int amfId, ASN_NGAP_InitialContextSetu
+     if (ue == nullptr)
+         return;
+ 
+-    auto w = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_UPDATE);
+-    w->update = std::make_unique<GtpUeContextUpdate>(true, ue->ctxId, ue->ueAmbr);
+-    m_base->gtpTask->push(std::move(w));
+-
++    // 5GC patch 0053: parse UE-AMBR before creating the GTP UE context, otherwise the rate limiter is created
++    // with the previous (zero = unlimited) value. TS 38.413 §8.3.1.2, §9.2.2.1; TS 23.501 §5.7.2.6.
+     auto *reqIe = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UEAggregateMaximumBitRate);
+     if (reqIe)
+     {
+         ue->ueAmbr.dlAmbr = asn::GetUnsigned64(reqIe->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateDL) / 8ull;
+         ue->ueAmbr.ulAmbr = asn::GetUnsigned64(reqIe->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateUL) / 8ull;
++        m_logger->info("UE-AMBR set from Initial Context Setup: DL %llu bit/s, UL %llu bit/s",
++                       (unsigned long long)(ue->ueAmbr.dlAmbr * 8ull), (unsigned long long)(ue->ueAmbr.ulAmbr * 8ull));
+     }
+ 
++    auto w = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_UPDATE);
++    w->update = std::make_unique<GtpUeContextUpdate>(true, ue->ctxId, ue->ueAmbr);
++    m_base->gtpTask->push(std::move(w));
++
+     std::vector<ASN_NGAP_PDUSessionResourceSetupItemCxtRes *> successList;
+     std::vector<ASN_NGAP_PDUSessionResourceFailedToSetupItemCxtRes *> failedList;
+ 
+@@ -258,6 +263,36 @@ void NgapTask::receiveSessionResourceModifyRequest(int amfId, ASN_NGAP_PDUSessio
+         {
+             auto &item = list.array[i];
+ 
++            // 5GC patch 0095: apply a changed Session-AMBR to the GTP rate limiter. Stock behaviour (and patch 0030)
++            // ignored the transfer, so the gNB kept policing at the setup-time value. TS 38.413 §9.3.4.3.
++            auto *modTr = ngap_encode::Decode<ASN_NGAP_PDUSessionResourceModifyRequestTransfer>(
++                asn_DEF_ASN_NGAP_PDUSessionResourceModifyRequestTransfer, item->pDUSessionResourceModifyRequestTransfer);
++            if (modTr != nullptr)
++            {
++                auto *ambrIe =
++                    asn::ngap::GetProtocolIe(modTr, ASN_NGAP_ProtocolIE_ID_id_PDUSessionAggregateMaximumBitRate);
++                if (ambrIe)
++                {
++                    auto w = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::SESSION_AMBR_UPDATE);
++                    w->ueId = ue->ctxId;
++                    w->psi = static_cast<int>(item->pDUSessionID);
++                    w->sessionAmbr.dlAmbr = asn::GetUnsigned64(
++                                                ambrIe->PDUSessionAggregateMaximumBitRate.pDUSessionAggregateMaximumBitRateDL) /
++                                            8ull;
++                    w->sessionAmbr.ulAmbr = asn::GetUnsigned64(
++                                                ambrIe->PDUSessionAggregateMaximumBitRate.pDUSessionAggregateMaximumBitRateUL) /
++                                            8ull;
++                    m_logger->info("Session-AMBR of PDU session[%d] set from PDU Session Resource Modify: DL %llu bit/s, "
++                                   "UL %llu bit/s",
++                                   w->psi, (unsigned long long)(w->sessionAmbr.dlAmbr * 8ull),
++                                   (unsigned long long)(w->sessionAmbr.ulAmbr * 8ull));
++                    m_base->gtpTask->push(std::move(w));
++                }
++                asn::Free(asn_DEF_ASN_NGAP_PDUSessionResourceModifyRequestTransfer, modTr);
++            }
++            else
++                m_logger->err("Unable to decode a PDU session resource modify request transfer");
++
+             // Deliver the embedded 5GSM Modification Command (0xCB) to the UE NAS layer.
+             if (item->nAS_PDU != nullptr)
+                 deliverDownlinkNas(ue->ctxId, asn::GetOctetString(*item->nAS_PDU));
+@@ -329,8 +364,11 @@ void NgapTask::receiveContextModification(int amfId, ASN_NGAP_UEContextModificat
+     auto *ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UEAggregateMaximumBitRate);
+     if (ie)
+     {
+-        ue->ueAmbr.dlAmbr = asn::GetUnsigned64(ie->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateDL);
+-        ue->ueAmbr.ulAmbr = asn::GetUnsigned64(ie->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateUL);
++        // 5GC patch 0053: NGAP Bit Rate is bit/s, the GTP rate limiter takes bytes/s (stock code missed the /8).
++        ue->ueAmbr.dlAmbr = asn::GetUnsigned64(ie->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateDL) / 8ull;
++        ue->ueAmbr.ulAmbr = asn::GetUnsigned64(ie->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateUL) / 8ull;
++        m_logger->info("UE-AMBR set from UE Context Modification: DL %llu bit/s, UL %llu bit/s",
++                       (unsigned long long)(ue->ueAmbr.dlAmbr * 8ull), (unsigned long long)(ue->ueAmbr.ulAmbr * 8ull));
+     }
+ 
+     ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_NewAMF_UE_NGAP_ID);
+diff --git a/src/gnb/ngap/session.cpp b/src/gnb/ngap/session.cpp
+index 3746905..afa3ef0 100644
+--- a/src/gnb/ngap/session.cpp
++++ b/src/gnb/ngap/session.cpp
+@@ -36,6 +36,7 @@
+ #include <asn/ngap/ASN_NGAP_QosFlowPerTNLInformationList.h>
+ #include <asn/ngap/ASN_NGAP_QosFlowSetupRequestItem.h>
+ #include <asn/ngap/ASN_NGAP_QosFlowSetupRequestList.h>
++#include <asn/ngap/ASN_NGAP_UEAggregateMaximumBitRate.h>
+ 
+ namespace nr::gnb
+ {
+@@ -49,6 +50,22 @@ void NgapTask::receiveSessionResourceSetupRequest(int amfId, ASN_NGAP_PDUSession
+     if (ue == nullptr)
+         return;
+ 
++    // 5GC patch 0053: the AMF sends UE-AMBR here (not in Initial Context Setup) when the ICS Request carried no
++    // PDU Session Resource Setup List. Stock UERANSIM ignored it, so the UE-level rate limit was never applied.
++    // TS 38.413 §8.2.1.2, §9.2.1.1 (UE Aggregate Maximum Bit Rate, O); TS 23.501 §5.7.2.6 (enforced by NG-RAN).
++    auto *ambrIe = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UEAggregateMaximumBitRate);
++    if (ambrIe)
++    {
++        ue->ueAmbr.dlAmbr = asn::GetUnsigned64(ambrIe->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateDL) / 8ull;
++        ue->ueAmbr.ulAmbr = asn::GetUnsigned64(ambrIe->UEAggregateMaximumBitRate.uEAggregateMaximumBitRateUL) / 8ull;
++        m_logger->info("UE-AMBR set from PDU Session Resource Setup: DL %llu bit/s, UL %llu bit/s",
++                       (unsigned long long)(ue->ueAmbr.dlAmbr * 8ull), (unsigned long long)(ue->ueAmbr.ulAmbr * 8ull));
++
++        auto w = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_UPDATE);
++        w->update = std::make_unique<GtpUeContextUpdate>(false, ue->ctxId, ue->ueAmbr);
++        m_base->gtpTask->push(std::move(w));
++    }
++
+     auto *ieList = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_PDUSessionResourceSetupListSUReq);
+     if (ieList)
+     {
+diff --git a/src/gnb/nts.hpp b/src/gnb/nts.hpp
+index ae328ee..3523b50 100644
+--- a/src/gnb/nts.hpp
++++ b/src/gnb/nts.hpp
+@@ -219,6 +219,7 @@ struct NmGnbNgapToGtp : NtsMessage
+         UE_CONTEXT_RELEASE,
+         SESSION_CREATE,
+         SESSION_RELEASE,
++        SESSION_AMBR_UPDATE, // 5GC patch 0095
+     } present;
+ 
+     // UE_CONTEXT_UPDATE
+@@ -232,8 +233,12 @@ struct NmGnbNgapToGtp : NtsMessage
+     int ueId{};
+ 
+     // SESSION_RELEASE
++    // SESSION_AMBR_UPDATE
+     int psi{};
+ 
++    // SESSION_AMBR_UPDATE (bytes/s, like PduSessionResource::sessionAmbr)
++    AggregateMaximumBitRate sessionAmbr{};
++
+     explicit NmGnbNgapToGtp(PR present) : NtsMessage(NtsMessageType::GNB_NGAP_TO_GTP), present(present)
+     {
+     }

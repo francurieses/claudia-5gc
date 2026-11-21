@@ -47,6 +47,15 @@ type Config struct {
 	} `yaml:"n3"`
 	N4 struct {
 		Address string `yaml:"address"` // PFCP listener address (e.g., 0.0.0.0:8805)
+		// DLBuffer bounds the per-session downlink buffer used while a FAR has
+		// Apply Action BUFF (SMF-011, TS 29.244 §5.2.3.1). 0 = built-in default.
+		DLBuffer struct {
+			// DefaultMaxPackets is the limit when the BAR has no Suggested
+			// Buffering Packets Count (default 64).
+			DefaultMaxPackets int `yaml:"default_max_packets"`
+			// MaxPacketsCap caps every limit, BAR-suggested included (default 256).
+			MaxPacketsCap int `yaml:"max_packets_cap"`
+		} `yaml:"dl_buffer"`
 	} `yaml:"n4"`
 	Metrics struct {
 		Address string `yaml:"address"` // Prometheus metrics listener (e.g., 0.0.0.0:9107)

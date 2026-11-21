@@ -278,6 +278,11 @@ type nefCtx struct {
 
 	// storedSubscriptionID is populated by the "subscription has been created … and the subscriptionId has been stored" step.
 	storedSubscriptionID string
+
+	// envSaved records the original OAUTH2_SECRET / CONFIG_PATH so reset can restore them.
+	envSaved map[string]*string
+	// tmpDir holds the temp YAML written by the NEF-002 config steps.
+	tmpDir string
 }
 
 // reset clears mutable state between scenarios.
@@ -296,6 +301,7 @@ func (c *nefCtx) reset() {
 	c.lastBody = nil
 	c.lastRawBody = nil
 	c.storedSubscriptionID = ""
+	c.restoreEnv()
 }
 
 // startScenario is the Before hook — creates fresh mock servers for each scenario.
@@ -327,6 +333,11 @@ func (c *nefCtx) stopScenario(ctx context.Context, _ *godog.Scenario, _ error) (
 // fake PCF client. The NEF uses plain HTTP (no TLS) so Handler() is directly
 // wrappable by httptest.NewServer.
 func newNEF(bsf *mockBSFServer, pcf nefserver.PolicyAuthorizationClient) *httptest.Server {
+	return newNEFWithSecret(bsf, pcf, oauth2pkg.DefaultDevSecret)
+}
+
+// newNEFWithSecret is newNEF with an explicit effective OAuth2 secret.
+func newNEFWithSecret(bsf *mockBSFServer, pcf nefserver.PolicyAuthorizationClient, secret string) *httptest.Server {
 	cfg := &nefcfg.Config{}
 	cfg.NFInstanceID = "test-nef-001"
 	cfg.SBI.Address = "127.0.0.1:0"
@@ -335,7 +346,7 @@ func newNEF(bsf *mockBSFServer, pcf nefserver.PolicyAuthorizationClient) *httpte
 	cfg.SBI.TLS.CertFile = ""
 	cfg.SBI.TLS.KeyFile = ""
 	cfg.SBI.TLS.CAFile = ""
-	cfg.OAuth2.Secret = "5gc-dev-secret"
+	cfg.OAuth2.Secret = secret
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -354,7 +365,7 @@ func newNEF(bsf *mockBSFServer, pcf nefserver.PolicyAuthorizationClient) *httpte
 
 // mintToken creates a signed HS256 JWT with the given scope and subject.
 func mintToken(scope, subject string) (string, error) {
-	tok, err := oauth2pkg.IssueToken([]byte("5gc-dev-secret"), &oauth2pkg.Claims{
+	tok, err := oauth2pkg.IssueToken([]byte(oauth2pkg.DefaultDevSecret), &oauth2pkg.Claims{
 		Issuer:    "nrf-test",
 		Subject:   subject,
 		Scope:     scope,
@@ -762,6 +773,7 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^a mock PCF is available for Npcf_PolicyAuthorization$`, c.mockPCFAvailable)
 
 	// --- Given — OAuth2 ---
+	c.registerOAuth2Steps(sc)
 	sc.Step(`^a valid OAuth2 bearer token with scope "([^"]+)" for scsAsId "([^"]+)"$`,
 		c.validBearerTokenWithScope)
 
@@ -935,6 +947,7 @@ func TestFeatures(t *testing.T) {
 		ScenarioInitializer: InitializeScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
+			Strict:   true,
 			Paths:    []string{"./"},
 			TestingT: t,
 		},

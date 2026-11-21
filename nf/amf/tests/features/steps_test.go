@@ -101,6 +101,7 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Initial Context Setup UE-AMBR conditional presence (TS 38.413 §8.3.1,
 	// §9.2.2.1, §8.2.1) — in-process builder + decoder steps.
 	initICSSteps(sc)
+	initAMF042Steps(sc)
 
 	// Xn Handover Path Switch Ack/Failure, NH/NCC chain, PPID 60 (TS 38.413 §8.4.4).
 	// Registered after initICSSteps: shared step texts are bound there and delegate
@@ -123,6 +124,22 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// NGAP error handling (TS 38.413 §10, §8.7.5) — in-process: real ngap.Server,
 	// fake SCTP association, wire-decoded ERROR INDICATION assertions.
 	initNGAPErrorHandlingSteps(sc)
+
+	// UDM-triggered network-initiated de-registration (AMF-037 slice A; TS 23.502
+	// §4.2.2.3.3) — in-process: real SBI callback + NAS handler + NGAP server.
+	initNetworkDeregistrationSteps(sc)
+
+	// NAS ciphering algorithm negotiation and use, NEA1/NEA2/NEA3 (SEC-006; TS 33.501
+	// §6.7.1.1, TS 24.501 §4.4.6) — in-process: real NAS + registration handlers.
+	initNASSecurityAlgorithmsSteps(sc)
+
+	// NG Reset (AMF-008; TS 38.413 §8.7.4.2.2) — in-process: real ngap.Server, fake SCTP
+	// transports, decoded NG RESET ACKNOWLEDGE / ERROR INDICATION.
+	initNGResetSteps(sc)
+
+	// Release of PDU sessions orphaned by an SMF restart, 5GSM cause #39 (SMF-012;
+	// TS 23.502 §4.3.4.2) — in-process: real mgmt route + NAS handler, fake N1/N2.
+	initSMFRestartReleaseSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

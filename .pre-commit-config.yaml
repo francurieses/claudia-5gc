@@ -19,8 +19,8 @@ repos:
   - repo: local
     hooks:
       - id: token-budget
-        name: token budget (CLAUDE.md, AGENTS.md, orchestrator)
+        name: token budget (CLAUDE.md files, AGENTS.md, orchestrator, session listing)
         entry: make token-audit
         language: system
-        files: ^(CLAUDE\.md|AGENTS\.md|nf/amf/CLAUDE\.md|\.claude/agents/.*\.md)$
+        files: (^|/)(CLAUDE|AGENTS)\.md$|^\.claude/(agents|commands)/.*\.md$|^\.claude/skills/.*/SKILL\.md$
         pass_filenames: false

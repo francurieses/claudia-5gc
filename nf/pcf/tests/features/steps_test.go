@@ -117,6 +117,10 @@ type world struct {
 	// TLS scenarios
 	pki        *testPKI
 	restoreEnv []func()
+
+	// config validation scenarios (PCF-004)
+	validated   bool
+	validateErr error
 }
 
 func newWorld() *world { return &world{} }
@@ -1152,6 +1156,9 @@ func initializeScenario(sc *godog.ScenarioContext) {
 	sc.Step(`^the update response status is (\d+)$`, func(s string) error { return w.statusIs(atoi(s)) })
 	sc.Step(`^the update cause is "([^"]*)"$`, w.causeIs)
 	sc.Step(`^the decision 5QI is (\d+)$`, func(s string) error { return w.decision5QI(atoi(s)) })
+
+	// sm_policy_decision_schema.feature
+	registerSMPolicyDecisionSteps(sc, w)
 }
 
 func TestFeatures(t *testing.T) {

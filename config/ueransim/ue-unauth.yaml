@@ -1,8 +1,8 @@
 # Unauthorized slice test (make test-slices T8): UE imsi-...401 is subscribed to
 # internet only (UDR SEED_EXTRA_SUPIS, (msin-1)%4 == 0), but requests gold.
 # Attaches to ueransim-gnb-ms, which runs in both ueransim-slices and ueransim-all.
-# Expected result: AMF AllowedNSSAI is empty (NSSAI_NOT_ALLOWED logged).
-# The UE will register but PDU session establishment will fail — no matching slice.
+# Expected result (AMF-036): REGISTRATION ACCEPT with Allowed NSSAI = default S-NSSAI (internet), gold in the rejected NSSAI.
+# PDU session establishment on gold fails (not in the Allowed NSSAI). TS 24.501 §5.5.1.2.4.
 supi: 'imsi-001010000000401'
 mcc: '001'
 mnc: '01'

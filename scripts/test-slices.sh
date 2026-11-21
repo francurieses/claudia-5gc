@@ -216,7 +216,7 @@ for supi in $MS_SUPIS; do
     fi
 done
 
-# T5b: no NSSAI_NOT_ALLOWED / REGISTRATION REJECT #62 for the multi-slice UEs (T8's imsi-...0401 is expected to get it).
+# T5b: no NSSAI_NOT_ALLOWED / REGISTRATION REJECT #62 for the multi-slice UEs.
 spurious=""
 for supi in $MS_SUPIS; do
     l=$(text_lines "\"supi\":\"$supi\"" "$AMF_LOGS")
@@ -293,10 +293,12 @@ for ue in $MS_UES; do
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-section "T8 · Isolation — unauthorized slice rejected"
+section "T8 · Isolation — unauthorized slice rejected, default S-NSSAI fallback"
 # ─────────────────────────────────────────────────────────────────────────────
-# imsi-...0401 (internet-only subscription) requesting gold slice → REGISTRATION REJECT #62
-# with Rejected NSSAI (TS 24.501 §5.5.1.2.5; AMF-030 / AUD-registration-02).
+# imsi-...0401 (internet-only subscription, marked default) requesting gold slice →
+# REGISTRATION ACCEPT with Allowed NSSAI = default S-NSSAI(s) and gold in the rejected
+# NSSAI; never REGISTRATION REJECT #62, which needs "all default S-NSSAIs not allowed"
+# (TS 23.501 §5.15.5.2.1 step (A); TS 24.501 §5.5.1.2.4, §5.5.1.2.5; AMF-036).
 # Runs a throw-away UE container (detached, named, always removed) on the N2 network.
 
 UNAUTH_SUPI="imsi-001010000000401"
@@ -325,15 +327,18 @@ else
 
     unauth_lines=$(text_lines "\"supi\":\"$UNAUTH_SUPI\"" "$(container_logs amf)")
     if text_has '"message_type":"RegistrationReject".*"cause":62' "$unauth_lines"; then
-        pass "AMF rejected unauthorized slice for $UNAUTH_SUPI (REGISTRATION REJECT #62)"
-    elif text_has 'NSSAI_NOT_ALLOWED' "$unauth_lines"; then
-        fail "AMF logged NSSAI_NOT_ALLOWED for $UNAUTH_SUPI but sent no REGISTRATION REJECT #62"
+        fail "AMF sent REGISTRATION REJECT #62 to $UNAUTH_SUPI although a default S-NSSAI is subscribed (TS 24.501 §5.5.1.2.5)"
+    elif text_has 'default S-NSSAI fallback applied.*"rejected_count":[1-9]' "$unauth_lines" \
+            && text_has '"msg":"UE registered"' "$unauth_lines"; then
+        pass "AMF accepted $UNAUTH_SUPI with the default S-NSSAI and rejected the unauthorized gold slice (TS 24.501 §5.5.1.2.4)"
+    elif text_has '"msg":"UE registered"' "$unauth_lines"; then
+        fail "AMF registered $UNAUTH_SUPI without the default S-NSSAI fallback / rejected NSSAI"
     else
-        skip "REGISTRATION REJECT #62 not found in AMF logs for $UNAUTH_SUPI — may require manual retry"
+        skip "No registration outcome found in AMF logs for $UNAUTH_SUPI — may require manual retry"
         echo "    Manual: docker run --rm --network $N2_NET --cap-add NET_ADMIN \\"
         echo "      -v $REPO_ROOT/config/ueransim/ue-unauth.yaml:/ueransim/config/ue-unauth.yaml:ro \\"
         echo "      $UE_IMAGE nr-ue -c /ueransim/config/ue-unauth.yaml"
-        echo "    Then: docker logs amf 2>&1 | grep $UNAUTH_SUPI | grep RegistrationReject"
+        echo "    Then: docker logs amf 2>&1 | grep $UNAUTH_SUPI | grep -E 'default S-NSSAI fallback|UE registered'"
     fi
 fi
 

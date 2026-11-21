@@ -2,10 +2,12 @@ package store
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
 
+	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 	"github.com/francurieses/claudia-5gc/shared/types"
 )
 
@@ -106,4 +108,75 @@ func EnsureSeedGPSI(s Store, supi, prefix string) (added bool, err error) {
 		return false, fmt.Errorf("udr: seed gpsi %s: %w", supi, err)
 	}
 	return added, nil
+}
+
+// fallbackSeedSlices is the slice set used when operator.yaml is absent or
+// lists no snssais: internet, gaming, ims and bronze, one DNN each.
+var fallbackSeedSlices = []operatorcfg.SNSSAIEntry{
+	{SST: 1, SD: "000001", DNN: "internet"},
+	{SST: 1, SD: "000002", DNN: "gaming"},
+	{SST: 2, SD: "000001", DNN: "ims"},
+	{SST: 3, SD: "000001", DNN: "bronze"},
+}
+
+// SeedSlices returns the dev seed slices (operator.yaml snssais, or the
+// 4-slice fallback) with each per-slice DNN normalised: trimmed, lower-cased,
+// "internet" stored empty (so am-data of internet-only subscribers is
+// unchanged) and a DNN missing from a non-empty op.dnns[] replaced by empty
+// (internet) with a WARN. Spec: TS 29.503 §6.1.6.2.9 (DnnConfiguration key).
+func SeedSlices(op *operatorcfg.OperatorConfig, logger *slog.Logger) []SNSSAISubscribed {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	entries := op.Slices()
+	if len(entries) == 0 {
+		entries = fallbackSeedSlices
+	}
+	known := make(map[string]bool, len(op.DNNList()))
+	for _, d := range op.DNNList() {
+		known[strings.ToLower(strings.TrimSpace(d.Name))] = true
+	}
+	out := make([]SNSSAISubscribed, 0, len(entries))
+	for _, e := range entries {
+		dnn := strings.ToLower(strings.TrimSpace(e.DNN))
+		if dnn != "" && len(known) > 0 && !known[dnn] {
+			logger.Warn("unknown seed DNN, falling back to internet",
+				"procedure", "SubscriberSeed", "interface", "internal",
+				"direction", "IN", "spec_ref", "TS 29.503 §6.1.6.2.9",
+				"sst", e.SST, "sd", e.SD, "dnn", dnn,
+				"result", "REJECT", "cause", "dnn not listed in operator dnns")
+			dnn = ""
+		}
+		if dnn == DefaultDNN {
+			dnn = ""
+		}
+		out = append(out, SNSSAISubscribed{SST: uint8(e.SST), SD: e.SD, DNN: dnn})
+	}
+	return out
+}
+
+// BuildSeedSliceProfiles builds the dev multi-slice profiles: profile 0 =
+// [first slice], profile i = [first slice, slice i]. The profiles are cycled
+// by UE index / SUPI MSIN (SliceProfileForSUPI).
+func BuildSeedSliceProfiles(op *operatorcfg.OperatorConfig, logger *slog.Logger) [][]SNSSAISubscribed {
+	slices := SeedSlices(op, logger)
+	first := slices[0]
+	profiles := [][]SNSSAISubscribed{{first}}
+	for _, s := range slices[1:] {
+		profiles = append(profiles, []SNSSAISubscribed{first, s})
+	}
+	return profiles
+}
+
+// FormatSeedSNSSAIs renders profile slices for the "seeded test subscriber"
+// log: "SST=%d/SD=%s" plus "/DNN=%s" when the DNN is set.
+func FormatSeedSNSSAIs(profile []SNSSAISubscribed) []string {
+	out := make([]string, len(profile))
+	for i, s := range profile {
+		out[i] = fmt.Sprintf("SST=%d/SD=%s", s.SST, s.SD)
+		if s.DNN != "" {
+			out[i] += "/DNN=" + s.DNN
+		}
+	}
+	return out
 }

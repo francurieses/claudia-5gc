@@ -84,7 +84,7 @@ func assertNSSAADeregBody(t *testing.T, req *nas.DeregistrationRequestNW, reject
 func TestNSSAADeregAllSlicesFailed(t *testing.T) {
 	h, sender, _, ue := nssaaTestHandler(t, true, &seqAAA{results: []*procedures.NSSAAAuthResult{eapFailure(), eapFailure()}})
 	ue.PendingNSSAA = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), sliceN(2, "000004")}
-	ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.PendingNSSAA...)
+	ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.PendingNSSAA...)
 	startOnQueue(h, ue)
 	if err := h.handleNSSAAComplete(context.Background(), ue, completeMsg(ue, 1, 3)); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestNSSAADeregAllSlicesFailed(t *testing.T) {
 func TestNSSAADeregT3575Abort(t *testing.T) {
 	h, sender, clk, ue := nssaaTestHandler(t, true, &nssaaScript{})
 	ue.PendingNSSAA = []amfctx.SNSSAISubscribed{sliceN(1, "000003")}
-	ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.PendingNSSAA...)
+	ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.PendingNSSAA...)
 	startOnQueue(h, ue)
 	for i := 0; i <= NSSAAT3575MaxRetransmissions; i++ {
 		fire(ue, clk.last())
@@ -120,7 +120,7 @@ func TestNSSAADeregT3575Abort(t *testing.T) {
 func TestNSSAADeregReauthFailure(t *testing.T) {
 	h, sender, _, ue := nssaaTestHandler(t, true, &seqAAA{results: []*procedures.NSSAAAuthResult{eapFailure()}})
 	ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003")}
-	ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
+	ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
 	if !h.ReauthNSSAASlice(context.Background(), ue, 1, "000003") {
 		t.Fatal("re-auth not queued")
 	}
@@ -139,7 +139,7 @@ func TestNSSAADeregRevocation(t *testing.T) {
 	t.Run("last slice", func(t *testing.T) {
 		h, sender, _, ue := nssaaTestHandler(t, true, &nssaaScript{})
 		ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003")}
-		ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
+		ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
 		if !h.RevokeNSSAASlice(context.Background(), ue, 1, "000003") {
 			t.Fatal("not revoked")
 		}
@@ -148,7 +148,7 @@ func TestNSSAADeregRevocation(t *testing.T) {
 	t.Run("one of two", func(t *testing.T) {
 		h, sender, _, ue := nssaaTestHandler(t, true, &nssaaScript{})
 		ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), sliceN(2, "000004")}
-		ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
+		ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), ue.AllowedNSSAI...)
 		if !h.RevokeNSSAASlice(context.Background(), ue, 1, "000003") {
 			t.Fatal("not revoked")
 		}
@@ -196,7 +196,7 @@ func TestNSSAADeregDecision(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, sender, _, ue := nssaaTestHandler(t, tc.spec, &seqAAA{results: []*procedures.NSSAAAuthResult{tc.first, tc.next}})
 			ue.PendingNSSAA = tc.pending
-			ue.SubscribedNSSAI = tc.subscribe
+			ue.DefaultNSSAI = tc.subscribe
 			ue.EmergencyPDUSession = tc.emergency
 			startOnQueue(h, ue)
 			for _, s := range tc.pending {

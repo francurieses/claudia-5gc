@@ -220,24 +220,14 @@ func (s *Server) markGNBReady(gnb *GNBContext) {
 	s.mu.Unlock()
 }
 
-// observeNGReset records an NG Reset from the gNB. Observe-only: no NG Reset
-// Acknowledge is sent and the state does not change.
+// observeNGReset records an NG Reset from the gNB in the registry (counter and timestamp;
+// the NG interface stays NG_READY). The release and the acknowledge are handleNGReset's.
 // Ref: TS 38.413 §8.7.4.
 func (s *Server) observeNGReset(gnb *GNBContext) {
 	gnb.mu.Lock()
 	gnb.LastNGResetAt = s.clock()
 	gnb.NGResetCount++
-	name := gnb.Name
 	gnb.mu.Unlock()
-	s.logger.Warn("NG Reset received",
-		"procedure", "NGReset",
-		"interface", "N2",
-		"direction", "IN",
-		"spec_ref", "TS 38.413 §8.7.4",
-		"gnb_name", name,
-		"result", "FAILURE",
-		"cause", "not implemented — no NG Reset Acknowledge sent",
-	)
 }
 
 // recordGNBDisconnectLocked appends a DISCONNECTED snapshot to the history.

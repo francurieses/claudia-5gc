@@ -7,7 +7,8 @@
 // grouped-child parser for grouped types go-pfcp does not know (ie.go), and
 // the UP/CP Function Features octets up to Rel-19 with bit names
 // (features.go). Nothing here changes what go-pfcp emits for IEs it already
-// supports; no NF imports this package yet.
+// supports. ParseMessage (parse.go) is the panic-safe message.Parse every SMF/UPF N4
+// read path uses.
 //
 // Type numbers, names and the grouped set follow TS 29.244 V19.6.0 Table
 // 8.1.2-1 (types 272-403); feature bits follow Table 8.2.25-1 and Table

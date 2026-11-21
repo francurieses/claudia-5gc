@@ -271,9 +271,11 @@ func DecodeServiceAccept(b []byte) (*ServiceAccept, error) {
 			if err != nil {
 				return a, fmt.Errorf("nas: ServiceAccept: truncated IE 0x72: %w", err)
 			}
-			if list, err := DecodePDUSessionReactivationResultErrorCause(val); err == nil {
-				a.PDUSessionReactivationResultErrorCause = list
+			list, err := DecodePDUSessionReactivationResultErrorCause(val)
+			if err != nil {
+				return a, fmt.Errorf("nas: ServiceAccept: IE 0x72: %w", err)
 			}
+			a.PDUSessionReactivationResultErrorCause = list
 			continue
 		}
 		if iei != IEIPDUSessionStatus && iei != IEIPDUSessionReactivationResult {
@@ -303,6 +305,10 @@ func DecodeServiceAccept(b []byte) (*ServiceAccept, error) {
 		case IEIPDUSessionReactivationResult:
 			a.PDUSessionReactivationResult = &v
 		}
+	}
+	if rdr.Len() != 0 {
+		// A lone trailing octet cannot start an IE (every IE has at least IEI+length).
+		return a, fmt.Errorf("nas: ServiceAccept: %d trailing octet(s) after last IE", rdr.Len())
 	}
 	return a, nil
 }

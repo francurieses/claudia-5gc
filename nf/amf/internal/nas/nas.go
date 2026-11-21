@@ -32,8 +32,6 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
-	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nea"
-	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nia"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/sbi/features"
@@ -122,6 +120,12 @@ type Handler struct {
 	// time.AfterFunc), set by SetTimerSchedulerForTest.
 	// Ref: TS 24.501 §5.4.7.2.3 a), §5.5.2.3.5 a)
 	timerAfter TimerScheduler
+
+	// pager pages a CM-IDLE UE for a pending #39 PDU session release (SMF-012).
+	pager Pager
+	// pagingGuardOverride / t3592GuardOverride: test seams, 0 = defaults.
+	pagingGuardOverride time.Duration
+	t3592GuardOverride  time.Duration
 }
 
 // pendingReleaseState tracks one in-flight NW-initiated PDU Session Release
@@ -363,6 +367,7 @@ func (h *Handler) handleRegistrationRequest(
 	// a UE that is registering again. No-op without a running T3522 (rel17).
 	// Ref: TS 24.501 §5.5.2.3.5 d), e)
 	ue.StopDeregTimer()
+	ue.ClearDeregByUDM() // a UDM-triggered de-registration is superseded too
 
 	// A REGISTRATION REQUEST received while a registration procedure is pending.
 	// Identical retransmission: ignored while the procedure is still in progress,
@@ -811,7 +816,7 @@ func (h *Handler) rejectNoNetworkSlices(ctx context.Context, ue *amfctx.UEContex
 	rejected []nas.RejectedSNSSAI) error {
 	body := &nas.RegistrationReject{Cause5GMM: byte(nas.CauseNoNetworkSlicesAvailable)}
 	if ue.ERNSSAISupported {
-		body.ExtendedRejectedNSSAI = nas.ExtendedRejectedNSSAIFromList(rejected)
+		body.ExtendedRejectedNSSAI = procedures.ExtendedRejectedNSSAIForUE(ue, rejected)
 	} else {
 		body.RejectedNSSAI = rejected
 	}
@@ -1045,6 +1050,7 @@ func (h *Handler) handleSecurityModeComplete(
 			return err
 		}
 		h.afterAcceptSent(ue, regAccept, nasPDU)
+		h.deliverPendingSMReleases(ctx, ue) // #39 follows the Accept, TS 23.502 §4.3.4.2 step 4
 		return nil
 	}
 
@@ -1102,8 +1108,9 @@ func (h *Handler) handleSecurityModeComplete(
 		return err
 	}
 	// N2 context now established — UE is CM-CONNECTED.
-	ue.CMState = amfctx.CMConnected
+	ue.SetCMState(amfctx.CMConnected)
 	h.afterAcceptSent(ue, regAccept, nasPDU)
+	h.deliverPendingSMReleases(ctx, ue) // #39 follows the Accept, TS 23.502 §4.3.4.2 step 4
 	return nil
 }
 
@@ -1121,12 +1128,12 @@ func (h *Handler) afterAcceptSent(ue *amfctx.UEContext, accept *nas.Registration
 	prior := ue.State == amfctx.GMMRegistered ||
 		(ue.State == amfctx.GMMCommonProcedureInitiated && updateReq)
 	if accept.FiveGGUTI == nil {
-		ue.TransitionTo(amfctx.GMMRegistered)
+		ue.TransitionToLocked(amfctx.GMMRegistered)
 		ue.Unlock()
 		ue.ClearRegProc()
 		return
 	}
-	ue.TransitionTo(amfctx.GMMCommonProcedureInitiated)
+	ue.TransitionToLocked(amfctx.GMMCommonProcedureInitiated)
 	ue.Unlock()
 	// The plain Accept is kept: every T3550 retransmission re-protects it with a
 	// fresh downlink NAS COUNT. Ref: TS 24.501 §4.4.3.1
@@ -1213,7 +1220,7 @@ func (h *Handler) handleRegistrationComplete(
 	}
 	ue.ClearRegProc() // T3550 stopped
 	ue.Lock()
-	ue.TransitionTo(amfctx.GMMRegistered)
+	ue.TransitionToLocked(amfctx.GMMRegistered)
 	ue.Unlock()
 
 	h.logger.Info("Registration Complete",
@@ -1571,10 +1578,16 @@ func (h *Handler) integrityProtectNAS(ue *amfctx.UEContext, innerPDU []byte, sht
 	macInput[0] = sqn
 	copy(macInput[1:], innerPDU)
 
-	// bearer=1 for 3GPP access per TS 33.501 §6.4.3 / UERANSIM enc.cpp
-	mac, err := nia.NIA2(ue.SecurityCtx.KNASint, count, 0x01, 0x01, macInput)
+	// bearer=1 for 3GPP access per TS 33.501 §6.4.3 / UERANSIM enc.cpp; the
+	// algorithm is the NIA selected in the SMC. Ref: TS 33.501 §6.7.2
+	mac, err := computeNASMAC(ue.SecurityCtx.IntegrityAlgID, ue.SecurityCtx.KNASint, count, nasDirDL, macInput)
 	if err != nil {
-		return nil, fmt.Errorf("nas: NIA2: %w", err)
+		h.logger.Error("DL NAS message not sent: integrity protection failed",
+			"procedure", "NASSecurity", "interface", "N1", "direction", "OUT",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI,
+			"integ_alg", ue.SecurityCtx.IntegrityAlgID, "result", "FAILURE",
+			"error", err, "spec_ref", "TS 33.501 §6.7.2")
+		return nil, fmt.Errorf("nas: integrity protect DL: %w", err)
 	}
 
 	pdu := make([]byte, 7+len(innerPDU))
@@ -1608,16 +1621,17 @@ func (h *Handler) cipherProtectNAS(ue *amfctx.UEContext, innerPDU []byte) ([]byt
 	count := ue.SecurityCtx.DownlinkCount
 	sqn := byte(count & 0xFF)
 
-	// Cipher inner PDU (skip for NEA0 — null cipher, inner stays plaintext).
-	var ciphered []byte
-	if ue.SecurityCtx.CipheringAlgID == 0 {
-		ciphered = innerPDU
-	} else {
-		var err error
-		ciphered, err = nea.NEA2(ue.SecurityCtx.KNASenc, count, 0x01, 0x01, innerPDU)
-		if err != nil {
-			return nil, fmt.Errorf("nas: NEA2: %w", err)
-		}
+	// Cipher the inner PDU with the selected NEA (NEA0 leaves it as plaintext).
+	ciphered, err := cipherNAS(ue.SecurityCtx.CipheringAlgID, ue.SecurityCtx.KNASenc, count, nasDirDL, innerPDU)
+	if err != nil {
+		// No fallback to NEA2 or plaintext: the message is not sent.
+		// Ref: TS 33.501 §6.7.2; docs/procedures/nas-security-algorithms.md §5
+		h.logger.Error("DL NAS message not sent: ciphering failed",
+			"procedure", "NASSecurity", "interface", "N1", "direction", "OUT",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI,
+			"cipher_alg", ue.SecurityCtx.CipheringAlgID, "result", "FAILURE",
+			"error", err, "spec_ref", "TS 33.501 §6.7.2")
+		return nil, fmt.Errorf("nas: cipher DL: %w", err)
 	}
 
 	// MAC over SQN || ciphertext (TS 33.501 §D.3.3 / UERANSIM enc.cpp)
@@ -1625,15 +1639,20 @@ func (h *Handler) cipherProtectNAS(ue *amfctx.UEContext, innerPDU []byte) ([]byt
 	macInput[0] = sqn
 	copy(macInput[1:], ciphered)
 
-	mac, err := nia.NIA2(ue.SecurityCtx.KNASint, count, 0x01, 0x01, macInput)
+	mac, err := computeNASMAC(ue.SecurityCtx.IntegrityAlgID, ue.SecurityCtx.KNASint, count, nasDirDL, macInput)
 	if err != nil {
-		return nil, fmt.Errorf("nas: NIA2: %w", err)
+		h.logger.Error("DL NAS message not sent: integrity protection failed",
+			"procedure", "NASSecurity", "interface", "N1", "direction", "OUT",
+			"amf_ue_ngap_id", ue.AMFUENGAPId, "supi", ue.SUPI,
+			"integ_alg", ue.SecurityCtx.IntegrityAlgID, "result", "FAILURE",
+			"error", err, "spec_ref", "TS 33.501 §6.7.2")
+		return nil, fmt.Errorf("nas: integrity protect DL: %w", err)
 	}
 
 	// Once the 5G NAS security context is active, every DL NAS message is sent
 	// as "integrity protected and ciphered" (SHT=0x02) per TS 24.501 §4.4.5 —
 	// this holds even when the selected ciphering algorithm is 5G-EA0, where the
-	// ciphering is a no-op and the inner PDU stays plaintext (handled above). Real
+	// ciphering is a no-op and the inner PDU stays plaintext. Real
 	// UEs (e.g. Nokia) that have activated a security context strictly require
 	// SHT=0x02 and silently discard SHT=0x01 messages, breaking Registration
 	// Complete and the whole registration. (UERANSIM leniently accepts 0x01.)
@@ -1651,8 +1670,8 @@ func (h *Handler) cipherProtectNAS(ue *amfctx.UEContext, innerPDU []byte) ([]byt
 }
 
 // unwrapNASSecurity strips the outer NAS security header from an uplink PDU.
-// For ciphered messages (SHT=0x02/0x04), deciphers the inner PDU with NEA2.
-// Verifies the NIA2 MAC. Increments UplinkCount.
+// For ciphered messages (SHT=0x02/0x04), deciphers the inner PDU with the negotiated NEA.
+// Verifies the NAS-MAC with the selected NIA. Increments UplinkCount.
 // Returns a reconstituted PDU (outer header preserved, inner now plaintext)
 // that nas.Decode can process normally.
 func (h *Handler) unwrapNASSecurity(ue *amfctx.UEContext, pdu []byte) ([]byte, error) {
@@ -1684,7 +1703,7 @@ func (h *Handler) unwrapWithContext(sc *amfctx.SecurityContext, pdu []byte) ([]b
 	macInput[0] = sqn
 	copy(macInput[1:], inner)
 
-	ok, err := nia.Verify(sc.KNASint, count, 0x01, 0x00, macInput, receivedMAC)
+	ok, err := verifyNASMAC(sc.IntegrityAlgID, sc.KNASint, count, nasDirUL, macInput, receivedMAC)
 	macBad := err != nil || !ok
 	if macBad {
 		if err != nil {
@@ -1710,9 +1729,9 @@ func (h *Handler) unwrapWithContext(sc *amfctx.SecurityContext, pdu []byte) ([]b
 	// Decipher if ciphered (SHT=0x02 or 0x04). Skip for NEA0 (null cipher — already plaintext).
 	var plainInner []byte
 	if ciphered && sc.CipheringAlgID != 0 {
-		deciphered, err := nea.NEA2(sc.KNASenc, count, 0x01, 0x00, inner)
+		deciphered, err := cipherNAS(sc.CipheringAlgID, sc.KNASenc, count, nasDirUL, inner)
 		if err != nil {
-			return nil, fmt.Errorf("nas: NEA2 decipher: %w", err)
+			return nil, fmt.Errorf("nas: decipher UL: %w", err)
 		}
 		plainInner = deciphered
 	} else {
@@ -1899,6 +1918,20 @@ func (h *Handler) handleServiceRequest(
 		return h.rejectServiceRestrictedArea(ctx, ue, svcReq.ServiceType, log)
 	}
 
+	// Empty Allowed NSSAI: no PDU session can be (re)activated and the mandatory
+	// Allowed NSSAI IE of the INITIAL CONTEXT SETUP REQUEST cannot be built
+	// (TS 38.413 §9.2.2.1). Checked before any KgNB/NH derivation. The Service
+	// Request is still accepted (TS 24.501 §5.6.1.4.1 lists no reject cause for
+	// it): SERVICE ACCEPT in DOWNLINK NAS TRANSPORT, no ICS, no PDU session
+	// reactivation (the Uplink data status shows up as failed in the
+	// reactivation result IE).
+	ue.Lock()
+	emptyAllowed := len(ue.AllowedNSSAI) == 0
+	ue.Unlock()
+	if emptyAllowed {
+		return h.acceptServiceRequestNoICS(ctx, ue, svcReq, log)
+	}
+
 	// Re-derive KgNB from the existing KAMF and the NAS UL COUNT of this message.
 	// unwrapNASSecurity already incremented UplinkCount; the SR's NAS COUNT is
 	// UplinkCount-1. Ref: TS 33.501 §A.9
@@ -1940,16 +1973,18 @@ func (h *Handler) handleServiceRequest(
 	// session status IE are released locally in the AMF and at the SMF, so
 	// they are never re-activated. Ref: TS 24.501 §5.6.1.4.1
 	released := h.releaseInactivePDUSessions(ctx, ue, svcReq.PDUSessionStatus)
-	pduSessions := h.activatePDUSessions(ctx, ue, svcReq.UplinkDataStatus, released, log)
+	pduSessions, failCauses := h.activatePDUSessions(ctx, ue, svcReq.UplinkDataStatus, released, log)
 
 	// Build the Service Accept: PDU session status (IEI 0x50) when the SR had
 	// one, PDU session reactivation result (IEI 0x26) when the SR had Uplink
 	// data status. Ref: TS 24.501 §5.6.1.4.1, §8.2.17
-	accept := buildServiceAccept(ue, svcReq, released, pduSessions)
+	accept := buildServiceAccept(ue, svcReq, released, pduSessions, failCauses)
 	log.Info("Service Accept built",
 		"message_type", "ServiceAccept",
 		"pdu_session_status_ie", accept.PDUSessionStatus != nil,
 		"reactivation_result_ie", accept.PDUSessionReactivationResult != nil,
+		"reactivation_error_cause_ie", len(accept.PDUSessionReactivationResultErrorCause) > 0,
+		"reactivation_error_cause_count", len(accept.PDUSessionReactivationResultErrorCause),
 		"released_locally", len(released),
 		"spec_ref", "TS 24.501 §5.6.1.4.1",
 	)
@@ -1980,7 +2015,7 @@ func (h *Handler) handleServiceRequest(
 		return fmt.Errorf("service request: SendInitialContextSetupRequest: %w", err)
 	}
 
-	ue.CMState = amfctx.CMConnected
+	ue.SetCMState(amfctx.CMConnected)
 
 	// UE is back to CM-CONNECTED — cancel the CM-IDLE reachability watchdogs
 	// (re-armed on AN Release). Ref: TS 23.501 §5.3.2
@@ -1991,8 +2026,71 @@ func (h *Handler) handleServiceRequest(
 		"spec_ref", "TS 23.502 §4.2.3",
 	)
 
+	// Pending #39 releases (restart orphans, incl. the ones found just now): the
+	// command follows the Service Accept. Ref: TS 23.502 §4.3.4.2 step 4.
+	h.deliverPendingSMReleases(ctx, ue)
+
 	// rel19: re-initiate NSSAA for slices left PENDING. Ref: TS 23.502 §4.2.9.2
 	h.retryPendingNSSAA(ctx, ue, "service_request")
+	return nil
+}
+
+// drainPagedNoICS consumes the paged PDU session set when no ICS can carry the
+// user plane (empty Allowed NSSAI), so it never leaks into a later Service
+// Request, and logs the PSIs that were not re-activated.
+// Ref: TS 23.502 §4.2.3.2 step 12; TS 24.501 §5.5.1.3.4, §5.6.1.4.1
+func drainPagedNoICS(ue *amfctx.UEContext, log *slog.Logger) {
+	paged := ue.TakePagedPDUSessions()
+	if len(paged) == 0 {
+		return
+	}
+	psis := make([]int, len(paged)) // []uint8 would be logged as base64
+	for i, p := range paged {
+		psis[i] = int(p)
+	}
+	log.Warn("paged PDU sessions not re-activated - no ICS without Allowed NSSAI",
+		"interface", "N1", "direction", "OUT", "result", "REJECT",
+		"cause", "empty_allowed_nssai_no_ics", "paged_pdu_sessions", psis,
+		"spec_ref", "TS 23.502 §4.2.3.2 step 12; TS 24.501 §5.5.1.3.4, §5.6.1.4.1")
+}
+
+// acceptServiceRequestNoICS answers a Service Request from a UE with an empty
+// Allowed NSSAI: SERVICE ACCEPT in DOWNLINK NAS TRANSPORT, no
+// InitialContextSetupRequest, KgNB/NH untouched.
+// Ref: TS 38.413 §9.2.2.1; TS 24.501 §5.6.1.4.1
+func (h *Handler) acceptServiceRequestNoICS(ctx context.Context, ue *amfctx.UEContext,
+	svcReq *nas.ServiceRequest, log *slog.Logger) error {
+
+	released := h.releaseInactivePDUSessions(ctx, ue, svcReq.PDUSessionStatus)
+	// No user plane can be re-activated without an ICS: drain the paged set so it
+	// never leaks into a later Service Request. The PDU session reactivation
+	// result IE answers only an Uplink data status IE (TS 24.501 §5.6.1.4.1,
+	// §9.11.3.42), so paged-only PSIs are logged, not reported in the Accept.
+	drainPagedNoICS(ue, log)
+	accept := buildServiceAccept(ue, svcReq, released, nil, nil)
+	// No ICS: the ULDS PSIs are reported not re-established (0x26) but carry no
+	// error cause (0x72), as on the registration no-ICS path (AMF-042).
+	// Ref: TS 24.501 §5.6.1.4.1, §9.11.3.43
+	accept.PDUSessionReactivationResultErrorCause = nil
+	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement,
+		nas.MsgTypeServiceAccept, accept)
+	if err != nil {
+		return fmt.Errorf("service request: encode Service Accept: %w", err)
+	}
+	log.Info("Service Accept without Allowed NSSAI — DL NAS TRANSPORT, no ICS",
+		"interface", "N2",
+		"direction", "OUT",
+		"message_type", "DownlinkNASTransport",
+		"result", "OK",
+		"cause", "empty_allowed_nssai_no_ics",
+		"spec_ref", "TS 38.413 §9.2.2.1; TS 24.501 §5.6.1.4.1",
+	)
+	if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
+		return fmt.Errorf("service request: send Service Accept: %w", err)
+	}
+	ue.SetCMState(amfctx.CMConnected)
+	h.notifyUEReachable(ue)
+	h.deliverPendingSMReleases(ctx, ue) // DL NAS Transport needs no ICS
 	return nil
 }
 
@@ -2048,6 +2146,7 @@ func (h *Handler) releaseInactivePDUSessions(
 	released := make(map[uint8]struct{}, len(victims))
 	for _, v := range victims {
 		released[v.psi] = struct{}{}
+		ue.ClearPendingSMRelease(v.psi) // the UE dropped it: nothing to command
 		log.Info("PDU session reported inactive by UE — releasing locally",
 			"interface", "N1", "direction", "IN",
 			"pdu_session_id", v.psi,
@@ -2081,7 +2180,14 @@ func (h *Handler) releaseInactivePDUSessions(
 		delCtx, cancel := context.WithTimeout(detached, releaseSMContextTimeout)
 		go func() {
 			defer cancel()
-			if err := smfDel.DeleteSMContext(delCtx, ref); err != nil {
+			if err := smfDel.DeleteSMContext(delCtx, ref); errors.Is(err, ErrSMContextNotFound) {
+				log.Info("SM context already released at SMF",
+					"interface", "Nsmf", "direction", "OUT",
+					"pdu_session_id", psi, "smContextRef", ref,
+					"result", "OK", "cause", "ALREADY_RELEASED",
+					"spec_ref", "TS 29.502 §5.2.2.4")
+				return
+			} else if err != nil {
 				log.Warn("SMF SM context release failed for UE-inactive PDU session",
 					"interface", "Nsmf", "direction", "OUT",
 					"pdu_session_id", psi, "smContextRef", ref,
@@ -2112,10 +2218,15 @@ func (h *Handler) releaseInactivePDUSessions(
 //     status: for each PSI the UE flagged, bit = 1 when its user-plane
 //     resources are not being re-established (not in the ICS
 //     PDUSessionResourceSetupListCxtReq), 0 otherwise.
+//   - PDU session reactivation result error cause (0x72) iff at least one PSI
+//     has bit 1 in 0x26: one (PSI, 5GMM cause) entry per such PSI, ascending;
+//     the SMF-failure cause from failCauses, else #111 (unknown PSI, no SM
+//     context, released locally). Absent when no bit is set.
 //
-// Ref: TS 24.501 §5.6.1.4.1, §8.2.17.1.1, §9.11.3.44, §9.11.3.42
+// Ref: TS 24.501 §5.6.1.4.1, §8.2.17.1.1, §9.11.3.44, §9.11.3.42, §9.11.3.43
 func buildServiceAccept(ue *amfctx.UEContext, svcReq *nas.ServiceRequest,
-	released map[uint8]struct{}, activated []ngap.PDUSessionSetupItemCxtReq) *nas.ServiceAccept {
+	released map[uint8]struct{}, activated []ngap.PDUSessionSetupItemCxtReq,
+	failCauses map[uint8]uint8) *nas.ServiceAccept {
 
 	accept := &nas.ServiceAccept{}
 	if svcReq.PDUSessionStatus != nil {
@@ -2150,6 +2261,15 @@ func buildServiceAccept(ue *amfctx.UEContext, svcReq *nas.ServiceRequest,
 		}
 		m := nas.PSIMask(failed...)
 		accept.PDUSessionReactivationResult = &m
+		for _, psi := range failed {
+			cause, ok := failCauses[psi]
+			if !ok {
+				cause = causeUnspecifiedProtocolError
+			}
+			accept.PDUSessionReactivationResultErrorCause = append(
+				accept.PDUSessionReactivationResultErrorCause,
+				nas.PDUSessionErrorCause{PDUSessionID: psi, Cause5GMM: cause})
+		}
 	}
 	return accept
 }
@@ -2161,23 +2281,26 @@ func buildServiceAccept(ue *amfctx.UEContext, svcReq *nas.ServiceRequest,
 // PSIs in released were just released locally because the UE reported them
 // inactive (releaseInactivePDUSessions) and are never activated.
 // Returns the PDUSessionResourceSetupListCxtReq items for the ICS Request, in
-// ascending PSI order. Failures are non-fatal per session: the Service Request
+// ascending PSI order, and the per-PSI 5GMM cause of every target whose
+// ActivateSMContext failed (TS 24.501 §5.6.1.4.1 a)-f), see
+// reactivationErrorCause). Failures are non-fatal per session: the Service Request
 // still completes and the UE can fall back to UE-requested re-establishment.
 // Ref: TS 23.502 §4.2.3.2 steps 4/12, TS 29.502 §5.2.2.3.2.2
 func (h *Handler) activatePDUSessions(
 	ctx context.Context, ue *amfctx.UEContext,
-	uplinkDataStatus *uint16, released map[uint8]struct{}, log *slog.Logger) []ngap.PDUSessionSetupItemCxtReq {
+	uplinkDataStatus *uint16, released map[uint8]struct{}, log *slog.Logger,
+) ([]ngap.PDUSessionSetupItemCxtReq, map[uint8]uint8) {
 
 	// Always consume the paged set so it never leaks into a later Service Request.
 	paged := ue.TakePagedPDUSessions()
 	if uplinkDataStatus == nil && len(paged) == 0 {
-		return nil // signalling-only Service Request — nothing to re-activate
+		return nil, nil // signalling-only Service Request — nothing to re-activate
 	}
 	activator, ok := h.sender.(interface {
 		ActivateSMContext(context.Context, string) ([]byte, error)
 	})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	type target struct {
@@ -2202,10 +2325,19 @@ func (h *Handler) activatePDUSessions(
 	for _, psi := range paged {
 		pagedSet[psi] = struct{}{}
 	}
+	// PDU sessions with a pending network release (restart orphan, cause #39) are
+	// never activated at the SMF. Ref: TS 23.502 §4.3.4.2 step 4.
+	pendingSM := make(map[uint8]struct{})
+	for _, p := range ue.PendingSMReleases() {
+		pendingSM[p.PSI] = struct{}{}
+	}
 	ue.Lock()
 	var targets []target
 	for psi, sess := range ue.PDUSessions {
 		if sess.SMFInstanceID == "" {
+			continue
+		}
+		if _, pend := pendingSM[psi]; pend {
 			continue
 		}
 		_, isPaged := pagedSet[psi]
@@ -2251,10 +2383,29 @@ func (h *Handler) activatePDUSessions(
 	sort.Slice(targets, func(i, j int) bool { return targets[i].psi < targets[j].psi })
 
 	var items []ngap.PDUSessionSetupItemCxtReq
+	var failCauses map[uint8]uint8
 	for _, t := range targets {
 		transfer, err := activator.ActivateSMContext(ctx, t.ref)
 		_, wasPaged := pagedSet[t.psi]
+		if errors.Is(err, ErrSMContextNotFound) {
+			// The SMF no longer knows the reference (it restarted): the PDU
+			// session is a restart orphan. Not activated; released with #39
+			// (the command follows the Service Accept). Ref: TS 23.502 §4.3.4.2.
+			if wasPaged {
+				metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "FAILURE").Inc()
+			}
+			log.Warn("UP activation: SMF has no SM context (restart orphan) - release with cause #39",
+				"pdu_session_id", t.psi, "smContextRef", t.ref,
+				"result", "FAILURE", "cause", "CONTEXT_NOT_FOUND",
+				"spec_ref", "TS 23.502 §4.3.4.2; TS 29.502 §5.2.2.3.2.2")
+			h.startPendingSMRelease(ctx, ue, t.psi, nas.Cause5GSMReactivationRequested, false, log)
+			continue
+		}
 		if err != nil {
+			if failCauses == nil {
+				failCauses = make(map[uint8]uint8)
+			}
+			failCauses[t.psi] = reactivationErrorCause(err)
 			if wasPaged {
 				metrics.ProcedureTotal.WithLabelValues("AMF", upActProc, "FAILURE").Inc()
 			}
@@ -2286,7 +2437,7 @@ func (h *Handler) activatePDUSessions(
 			"spec_ref", "TS 23.502 §4.2.3.2 step 12",
 		)
 	}
-	return items
+	return items, failCauses
 }
 
 // ---- Registration Update (Periodic / Mobility) ----------------------------
@@ -2335,6 +2486,13 @@ func (h *Handler) handleRegistrationUpdate(
 	if c := regReq.Capability5GMM(); c != nil {
 		ue.Capability5GMM = c
 	}
+	// NG-RAN-RCU: delete the stored UE radio capability before any ICS /
+	// HANDOVER REQUEST can use it. Ref: TS 24.501 §5.5.1.3.4, §9.11.3.9A
+	if ue.ApplyNGRANRCU(regReq.FiveGSUpdateType) {
+		log.Info("NG-RAN-RCU set — stored UE radio capability deleted",
+			"nf", "AMF", "result", "OK",
+			"spec_ref", "TS 24.501 §5.5.1.3.4, §9.11.3.9A")
+	}
 	log.Info("UE 5GMM capability",
 		"capability_5gmm", ue.Capability5GMM.RawHex(),
 		"capability_5gmm_bits", strings.Join(ue.Capability5GMM.SetBitNames(), ","),
@@ -2365,20 +2523,40 @@ func (h *Handler) handleRegistrationUpdate(
 	// TRANSPORT): no CM-IDLE to CM-CONNECTED transition, hence no new KgNB and
 	// no ICS; KgNB/NH/NCC are kept and the Accept goes in DOWNLINK NAS TRANSPORT.
 	// Ref: TS 33.501 §6.8.1.2.1; TS 24.501 §5.5.1.3.2
+	//
+	// Empty Allowed NSSAI (e.g. NSSAA-only accept, NSSAA revoking every slice):
+	// the mandatory Allowed NSSAI IE of the ICS cannot be built (TS 38.413
+	// §9.2.2.1), so even on a new N2 connection the Accept (with the Pending /
+	// Rejected NSSAI) goes in DOWNLINK NAS TRANSPORT, no ICS, and the KgNB/NH
+	// are left untouched. Same decision as the initial registration path.
+	// Ref: TS 38.413 §9.2.2.1; TS 24.501 §5.5.1.3.4
 	ue.Lock()
 	onNewN2 := ue.NASOnNewN2Connection
+	emptyAllowed := len(ue.AllowedNSSAI) == 0
 	ue.Unlock()
-	if !onNewN2 {
-		log.Info("Registration Update over existing N2 connection — Accept in DL NAS TRANSPORT, KgNB kept",
-			"interface", "N2",
-			"direction", "OUT",
-			"message_type", "DownlinkNASTransport",
-			"spec_ref", "TS 33.501 §6.8.1.2.1",
-		)
+	if !onNewN2 || emptyAllowed {
+		if emptyAllowed && onNewN2 {
+			log.Info("Registration Accept without Allowed NSSAI — DL NAS TRANSPORT, no ICS",
+				"interface", "N2",
+				"direction", "OUT",
+				"message_type", "DownlinkNASTransport",
+				"result", "OK",
+				"cause", "empty_allowed_nssai_no_ics",
+				"spec_ref", "TS 38.413 §9.2.2.1; TS 24.501 §5.5.1.3.4",
+			)
+		} else {
+			log.Info("Registration Update over existing N2 connection — Accept in DL NAS TRANSPORT, KgNB kept",
+				"interface", "N2",
+				"direction", "OUT",
+				"message_type", "DownlinkNASTransport",
+				"spec_ref", "TS 33.501 §6.8.1.2.1",
+			)
+		}
 		if err := h.sender.SendDownlinkNASTransport(ue, nasPDU); err != nil {
 			return fmt.Errorf("%s: send Registration Accept: %w", procedureName, err)
 		}
 		h.afterAcceptSent(ue, regAccept, nasPDU)
+		h.deliverPendingSMReleases(ctx, ue) // #39 follows the Accept, TS 23.502 §4.3.4.2 step 4
 		// Uplink data pending: re-establish the user plane over the existing N2
 		// connection, no ICS carries it. Ref: TS 24.501 §5.5.1.3.4
 		h.sendReactivatedSessions(ctx, ue, sessSync.Items, log)
@@ -2426,8 +2604,9 @@ func (h *Handler) handleRegistrationUpdate(
 		ue.TakePendingICS() // nothing in flight: a stale kind would mis-handle a later failure
 		return fmt.Errorf("%s: SendInitialContextSetupRequest: %w", procedureName, err)
 	}
-	ue.CMState = amfctx.CMConnected
+	ue.SetCMState(amfctx.CMConnected)
 	h.afterAcceptSent(ue, regAccept, nasPDU)
+	h.deliverPendingSMReleases(ctx, ue) // #39 follows the Accept, TS 23.502 §4.3.4.2 step 4
 	return h.finishRegistrationUpdate(ctx, ue, log, specRef)
 }
 
@@ -2536,9 +2715,14 @@ func (h *Handler) handleDeregistration(
 	}
 	ue.Unlock()
 
+	psis := make([]uint8, 0, len(sessions))
+	for psi := range sessions {
+		psis = append(psis, psi)
+	}
+	h.dropPendingReleases(ue, psis) // pending #39 releases die with the registration
 	for _, sess := range sessions {
 		if sess.SMFInstanceID != "" && canDel {
-			if err := smfDel.DeleteSMContext(ctx, sess.SMFInstanceID); err != nil {
+			if err := smfDel.DeleteSMContext(ctx, sess.SMFInstanceID); err != nil && !errors.Is(err, ErrSMContextNotFound) {
 				log.Warn("SMF DeleteSMContext failed during deregistration",
 					"smContextRef", sess.SMFInstanceID, "error", err)
 			}
@@ -2695,53 +2879,23 @@ func (h *Handler) handleNWDeregistrationAccept(ctx context.Context, ue *amfctx.U
 // and, locally, when T3522 expires for the fifth time (TS 24.501 §5.5.2.3.5 a)).
 // Ref: TS 23.502 §4.2.2.3.3
 func (h *Handler) completeNWDeregistration(ctx context.Context, ue *amfctx.UEContext, log *slog.Logger) {
-	// Teardown PDU sessions
-	smfDel, canDel := h.sender.(interface {
-		DeleteSMContext(ctx context.Context, smContextRef string) error
-	})
-	ue.Lock()
-	sessions := make(map[uint8]*amfctx.PDUSession, len(ue.PDUSessions))
-	for k, v := range ue.PDUSessions {
-		sessions[k] = v
-	}
-	ue.Unlock()
+	// Teardown PDU sessions (no-op when already released, UDM-triggered path).
+	h.releaseSMContexts(ctx, ue, log, "NW deregistration")
 
-	for _, sess := range sessions {
-		if sess.SMFInstanceID != "" && canDel {
-			if err := smfDel.DeleteSMContext(ctx, sess.SMFInstanceID); err != nil {
-				log.Warn("SMF DeleteSMContext failed during NW deregistration",
-					"smContextRef", sess.SMFInstanceID, "error", err)
-			}
-		}
-		ue.Lock()
-		delete(ue.PDUSessions, sess.PDUSessionID)
-		ue.Unlock()
-	}
-
-	// Deregister from UDM
-	if ue.SUPI != "" {
+	if ue.DeregByUDM() {
+		// The UDM already removed the AMF registration (Nudm_UECM_DeregistrationNotification):
+		// a UECM DELETE could remove the new serving AMF's registration, so only the
+		// SDM subscription is deleted (idempotent). Ref: TS 23.502 §4.2.2.3.3 step 3
+		h.reg.UnsubscribeSDMOf(ctx, ue)
+	} else if ue.SUPI != "" {
+		// Deregister from UDM
 		if err := h.reg.DeregisterUECM(ctx, ue.SUPI); err != nil {
 			log.Warn("UDM UECM deregistration failed (non-fatal)", "error", err)
 		}
 	}
 
-	// Release PCF AM policy association (Npcf_AMPolicyControl, TS 29.507 §4.2.5)
-	if ue.AMPolicyAssocID != "" {
-		if err := h.reg.ReleaseAMPolicy(ctx, ue.AMPolicyAssocID); err != nil {
-			log.Warn("PCF AM policy release failed (non-fatal)", "error", err,
-				"am_pol_asso_id", ue.AMPolicyAssocID)
-		}
-		ue.AMPolicyAssocID = ""
-	}
-
-	// Release PCF UE policy association (Npcf_UEPolicyControl / URSP, TS 29.525 §4.2.5)
-	if ue.PolicyAssociationID != "" {
-		if err := h.reg.ReleasePCFPolicy(ctx, ue.PolicyAssociationID); err != nil {
-			log.Warn("PCF UE policy release failed (non-fatal)", "error", err,
-				"pol_asso_id", ue.PolicyAssociationID)
-		}
-		ue.PolicyAssociationID = ""
-	}
+	// PCF AM + UE policy associations (no-op when already released).
+	h.releasePCFAssociations(ctx, ue, log)
 
 	// Mark context for deferred removal BEFORE releasing N2, so the watchdog timer
 	// in SendUEContextReleaseCommandForUE is armed correctly. Ref: TS 38.413 §8.3.3
@@ -3388,7 +3542,7 @@ func (h *Handler) handlePDUSessionRelease(
 
 	log.Info("PDU Session Release Command sent",
 		"interface", "N2", "direction", "OUT",
-		"spec_ref", "TS 38.413 §8.4.2",
+		"spec_ref", "TS 38.413 §8.2.2",
 		"result", "OK",
 	)
 	return nil
@@ -3396,60 +3550,91 @@ func (h *Handler) handlePDUSessionRelease(
 
 // ---- NW-Initiated PDU Session Release ----------------------------------------
 
-// InitiateNetworkPDUSessionRelease sends a PDU Session Release Command to the UE
-// on behalf of the network (e.g. operator-triggered or timer-based). The flow mirrors
-// the UE-initiated path but the initiator is the AMF/network.
+// InitiateNetworkPDUSessionRelease releases a PDU session on behalf of the
+// network (operator mgmt DELETE, or the SMF after a restart) with the given
+// 5GSM cause (36 operator, 39 restart orphan).
 //
-// Flow per TS 23.502 §4.3.4.3:
-//  1. Build 5GSM PDU Session Release Command + wrap in secured DL NAS Transport
-//  2. Send NGAP PDU Session Resource Release Command to gNB (steps 3-4)
-//  3. Wait for the UE's PDU Session Release Complete on N1 (steps 5-6)
-//  4. Call SMF to delete the SM context — this is the Nsmf_PDUSession_UpdateSMContext
-//     of step 7, and it is what makes the SMF tear the N4 session down (step 8)
-//  5. Remove PDU session from UE context
+// Flow per TS 23.502 §4.3.4.2:
+//   - CM-CONNECTED: PDU SESSION RELEASE COMMAND in a secured DL NAS Transport +
+//     NGAP PDU Session Resource Release Command (steps 3-4); the SM context is
+//     released only after the UE's Release Complete (steps 5-8) or the T3592
+//     guard, in completeNetworkPDUSessionRelease.
+//   - CM-IDLE + #39: N1 delivery may not be skipped (TS 24.501 §6.3.3.2), so the
+//     release is recorded as pending and the UE paged; the command follows the
+//     Service Accept (deliverPendingSMReleases). A paging guard releases locally
+//     if the UE never answers.
+//   - CM-IDLE + other cause: skip N1 (TS 24.501 §6.3.3.2 b), release locally; the
+//     UE is synchronised by the PDU session status IE (§5.6.1.4).
 //
-// Steps 3-5 run in completeNetworkPDUSessionRelease, driven either by the UE's
-// Release Complete or by the T3592 guard timer if the UE never answers. Deleting
-// the SM context here — before the UE has confirmed — would both invert the spec
-// ordering and race the caller's request context.
+// A release already pending for the PSI is a no-op success (idempotent). An
+// unknown PSI returns ErrPDUSessionNotFound.
 //
-// Ref: TS 23.502 §4.3.4.3, TS 24.501 §8.3.9
-func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfctx.UEContext, pduSessionID uint8) error {
+// Ref: TS 23.502 §4.3.4.2, TS 24.501 §6.3.3.2, §8.3.14
+func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfctx.UEContext, pduSessionID uint8, cause uint8) error {
+	const specRef = "TS 23.502 §4.3.4.2"
 	log := h.logger.With(
+		"nf", "AMF",
 		"procedure", "NetworkPDUSessionRelease",
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
 		"pdu_session_id", pduSessionID,
+		"cause", cause,
 		"interface", "N1",
 		"direction", "OUT",
-		"spec_ref", "TS 23.502 §4.3.4.3",
+		"spec_ref", specRef,
 	)
 
 	ue.Lock()
 	pduSess, ok := ue.PDUSessions[pduSessionID]
+	cm := ue.CMState
 	ue.Unlock()
 	if !ok {
-		return fmt.Errorf("nas: NW PDU release: pduSessionID %d not found", pduSessionID)
+		return fmt.Errorf("nas: NW PDU release: pduSessionID %d: %w", pduSessionID, ErrPDUSessionNotFound)
 	}
 	smContextRef := pduSess.SMFInstanceID
 
-	// PTI = 0 for NW-initiated (TS 24.501 §9.4)
-	const nwPTI uint8 = 0
-	releaseCmd := nas.WrapPDUSessionReleaseCommandBody(pduSessionID, nwPTI, nas.Cause5GSMRegularDeactivation)
-	psi := pduSessionID
-	dlTransport := &nas.DLNASTransport{
-		PayloadContainerType: nas.PayloadContainerTypeN1SM,
-		PayloadContainer:     releaseCmd,
-		PDUSessionID:         &psi,
-	}
-	nasPDU, err := h.sendNASSecured(ue, nas.PDMobilityManagement,
-		nas.MsgTypeDLNASTransport, dlTransport)
-	if err != nil {
-		return fmt.Errorf("nas: NW PDU release: encode DL NAS Transport: %w", err)
+	// Idempotent: a release already in flight or waiting for paging.
+	if _, inFlight := h.pendingRelease.Load(pendingReleaseKey(ue.AMFUENGAPId, pduSessionID)); inFlight {
+		log.Info("NW PDU Session Release already in progress - no second command", "result", "OK")
+		return nil
 	}
 
-	// Send NGAP PDU Session Resource Release Command to gNB (TS 23.502 §4.3.4.3 step 3)
-	if err := h.sender.SendPDUSessionResourceReleaseCommand(ue, pduSessionID, nasPDU); err != nil {
+	if cm == amfctx.CMIdle {
+		if cause == nas.Cause5GSMReactivationRequested {
+			if !h.startPendingSMRelease(ctx, ue, pduSessionID, cause, true, log) {
+				log.Info("NW PDU Session Release already pending - no second paging", "result", "OK")
+				return nil
+			}
+			// The UE may have reached CM-CONNECTED (Service Request done) between
+			// the CMState read and the pending entry: deliver now, nobody else will.
+			ue.Lock()
+			connected := ue.CMState != amfctx.CMIdle
+			ue.Unlock()
+			if connected {
+				h.deliverPendingSMReleases(ctx, ue)
+			}
+			return nil
+		}
+		log.Info("CM-IDLE UE, N1 delivery skipped - PDU session released locally",
+			"result", "OK", "spec_ref", "TS 24.501 §6.3.3.2 b)")
+		h.releaseLocally(ctx, ue, pduSessionID, "CM_IDLE_LOCAL_RELEASE")
+		return nil
+	}
+
+	// PTI = 0 for NW-initiated (TS 24.501 §9.4)
+	// DL NAS COUNT allocation, encode and NGAP send are atomic per UE so that
+	// concurrent releases reach the UE in COUNT order (TS 24.501 §4.4.3.1).
+	ue.LockDLNAS()
+	nasPDU, err := h.buildReleaseCommandPDU(ue, pduSessionID, cause)
+	if err != nil {
+		ue.UnlockDLNAS()
+		return err
+	}
+
+	// Send NGAP PDU Session Resource Release Command to gNB (TS 23.502 §4.3.4.2 step 4)
+	sendErr := h.sender.SendPDUSessionResourceReleaseCommand(ue, pduSessionID, nasPDU)
+	ue.UnlockDLNAS()
+	if err := sendErr; err != nil {
 		return fmt.Errorf("nas: NW PDU release: SendPDUSessionResourceReleaseCommand: %w", err)
 	}
 
@@ -3458,20 +3643,11 @@ func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 	// completeNetworkPDUSessionRelease. The context is detached from the caller's
 	// (an HTTP mgmt request whose ctx is cancelled as soon as it returns 202) but
 	// keeps its values so the correlation_id survives into the SBI call.
-	detached := context.WithoutCancel(ctx)
-	key := pendingReleaseKey(ue.AMFUENGAPId, pduSessionID)
-	st := &pendingReleaseState{smContextRef: smContextRef}
-	st.guard = time.AfterFunc(t3592Guard, func() {
-		log.Warn("PDU Session Release Complete not received before T3592 — releasing SM context anyway",
-			"spec_ref", "TS 24.501 §10.3",
-		)
-		h.completeNetworkPDUSessionRelease(detached, ue, pduSessionID, "T3592_EXPIRY")
-	})
-	h.pendingRelease.Store(key, st)
+	h.armReleaseGuard(ctx, ue, pduSessionID, smContextRef, log)
 
 	log.Info("NW PDU Session Release Command sent",
 		"interface", "N2", "direction", "OUT",
-		"spec_ref", "TS 23.502 §4.3.4.3",
+		"spec_ref", "TS 38.413 §8.2.2; "+specRef,
 		"result", "OK",
 	)
 	return nil
@@ -3483,7 +3659,7 @@ func (h *Handler) InitiateNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 // the session from the UE context. Safe to call more than once and for sessions
 // that were never NW-released; both are no-ops.
 //
-// Ref: TS 23.502 §4.3.4.3 steps 7-8, TS 29.502 §5.2.2.3.3.
+// Ref: TS 23.502 §4.3.4.2 steps 7-8, TS 29.502 §5.2.2.3.3.
 func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfctx.UEContext, pduSessionID uint8, reason string) {
 	key := pendingReleaseKey(ue.AMFUENGAPId, pduSessionID)
 	v, ok := h.pendingRelease.LoadAndDelete(key)
@@ -3495,6 +3671,7 @@ func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 		if st.guard != nil {
 			st.guard.Stop()
 		}
+		ue.ClearPendingSMRelease(pduSessionID)
 
 		log := h.logger.With(
 			"procedure", "NetworkPDUSessionRelease",
@@ -3511,7 +3688,13 @@ func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 			}); canDel {
 				delCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseSMContextTimeout)
 				defer cancel()
-				if err := smfDel.DeleteSMContext(delCtx, st.smContextRef); err != nil {
+				if err := smfDel.DeleteSMContext(delCtx, st.smContextRef); errors.Is(err, ErrSMContextNotFound) {
+					log.Info("SM context already released at SMF",
+						"interface", "Nsmf", "direction", "OUT",
+						"spec_ref", "TS 29.502 §5.2.2.3.3",
+						"result", "OK", "cause", "ALREADY_RELEASED",
+					)
+				} else if err != nil {
 					log.Warn("SMF DeleteSMContext failed on NW PDU release",
 						"interface", "Nsmf", "direction", "OUT",
 						"spec_ref", "TS 29.502 §5.2.2.3.3",
@@ -3520,7 +3703,7 @@ func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 				} else {
 					log.Info("SM context deleted at SMF",
 						"interface", "Nsmf", "direction", "OUT",
-						"spec_ref", "TS 23.502 §4.3.4.3 step 7",
+						"spec_ref", "TS 23.502 §4.3.4.2 step 7",
 						"result", "OK",
 					)
 				}
@@ -3534,7 +3717,7 @@ func (h *Handler) completeNetworkPDUSessionRelease(ctx context.Context, ue *amfc
 		h.reg.PersistUE(ctx, ue)
 
 		log.Info("NW-initiated PDU Session Release complete",
-			"spec_ref", "TS 23.502 §4.3.4.3",
+			"spec_ref", "TS 23.502 §4.3.4.2",
 			"result", "OK",
 		)
 	})
@@ -3759,7 +3942,16 @@ func nssaiToSubscribed(n *nas.NSSAI) []amfctx.SNSSAISubscribed {
 		if s.SD != nas.SDNotPresent {
 			sd = fmt.Sprintf("%06x", s.SD)
 		}
-		out = append(out, amfctx.SNSSAISubscribed{SST: s.SST, SD: sd})
+		e := amfctx.SNSSAISubscribed{SST: s.SST, SD: sd}
+		if s.HasMappedHPLMN {
+			// Keep the mapped HPLMN value for the Extended rejected NSSAI IE
+			// (TS 24.501 §9.11.3.75, §5.5.1.2.4).
+			e.HasMapped, e.MappedSST = true, s.MappedHPLMNSST
+			if s.MappedHPLMNSD != nas.SDNotPresent {
+				e.MappedSD = fmt.Sprintf("%06x", s.MappedHPLMNSD)
+			}
+		}
+		out = append(out, e)
 	}
 	return out
 }

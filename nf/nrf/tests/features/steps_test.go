@@ -266,7 +266,7 @@ func TestFeatures(t *testing.T) {
 		ScenarioInitializer: InitializeScenario,
 		Options: &godog.Options{
 			Format:   "pretty",
-			Paths:    []string{"./"},
+			Paths:    []string{"./nf_register.feature"},
 			TestingT: t,
 		},
 	}

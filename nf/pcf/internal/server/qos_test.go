@@ -98,9 +98,9 @@ func TestSmPolicySubscribedDefaultQos(t *testing.T) {
 	}
 	sessRules := resp["sessRules"].(map[string]any)
 	for _, v := range sessRules {
-		ambr := v.(map[string]any)["sessAmbr"].(map[string]any)
+		ambr := v.(map[string]any)["authSessAmbr"].(map[string]any)
 		if ambr["downlink"] != "500 Mbps" {
-			t.Errorf("sessAmbr downlink: got %v want 500 Mbps", ambr["downlink"])
+			t.Errorf("authSessAmbr downlink: got %v want 500 Mbps", ambr["downlink"])
 		}
 	}
 }
@@ -142,9 +142,9 @@ func TestSmPolicyDNNScopedOverride(t *testing.T) {
 		t.Errorf("ims 5qi: got %d want 1 (DNN-scoped override)", got)
 	}
 	for _, v := range resp["sessRules"].(map[string]any) {
-		ambr := v.(map[string]any)["sessAmbr"].(map[string]any)
+		ambr := v.(map[string]any)["authSessAmbr"].(map[string]any)
 		if ambr["downlink"] != "20 Mbps" {
-			t.Errorf("ims sessAmbr downlink: got %v want 20 Mbps", ambr["downlink"])
+			t.Errorf("ims authSessAmbr downlink: got %v want 20 Mbps", ambr["downlink"])
 		}
 	}
 

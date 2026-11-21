@@ -11,9 +11,11 @@ func TestFilterAllowedNSSAI_NilRequest(t *testing.T) {
 		{SST: 1, SD: "000001"},
 		{SST: 2, SD: "000002"},
 	}
+	// AMF-036: no Requested NSSAI selects nothing here; the caller applies the
+	// default S-NSSAI fallback (selectAllowedNSSAI), never "all subscribed".
 	got := filterAllowedNSSAI(nil, subscribed)
-	if len(got) != 2 {
-		t.Fatalf("expected 2 slices, got %d", len(got))
+	if len(got) != 0 {
+		t.Fatalf("expected no slices, got %d", len(got))
 	}
 }
 

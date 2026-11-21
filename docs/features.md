@@ -129,7 +129,7 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 ### Paging and network-triggered service request
 - **What**: a downlink-data trigger makes the AMF page a CM-IDLE UE; the UE answers with a Service Request and the user plane is restored.
 - **Spec**: TS 23.502 §4.2.3.3, TS 38.413 §9.2.8.
-- **Limits**: the downlink-data trigger is simulated by an SMF endpoint.
+- **Limits**: the UPF buffers downlink per session in a bounded FIFO (configurable); the Service Accept does not yet carry the re-activation result.
 
 ### UE-triggered service request
 - **What**: a CM-IDLE UE with pending uplink data re-activates its PDU sessions; Service Accept carries the PDU-session status and re-activation result.
@@ -226,3 +226,91 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 Sequence diagrams, information elements, error cases, clause-level conformance and validation
 recipes for each procedure are part of the **members documentation**
 (<https://www.claudia5gc.dev/docs/members/>).
+
+## v3.1.0 release notes
+
+Changes since v3.0.0. Rel-19 stays the default release profile; Rel-15/16/17 peers keep
+getting byte-identical messages under the `rel17` profile.
+
+### New features
+
+- **NAS security algorithms**: 128-NEA1 (SNOW 3G) and 128-NEA3 (ZUC) ciphering, and 128-NIA1
+  and 128-NIA3 integrity, verified against the TS 35.217 / 35.223 test vectors. The AMF picks
+  algorithms from an operator-ordered list and never falls back silently to a null algorithm;
+  `null_ciphering` now selects NEA0 only when the UE advertises EA0 [TS 33.501 §6.7.1.1, §6.7.2,
+  Annex D].
+- **Downlink data buffering for idle UEs**: the UPF buffers downlink packets (bounded queue),
+  reports them to the SMF with a PFCP Downlink Data Report, the AMF pages the UE, and the first
+  buffered packet is delivered after the Service Request [TS 23.502 §4.2.3.3; TS 29.244
+  §5.2.3.1].
+- **SMF restart recovery**: after an SMF restart, PDU sessions it lost are released towards
+  the UE with 5GSM cause #39, so the UE re-establishes them without a manual step; idle UEs are
+  paged first [TS 23.527 §4.4.2].
+- **NG Reset**: a gNB-initiated NG RESET (whole interface or a UE list) is answered with
+  NG RESET ACKNOWLEDGE and the affected UE contexts are released [TS 38.413 §8.7.4].
+- **UDM-triggered network deregistration**: deregistration notifications from the UDM are
+  acted on per reason (Deregistration Request + N2 release for connected UEs, implicit
+  deregistration for idle UEs) [TS 23.502 §4.2.2.3].
+- **Registration NSSAI handling**: default S-NSSAI fallback, `singleNssais` from the
+  subscription, NSSAA-capability gating and mapped S-NSSAIs in the Extended rejected NSSAI
+  [TS 23.501 §5.15.5.2.1; TS 24.501 §5.5.1.2.4].
+- **Service Accept error causes**: when some PDU sessions cannot be re-activated, Service
+  Accept carries the PDU session reactivation result error cause IE with one 5GMM cause per
+  failed session [TS 24.501 §8.2.17.1.1, §9.11.3.43].
+- **Per-slice DNNs**: each slice in `config/operator.yaml` can name its DNN; the seeded
+  subscriber data follows it, so slice sessions get their subscribed 5QI and Session-AMBR
+  instead of the operator default.
+- **Subscribed UE-AMBR**: the UDM serves the UE-AMBR provisioned in the UDR instead of a fixed
+  100 Mbps [TS 29.503 §5.2.2.2.3].
+- **NRF feature negotiation (Rel-19 profile)**: discovery, profile retrieval and status
+  notifications return `nfServices` or `nfServiceList` according to the negotiated
+  Service-Map feature; Inter-Plmn-Fqdn is supported; subscribe returns SubscriptionData;
+  400 errors use `application/problem+json` [TS 29.510 §6.1.6.2.2].
+- **UERANSIM gNB reconnects to the AMF**: after the AMF link drops, the gNB bars the cell,
+  reconnects with backoff, redoes NG Setup and unbars the cell, without restarting the
+  container; a connected UE then performs a mobility registration update [TS 38.413 §8.7.1].
+- **UERANSIM UE-AMBR enforcement**: the gNB enforces the subscribed UE-AMBR and Session-AMBR
+  changes from PDU Session Resource Setup / Modify [TS 38.413 §8.2.1.2, §9.3.4.3].
+
+### Improvements and fixes
+
+- **SM policy decisions follow TS 29.512**: `qosId`, full ARP enums, `sessRuleId`,
+  `authSessAmbr`, `refQosData` and `flowDescription`; invalid ARP settings stop the PCF at
+  startup.
+- **QoS modification**: the network-requested PDU Session Resource Modify now carries the
+  Session-AMBR and the QoS flow list [TS 38.413 §8.2.3].
+- **AN release** keeps downlink data buffered (BUFF+NOCP) instead of dropping it [TS 23.502
+  §4.2.6].
+- **Empty Allowed NSSAI**: the AMF never sends Initial Context Setup with an empty Allowed
+  NSSAI and does not activate user plane in that case [TS 24.501 §5.6.1.4.1].
+- **Registration**: 5G-S-TMSI resolution by AMF Set ID and Pointer, stored radio capability
+  cleared on request, stricter Service Accept decoding.
+- **Rolling upgrade**: AUSF and UDM also accept the legacy v2.6 SUCI string on input, so a
+  Rel-17 AMF can stay in service during an upgrade.
+- **Startup robustness**: AMF, SMF, AUSF and NRF wait (with backoff) for PostgreSQL and Redis
+  and exit if they never come up, instead of silently running in memory; PostgreSQL and Redis
+  restart with the Docker daemon like the NFs.
+- **NEF accepts NRF-issued OAuth2 tokens**: one signing-secret source (`OAUTH2_SECRET` env,
+  then YAML) for both NFs.
+- **AMF defaults**: the AMF configuration decides whether URSP is delivered (off by default)
+  and the operator network name defaults to `ClaudIA`.
+- **Codec robustness**: round-trip fuzzing of the NAS, NRPPa, LPP and PFCP codecs
+  (`make fuzz-smoke`); truncated mandatory IEs are now rejected.
+- **Security hardening**: constant-time NIA1 multiply.
+
+### Upgrade notes
+
+- **Breaking (Npcf_SMPolicyControl)**: the PCF now sends the session AMBR as `authSessAmbr`,
+  as in the TS 29.512 schema, instead of `sessAmbr`. The bundled SMF reads both; an external
+  SMF reading `sessAmbr` must be updated.
+- `URSP_ENABLED` is no longer forced on by docker-compose; set it (or the AMF config) if you
+  rely on URSP delivery.
+
+### Known limits
+
+- After an AMF restart, the UERANSIM UE registers again but does not re-establish its PDU
+  session; restart the UE container to restore the data plane.
+- After a long UPF outage while UEs are idle, sessions can stay stale until the UE
+  re-establishes them.
+- The Service Accept error-cause IE is covered by functional tests; it has not yet been
+  observed in a live capture.

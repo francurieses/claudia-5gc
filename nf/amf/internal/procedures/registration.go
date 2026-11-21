@@ -133,7 +133,12 @@ type UDMSDMSubscriber interface {
 
 // UDMAMSubscription is a subset of the access/mobility subscription data from UDM.
 type UDMAMSubscription struct {
+	// AllowedNSSAI is the subscribed S-NSSAI list: nssai.defaultSingleNssais
+	// followed by nssai.singleNssais, de-duplicated on SST+SD (TS 29.503 Nssai).
 	AllowedNSSAI []amfctx.SNSSAISubscribed
+	// DefaultNSSAI is the subset marked as default S-NSSAI
+	// (nssai.defaultSingleNssais). Empty when the subscription has none.
+	DefaultNSSAI []amfctx.SNSSAISubscribed
 	AMBRUplink   uint64
 	AMBRDownlink uint64
 	// GPSI is the UE's GPSI from am-data "gpsis" (msisdn- form preferred), ""
@@ -194,11 +199,18 @@ type RegistrationHandler struct {
 	// nf/amf/config/dev.yaml "timers.t3512_secs".
 	// Ref: TS 24.501 §8.2.7.1, §10.2
 	timers *timercfg.Store
-	// nullSecurity forces NEA0 (no ciphering) + NIA0 (no integrity) for all UEs.
+	// nullSecurity selects NEA0 (no ciphering) when the UE advertises 5G-EA0 (AMF-009);
+	// integrity stays a real NIA (TS 33.501 §5.5.2).
 	// Dev/debug only — NAS PDUs travel in plain text, visible in Wireshark.
 	// Set via nf/amf/config/dev.yaml "security.null_ciphering: true".
 	// TS 33.501 §6.7.2: NEA0/NIA0 MUST NOT be used in production.
 	nullSecurity bool
+	// cipheringOrder is the operator-ordered NEA priority list (SEC-006);
+	// empty means DefaultCipheringOrder. Ref: TS 33.501 §6.7.1.1
+	cipheringOrder []byte
+	// integrityOrder is the operator-ordered NIA priority list (SEC-007);
+	// empty means DefaultIntegrityOrder. Ref: TS 33.501 §6.7.1.1
+	integrityOrder []byte
 	// defaultRFSP is the operator-configured Radio Frequency Selection Priority
 	// index (1-256) sent in NGAP InitialContextSetupRequest (IE id=31) when PCF
 	// does not provide one. 0 means "omit the IE entirely".
@@ -431,7 +443,7 @@ func (h *RegistrationHandler) buildTAIList(ue *amfctx.UEContext) []byte {
 	return nas.EncodeTAIList(h.plmnMCC, h.plmnMNC, tacs)
 }
 
-// WithNullSecurity forces NEA0+NIA0 for all UEs when enabled (dev/debug only).
+// WithNullSecurity selects NEA0 (if the UE offers EA0) with a real NIA when enabled (dev/debug only).
 // NAS PDUs travel in plain text — do NOT use in production.
 // Ref: TS 33.501 §6.7.2
 func (h *RegistrationHandler) WithNullSecurity(enabled bool) {
@@ -538,7 +550,7 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 	// TS 24.501 §5.5.1.2.8 i): reject a REGISTRATION REQUEST whose UE security
 	// capability is missing or offers nothing this AMF can select, before any
 	// AUSF call (NIA0/NEA0 would otherwise be selected for a non-emergency UE).
-	if !acceptableUESecurityCapability(ueSecCap) {
+	if !acceptableUESecurityCapability(ueSecCap, h.effectiveCipheringOrder(), h.effectiveIntegrityOrder()) {
 		log.Warn("REGISTRATION REQUEST with invalid or unacceptable UE security capability",
 			"interface", "N1", "direction", "IN",
 			"result", "REJECT", "cause", int(UESecCapRejectCause),
@@ -567,6 +579,15 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 	ue.ERNSSAISupported = in.RegRequest.ERNSSAISupported()
 	// Full 5GMM capability (all octets) for capability.PeerUE gating, REL19-5.4.
 	ue.Capability5GMM = in.RegRequest.Capability5GMM()
+	// NG-RAN-RCU in an initial registration: delete stored radio capability.
+	// Ref: TS 24.501 §5.5.1.3.4, §9.11.3.9A
+	if ue.ApplyNGRANRCU(in.RegRequest.FiveGSUpdateType) {
+		h.logger.InfoContext(ctx, "NG-RAN-RCU set - stored UE radio capability deleted",
+			"nf", "AMF", "procedure", "InitialRegistration",
+			"interface", "N1", "direction", "IN", "result", "OK",
+			"amf_ue_ngap_id", ue.AMFUENGAPId,
+			"spec_ref", "TS 24.501 §5.5.1.3.4, §9.11.3.9A")
+	}
 	if ue.Capability5GMM != nil {
 		h.logger.InfoContext(ctx, "UE 5GMM capability decoded",
 			"procedure", "InitialRegistration",
@@ -906,15 +927,31 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	supiForKDF := strings.TrimPrefix(ue.SUPI, "imsi-")
 	kseaf := kdf.KSEAF(confirmResp.KAUSF, h.servingNetName)
 	kamf := kdf.KAMF(kseaf, supiForKDF, [2]byte(h.abba))
+	// Select NAS security algorithms (operator ciphering and integrity orders).
+	// No common ciphering or integrity algorithm is a UE security capabilities
+	// mismatch: never fall through to NEA0/NIA0. Ref: TS 24.501 §5.5.1.2.8 i), TS 33.501 §6.7.1.1
+	cipherAlg, integAlg, ok, nullFallback := h.selectSecurityAlgorithmsNull(ue)
+	if ok && nullFallback {
+		log.Warn("null_ciphering set but UE does not advertise 5G-EA0, selecting NEA from ciphering order",
+			"interface", "N1", "direction", "OUT",
+			"supi", ue.SUPI, "cipher_alg", cipherAlg,
+			"spec_ref", "TS 33.501 §6.7.1.1, §6.7.2")
+	}
+	if !ok {
+		log.Warn("no common NAS ciphering or integrity algorithm, rejecting registration",
+			"interface", "N1", "direction", "IN",
+			"result", "REJECT", "cause", int(UESecCapRejectCause),
+			"spec_ref", "TS 24.501 §5.5.1.2.8 i)")
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		return nil, nil, &ErrRejectCause{Cause: UESecCapRejectCause,
+			SpecRef: "TS 24.501 §5.5.1.2.8 i)", Err: ErrUESecurityCapabilityUnacceptable}
+	}
 	// A new context is taken into use only once the SECURITY MODE COMPLETE is
 	// verified; the one in use before is kept for a SECURITY MODE REJECT / abort.
 	// Ref: TS 24.501 §5.4.2.5
 	ue.BeginSecurityCtxChange()
 	ue.SecurityCtx.KAMF = kamf
 
-	// Select NAS security algorithms
-	// Policy: prefer NEA2 (AES-CTR), NIA2 (AES-CMAC) if UE supports them
-	cipherAlg, integAlg := h.selectSecurityAlgorithms(ue)
 	ue.SecurityCtx.CipheringAlgID = cipherAlg
 	ue.SecurityCtx.IntegrityAlgID = integAlg
 
@@ -1106,10 +1143,16 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 				"error", opt.nssfErr,
 				"spec_ref", "TS 23.502 §4.2.9",
 			)
-			ue.AllowedNSSAI = filterAllowedNSSAI(ue.RequestedNSSAI, amSub.AllowedNSSAI)
+			h.applyAllowedNSSAISelection(ctx, ue, ue.RequestedNSSAI, amSub.AllowedNSSAI, amSub.DefaultNSSAI)
 		} else {
 			// Intersect NSSF result with UDM subscription to enforce subscription limits.
-			ue.AllowedNSSAI = filterAllowedNSSAI(opt.nssfAllowed, amSub.AllowedNSSAI)
+			if len(ue.RequestedNSSAI) == 0 {
+				// TS 23.501 §5.15.5.2.1 (B): no Requested NSSAI -> the default S-NSSAIs
+				// (within what the NSSF selected), flagged as the fallback.
+				h.applyDefaultNSSAISelection(ctx, ue, opt.nssfAllowed, amSub.DefaultNSSAI)
+			} else {
+				h.applyAllowedNSSAISelection(ctx, ue, opt.nssfAllowed, amSub.AllowedNSSAI, amSub.DefaultNSSAI)
+			}
 			log.Info("NSSF NSSelection completed",
 				"nssf_allowed_count", len(opt.nssfAllowed),
 				"final_count", len(ue.AllowedNSSAI),
@@ -1117,19 +1160,26 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 			)
 		}
 	} else {
-		ue.AllowedNSSAI = filterAllowedNSSAI(ue.RequestedNSSAI, amSub.AllowedNSSAI)
+		// TS 23.501 §5.15.5.2.1 (A): requested ∩ subscribed, else the default S-NSSAIs.
+		h.applyAllowedNSSAISelection(ctx, ue, ue.RequestedNSSAI, amSub.AllowedNSSAI, amSub.DefaultNSSAI)
 	}
-	ue.AllowedNSSAI = h.limitAllowedNSSAI(ctx, ue, ue.AllowedNSSAI)
 	ue.SubscribedNSSAI = append([]amfctx.SNSSAISubscribed(nil), amSub.AllowedNSSAI...)
+	ue.DefaultNSSAI = append([]amfctx.SNSSAISubscribed(nil), amSub.DefaultNSSAI...)
 	// Withhold slices subject to NSSAA from the initial Allowed NSSAI; they are
 	// granted only after slice-level EAP auth succeeds (run after RegistrationComplete).
 	// No-op when NSSAA is unconfigured or no slice is flagged. Ref: TS 23.502 §4.2.9.2.
-	h.SplitPendingNSSAA(ue)
+	// A UE that does not support NSSAA never gets NSSAA-subject S-NSSAIs
+	// (allowed or pending) and NSSAA is not started for it.
+	// Ref: TS 23.501 §5.15.10; TS 24.501 §5.5.1.2.4, §5.5.1.2.5 b) 2)
+	nssaaUnsupported := h.restrictNSSAAForUnsupportedUE(ctx, ue)
+	if !nssaaUnsupported {
+		h.SplitPendingNSSAA(ue)
+	}
 	// No allowed slice and none pending NSSAA: REGISTRATION REJECT #62, never an
 	// Accept with an empty Allowed NSSAI (min length 4, §9.11.3.37).
 	// Ref: TS 24.501 §5.5.1.2.5; TS 23.502 §4.2.2.2.2 step 21
 	if len(ue.AllowedNSSAI) == 0 && len(ue.PendingNSSAA) == 0 &&
-		ue.NSSAAInProgress == nil && len(ue.NSSAAPendingStatus) == 0 {
+		(nssaaUnsupported || (ue.NSSAAInProgress == nil && len(ue.NSSAAPendingStatus) == 0)) {
 		rejected := rejectedNSSAIForRegistration(ue)
 		log.Warn("no network slices available — rejecting registration",
 			"procedure", "InitialRegistration",
@@ -1179,9 +1229,10 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 
 	// Step 14c (optional): AM Policy Association with PCF (Npcf_AMPolicyControl),
 	// created in the parallel group above. PCF may return servAreaRes (Service
-	// Area Restriction); if so, enforce it: reject the registration with 5GMM
-	// cause #73 if the UE's TAC is not allowed. Non-fatal when PCF is
-	// unavailable - operator default RFSP is used instead.
+	// Area Restriction); if so it is stored and enforced as of AMF-034: the
+	// Registration Accept carries the Service area list (TS 24.501 §5.3.5) and
+	// no REGISTRATION REJECT #73 is built. Non-fatal when PCF is unavailable -
+	// operator default RFSP is used instead.
 	// Ref: TS 23.502 §4.2.2.2.2 step 14c; TS 23.501 §5.3.4; TS 29.507 §4.2.2
 	if h.amPolicy != nil {
 		if opt.amErr != nil {
@@ -1423,63 +1474,75 @@ func (h *RegistrationHandler) gutiAllocatedHere(g *nas.GUTIMobileIdentity) bool 
 }
 
 // acceptableUESecurityCapability reports whether the UE security capability IE
-// is present and offers at least one 5GS encryption algorithm (NEA0..NEA2) and
-// one non-null 5GS integrity algorithm (NIA1, NIA2) that selectSecurityAlgorithms
-// can choose. NIA0 alone is not acceptable outside emergency services.
-// Ref: TS 24.501 §5.5.1.2.8 i); TS 33.501 §5.5.2
-func acceptableUESecurityCapability(sc *nas.UESecurityCapability) bool {
+// is present, shares at least one 5GS encryption algorithm with the operator
+// ciphering list (order, NEA0..NEA3) and one non-null 5GS integrity algorithm
+// with the operator integrity list (integOrder, NIA1..NIA3). NIA0 alone is not
+// acceptable outside emergency services.
+// Ref: TS 24.501 §5.5.1.2.8 i); TS 33.501 §5.5.2, §6.7.1.1
+func acceptableUESecurityCapability(sc *nas.UESecurityCapability, order, integOrder []byte) bool {
 	if sc == nil {
 		return false
 	}
-	return (sc.EA0 || sc.EA1 || sc.EA2) && (sc.IA1 || sc.IA2)
+	ea := [8]bool{sc.EA0, sc.EA1, sc.EA2, sc.EA3}
+	if _, ok := selectCipheringAlgorithm(order, ea); !ok {
+		return false
+	}
+	ia := [8]bool{sc.IA0, sc.IA1, sc.IA2, sc.IA3}
+	_, ok := selectIntegrityAlgorithm(integOrder, ia)
+	return ok
 }
 
 // selectSecurityAlgorithms chooses NAS security algorithms based on UE capability
-// and AMF operator policy.
-// Policy (configurable): prefer NIA2 > NIA1 > NIA0; prefer NEA2 > NEA1 > NEA0.
-// When h.nullSecurity is true, forces NEA0+NIA0 (plain-text NAS for debugging).
-// Ref: TS 33.501 §6.7.2
-func (h *RegistrationHandler) selectSecurityAlgorithms(ue *amfctx.UEContext) (cipher, integ byte) {
+// and AMF operator policy: integrity follows nas_security.integrity_order
+// (default NIA2 > NIA1 > NIA3), ciphering follows nas_security.ciphering_order.
+// When h.nullSecurity is true, selects NEA0 if the UE advertises 5G-EA0 (else
+// falls back to the ciphering order) and keeps a real integrity algorithm.
+// Ref: TS 33.501 §6.7.1.1, §6.7.2
+// ok is false when the UE shares no ciphering or no integrity algorithm with the
+// operator lists (the caller must reject with 5GMM #23, never use NEA0/NIA0 as a
+// fallback).
+func (h *RegistrationHandler) selectSecurityAlgorithms(ue *amfctx.UEContext) (cipher, integ byte, ok bool) {
+	cipher, integ, ok, _ = h.selectSecurityAlgorithmsNull(ue)
+	return cipher, integ, ok
+}
+
+// selectSecurityAlgorithmsNull is selectSecurityAlgorithms plus nullFallback,
+// true when null_ciphering is on but the UE did not advertise 5G-EA0, so the
+// cipher came from the operator ciphering order instead (AMF-009); the caller
+// logs the WARN. Ref: TS 33.501 §6.7.1.1, §6.7.2; TS 24.501 §9.11.3.54
+func (h *RegistrationHandler) selectSecurityAlgorithmsNull(ue *amfctx.UEContext) (cipher, integ byte, ok, nullFallback bool) {
+	// TS 33.501 §5.5.2 forbids NIA0 in a non-emergency registration, so even the
+	// null-security debug mode keeps a real integrity algorithm (the UE would
+	// otherwise reject the SMC).
+	integ, ok = selectIntegrityAlgorithm(h.effectiveIntegrityOrder(), ue.UESecCapIA)
+	if !ok {
+		return 0, 0, false, false
+	}
 	if h.nullSecurity {
-		// NEA0 = no ciphering → NAS payload visible in Wireshark.
-		// Integrity still uses the best algorithm the UE supports: TS 33.501 §6.7.2
-		// forbids accepting IA0+EA0 together in a non-emergency registration, so
-		// we must keep a real integrity algorithm or the UE will reject the SMC.
-		integ = 0
-		if ue.UESecCapIA[2] {
-			integ = 2
-		} else if ue.UESecCapIA[1] {
-			integ = 1
+		// NEA0 = no ciphering → NAS payload visible in Wireshark, but only if
+		// the UE offered 5G-EA0 (TS 33.501 §5.11.1.1: never pick an algorithm
+		// absent from the UE security capability).
+		if ue.UESecCapEA[0] {
+			return 0, integ, true, false
 		}
-		return 0, integ
+		nullFallback = true
 	}
-	// Integrity: NIA2 preferred
-	integ = 0 // NIA0 (null) fallback — should only be used for emergency
-	if ue.UESecCapIA[2] {
-		integ = 2 // NIA2 (AES-CMAC)
-	} else if ue.UESecCapIA[1] {
-		integ = 1 // NIA1 (SNOW 3G)
-	}
-	// Ciphering: NEA2 preferred; NEA0 = no ciphering (acceptable in lab)
-	cipher = 0 // NEA0 (null cipher)
-	if ue.UESecCapEA[2] {
-		cipher = 2 // NEA2 (AES-CTR)
-	} else if ue.UESecCapEA[1] {
-		cipher = 1 // NEA1 (SNOW 3G)
-	}
-	return cipher, integ
+	// Ciphering: highest-priority algorithm of the operator list the UE
+	// supports (default NEA2 > NEA1 > NEA3 > NEA0). Ref: TS 33.501 §6.7.1.1
+	cipher, ok = selectCipheringAlgorithm(h.effectiveCipheringOrder(), ue.UESecCapEA)
+	return cipher, integ, ok, nullFallback && ok
 }
 
 // filterAllowedNSSAI returns the intersection of the UE's requested slices and
-// its subscribed slices. If requested is empty, all subscribed slices are allowed
-// (backward compatibility when UE sends no RequestedNSSAI IE).
+// its subscribed slices. If requested is empty the result is empty: the caller
+// applies the default S-NSSAI fallback (selectAllowedNSSAI, TS 23.501 §5.15.5.2.1).
 // A requested entry with SD=="" is treated as a wildcard matching any SD with
 // the same SST. The result is not limited to MaxAllowedNSSAI; the registration
 // path applies limitAllowedNSSAI once after the filter.
 // Ref: TS 23.502 §4.2.2.2.2, TS 24.501 §5.5.1.2.4
 func filterAllowedNSSAI(requested, subscribed []amfctx.SNSSAISubscribed) []amfctx.SNSSAISubscribed {
 	if len(requested) == 0 {
-		return subscribed
+		return nil
 	}
 	var result []amfctx.SNSSAISubscribed
 	for _, sub := range subscribed {
@@ -1627,6 +1690,29 @@ func (h *RegistrationHandler) unsubscribeSDM(ctx context.Context, supi string) {
 		h.logger.Warn("UDM SDM unsubscribe failed (non-fatal)", "procedure", "Deregistration",
 			"interface", "Nudm", "direction", "OUT", "supi", supi, "subscription_id", id,
 			"result", "FAILURE", "error", err, "spec_ref", "TS 29.503 §5.2.2.4")
+	}
+}
+
+// UnsubscribeSDMOf deletes the UE's Nudm_SDM subscription without touching the
+// UECM registration (UDM-triggered de-registration, where the UDM already removed
+// it). Best-effort and idempotent: the id is taken from the context.
+// Ref: TS 23.502 §4.2.2.3.3 step 3, TS 29.503 §5.2.2.4
+func (h *RegistrationHandler) UnsubscribeSDMOf(ctx context.Context, ue *amfctx.UEContext) {
+	if h == nil || h.udm == nil || ue == nil || ue.SUPI == "" {
+		return
+	}
+	sub, ok := h.udm.(UDMSDMSubscriber)
+	if !ok {
+		return
+	}
+	id := ue.TakeSDMSubscriptionID()
+	if id == "" {
+		return
+	}
+	if err := sub.UnsubscribeSDM(ctx, ue.SUPI, id); err != nil {
+		h.logger.Warn("UDM SDM unsubscribe failed (non-fatal)", "procedure", "NetworkDeregistration",
+			"interface", "Nudm", "direction", "OUT", "supi", ue.SUPI, "subscription_id", id,
+			"result", "FAILURE", "error", err, "spec_ref", "TS 23.502 §4.2.2.3.3 step 3")
 	}
 }
 

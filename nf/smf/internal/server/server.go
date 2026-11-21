@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
+	"github.com/francurieses/claudia-5gc/shared/pfcpx"
 	"github.com/free5gc/aper"
 	"github.com/google/uuid"
 	"github.com/oklog/ulid/v2"
@@ -120,6 +121,14 @@ type Session struct {
 	// only, not persisted (sessions are purged at startup). Ref: TS 24.501
 	// §9.11.4.1.
 	Capability5GSM *nas.FiveGSMCapability
+
+	// DLPagingPending is set when a Downlink Data Report triggered an
+	// N1N2MessageTransfer and the UE has not re-activated the user plane yet
+	// (suppresses duplicate DLDRs; SMF-011). dlPagingGen/dlPagingTimer implement the
+	// dlPagingGuardTimeout guard. In-memory only. Ref: TS 23.502 §4.2.3.3 step 3a.
+	DLPagingPending bool
+	dlPagingGen     uint64
+	dlPagingTimer   *time.Timer
 }
 
 // smPolicyQoS carries the QoS parameters extracted from the PCF SM Policy response.
@@ -140,6 +149,15 @@ type Server struct {
 	// stopped; once associated with the UPF the SMF asks the AMF to release
 	// them so the UEs re-establish (TS 23.527 §4.3). Guarded by sessionMu.
 	orphanedByRestart []restartOrphan
+
+	// SMF-012 restart recovery (restart_recovery.go): orphan-release retry
+	// policy, association gate timeout and the first-association signal.
+	orphanRelease    orphanReleaseConfig
+	assocGateTimeout time.Duration
+	assocGateActive  atomic.Bool   // set by RunPFCPNodeSupervisor; the gate is off without a supervisor
+	firstAssoc       chan struct{} // closed on the first successful Association Setup of this run
+	firstAssocOnce   sync.Once
+	orphanWG         sync.WaitGroup // orphan release goroutine (ends with the supervisor ctx)
 
 	cfg        *config.Config
 	logger     *slog.Logger
@@ -358,6 +376,9 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option
 		recoveryTS:        time.Now().UTC().Truncate(time.Second),
 		pfcpTimers:        pfcpTimersFromConfig(cfg.N4),
 		assocKick:         make(chan struct{}, 1),
+		firstAssoc:        make(chan struct{}),
+		orphanRelease:     defaultOrphanReleaseConfig(),
+		assocGateTimeout:  defaultAssocGateTimeout,
 		recoverCh:         make(chan struct{}, 1),
 		shutdownDone:      make(chan struct{}),
 		nsmfCat:           nsmfPDUSessionCatalog,
@@ -418,8 +439,10 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option
 // persisted sessions as stale and delete them, so each run starts with a
 // clean IP pool and counters starting at 1.
 //
-// Ref: TS 29.244 §8.2 (PFCP Association Establishment — peer state is reset
-// on re-association, so CP-side sessions must be re-established from scratch).
+// Ref: TS 23.527 §4.4.2 (SMF restart without restoration: affected PDU
+// sessions are released and the UE re-establishes them); TS 29.244 §6.2.6.2.2
+// (the UPF deletes the PFCP sessions of a re-associating CP function that
+// does not send PFCP Session Retention Information).
 func (s *Server) loadFromStore(ctx context.Context) error {
 	sessions, err := s.db.ListSessions(ctx)
 	if err != nil {
@@ -582,6 +605,9 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Info("Nsmf_PDUSession_CreateSMContext received")
+	if !s.passAssociationGate(r.Context(), log, w, req, corrID) {
+		return
+	}
 	s.warnIfNotAssociated(r.Context(), corrID)
 
 	// Extract request fields
@@ -1048,19 +1074,23 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Info("AN Release — deactivating UPF DL forwarding",
-			"interface", "N4",
-			"direction", "OUT",
+		// Base logger: log already carries procedure=SmContextUpdate (no duplicate JSON keys).
+		s.logger.Info("AN Release — UP deactivation requested by AMF",
+			"procedure", "AnRelease",
+			"correlation_id", r.Header.Get("X-Correlation-Id"),
+			"interface", "Nsmf",
+			"direction", "IN",
 			"supi", sess.SUPI,
 			"seid", sess.SEID,
-			"spec_ref", "TS 23.502 §4.2.6",
+			"spec_ref", "TS 23.502 §4.2.6 step 5",
 		)
 		s.sessionMu.Lock()
 		if sess.State != sessionStateReleasing {
 			sess.State = "IDLE"
 		}
 		s.sessionMu.Unlock()
-		go s.sendPFCPSessionDeactivation(context.Background(), sess)
+		anCtx := logging.WithCorrelationID(context.Background(), r.Header.Get("X-Correlation-Id"))
+		go s.sendPFCPSessionDeactivation(anCtx, sess)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1135,7 +1165,9 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 		cmdBody := nas.EncodePDUSessionModificationCommandBodyWithQoS(1 /* QFI=1 */, fiveQI, ambrDL, ambrUL)
 		n1SmCmd := nas.WrapPDUSessionModificationCommandBody(uint8(pduSessionID), nwPTI, cmdBody)
 
-		n2SmInfo, err := buildPDUSessionResourceModifyRequestTransfer()
+		n2SmInfo, err := buildPDUSessionResourceModifyRequestTransferQoS(
+			1 /* QFI=1, same flow as the NAS command */, int64(fiveQI),
+			int64(ambrUL)*1_000_000, int64(ambrDL)*1_000_000)
 		if err != nil {
 			log.Error("N2SM Modify Transfer encoding failed for policy update", "error", err)
 			problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
@@ -1185,6 +1217,9 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			// override is applied as a real QoS modification (N4 QER + QoS IEs).
 			// Ref: TS 29.512 §5.2.2.3, TS 23.502 §4.3.3.1 step 1b.
 			cmdBody := nas.EncodePDUSessionModificationCommandBody()
+			var qosChanged bool
+			var chFiveQI uint8
+			var chUL, chDL int
 			s.sessionMu.Lock()
 			sess := s.sessions[smContextRef]
 			s.sessionMu.Unlock()
@@ -1192,6 +1227,7 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 				curFiveQI, curUL, curDL := sess.FiveQI, sess.AMBRULMbps, sess.AMBRDLMbps
 				granted, authorized := s.updateSMPolicy(r.Context(), sess, curFiveQI, curUL, curDL)
 				if authorized && (granted.FiveQI != curFiveQI || granted.AMBRULMbps != curUL || granted.AMBRDLMbps != curDL) {
+					qosChanged, chFiveQI, chUL, chDL = true, granted.FiveQI, granted.AMBRULMbps, granted.AMBRDLMbps
 					s.sessionMu.Lock()
 					sess.FiveQI = granted.FiveQI
 					sess.AMBRULMbps = granted.AMBRULMbps
@@ -1213,7 +1249,16 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			}
 			n1SmCmd := nas.WrapPDUSessionModificationCommandBody(pduSessionID, pti, cmdBody)
 
-			n2SmInfo, err := buildPDUSessionResourceModifyRequestTransfer()
+			// Empty transfer when QoS is unchanged (bytes stay as before); populated
+			// AMBR + QoS Flow Add or Modify list when the PCF changed it (TS 38.413 §9.3.4.3).
+			var n2SmInfo []byte
+			var err error
+			if qosChanged {
+				n2SmInfo, err = buildPDUSessionResourceModifyRequestTransferQoS(
+					1, int64(chFiveQI), int64(chUL)*1_000_000, int64(chDL)*1_000_000)
+			} else {
+				n2SmInfo, err = buildPDUSessionResourceModifyRequestTransfer()
+			}
 			if err != nil {
 				log.Error("N2SM Modify Transfer encoding failed", "error", err)
 				problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", err.Error())
@@ -1362,6 +1407,8 @@ func (s *Server) markSessionActive(sess *Session) bool {
 		return false
 	}
 	sess.State = "ACTIVE"
+	// UP re-activated (Update FAR 1 FORW follows): the page was answered.
+	s.clearDLPagingLocked(sess)
 	return true
 }
 
@@ -1677,6 +1724,7 @@ func (s *Server) releaseSessionLocal(ctx context.Context, ref string, sess *Sess
 		}
 	}
 	delete(s.sessions, ref)
+	s.clearDLPagingLocked(sess) // stop the DLDR guard timer, drop pending
 	n4Stale := sess.N4Stale
 	s.sessionMu.Unlock()
 	s.deleteSession(ctx, ref)
@@ -1770,7 +1818,7 @@ func (s *Server) sendPFCPSessionDeletion(ctx context.Context, sess *Session) {
 		s.logger.Warn("PFCP: no deletion response", "error", err)
 		return
 	}
-	msg, err := pfcpmsg.Parse(buf[:n])
+	msg, err := pfcpx.ParseMessage(buf[:n])
 	if err != nil {
 		s.logger.Warn("PFCP: parse deletion response", "error", err)
 		return
@@ -1778,61 +1826,23 @@ func (s *Server) sendPFCPSessionDeletion(ctx context.Context, sess *Session) {
 	s.logger.Info("PFCP SessionDeletion response", "type", msg.MessageTypeName(), "seid", sess.SEID)
 }
 
-// sendPFCPSessionDeactivation sends a PFCP Session Modification to the UPF instructing
-// it to DROP DL packets (no outer header creation) for this session. Called when the UE
-// goes CM-IDLE (AN release). When the UE reconnects via Service Request, a subsequent
-// sendPFCPSessionModification re-enables DL forwarding with the new gNB tunnel.
-// Ref: TS 29.244 §6.3.3, TS 23.502 §4.2.6
+// sendPFCPSessionDeactivation sends a PFCP Session Modification to the UPF setting the DL FAR
+// to BUFF+NOCP (no outer header creation) for this session. Called when the UE goes CM-IDLE
+// (AN release): the UPF buffers DL data and notifies the SMF (DLDR) so the UE is paged. When
+// the UE reconnects via Service Request, sendPFCPSessionModification re-enables DL forwarding
+// with the new gNB tunnel. The handover-target-failed / PDU resource setup failure paths keep DROP.
+// Ref: TS 23.502 §4.2.6 steps 6a/6b; TS 29.244 §5.2.3, §7.5.4.3, §8.2.26
 func (s *Server) sendPFCPSessionDeactivation(ctx context.Context, sess *Session) {
 	if s.skipN4ForReleasing(sess, "SessionDeactivation") {
 		return
 	}
-	upfAddr, err := net.ResolveUDPAddr("udp", s.cfg.Peers.UPF)
+	base := s.logger.With("correlation_id", logging.CorrelationID(ctx))
+	_, err := s.pfcpModifyFAR(ctx, base, "AnRelease", specAnRelease, sess, buildDLBuffNocpFAR(), applyActionBuffNocpLabel)
+	result := "OK"
 	if err != nil {
-		s.logger.Error("PFCP: resolve UPF address", "error", err)
-		return
+		result = hoN4Result(err)
 	}
-	conn, err := net.DialUDP("udp", nil, upfAddr)
-	if err != nil {
-		s.logger.Error("PFCP: dial UPF", "error", err)
-		return
-	}
-	defer conn.Close()
-
-	seq := s.nextPFCPSeq()
-	// Update the DL FAR: remove outer header creation (DROP action = no forwarding).
-	// ApplyAction 0x01 = DROP per TS 29.244 Table 7.5.2.3-1.
-	req := pfcpmsg.NewSessionModificationRequest(
-		0, 0, sess.SEID, seq, 0,
-		buildDLDropFAR(),
-	)
-
-	b, err := req.Marshal()
-	if err != nil {
-		s.logger.Error("PFCP: marshal deactivation request", "error", err)
-		return
-	}
-	if _, err := conn.Write(b); err != nil {
-		s.logger.Error("PFCP: send deactivation request", "error", err)
-		return
-	}
-
-	s.logger.Info("PFCP SessionDeactivation sent (AN release)",
-		"seid", sess.SEID, "supi", sess.SUPI)
-
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	if err != nil {
-		s.logger.Warn("PFCP: no deactivation response", "error", err)
-		return
-	}
-	msg, err := pfcpmsg.Parse(buf[:n])
-	if err != nil {
-		s.logger.Warn("PFCP: parse deactivation response", "error", err)
-		return
-	}
-	s.logger.Info("PFCP SessionDeactivation response", "type", msg.MessageTypeName(), "seid", sess.SEID)
+	metrics.ProcedureTotal.WithLabelValues("SMF", "AnRelease", result).Inc()
 }
 
 // smPoliciesPath is the Npcf_SMPolicyControl sm-policies collection
@@ -1970,7 +1980,7 @@ func (s *Server) createSMPolicy(ctx context.Context, supi, dnn, ueIPv4 string, s
 		if sessRules, ok := respBody["sessRules"].(map[string]interface{}); ok {
 			for _, v := range sessRules {
 				if rule, ok := v.(map[string]interface{}); ok {
-					if ambr, ok := rule["sessAmbr"].(map[string]interface{}); ok {
+					if ambr, ok := sessRuleAmbr(rule); ok {
 						if ul, ok := ambr["uplink"].(string); ok {
 							qos.AMBRULKbps, qos.AMBRULMbps = parseAMBR(ul, fallback.AMBRULKbps, fallback.AMBRULMbps)
 						}
@@ -2135,7 +2145,7 @@ func (s *Server) updateSMPolicy(ctx context.Context, sess *Session, reqFiveQI ui
 		if sessRules, ok := respBody["sessRules"].(map[string]interface{}); ok {
 			for _, v := range sessRules {
 				if rule, ok := v.(map[string]interface{}); ok {
-					if ambr, ok := rule["sessAmbr"].(map[string]interface{}); ok {
+					if ambr, ok := sessRuleAmbr(rule); ok {
 						if ul, ok := ambr["uplink"].(string); ok {
 							granted.AMBRULKbps, granted.AMBRULMbps = parseAMBR(ul, requested.AMBRULKbps, reqAMBRULMbps)
 						}
@@ -2310,6 +2320,52 @@ func buildPDUSessionResourceModifyRequestTransfer() ([]byte, error) {
 	return encoded, nil
 }
 
+// buildPDUSessionResourceModifyRequestTransferQoS builds the N2SM Modify Request
+// Transfer for a network-requested QoS change: PDU Session AMBR (id 130) then
+// QoS Flow Add or Modify Request List (id 135), in the IE order of the TS 38.413
+// §9.3.4.3 ASN.1 (aper encodes in append order; real gNBs reject out-of-order IEs).
+// The gNB enforces the new 5QI/AMBR from this transfer; the NAS Modification
+// Command alone only informs the UE.
+// Ref: TS 38.413 §8.2.3, §9.3.4.3; TS 23.502 §4.3.3.2 step 3a
+func buildPDUSessionResourceModifyRequestTransferQoS(qfi uint8, fiveQI, ambrULBps, ambrDLBps int64) ([]byte, error) {
+	params := buildQosFlowLevelQosParameters(fiveQI, ambrULBps, ambrDLBps)
+	transfer := ngapType.PDUSessionResourceModifyRequestTransfer{
+		ProtocolIEs: ngapType.ProtocolIEContainerPDUSessionResourceModifyRequestTransferIEs{
+			List: []ngapType.PDUSessionResourceModifyRequestTransferIEs{
+				{
+					Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDPDUSessionAggregateMaximumBitRate},
+					Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+					Value: ngapType.PDUSessionResourceModifyRequestTransferIEsValue{
+						Present: ngapType.PDUSessionResourceModifyRequestTransferIEsPresentPDUSessionAggregateMaximumBitRate,
+						PDUSessionAggregateMaximumBitRate: &ngapType.PDUSessionAggregateMaximumBitRate{
+							PDUSessionAggregateMaximumBitRateUL: ngapType.BitRate{Value: ambrULBps},
+							PDUSessionAggregateMaximumBitRateDL: ngapType.BitRate{Value: ambrDLBps},
+						},
+					},
+				},
+				{
+					Id:          ngapType.ProtocolIEID{Value: ngapType.ProtocolIEIDQosFlowAddOrModifyRequestList},
+					Criticality: ngapType.Criticality{Value: ngapType.CriticalityPresentReject},
+					Value: ngapType.PDUSessionResourceModifyRequestTransferIEsValue{
+						Present: ngapType.PDUSessionResourceModifyRequestTransferIEsPresentQosFlowAddOrModifyRequestList,
+						QosFlowAddOrModifyRequestList: &ngapType.QosFlowAddOrModifyRequestList{
+							List: []ngapType.QosFlowAddOrModifyRequestItem{{
+								QosFlowIdentifier:         ngapType.QosFlowIdentifier{Value: int64(qfi)},
+								QosFlowLevelQosParameters: &params,
+							}},
+						},
+					},
+				},
+			},
+		},
+	}
+	encoded, err := aper.MarshalWithParams(transfer, "valueExt")
+	if err != nil {
+		return nil, fmt.Errorf("smf: encode PDUSessionResourceModifyRequestTransfer (QoS): %w", err)
+	}
+	return encoded, nil
+}
+
 // buildTransportLayerAddress encodes UPF IP as APER BitString with length (32 for IPv4)
 // Ref: TS 38.413 §9.3.4.5, Annex B — TransportLayerAddress is BIT STRING
 func buildTransportLayerAddress(ip net.IP) ngapType.TransportLayerAddress {
@@ -2341,6 +2397,21 @@ func encodeGTPTEID(teid uint32) []byte {
 // it. GFBR/MFBR are set to the session AMBR since our flows carry the whole
 // session. Ref: TS 38.413 §9.3.4.1, §9.3.1.12; TS 23.501 §5.7.2
 func buildQosFlowSetupRequestList(qfi uint8, fiveQI, ambrULBps, ambrDLBps int64) *ngapType.QosFlowSetupRequestList {
+	return &ngapType.QosFlowSetupRequestList{
+		List: []ngapType.QosFlowSetupRequestItem{
+			{
+				QosFlowIdentifier:         ngapType.QosFlowIdentifier{Value: int64(qfi)},
+				QosFlowLevelQosParameters: buildQosFlowLevelQosParameters(fiveQI, ambrULBps, ambrDLBps),
+			},
+		},
+	}
+}
+
+// buildQosFlowLevelQosParameters builds the QoS Flow Level QoS Parameters IE
+// shared by the PDU Session Resource Setup and Modify transfers (non-dynamic
+// 5QI + ARP; GBR flows add the mandatory GBR QoS Flow Information).
+// Ref: TS 38.413 §9.3.1.12
+func buildQosFlowLevelQosParameters(fiveQI, ambrULBps, ambrDLBps int64) ngapType.QosFlowLevelQosParameters {
 	params := ngapType.QosFlowLevelQosParameters{
 		QosCharacteristics: ngapType.QosCharacteristics{
 			Present: ngapType.QosCharacteristicsPresentNonDynamic5QI,
@@ -2362,14 +2433,7 @@ func buildQosFlowSetupRequestList(qfi uint8, fiveQI, ambrULBps, ambrDLBps int64)
 			GuaranteedFlowBitRateUL: ngapType.BitRate{Value: ambrULBps},
 		}
 	}
-	return &ngapType.QosFlowSetupRequestList{
-		List: []ngapType.QosFlowSetupRequestItem{
-			{
-				QosFlowIdentifier:         ngapType.QosFlowIdentifier{Value: int64(qfi)},
-				QosFlowLevelQosParameters: params,
-			},
-		},
-	}
+	return params
 }
 
 func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
@@ -2413,6 +2477,23 @@ func problemWithParams(w http.ResponseWriter, status int, cause, detail string, 
 // session for active usage reporting (volume-threshold + periodic). The SMF
 // installs exactly one URR per session for the MVP. Ref: TS 29.244 §7.5.2.4.
 const usageReportingURRID uint32 = 1
+
+// PDR / FAR / BAR IDs of the per-session N4 rule set (SMF-011). Update FAR 1 is the DL
+// FAR everywhere (AN release BUFF+NOCP, handover switch, Service Request FORW+OHC).
+// Ref: TS 29.244 §7.5.2.2/§7.5.2.3/§7.5.2.6, §8.2.36, §8.2.74, §8.2.88.
+const (
+	// ulPDRID is the UL PDR (Source Interface Access, UL TEID), forwarding to ulFARID.
+	ulPDRID uint16 = 1
+	// dlPDRID is the DL PDR (Source Interface Core, UE IP), forwarding to dlFARID; the PDR ID
+	// reported in a Downlink Data Report (TS 29.244 §7.5.8.2).
+	dlPDRID uint16 = 2
+	// dlFARID is the DL FAR (FORW / BUFF+NOCP / DROP) and carries the BAR.
+	dlFARID uint32 = 1
+	// ulFARID is the UL FAR (FORW to Destination Interface Core).
+	ulFARID uint32 = 2
+	// defaultBARID is the BAR of the DL FAR (Create BAR, TS 29.244 §7.5.2.6).
+	defaultBARID uint8 = 1
+)
 
 // reportingTriggersPerioVolth is the Reporting Triggers IE bitmask enabling
 // both the periodic (PERIO) and volume-threshold (VOLTH) triggers. TS 29.244
@@ -2512,13 +2593,20 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 		return
 	}
 
+	// DL PDR 2 matches on the UE IP as destination address (S/D bit).
+	dlUEIPIE, _, err := buildUEIPAddressIEDest(sess, true)
+	if err != nil {
+		s.logger.Error("PFCP: build DL UE IP Address IE", "error", err, "seid", sess.SEID)
+		return
+	}
+
 	seq := s.nextPFCPSeq()
 	req := pfcpmsg.NewSessionEstablishmentRequest(
 		0, 0, 0, seq, 0,
 		pfcpie.NewNodeID("", "", "smf"),
 		pfcpie.NewFSEID(sess.SEID, net.ParseIP("0.0.0.0"), nil),
 		pfcpie.NewCreatePDR(
-			pfcpie.NewPDRID(1),
+			pfcpie.NewPDRID(ulPDRID),
 			pfcpie.NewPrecedence(100),
 			pfcpie.NewPDI(
 				pfcpie.NewSourceInterface(pfcpie.SrcInterfaceAccess),
@@ -2531,7 +2619,7 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 				pfcpie.NewNetworkInstance(sess.DNN),
 			),
 			pfcpie.NewOuterHeaderRemoval(0, 0),
-			pfcpie.NewFARID(1),
+			pfcpie.NewFARID(ulFARID),
 			// QER ID list: Session-AMBR QER + QoS-flow QER (TS 29.244 §7.5.2.2).
 			pfcpie.NewQERID(sessionAMBRQERID),
 			pfcpie.NewQERID(defaultFlowQERID),
@@ -2540,9 +2628,37 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			// Ref: TS 29.244 §7.5.2.2.
 			pfcpie.NewURRID(usageReportingURRID),
 		),
+		// DL PDR (SMF-011): matches DL packets from the N6 (Core) side by UE IP
+		// (S/D = destination) and names FAR 1, the DL FAR that carries the BAR. Its
+		// PDR ID is what the UPF reports in a Downlink Data Report.
+		// Ref: TS 29.244 §7.5.2.2, §8.2.62, §7.5.8.2.
+		pfcpie.NewCreatePDR(
+			pfcpie.NewPDRID(dlPDRID),
+			pfcpie.NewPrecedence(100),
+			pfcpie.NewPDI(
+				pfcpie.NewSourceInterface(pfcpie.SrcInterfaceCore),
+				dlUEIPIE,
+				pfcpie.NewNetworkInstance(sess.DNN),
+			),
+			pfcpie.NewFARID(dlFARID),
+			pfcpie.NewURRID(usageReportingURRID),
+			pfcpie.NewQERID(sessionAMBRQERID),
+			pfcpie.NewQERID(defaultFlowQERID),
+		),
+		// FAR 1 = DL: FORW until the AN release turns it into BUFF+NOCP (Update FAR 1);
+		// BAR ID 1 defines the buffering instructions applied when BUFF is set.
+		// Ref: TS 29.244 §7.5.2.3 (Table 7.5.2.3-1).
 		pfcpie.NewCreateFAR(
-			pfcpie.NewFARID(1),
+			pfcpie.NewFARID(dlFARID),
 			pfcpie.NewApplyAction(0x02), // FORWARD (DL header added via Modification later)
+			pfcpie.NewForwardingParameters(pfcpie.NewDestinationInterface(pfcpie.DstInterfaceAccess)),
+			pfcpie.NewBARID(defaultBARID),
+		),
+		// FAR 2 = UL: forward to the DN (N6).
+		pfcpie.NewCreateFAR(
+			pfcpie.NewFARID(ulFARID),
+			pfcpie.NewApplyAction(0x02), // FORWARD
+			pfcpie.NewForwardingParameters(pfcpie.NewDestinationInterface(pfcpie.DstInterfaceCore)),
 		),
 		// Session-AMBR QER (shared by all non-GBR PDRs) and QoS-flow QER of the
 		// default flow. Ref: TS 29.244 §7.5.2.5, TS 23.501 §5.7.2.6.
@@ -2558,6 +2674,10 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 			pfcpie.NewVolumeThreshold(volumeThresholdFlagTOVOL, s.cfg.N4.VolumeThresholdBytes, 0, 0),
 			pfcpie.NewMeasurementPeriod(time.Duration(s.cfg.N4.MeasurementPeriodSeconds)*time.Second),
 		),
+		// Create BAR (SMF-011): buffering instructions of the DL FAR. No Suggested
+		// Buffering Packets Count — the UPF does not advertise UDBC, so it applies its
+		// configured limit. Ref: TS 29.244 §7.5.2.6 (Table 7.5.2.6-1), §8.2.88.
+		pfcpie.NewCreateBAR(pfcpie.NewBARID(defaultBARID)),
 	)
 
 	b, err := req.Marshal()
@@ -2596,7 +2716,7 @@ func (s *Server) sendPFCPSessionEstablishment(ctx context.Context, sess *Session
 		s.logger.Warn("PFCP: no establishment response", "error", err)
 		return
 	}
-	msg, err := pfcpmsg.Parse(buf[:n])
+	msg, err := pfcpx.ParseMessage(buf[:n])
 	if err != nil {
 		s.logger.Warn("PFCP: parse establishment response", "error", err)
 		return
@@ -2674,7 +2794,7 @@ func (s *Server) sendPFCPQoSModification(ctx context.Context, sess *Session) boo
 		s.logger.Warn("PFCP: no QER modification response", "error", err)
 		return false
 	}
-	msg, err := pfcpmsg.Parse(buf[:n])
+	msg, err := pfcpx.ParseMessage(buf[:n])
 	if err != nil {
 		s.logger.Warn("PFCP: parse QER modification response", "error", err)
 		return false
@@ -2734,7 +2854,7 @@ func (s *Server) sendPFCPSessionModification(ctx context.Context, sess *Session,
 		s.logger.Warn("PFCP: no modification response", "error", err)
 		return
 	}
-	msg, err := pfcpmsg.Parse(buf[:n])
+	msg, err := pfcpx.ParseMessage(buf[:n])
 	if err != nil {
 		s.logger.Warn("PFCP: parse modification response", "error", err)
 		return

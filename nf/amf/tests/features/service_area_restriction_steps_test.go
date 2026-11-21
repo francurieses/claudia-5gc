@@ -30,7 +30,7 @@ type sarUDM struct{}
 
 func (sarUDM) RegisterAMF(context.Context, string, string, string) error { return nil }
 func (sarUDM) GetAMSubscriptionData(context.Context, string) (*procedures.UDMAMSubscription, error) {
-	return &procedures.UDMAMSubscription{AllowedNSSAI: []amfctx.SNSSAISubscribed{{SST: 1}}}, nil
+	return &procedures.UDMAMSubscription{AllowedNSSAI: []amfctx.SNSSAISubscribed{{SST: 1}}, DefaultNSSAI: []amfctx.SNSSAISubscribed{{SST: 1}}}, nil
 }
 func (sarUDM) DeregisterUECM(context.Context, string) error { return nil }
 

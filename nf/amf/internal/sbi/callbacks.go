@@ -7,7 +7,7 @@ package sbi
 //
 // Both validate the body, log with the canonical fields and answer 204. The
 // DeregistrationNotification resolves the UE by the SUPI path suffix of the
-// deregCallbackUri and runs the local deregistration (404 if unknown).
+// deregCallbackUri and hands it to the AMF deregistration handler (404 if unknown; explicit NW-initiated or implicit per deregReason and CM state, TS 23.502 §4.2.2.3.3).
 
 import (
 	"encoding/json"
@@ -59,13 +59,13 @@ func (s *Server) handleUDMDeregNotify(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", "deregistration not available")
 		return
 	}
-	if err := s.onUDMDereg(r.Context(), ue, body.DeregReason); err != nil {
+	if err := s.onUDMDereg(r.Context(), ue, body.DeregReason, body.AccessType); err != nil {
 		log.Error("UDM deregistration notification: local deregistration failed",
 			"result", "FAILURE", "cause", "DEREGISTRATION_FAILED", "supi", supi, "error", err.Error())
 		s.problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", "local deregistration failed")
 		return
 	}
-	log.Info("UDM deregistration notification: UE deregistered locally",
+	log.Info("UDM deregistration notification: deregistration handed to the AMF",
 		"result", "OK", "supi", supi, "dereg_reason", body.DeregReason, "access_type", body.AccessType)
 	w.WriteHeader(http.StatusNoContent)
 }

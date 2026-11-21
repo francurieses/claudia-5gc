@@ -68,8 +68,8 @@ simulators on a running core with `make ran-up RAN=…` / `make ran-down`.
 
 The portal detects the active mode at runtime. In standalone mode the UERANSIM and PacketRusher pages are
 hidden; the **gNBs (RAN)** page lists every gNB attached to the AMF (name, Global gNB ID, IP address, status,
-slices, UEs) in all modes. PacketRusher may stop on the URSP policy container the AMF sends by default; start the
-AMF with `URSP_ENABLED=false` for PacketRusher-only runs.
+slices, UEs) in all modes. PacketRusher may stop on the URSP policy container the AMF sends when URSP is on; keep
+URSP off (the shipped AMF config default, see *How the toggle works* below) for PacketRusher-only runs.
 
 | Service | URL | Notes |
 |---------|-----|-------|
@@ -133,7 +133,7 @@ Run `make help` for the full, always-current list. The main groups:
 | Command | Description |
 |---------|-------------|
 | `make ueransim` | Bring up core + obs + UERANSIM (gNB + N UEs). Accepts `UE_COUNT=N` |
-| `make ueransim-ursp` | Build + bring up the full core + obs + UERANSIM **with URSP delivery** (default) |
+| `make ueransim-ursp` | Build + bring up the full core + obs + UERANSIM **with URSP delivery** (forces `URSP_ENABLED=true`) |
 | `make ueransim-no-ursp` | Build + bring up the full core + obs + UERANSIM **without URSP delivery** |
 | `make ueransim-only` | Force-recreate the gNB then the UEs (core untouched, no UDR reseed). Accepts `UE_COUNT=N` |
 | `make ueransim-down` | Stop UERANSIM containers |
@@ -193,21 +193,24 @@ make ueransim-no-ursp
 docker logs amf | grep "URSP delivery disabled"       # confirms it is off
 ```
 
-**How the toggle works.** The AMF reads the `URSP_ENABLED` environment variable
-(default `true`), which the two make targets set for you. You can also flip it on
-any compose command, or persist it in the AMF config:
+**How the toggle works.** The shipped AMF config sets `features.ursp_enabled: false`, and
+`docker-compose.yml` passes `URSP_ENABLED` through **empty** unless you set it on the host, so
+that file value is what takes effect by default. The two make targets above force the env var
+for you; you can also override it on any compose command, or change the default in the AMF config:
 
 ```bash
-URSP_ENABLED=false make up-obs        # ad-hoc, any target
+URSP_ENABLED=true make up-obs         # ad-hoc override, any target
 ```
 ```yaml
-# nf/amf/config/dev.yaml
+# nf/amf/config/dev.yaml  (the default; the env var overrides it)
 features:
-  ursp_enabled: false                 # env var overrides this
+  ursp_enabled: false
 ```
 
-Resolution order: `URSP_ENABLED` env → `features.ursp_enabled` in the AMF config →
-default (enabled).
+Resolution order: `URSP_ENABLED` env (non-empty) → `features.ursp_enabled` in the AMF config →
+built-in default (enabled, only when neither is set). Recreate the AMF after editing the file
+(`docker compose --profile core up -d --no-deps amf`). `make validate-ursp` / `make ursp-e2e`
+need URSP on, so run them after `make ueransim-ursp`.
 
 > **Note:** UERANSIM v3.2.8 does not implement the UE policy delivery service, so in
 > the *with URSP* scenario it logs `Unhandled DL NAS Transport payload container

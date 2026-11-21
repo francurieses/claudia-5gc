@@ -120,3 +120,28 @@ func TestDecodeServiceAccept_SkipsUnknownAndTLVE(t *testing.T) {
 		t.Error("expected error on truncated IE")
 	}
 }
+
+// TestDecodeServiceAccept_Hardening: a lone trailing octet and a malformed
+// IE 0x72 value are errors, not silently dropped.
+// Ref: TS 24.501 section 8.2.17.1.1, 9.11.3.43
+func TestDecodeServiceAccept_Hardening(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      []byte
+		wantErr bool
+	}{
+		{"valid 0x50 0x26 0x72", []byte{0x50, 0x02, 0x00, 0x00, 0x26, 0x02, 0x02, 0x00, 0x72, 0x00, 0x02, 0x01, 0x5C}, false},
+		{"lone trailing octet", []byte{0x50, 0x02, 0x00, 0x00, 0x99}, true},
+		{"0x72 odd value length", []byte{0x72, 0x00, 0x03, 0x01, 0x5C, 0x02}, true},
+		{"0x72 empty value", []byte{0x72, 0x00, 0x00}, true},
+		{"empty body", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := nas.DecodeServiceAccept(c.in)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+		})
+	}
+}

@@ -131,3 +131,36 @@ func TestN2SMExtensionPrefix(t *testing.T) {
 		t.Fatalf("correct message must decode with valueExt: %v", err)
 	}
 }
+
+// TestN2SMModifyTransferQoS proves AMF-017: a NW-requested QoS change carries
+// PDU Session AMBR (id 130) then QoS Flow Add or Modify Request List (id 135),
+// in spec IE order, instead of the empty transfer.
+// Ref: TS 38.413 §8.2.3, §9.3.4.3; TS 23.502 §4.3.3.2
+func TestN2SMModifyTransferQoS(t *testing.T) {
+	encoded, err := buildPDUSessionResourceModifyRequestTransferQoS(1, 7, 100_000_000, 100_000_000)
+	if err != nil {
+		t.Fatalf("encode failed: %v", err)
+	}
+	empty, _ := buildPDUSessionResourceModifyRequestTransfer()
+	if len(encoded) <= len(empty) {
+		t.Fatalf("QoS transfer (%d B) must be larger than the empty one (%d B)", len(encoded), len(empty))
+	}
+	var d ngapType.PDUSessionResourceModifyRequestTransfer
+	if err := aper.UnmarshalWithParams(encoded, &d, "valueExt"); err != nil {
+		t.Fatalf("APER decode failed: %v", err)
+	}
+	l := d.ProtocolIEs.List
+	if len(l) != 2 || l[0].Id.Value != ngapType.ProtocolIEIDPDUSessionAggregateMaximumBitRate ||
+		l[1].Id.Value != ngapType.ProtocolIEIDQosFlowAddOrModifyRequestList {
+		t.Fatalf("want IEs [130,135] in order, got %+v", l)
+	}
+	ambr := l[0].Value.PDUSessionAggregateMaximumBitRate
+	if ambr.PDUSessionAggregateMaximumBitRateUL.Value != 100_000_000 || ambr.PDUSessionAggregateMaximumBitRateDL.Value != 100_000_000 {
+		t.Errorf("AMBR mismatch: %+v", ambr)
+	}
+	it := l[1].Value.QosFlowAddOrModifyRequestList.List[0]
+	if it.QosFlowIdentifier.Value != 1 || it.QosFlowLevelQosParameters == nil ||
+		it.QosFlowLevelQosParameters.QosCharacteristics.NonDynamic5QI.FiveQI.Value != 7 {
+		t.Errorf("QoS flow item mismatch: %+v", it)
+	}
+}

@@ -114,7 +114,11 @@ func (s *Server) triggerN1N2MessageTransfer(ctx context.Context, supi string, ps
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return "", fmt.Errorf("smf: N1N2MessageTransfer: status %d", resp.StatusCode)
+		var pd struct {
+			Cause string `json:"cause"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&pd)
+		return "", &n1n2Error{Status: resp.StatusCode, Cause: pd.Cause}
 	}
 	var rsp struct {
 		Cause             string `json:"cause"`
@@ -124,3 +128,17 @@ func (s *Server) triggerN1N2MessageTransfer(ctx context.Context, supi string, ps
 	s.acceptN1N2Features(ctx, offer, rsp.SupportedFeatures, "supi", supi, "pdu_session_id", psi)
 	return rsp.Cause, nil
 }
+
+// n1n2Error is a non-2xx answer of the AMF to N1N2MessageTransfer; Cause is the
+// ProblemDetails cause (e.g. CONTEXT_NOT_FOUND) when present.
+// Ref: TS 29.518 §6.1.3.5.3.
+type n1n2Error struct {
+	Status int
+	Cause  string
+}
+
+func (e *n1n2Error) Error() string {
+	return fmt.Sprintf("smf: N1N2MessageTransfer: status %d", e.Status)
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }

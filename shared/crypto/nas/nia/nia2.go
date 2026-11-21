@@ -1,11 +1,11 @@
 // Package nia implements the 5G NAS integrity algorithms.
 //
 // NIA0: Null integrity (no protection — emergency calls only).
-// NIA1: SNOW 3G based — not implemented (use free5GC implementation).
-// NIA2: AES-CMAC (128-bit key, 128-bit block) — THIS PACKAGE.
-// NIA3: ZUC based — not implemented.
+// NIA1: SNOW 3G based (128-EIA1 = UIA2 f9) — nia1.go.
+// NIA2: AES-CMAC (128-bit key, 128-bit block) — this file.
+// NIA3: ZUC based (128-EIA3) — nia3.go.
 //
-// Ref: TS 33.501 Annex D §D.2 (NIA2)
+// Ref: TS 33.501 Annex D.3.1 (NIA1/NIA2/NIA3)
 //      TS 33.401 Annex B §B.2 (EIA2, identical algorithm)
 //      RFC 4493 (AES-CMAC)
 package nia
@@ -60,7 +60,8 @@ func NIA0(message []byte) []byte {
 	return []byte{0, 0, 0, 0}
 }
 
-// Verify checks a NAS-MAC using NIA2.
+// Verify checks a NAS-MAC using NIA2 only; callers that dispatch by the
+// selected algorithm compute the MAC and compare in constant time themselves.
 func Verify(key []byte, count uint32, bearer, dir byte, message, mac []byte) (bool, error) {
 	expected, err := NIA2(key, count, bearer, dir, message)
 	if err != nil {

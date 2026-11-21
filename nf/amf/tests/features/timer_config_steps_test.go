@@ -65,12 +65,15 @@ func (l *tcLockedBuf) String() string {
 	return l.b.String()
 }
 
-// tcUDM is a minimal UDM for Phase3_ProcessSMCComplete.
+// tcUDM is a minimal UDM for Phase3_ProcessSMCComplete. The am-data carries one
+// default S-NSSAI: without a subscribed S-NSSAI Phase 3 answers REGISTRATION
+// REJECT #62 instead of building an Accept (TS 23.501 §5.15.5.2.1, TS 24.501 §5.5.1.2.5).
 type tcUDM struct{}
 
 func (tcUDM) RegisterAMF(context.Context, string, string, string) error { return nil }
 func (tcUDM) GetAMSubscriptionData(context.Context, string) (*procedures.UDMAMSubscription, error) {
-	return &procedures.UDMAMSubscription{}, nil
+	def := []amfctx.SNSSAISubscribed{{SST: 1}}
+	return &procedures.UDMAMSubscription{AllowedNSSAI: def, DefaultNSSAI: def}, nil
 }
 func (tcUDM) DeregisterUECM(context.Context, string) error { return nil }
 

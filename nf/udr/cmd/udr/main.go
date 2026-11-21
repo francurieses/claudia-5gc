@@ -106,21 +106,7 @@ func main() {
 	//
 	// Slice identifiers come from config/operator.yaml (single source of truth).
 	// Falls back to the default 4-slice set when the operator file is absent.
-	opSlices := []operatorcfg.SNSSAIEntry{
-		{SST: 1, SD: "000001"},
-		{SST: 1, SD: "000002"},
-		{SST: 2, SD: "000001"},
-		{SST: 3, SD: "000001"},
-	}
-	if len(op.Slices()) > 0 {
-		opSlices = op.Slices()
-	}
-	internet := store.SNSSAISubscribed{SST: uint8(opSlices[0].SST), SD: opSlices[0].SD}
-	sliceProfiles := [][]store.SNSSAISubscribed{{internet}}
-	for _, s := range opSlices[1:] {
-		sliceProfiles = append(sliceProfiles,
-			[]store.SNSSAISubscribed{internet, {SST: uint8(s.SST), SD: s.SD}})
-	}
+	sliceProfiles := store.BuildSeedSliceProfiles(op, logger)
 	// GPSI per seeded subscriber (AMF-020): msisdn-<SEED_GPSI_PREFIX><MSIN>,
 	// derived from the SUPI by store.SeedMSISDN. SEED_GPSI_PREFIX="off"
 	// disables; an invalid prefix is logged and also disables. Existing GPSIs
@@ -175,11 +161,8 @@ func main() {
 			logger.Error("seed subscriber failed", "supi", supi, "error", err)
 			continue
 		}
-		snssaiLog := make([]string, len(profile))
-		for j, s := range profile {
-			snssaiLog[j] = fmt.Sprintf("SST=%d/SD=%s", s.SST, s.SD)
-		}
-		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
+		logger.Info("seeded test subscriber", "procedure", "SubscriberSeed", "interface", "internal", "direction", "OUT",
+			"spec_ref", "TS 29.503 §6.1.6.2.8", "supi", supi, "snssais", store.FormatSeedSNSSAIs(profile))
 		seedGPSI(supi)
 	}
 
@@ -209,11 +192,8 @@ func main() {
 			logger.Error("seed subscriber failed", "supi", supi, "error", err)
 			continue
 		}
-		snssaiLog := make([]string, len(profile))
-		for j, sn := range profile {
-			snssaiLog[j] = fmt.Sprintf("SST=%d/SD=%s", sn.SST, sn.SD)
-		}
-		logger.Info("seeded test subscriber", "supi", supi, "snssais", snssaiLog)
+		logger.Info("seeded test subscriber", "procedure", "SubscriberSeed", "interface", "internal", "direction", "OUT",
+			"spec_ref", "TS 29.503 §6.1.6.2.8", "supi", supi, "snssais", store.FormatSeedSNSSAIs(profile))
 		seedGPSI(supi)
 	}
 

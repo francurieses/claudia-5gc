@@ -3,6 +3,7 @@ package n32c
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -179,7 +180,7 @@ func (s *Service) Teardown(ctx context.Context, peerAPIRoot string, remote PlmnI
 
 // post sends req and decodes a 200 body into rsp; other statuses map to the
 // error classes above.
-func (s *Service) post(ctx context.Context, apiRoot string, req SecNegotiateReqData, rsp *SecNegotiateRspData) (*http.Response, error) {
+func (s *Service) post(ctx context.Context, apiRoot string, req SecNegotiateReqData, rsp *SecNegotiateRspData) (*tls.ConnectionState, error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -209,7 +210,7 @@ func (s *Service) post(ctx context.Context, apiRoot string, req SecNegotiateReqD
 		if rsp.SelectedSecCapability == "" {
 			return nil, fmt.Errorf("response without selectedSecCapability: %w", ErrInvalidSelected)
 		}
-		return resp, nil
+		return resp.TLS, nil
 	}
 	var pd ProblemDetails
 	_ = json.Unmarshal(body, &pd)

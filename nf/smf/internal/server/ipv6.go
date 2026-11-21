@@ -156,11 +156,25 @@ func pduTypeNeedsIPv6(t uint8) bool {
 // flow. Returns the IE and the computed UE IPv6 address (nil for IPv4-only).
 // Ref: TS 23.501 §5.8.2.2.
 func buildUEIPAddressIE(sess *Session) (*pfcpie.IE, net.IP, error) {
+	return buildUEIPAddressIEDest(sess, false)
+}
+
+// ueIPFlagDestination is the S/D bit (bit 3) of the UE IP Address IE flags: the address
+// is a destination address (DL PDR). Ref: TS 29.244 §8.2.62 Figure 8.2.62-1.
+const ueIPFlagDestination = 0x04
+
+// buildUEIPAddressIEDest is buildUEIPAddressIE with an optional S/D = destination bit,
+// used by the DL PDR (matching packets addressed to the UE).
+func buildUEIPAddressIEDest(sess *Session, destination bool) (*pfcpie.IE, net.IP, error) {
+	var sd uint8
+	if destination {
+		sd = ueIPFlagDestination
+	}
 	needV4 := pduTypeNeedsIPv4(sess.PDUSessionType)
 	needV6 := pduTypeNeedsIPv6(sess.PDUSessionType)
 
 	if !needV6 {
-		return pfcpie.NewUEIPAddress(0x02, sess.UEIP.String(), "", 0, 0), nil, nil
+		return pfcpie.NewUEIPAddress(0x02|sd, sess.UEIP.String(), "", 0, 0), nil, nil
 	}
 
 	ueIPv6, err := ueIPv6Address(sess.UEIPv6Prefix)
@@ -168,9 +182,9 @@ func buildUEIPAddressIE(sess *Session) (*pfcpie.IE, net.IP, error) {
 		return nil, nil, err
 	}
 	if needV4 {
-		return pfcpie.NewUEIPAddress(0x03, sess.UEIP.String(), ueIPv6.String(), 0, 0), ueIPv6, nil
+		return pfcpie.NewUEIPAddress(0x03|sd, sess.UEIP.String(), ueIPv6.String(), 0, 0), ueIPv6, nil
 	}
-	return pfcpie.NewUEIPAddress(0x01, "", ueIPv6.String(), 0, 0), ueIPv6, nil
+	return pfcpie.NewUEIPAddress(0x01|sd, "", ueIPv6.String(), 0, 0), ueIPv6, nil
 }
 
 // ueIPv6Address computes the full 128-bit UE IPv6 address installed in the

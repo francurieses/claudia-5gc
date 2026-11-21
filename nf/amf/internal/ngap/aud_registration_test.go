@@ -1,31 +1,31 @@
 package ngap
 
-// aud_registration_test.go — failing-by-design reproductions for the
-// registration spec audit (dev/campaigns/results/audit-registration.md).
-// Every test is skipped; run them to see today's deviation:
+// aud_registration_test.go — regression tests for the registration spec audit
+// (dev/campaigns/results/audit-registration.md). All findings are fixed
+// (registration audit W1-W4 tasks), so every reproduction runs as a normal regression test:
 //
-//	GOWORK=off go test ./nf/amf/internal/ngap/ -run TestAUDRegistration -v -args -aud-registration-repro
-//	GOWORK=off go test -race ./nf/amf/internal/ngap/ -run TestAUDRegistration24 -v -args -aud-registration-repro
+//	GOWORK=off go test ./nf/amf/internal/ngap/ -run TestAUDRegistration -v
 //
 // Ref: TS 24.501 §5.5.1.2.5, §5.5.1.2.7, §5.5.1.3.8; TS 38.413 §8.3.1, §9.2.2.1
 
 import (
+	"bytes"
 	"context"
-	"flag"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
+
+	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
+	"github.com/ishidawataru/sctp"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/ngap/ngapType"
 )
-
-// regAudRepro opts in to the AUD-registration reproductions below; without it
-// they are skipped (command in the file header).
-var regAudRepro = flag.Bool("aud-registration-repro", false, "run the AUD-registration failing-by-design reproductions")
 
 func newRegAudServer(t *testing.T) *Server {
 	t.Helper()
@@ -82,16 +82,103 @@ func TestAUDRegistration01_UnknownTMSIInitialRegistrationNotCause10(t *testing.T
 	}
 }
 
-// TestAUDRegistration02_ICSCarriesMandatoryAllowedNSSAI: with an empty Allowed
-// NSSAI the builder leaves out the mandatory (criticality reject) Allowed NSSAI
-// IE and still emits the PDU (TS 38.413 §9.2.2.1); a strict gNB rejects it.
+// TestAUDRegistration02_ICSCarriesMandatoryAllowedNSSAI: Allowed NSSAI is
+// mandatory (criticality reject) in the INITIAL CONTEXT SETUP REQUEST
+// (TS 38.413 §9.2.2.1); the builder emits no bytes when it is empty and carries
+// the IE with criticality reject otherwise.
 func TestAUDRegistration02_ICSCarriesMandatoryAllowedNSSAI(t *testing.T) {
-	raw := BuildInitialContextSetupRequest(1, 2, []byte{0x7e, 0x02}, testSecKey,
-		0x8000, 0x8000, "001", "01", 0x80, 1, 0x01,
-		nil, // empty Allowed NSSAI (e.g. no requested slice subscribed, or all pending NSSAA)
-		0, 0, 0, nil, capability.PeerRAN{})
-	if len(raw) > 0 && !contains(icsIEIDs(t, raw), ngapType.ProtocolIEIDAllowedNSSAI) {
-		t.Fatal("INITIAL CONTEXT SETUP REQUEST emitted without the mandatory Allowed NSSAI IE (TS 38.413 §9.2.2.1)")
+	build := func(nssai []amfctx.SNSSAISubscribed) ([]byte, error) {
+		return buildInitialContextSetupRequest(1, 2, []byte{0x7e, 0x02}, testSecKey,
+			UESecCapBitmaps{Enc: 0x8000, Int: 0x8000}, "001", "01", 0x80, 1, 0x01,
+			nssai, 0, 0, 0, nil, capability.PeerRAN{}, nil)
+	}
+	raw, err := build(nil)
+	if err == nil || raw != nil {
+		t.Fatalf("empty Allowed NSSAI: got %d bytes, err=%v; want nil bytes and an error", len(raw), err)
+	}
+	raw, err = build([]amfctx.SNSSAISubscribed{{SST: 1}})
+	if err != nil {
+		t.Fatalf("non-empty Allowed NSSAI: %v", err)
+	}
+	pdu, derr := libngap.Decoder(raw)
+	if derr != nil {
+		t.Fatalf("decode: %v", derr)
+	}
+	if pdu.InitiatingMessage == nil || pdu.InitiatingMessage.Value.InitialContextSetupRequest == nil {
+		t.Fatal("decoded PDU is not an InitialContextSetupRequest")
+	}
+	found := false
+	for _, ie := range pdu.InitiatingMessage.Value.InitialContextSetupRequest.ProtocolIEs.List {
+		if ie.Id.Value == ngapType.ProtocolIEIDAllowedNSSAI {
+			found = true
+			if ie.Criticality.Value != ngapType.CriticalityPresentReject {
+				t.Fatalf("Allowed NSSAI criticality = %d, want reject", ie.Criticality.Value)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Allowed NSSAI IE missing from a non-empty-set ICS Request")
+	}
+}
+
+// TestSendICS_EmptyAllowedNSSAINothingSent: the send path never reaches the gNB
+// with an empty Allowed NSSAI and wraps errICSEncodeFailed.
+func TestSendICS_EmptyAllowedNSSAINothingSent(t *testing.T) {
+	s := newRegAudServer(t)
+	gnb := newReleaseGNB("10.0.0.9:38412")
+	writes := 0
+	gnb.SetTransportForTest("10.0.0.9:38412", func([]byte, *sctp.SndRcvInfo) (int, error) { writes++; return 0, nil })
+	s.AddGNBForTest("10.0.0.9:38412", gnb)
+	ue := s.mgr.AllocateUEContext(7)
+	ue.GNBAddr = "10.0.0.9:38412"
+	ue.AllowedNSSAI = nil
+	err := s.SendInitialContextSetupRequest(ue, []byte{0x7e}, testSecKey, 0, 0, 0x8000, 0x8000, nil)
+	if !errors.Is(err, errICSEncodeFailed) {
+		t.Fatalf("err = %v, want errICSEncodeFailed", err)
+	}
+	if writes != 0 {
+		t.Fatalf("%d NGAP writes with empty Allowed NSSAI, want 0", writes)
+	}
+}
+
+// TestSendICS_LogProcedurePerKind: the ICS send path logs the procedure that
+// owns the pending ICS kind (not always InitialRegistration).
+func TestSendICS_LogProcedurePerKind(t *testing.T) {
+	tests := []struct {
+		kind amfctx.ICSKind
+		want string
+	}{
+		{amfctx.ICSNone, "InitialContextSetup"},
+		{amfctx.ICSInitialRegistration, "InitialRegistration"},
+		{amfctx.ICSRegistrationUpdate, "MobilityRegistrationUpdate"},
+		{amfctx.ICSServiceRequest, "ServiceRequest"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			var buf bytes.Buffer
+			s := newRegAudServer(t)
+			s.logger = slog.New(slog.NewJSONHandler(&buf, nil)).With("nf", "AMF") // as cmd/amf/main.go
+			gnb := newReleaseGNB("10.0.0.9:38412")
+			gnb.SetTransportForTest("10.0.0.9:38412", func(p []byte, _ *sctp.SndRcvInfo) (int, error) { return len(p), nil })
+			s.AddGNBForTest("10.0.0.9:38412", gnb)
+			ue := s.mgr.AllocateUEContext(7)
+			ue.GNBAddr = "10.0.0.9:38412"
+			ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{{SST: 1}}
+			ue.SetPendingICS(tc.kind)
+			if err := s.SendInitialContextSetupRequest(ue, []byte{0x7e}, testSecKey, 0, 0, 0x8000, 0x8000, nil); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			var rec map[string]any
+			if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+				t.Fatalf("log json: %v (%q)", err, buf.String())
+			}
+			if rec["procedure"] != tc.want || rec["nf"] != "AMF" {
+				t.Fatalf("log procedure=%v nf=%v, want %s/AMF", rec["procedure"], rec["nf"], tc.want)
+			}
+			if ue.PendingICS() != tc.kind {
+				t.Fatal("send path must not clear the pending ICS kind")
+			}
+		})
 	}
 }
 
@@ -212,5 +299,53 @@ func TestAUDRegistration31_CipheredUnknownTMSINeverFresh(t *testing.T) {
 	}
 	if unknownTMSIStartsFreshRegistration([]byte{0x7e}) {
 		t.Error("truncated PDU treated as fresh registration")
+	}
+}
+
+// TestICSResponseLogProcedurePerKind (AMF-042): the ICS Response (no PDU
+// sessions) log carries the procedure that owns the pending ICS kind, and the
+// pending kind is consumed.
+// Ref: TS 38.413 §8.3.1.2; TS 23.502 §4.2.3.2 step 12
+func TestICSResponseLogProcedurePerKind(t *testing.T) {
+	tests := []struct {
+		kind amfctx.ICSKind
+		want string
+	}{
+		{amfctx.ICSNone, "InitialContextSetup"},
+		{amfctx.ICSInitialRegistration, "InitialRegistration"},
+		{amfctx.ICSRegistrationUpdate, "MobilityRegistrationUpdate"},
+		{amfctx.ICSServiceRequest, "ServiceRequest"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			var buf bytes.Buffer
+			s := newRegAudServer(t)
+			s.logger = slog.New(slog.NewJSONHandler(&buf, nil)).With("nf", "AMF")
+			ue := s.mgr.AllocateUEContext(7)
+			ue.SetPendingICS(tc.kind)
+
+			s.handleInitialContextSetupResponse(context.Background(), newReleaseGNB("10.0.0.1:38412"), &Message{
+				Type: 1, ProcedureCode: ProcInitialContextSetup,
+				Value: &InitialContextSetupResponseMsg{AMFUENGAPId: ue.AMFUENGAPId, RANUENGAPId: 7},
+			})
+			var rec map[string]any
+			dec := json.NewDecoder(&buf)
+			for dec.More() {
+				var r map[string]any
+				if err := dec.Decode(&r); err != nil {
+					t.Fatalf("log json: %v", err)
+				}
+				if r["message_type"] == "InitialContextSetupResponse" {
+					rec = r
+					break
+				}
+			}
+			if rec == nil || rec["procedure"] != tc.want {
+				t.Fatalf("log record=%v, want procedure %s for InitialContextSetupResponse", rec, tc.want)
+			}
+			if got := ue.PendingICS(); got != amfctx.ICSNone {
+				t.Fatalf("pending ICS after response = %v, want ICSNone", got)
+			}
+		})
 	}
 }

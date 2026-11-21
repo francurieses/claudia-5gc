@@ -26,6 +26,7 @@ type audUDM struct {
 	uecmStatus  int // forced answer for a valid PUT (0 = 201)
 	uecmCause   string
 	amDataCalls int
+	amAnswer    string // am-data body override ("" = goldenAMAnswer)
 	subscribed  []map[string]any
 	deleted     []string
 	uecmDeleted int
@@ -64,7 +65,11 @@ func (u *audUDM) handler() http.Handler {
 		u.amDataCalls++
 		u.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(goldenAMAnswer))
+		body := goldenAMAnswer
+		if u.amAnswer != "" {
+			body = u.amAnswer
+		}
+		_, _ = w.Write([]byte(body))
 	})
 	mux.HandleFunc("POST /nudm-sdm/v2/{supi}/sdm-subscriptions", func(w http.ResponseWriter, r *http.Request) {
 		var b map[string]any
@@ -213,6 +218,9 @@ func TestAUDRegistration17_StatusToCause(t *testing.T) {
 // and deregisters the AMF from the UDM, so nothing leaks (TS 23.502 §4.2.2.2.2).
 func TestAUDRegistration17_RejectAfterUECMRollsBackUDM(t *testing.T) {
 	u, h, ue := newAUD17Env(t, true, false)
+	// No default S-NSSAI in the subscription: the TS 23.501 §5.15.5.2.1 fallback
+	// has nothing to offer, so a not-subscribed request still ends in #62.
+	u.amAnswer = `{"nssai":{"defaultSingleNssais":[],"singleNssais":[{"sst":1,"sd":"000001"}]}}`
 	ue.RequestedNSSAI = []amfctx.SNSSAISubscribed{{SST: 99, SD: "ABCDEF"}} // not subscribed
 	ra, err := h.Phase3_ProcessSMCComplete(t.Context(), ue)
 	var nn *procedures.NoNetworkSlicesError

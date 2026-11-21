@@ -171,7 +171,7 @@ func sliceN(sst uint8, sd string) amfctx.SNSSAISubscribed {
 // failed NSSAA ends in a Configuration Update Command and not in a
 // de-registration (TS 24.501 §4.6.2.4 b)).
 func withPlainDefault(ue *amfctx.UEContext) {
-	ue.SubscribedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), {SST: 1, SD: "000009"}}
+	ue.DefaultNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), {SST: 1, SD: "000009"}}
 }
 
 func completeMsg(ue *amfctx.UEContext, sst uint8, sd uint32) *nas.Message {

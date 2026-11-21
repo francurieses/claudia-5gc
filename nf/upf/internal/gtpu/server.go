@@ -19,6 +19,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/l4csum"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/pfcp"
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/ra"
+	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -660,6 +661,30 @@ func (s *Server) handleTUNPacket(t *tunRoute, buf []byte, n int) bool {
 		s.dropDLNoSession.Inc()
 		return false
 	}
+	// FAR Apply Action BUFF (or a flush still draining): queue a copy behind the
+	// backlog instead of dropping; the first packet of a NOCP period triggers
+	// the DLDR. buf is reused by the TUN reader, so Offer copies. Lock-free
+	// when the session is not buffering. Ref: TS 29.244 §5.2.3.1.
+	if sess.DLBuf.Active() {
+		switch sess.DLBuf.Offer(pkt) {
+		case pfcp.OfferQueued:
+			return false
+		case pfcp.OfferQueuedReport:
+			if s.pfcpSrv != nil {
+				// Off the TUN reader hot path: one goroutine per buffering
+				// period (Offer yields OfferQueuedReport exactly once).
+				go s.pfcpSrv.NotifyDownlinkData(logging.WithCorrelationID(context.Background(), ""), sess)
+			}
+			return false
+		case pfcp.OfferFull:
+			if s.limiter.allow("dlbuf_full") {
+				s.logger.Warn("TUN: DL buffer full, packet dropped (repeats suppressed 10s)",
+					"dnn", t.dnn, "ueIP", dstIP.String(), "reason", pfcp.DLDropBufferFull,
+					"spec_ref", "TS 29.244 §5.2.3.1")
+			}
+			return false
+		}
+	}
 	if sess.DLTEID == 0 || sess.GNBIP == nil {
 		if s.limiter.allow(sess.DLTEID) {
 			s.logger.Warn("TUN: DL tunnel not ready (repeats suppressed 10s)", "dnn", t.dnn, "ueIP", dstIP.String())
@@ -685,6 +710,37 @@ func (s *Server) handleTUNPacket(t *tunRoute, buf []byte, n int) bool {
 	if s.debug {
 		s.logger.Debug("TUN → GTP-U", "dnn", t.dnn, "dst", dstIP,
 			"dlTEID", sess.DLTEID, "gnb", sess.GNBIP)
+	}
+	return true
+}
+
+// SendBuffered sends one packet that was held in a session's DL buffer through
+// the normal downlink path: QoS/AMBR admission, L4 checksum repair, GTP-U
+// encapsulation, URR volume and per-DNN counters. It implements pfcp.DLFlusher.
+// Ref: TS 29.244 §5.2.3.1.
+func (s *Server) SendBuffered(sess *pfcp.Session, ipPkt []byte) bool {
+	n := len(ipPkt)
+	if n == 0 || sess.DLTEID == 0 || sess.GNBIP == nil {
+		s.dropDLNotReady.Inc()
+		return false
+	}
+	if !s.AdmitDL(sess, n) {
+		return false
+	}
+	buf := make([]byte, dlHeadroom+n)
+	pkt := buf[dlHeadroom:]
+	copy(pkt, ipPkt)
+	s.repairDownlinkChecksum(pkt, nil, sess.DNN)
+	putDLHeader(buf[:dlHeadroom], sess.DLTEID, sess.DLQFI(), n)
+	if !s.sendFrame(sess, buf, n) {
+		return false
+	}
+	for i := range s.tuns {
+		if s.tuns[i].dnn == sess.DNN {
+			s.tuns[i].dlPkts.Inc()
+			s.tuns[i].dlBytes.Add(float64(n))
+			break
+		}
 	}
 	return true
 }

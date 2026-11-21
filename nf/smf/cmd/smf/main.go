@@ -20,6 +20,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/storewait"
 )
 
 func main() {
@@ -75,10 +76,24 @@ func main() {
 	}()
 
 	// ---- Persistent store (PostgreSQL) ------------------------------------
+	// Wait for it at startup and exit if it stays down (OPS-002); a SIGTERM
+	// during the wait ends the process cleanly.
+	storePolicy, err := storewait.PolicyFromEnv()
+	if err != nil {
+		logger.Error("SMF: invalid store config", "error", err)
+		os.Exit(1)
+	}
+	waitCtx, stopWait := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	var smfStore store.Store
 	if dsn := getEnvOrDefault("DATABASE_URL", ""); dsn != "" {
-		pg, err := store.NewPostgres(context.Background(), dsn)
+		opts := storewait.Options{Store: "postgres", Interface: "Postgres", Policy: storePolicy, Logger: logger}
+		pg, err := storewait.Open(waitCtx, opts, func(ctx context.Context) (*store.Postgres, error) {
+			return store.NewPostgres(ctx, dsn)
+		})
 		if err != nil {
+			if fallback, code := storewait.Decide(waitCtx, opts, err); !fallback {
+				os.Exit(code)
+			}
 			logger.Warn("SMF PostgreSQL unavailable — running in-memory only",
 				"error", err)
 		} else {
@@ -87,6 +102,7 @@ func main() {
 			logger.Info("SMF PostgreSQL store connected")
 		}
 	}
+	stopWait()
 
 	sbiSrv, err := server.New(cfg, logger, smfStore, server.WithProfile(relProfile))
 	if err != nil {

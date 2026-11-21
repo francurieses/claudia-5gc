@@ -16,10 +16,13 @@ type RedisCache struct {
 	client *redis.Client
 }
 
-// NewRedisCache connects to Redis at the given address (host:port).
-func NewRedisCache(addr string) (*RedisCache, error) {
+// NewRedisCache connects to Redis at the given address (host:port). The ping
+// honours ctx; on failure the client is closed, so a caller may retry
+// (shared/storewait) without leaking clients.
+func NewRedisCache(ctx context.Context, addr string) (*RedisCache, error) {
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("amf cache: redis ping %s: %w", addr, err)
 	}
 	return &RedisCache{client: rdb}, nil

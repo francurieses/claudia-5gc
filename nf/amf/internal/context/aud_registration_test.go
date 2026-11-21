@@ -1,23 +1,17 @@
 package context
 
-// aud_registration_test.go — failing-by-design reproductions for the
-// registration spec audit (dev/campaigns/results/audit-registration.md).
-// Fixed findings (15, 21) run as normal regression tests; a still-open finding
-// is skipped unless the opt-in flag is given:
+// aud_registration_test.go — regression tests for the registration spec audit
+// (dev/campaigns/results/audit-registration.md). All findings are fixed
+// (registration audit W1-W4 tasks), so every reproduction runs as a normal regression test:
 //
-//	GOWORK=off go test ./nf/amf/internal/context/ -run TestAUDRegistration -v -args -aud-registration-repro
+//	GOWORK=off go test ./nf/amf/internal/context/ -run TestAUDRegistration -v
 //
 // Ref: TS 24.501 §5.5.1.2.4, §5.5.1.3.8 a)
 
 import (
 	"context"
-	"flag"
 	"testing"
 )
-
-// regAudRepro opts in to the AUD-registration reproductions below; without it
-// they are skipped (command in the file header).
-var regAudRepro = flag.Bool("aud-registration-repro", false, "run the AUD-registration failing-by-design reproductions")
 
 // TestAUDRegistration15_ReallocatedGUTIReleasesOldTMSI: AssignGUTI adds a
 // 5G-TMSI index entry on every (re)allocation and never drops the previous one,
@@ -50,4 +44,61 @@ func TestAUDRegistration21_CorrelationIDNoPanic(t *testing.T) {
 	}()
 	u := &UEContext{SUCI: "unknown"}
 	_ = u.CorrelationID()
+}
+
+// TestAUDRegistration24_TransitionAndCMStateRaceSnapshot: TransitionTo /
+// SetCMState take the UE lock, so concurrent writers and Snapshot readers do
+// not race (run under -race). TransitionToLocked is for callers holding u.mu.
+func TestAUDRegistration24_TransitionAndCMStateRaceSnapshot(t *testing.T) {
+	m := NewManager(AMFIdentity{MCC: "001", MNC: "01"}, nil, nil, nil)
+	ue := m.AllocateUEContext(1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 2000; i++ {
+			ue.TransitionTo(GMMRegistered)
+			ue.SetCMState(CMConnected)
+			ue.Lock()
+			ue.TransitionToLocked(GMMDeregistered)
+			ue.Unlock()
+			ue.SetCMState(CMIdle)
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			_ = ue.Snapshot()
+		}
+	}
+}
+
+// TestAUDRegistration22_NGRANRCUDeletesStoredRadioCapability: the NG-RAN-RCU bit
+// (octet 3 bit 2) of the 5GS update type IE deletes the stored UE radio
+// capability; other bits (SMS requested) or an absent IE keep it.
+// Ref: TS 24.501 §5.5.1.3.4, §9.11.3.9A.
+func TestAUDRegistration22_NGRANRCUDeletesStoredRadioCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ie   []byte
+		kept bool
+	}{
+		{"absent", nil, true},
+		{"sms requested only", []byte{0x01}, true},
+		{"ng-ran-rcu", []byte{0x02}, false},
+		{"ng-ran-rcu + sms", []byte{0x03}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(AMFIdentity{MCC: "001", MNC: "01"}, nil, nil, nil)
+			ue := m.AllocateUEContext(1)
+			ue.UERadioCapability = []byte{1, 2, 3}
+			if got := ue.ApplyNGRANRCU(tc.ie); got == tc.kept {
+				t.Fatalf("ApplyNGRANRCU = %v", got)
+			}
+			if kept := len(ue.UERadioCapability) > 0; kept != tc.kept {
+				t.Fatalf("capability kept=%v, want %v", kept, tc.kept)
+			}
+		})
+	}
 }

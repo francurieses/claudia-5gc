@@ -19,6 +19,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/upf/internal/ra"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
+	"github.com/francurieses/claudia-5gc/shared/pfcpx"
 )
 
 // smfPFCPPort is the well-known UDP port on which every SMF is expected to
@@ -92,6 +93,16 @@ type Session struct {
 	// §5.8.2.2.2). Guarded by SessionTable.mu (same lock used elsewhere for
 	// mutable Session fields). Nil when no advertiser is running.
 	raCancel context.CancelFunc
+
+	// DL buffering state (SMF-011, TS 29.244 §5.2.3.1). DLPDRID is the PDR
+	// that matches downlink packets (Source Interface Core; legacyDLPDRID for
+	// SMFs that install a single PDR 1), DLFARID the FAR it references and
+	// BARID the BAR linked to that FAR (0 = none). Written at establishment
+	// only. DLBuf is the bounded FIFO, independently locked.
+	DLPDRID uint16
+	DLFARID uint32
+	BARID   uint8
+	DLBuf   DLBuffer
 }
 
 // URRState mirrors the Usage Reporting Rule installed by the SMF for active
@@ -277,6 +288,13 @@ type Config struct {
 	// QoS configures MBR / Session-AMBR enforcement (AmbrEnforcement, UPF-005).
 	// The zero value enforces with qos.DefaultBurstMs and the real clock.
 	QoS QoSConfig
+
+	// DLBufferDefaultPackets is the per-session DL buffer limit when the BAR has
+	// no Suggested Buffering Packets Count (0 = defaultDLBufferPackets);
+	// DLBufferMaxPackets caps any limit (0 = maxDLBufferPackets).
+	// Config keys n4.dl_buffer.default_max_packets / max_packets_cap.
+	DLBufferDefaultPackets int
+	DLBufferMaxPackets     int
 }
 
 // RASender delivers a downlink IP packet (a Router Advertisement) to the UE
@@ -309,6 +327,17 @@ type Server struct {
 	// cpFeatures holds the CP Function Features announced by each CP peer in
 	// its last Association Setup Request (guarded by cpMu).
 	cpFeatures map[string]cpPeerFeatures
+
+	// DL buffering (SMF-011): flusher, effective limits and the outstanding
+	// DLDRs keyed by Session Report Request sequence number.
+	dlFlusher    DLFlusher
+	dlBufDefault int
+	dlBufCap     int
+	dldrMu       sync.Mutex
+	dldrPending  map[uint32]*dldrEntry
+	// dldrT1 / dldrN1 are the DLDR retransmission timer and limit (tests override).
+	dldrT1 time.Duration
+	dldrN1 int
 }
 
 // New creates a PFCP server.
@@ -325,17 +354,34 @@ func New(cfg Config, logger *slog.Logger, sessions *SessionTable) (*Server, erro
 	if raInterval <= 0 {
 		raInterval = ra.MaxRtrAdvInterval
 	}
+	dlCap := cfg.DLBufferMaxPackets
+	if dlCap <= 0 {
+		dlCap = maxDLBufferPackets
+	}
+	dlDef := cfg.DLBufferDefaultPackets
+	if dlDef <= 0 {
+		dlDef = defaultDLBufferPackets
+	}
+	if dlDef > dlCap {
+		dlDef = dlCap
+	}
+	UPFDLBufferLimitPackets.Set(float64(dlDef))
 	return &Server{
-		cfg:        cfg,
-		logger:     logger.With("component", "pfcp"),
-		conn:       conn,
-		sessions:   sessions,
-		raInterval: raInterval,
-		recoveryTS: time.Now().UTC().Truncate(time.Second),
-		qosCfg:     cfg.QoS.normalized(),
-		cpPeerRTS:  make(map[string]time.Time),
-		cpAddrPeer: make(map[string]string),
-		cpFeatures: make(map[string]cpPeerFeatures),
+		dlBufDefault: dlDef,
+		dlBufCap:     dlCap,
+		dldrPending:  make(map[uint32]*dldrEntry),
+		dldrT1:       dldrT1,
+		dldrN1:       dldrN1,
+		cfg:          cfg,
+		logger:       logger.With("component", "pfcp"),
+		conn:         conn,
+		sessions:     sessions,
+		raInterval:   raInterval,
+		recoveryTS:   time.Now().UTC().Truncate(time.Second),
+		qosCfg:       cfg.QoS.normalized(),
+		cpPeerRTS:    make(map[string]time.Time),
+		cpAddrPeer:   make(map[string]string),
+		cpFeatures:   make(map[string]cpPeerFeatures),
 	}, nil
 }
 
@@ -343,6 +389,9 @@ func New(cfg Config, logger *slog.Logger, sessions *SessionTable) (*Server, erro
 // Advertisements built by this PFCP server's per-session advertisers.
 func (s *Server) SetRASender(sender RASender) {
 	s.raSender = sender
+	if f, ok := sender.(DLFlusher); ok && s.dlFlusher == nil {
+		s.dlFlusher = f
+	}
 }
 
 // Start runs the PFCP receive loop and the usage-reporter sweep goroutine.
@@ -366,7 +415,7 @@ func (s *Server) Start(ctx context.Context) error {
 			continue
 		}
 
-		msg, err := pfcpmsg.Parse(buf[:n])
+		msg, err := pfcpx.ParseMessage(buf[:n])
 		if err != nil {
 			s.logger.Warn("PFCP parse error", "error", err, "bytes", n)
 			continue
@@ -447,6 +496,7 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 	var ueIP, ueIPv6 net.IP
 	var dnn string
 	var pdrStates []*PDRState
+	pdrFAR := make(map[uint16]uint32) // PDR ID -> FAR ID (TS 29.244 §8.2.74)
 	for _, pdr := range req.CreatePDR {
 		pdrIEs, err := pdr.CreatePDR()
 		if err != nil {
@@ -461,6 +511,11 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 		}
 		pdrStates = append(pdrStates, ps)
 		for _, child := range pdrIEs {
+			if child.Type == pfcpie.FARID {
+				if v, err := child.FARID(); err == nil {
+					pdrFAR[ps.PDRID] = v
+				}
+			}
 			if child.Type != pfcpie.PDI {
 				continue
 			}
@@ -583,12 +638,15 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 		}
 	}
 
+	s.setupDLBuffering(sess, req, pdrStates, pdrFAR)
+
 	s.sessions.store(sess)
 	metrics.UPFPFCPSessionsActive.Inc()
 
 	s.logger.Info("PFCP Session established",
 		"cpSEID", cpSEID, "ulTEID", ulTEID, "ueIP", ueIP, "ueIPv6", ueIPv6, "dnn", dnn,
 		"qer_count", len(sess.QERs), "dl_qfi", sess.DLQFI(),
+		"dl_pdr_id", sess.DLPDRID, "dl_far_id", sess.DLFARID, "bar_id", sess.BARID,
 		"urr_installed", sess.URRState.Installed, "urr_id", sess.URRState.URRID,
 		"volume_threshold", sess.URRState.VolumeThreshold,
 		"measurement_period", sess.URRState.MeasurementPeriod,
@@ -704,7 +762,9 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 	//   the datapath drops DL traffic ("dl_tunnel_not_ready"). Used by the SMF
 	//   for UP deactivation, e.g. N2 handover. Ref: TS 29.244 §7.5.4.3, §8.2.26.
 	// - Apply Action absent: only the Outer Header Creation is honoured.
+	flush := false
 	for _, ufar := range req.UpdateFAR {
+		tunnelSet := false
 		ufarIEs, err := ufar.UpdateFAR()
 		if err != nil {
 			continue
@@ -713,10 +773,16 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 			haveAA bool
 			aa     uint8
 		)
+		isDLFAR := true // an Update FAR without a parsable FAR ID is treated as the DL FAR
 		for _, child := range ufarIEs {
-			if child.Type == pfcpie.ApplyAction {
+			switch child.Type {
+			case pfcpie.ApplyAction:
 				if v, err := child.ApplyAction(); err == nil {
 					haveAA, aa = true, v
+				}
+			case pfcpie.FARID:
+				if v, err := child.FARID(); err == nil && sess.DLFARID != 0 {
+					isDLFAR = v == sess.DLFARID
 				}
 			}
 		}
@@ -725,6 +791,9 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 			sess.DLTEID = 0
 			sess.GNBIP = nil
 			s.sessions.mu.Unlock()
+			if isDLFAR {
+				s.applyDLBufferAction(ctx, sess, aa)
+			}
 			logging.NewProcedureLogger(ctx, s.logger, procPduSessionModification).Info("PFCP Session DL tunnel cleared",
 				"nf", "UPF", "interface", "N4", "direction", "IN",
 				"seid", upSEID, "apply_action", aa,
@@ -743,8 +812,17 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 				s.sessions.mu.Unlock()
 				s.logger.Info("PFCP Session DL tunnel updated",
 					"upSEID", upSEID, "dlTEID", ohc.TEID, "gnbIP", ohc.IPv4Address)
+				tunnelSet = true
 			}
 		}
+		// FORW (or OHC without Apply Action) on the DL FAR: the tunnel is up,
+		// flush the buffered packets in FIFO order. TS 29.244 §5.2.3.1.
+		if isDLFAR && tunnelSet && (!haveAA || aa&applyActionFORW != 0) {
+			flush = true
+		}
+	}
+	if flush {
+		s.flushDLBuffer(ctx, sess)
 	}
 
 	resp := pfcpmsg.NewSessionModificationResponse(
@@ -780,6 +858,7 @@ func (s *Server) handleSessionDeletion(ctx context.Context, raddr *net.UDPAddr, 
 	// Drop the QoS snapshot first so a datapath goroutine still holding the
 	// session pointer enforces and forwards nothing stale.
 	sess.qos.Store(nil)
+	s.discardDLBuffer(ctx, sess, DLDropSessionDeleted)
 	s.sessions.delete(upSEID)
 	metrics.UPFPFCPSessionsActive.Dec()
 	s.logger.Info("PFCP Session deleted", "upSEID", upSEID)
@@ -799,7 +878,14 @@ func (s *Server) handleSessionReportResponse(ctx context.Context, raddr *net.UDP
 	if resp.Cause != nil {
 		if c, err := resp.Cause.Cause(); err == nil {
 			cause = c
+		} else {
+			logging.NewProcedureLogger(ctx, s.logger, "SessionReport").Warn("PFCP Session Report Response: Cause parse error",
+				"nf", "UPF", "interface", "N4", "direction", "IN", "spec_ref", "TS 29.244 §7.5.9, §8.2.1",
+				"error", fmt.Errorf("upf: parse cause: %w", err), "seid", resp.SEID(), "result", "FAILURE")
 		}
+	}
+	if s.handleDLDRResponse(ctx, resp.Sequence(), cause) {
+		return
 	}
 	logger := logging.NewProcedureLogger(ctx, s.logger, "UsageReporting")
 	logger.Info("PFCP Session Report Response received",
@@ -1021,5 +1107,6 @@ func (s *Server) sendResponse(raddr *net.UDPAddr, msg pfcpmsg.Message) {
 
 // Close closes the PFCP server.
 func (s *Server) Close() error {
+	s.stopDLDRTimers()
 	return s.conn.Close()
 }

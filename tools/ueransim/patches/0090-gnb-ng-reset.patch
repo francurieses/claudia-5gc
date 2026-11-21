@@ -1,0 +1,303 @@
+diff --git a/src/lib/app/cli_cmd.cpp b/src/lib/app/cli_cmd.cpp
+--- a/src/lib/app/cli_cmd.cpp
++++ b/src/lib/app/cli_cmd.cpp
+@@ -167,6 +167,9 @@
+     {"ue-list", {"List all UEs associated with the gNB", "", DefaultDesc, false}},
+     {"ue-count", {"Print the total number of UEs connected the this gNB", "", DefaultDesc, false}},
+     {"ue-release", {"Request a UE context release for the given UE", "<ue-id>", DefaultDesc, false}},
++    // 5GC Rel-19 mod (0090)
++    {"ng-reset",
++     {"Send a gNB-initiated NG RESET (TS 38.413 §8.7.4)", "<all | ue <ran-ue-ngap-id>[,<id>...]>", DefaultDesc, true}},
+ };
+ 
+ static OrderedMap<std::string, CmdEntry> g_ueCmdEntries = {
+@@ -241,6 +244,42 @@
+             CMD_ERR("Invalid UE ID")
+         return cmd;
+     }
++    else if (subCmd == "ng-reset")
++    {
++        // 5GC Rel-19 mod (0090): "ng-reset all" | "ng-reset ue <id>[,<id>...]"
++        auto cmd = std::make_unique<GnbCliCommand>(GnbCliCommand::NG_RESET);
++        if (options.positionalCount() == 0)
++            CMD_ERR("Reset type is expected: all | ue <ran-ue-ngap-id>[,<id>...]")
++        std::string type = options.getPositional(0);
++        if (type == "all")
++        {
++            if (options.positionalCount() > 1)
++                CMD_ERR("No arguments are expected after 'all'")
++            cmd->ngResetAll = true;
++            return cmd;
++        }
++        if (type != "ue")
++            CMD_ERR("Unknown reset type, expected 'all' or 'ue'")
++        if (options.positionalCount() < 2)
++            CMD_ERR("At least one RAN UE NGAP ID is expected")
++        for (int i = 1; i < options.positionalCount(); i++)
++        {
++            std::stringstream ss(options.getPositional(i));
++            std::string item;
++            while (std::getline(ss, item, ','))
++            {
++                if (item.empty())
++                    continue;
++                int id = 0;
++                if (!utils::TryParseInt(item, id) || id < 0)
++                    CMD_ERR("Invalid RAN UE NGAP ID: " + item)
++                cmd->ngResetRanIds.push_back(id);
++            }
++        }
++        if (cmd->ngResetRanIds.empty())
++            CMD_ERR("At least one RAN UE NGAP ID is expected")
++        return cmd;
++    }
+ 
+     return nullptr;
+ }
+diff --git a/src/lib/app/cli_cmd.hpp b/src/lib/app/cli_cmd.hpp
+--- a/src/lib/app/cli_cmd.hpp
++++ b/src/lib/app/cli_cmd.hpp
+@@ -30,6 +30,8 @@
+         UE_LIST,
+         UE_COUNT,
+         UE_RELEASE_REQ,
++        // 5GC Rel-19 mod (0090)
++        NG_RESET,
+     } present;
+ 
+     // AMF_INFO
+@@ -38,6 +40,10 @@
+     // UE_RELEASE_REQ
+     int ueId{};
+ 
++    // NG_RESET (0090): true = ResetAll, else the listed RAN UE NGAP IDs
++    bool ngResetAll{};
++    std::vector<int64_t> ngResetRanIds{};
++
+     explicit GnbCliCommand(PR present) : present(present)
+     {
+     }
+diff --git a/src/gnb/app/cmd_handler.cpp b/src/gnb/app/cmd_handler.cpp
+--- a/src/gnb/app/cmd_handler.cpp
++++ b/src/gnb/app/cmd_handler.cpp
+@@ -154,7 +154,16 @@
+         }
+         break;
+     }
++    case app::GnbCliCommand::NG_RESET: {
++        // 5GC Rel-19 mod (0090): gNB-initiated NG RESET (TS 38.413 §8.7.4)
++        std::string result;
++        if (m_base->ngapTask->sendNgReset(msg.cmd->ngResetAll, msg.cmd->ngResetRanIds, result))
++            sendResult(msg.address, result);
++        else
++            sendError(msg.address, result);
++        break;
+     }
++    }
+ }
+ 
+ } // namespace nr::gnb
+\ No newline at end of file
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -33,6 +33,7 @@
+     struct ASN_NGAP_AMFConfigurationUpdate;
+     struct ASN_NGAP_OverloadStart;
+     struct ASN_NGAP_OverloadStop;
++    struct ASN_NGAP_NGResetAcknowledge;
+     struct ASN_NGAP_PDUSessionResourceReleaseCommand;
+     struct ASN_NGAP_Paging;
+     struct ASN_NGAP_WriteReplaceWarningRequest;
+@@ -95,6 +96,9 @@
+     void receiveAmfConfigurationUpdate(int amfId, ASN_NGAP_AMFConfigurationUpdate *msg);
+     void receiveOverloadStart(int amfId, ASN_NGAP_OverloadStart *msg);
+     void receiveOverloadStop(int amfId, ASN_NGAP_OverloadStop *msg);
++    // 5GC Rel-19 mod (0090): gNB-initiated NG RESET, TS 38.413 §8.7.4
++    bool sendNgReset(bool resetAll, const std::vector<int64_t> &ranUeNgapIds, std::string &result);
++    void receiveNgResetAcknowledge(int amfId, ASN_NGAP_NGResetAcknowledge *msg);
+ 
+     /* Message transport */
+     void sendNgapNonUe(int amfId, ASN_NGAP_NGAP_PDU *pdu);
+diff --git a/src/gnb/ngap/transport.cpp b/src/gnb/ngap/transport.cpp
+--- a/src/gnb/ngap/transport.cpp
++++ b/src/gnb/ngap/transport.cpp
+@@ -333,6 +333,10 @@
+         {
+         case ASN_NGAP_SuccessfulOutcome__value_PR_NGSetupResponse:
+             receiveNgSetupResponse(amf->ctxId, &value.choice.NGSetupResponse);
++            break;
++        case ASN_NGAP_SuccessfulOutcome__value_PR_NGResetAcknowledge:
++            // 5GC Rel-19 mod (0090): answer to our NG RESET, TS 38.413 §8.7.4.
++            receiveNgResetAcknowledge(amf->ctxId, &value.choice.NGResetAcknowledge);
+             break;
+         default:
+             m_logger->err("Unhandled NGAP successful-outcome received (%d)", value.present);
+diff --git a/src/gnb/ngap/interface.cpp b/src/gnb/ngap/interface.cpp
+--- a/src/gnb/ngap/interface.cpp
++++ b/src/gnb/ngap/interface.cpp
+@@ -10,6 +10,10 @@
+ #include "utils.hpp"
+ 
+ #include <algorithm>
++#include <map>
++#include <string>
++#include <vector>
+ 
+ #include <gnb/app/task.hpp>
++#include <gnb/gtp/task.hpp>
+ #include <gnb/rrc/task.hpp>
+@@ -23,6 +26,9 @@
+ #include <asn/ngap/ASN_NGAP_GlobalGNB-ID.h>
+ #include <asn/ngap/ASN_NGAP_InitiatingMessage.h>
+ #include <asn/ngap/ASN_NGAP_NGAP-PDU.h>
++#include <asn/ngap/ASN_NGAP_NGReset.h>
++#include <asn/ngap/ASN_NGAP_NGResetAcknowledge.h>
++#include <asn/ngap/ASN_NGAP_UE-associatedLogicalNG-connectionItem.h>
+ #include <asn/ngap/ASN_NGAP_NGSetupRequest.h>
+ #include <asn/ngap/ASN_NGAP_OverloadStartNSSAIItem.h>
+ #include <asn/ngap/ASN_NGAP_PLMNSupportItem.h>
+@@ -251,8 +257,127 @@
+         sendNgapUeAssociated(ueId, pdu);
+     else
+         sendNgapNonUe(amfId, pdu);
++}
++
++// 5GC Rel-19 mod (0090): gNB-initiated NG RESET, TS 38.413 §8.7.4 / §9.2.6.1.
++// IE order: Cause (id 15, ignore), ResetType (id 88, reject).
++// Returns false (and an error text in result) if nothing could be sent.
++bool NgapTask::sendNgReset(bool resetAll, const std::vector<int64_t> &ranUeNgapIds, std::string &result)
++{
++    // amfId -> UE items; for ResetAll one empty entry per connected AMF
++    std::map<int, std::vector<std::pair<int64_t, int64_t>>> perAmf{};
++    // gNB UE context ids (ctxId) whose logical NG-connection is reset, per AMF (released after sending)
++    std::map<int, std::vector<int>> releaseIds{};
++
++    if (resetAll)
++    {
++        for (auto &amf : m_amfCtx)
++            perAmf[amf.first];
++        for (auto &uePair : m_ueCtx)
++            if (uePair.second != nullptr)
++                releaseIds[uePair.second->associatedAmfId].push_back(uePair.second->ctxId);
++    }
++    else
++    {
++        for (int64_t ranId : ranUeNgapIds)
++        {
++            auto *ue = findUeByRanId(ranId);
++            if (ue == nullptr)
++            {
++                result = "UE not found with RAN UE NGAP ID " + std::to_string(ranId);
++                return false;
++            }
++            perAmf[ue->associatedAmfId].emplace_back(ue->amfUeNgapId, ue->ranUeNgapId);
++            releaseIds[ue->associatedAmfId].push_back(ue->ctxId);
++        }
++    }
++
++    if (perAmf.empty())
++    {
++        result = "No AMF to send NG RESET to";
++        return false;
++    }
++
++    int sent = 0;
++    for (auto &entry : perAmf)
++    {
++        auto ieCause = asn::New<ASN_NGAP_NGResetIEs>();
++        ieCause->id = ASN_NGAP_ProtocolIE_ID_id_Cause;
++        ieCause->criticality = ASN_NGAP_Criticality_ignore;
++        ieCause->value.present = ASN_NGAP_NGResetIEs__value_PR_Cause;
++        ngap_utils::ToCauseAsn_Ref(NgapCause::RadioNetwork_unspecified, ieCause->value.choice.Cause);
++
++        auto ieType = asn::New<ASN_NGAP_NGResetIEs>();
++        ieType->id = ASN_NGAP_ProtocolIE_ID_id_ResetType;
++        ieType->criticality = ASN_NGAP_Criticality_reject;
++        ieType->value.present = ASN_NGAP_NGResetIEs__value_PR_ResetType;
++        if (resetAll)
++        {
++            ieType->value.choice.ResetType.present = ASN_NGAP_ResetType_PR_nG_Interface;
++            ieType->value.choice.ResetType.choice.nG_Interface = ASN_NGAP_ResetAll_reset_all;
++        }
++        else
++        {
++            ieType->value.choice.ResetType.present = ASN_NGAP_ResetType_PR_partOfNG_Interface;
++            auto *listPtr = asn::New<ASN_NGAP_UE_associatedLogicalNG_connectionList>();
++            ieType->value.choice.ResetType.choice.partOfNG_Interface = listPtr;
++            auto &list = *listPtr;
++            for (auto &ids : entry.second)
++            {
++                auto *item = asn::New<ASN_NGAP_UE_associatedLogicalNG_connectionItem>();
++                if (ids.first > 0)
++                {
++                    item->aMF_UE_NGAP_ID = asn::New<ASN_NGAP_AMF_UE_NGAP_ID_t>();
++                    asn::SetSigned64(ids.first, *item->aMF_UE_NGAP_ID);
++                }
++                item->rAN_UE_NGAP_ID = asn::New<ASN_NGAP_RAN_UE_NGAP_ID_t>();
++                *item->rAN_UE_NGAP_ID = ids.second;
++                asn::SequenceAdd(list, item);
++            }
++        }
++
++        m_logger->info("Sending NG RESET to AMF[%d] (%s, %d UE(s))", entry.first,
++                       resetAll ? "reset-all" : "part-of-NG-interface", (int)entry.second.size());
++
++        auto *pdu = asn::ngap::NewMessagePdu<ASN_NGAP_NGReset>({ieCause, ieType});
++        sendNgapNonUe(entry.first, pdu);
++        sent++;
++
++        // TS 38.413 §8.7.4.2.2: the NG-RAN node releases the resources of the reset UE-associated
++        // logical NG-connections. Same local release as UE CONTEXT RELEASE COMMAND (RRC release towards
++        // the UE + GTP context + NGAP context), but without a UE CONTEXT RELEASE COMPLETE: the NG RESET
++        // itself replaces it. The UE goes RRC-IDLE and re-attaches via Service Request.
++        for (int ueCtxId : releaseIds[entry.first])
++        {
++            auto w1 = std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::AN_RELEASE);
++            w1->ueId = ueCtxId;
++            m_base->rrcTask->push(std::move(w1));
++
++            auto w2 = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_RELEASE);
++            w2->ueId = ueCtxId;
++            m_base->gtpTask->push(std::move(w2));
++
++            deleteUeContext(ueCtxId);
++        }
++    }
++
++    result = "NG RESET sent to " + std::to_string(sent) + " AMF(s)";
++    return true;
+ }
+ 
++// 5GC Rel-19 mod (0090): log the NG RESET ACKNOWLEDGE (TS 38.413 §8.7.4.2). The local UE contexts were
++// already released when the NG RESET was sent (see sendNgReset); nothing blocks on the answer.
++void NgapTask::receiveNgResetAcknowledge(int amfId, ASN_NGAP_NGResetAcknowledge *msg)
++{
++    int items = 0;
++    auto *ie = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_UE_associatedLogicalNG_connectionList);
++    if (ie)
++        items = ie->UE_associatedLogicalNG_connectionList.list.count;
++
++    m_logger->info("NG RESET ACKNOWLEDGE received from AMF[%d], UE-associated logical NG-connection list size: %d",
++                   amfId, items);
++}
++
+ void NgapTask::receiveAmfConfigurationUpdate(int amfId, ASN_NGAP_AMFConfigurationUpdate *msg)
+ {
+     m_logger->debug("AMF configuration update received");
+diff --git a/src/asn/asn1c/constr_SET_OF.c b/src/asn/asn1c/constr_SET_OF.c
+--- a/src/asn/asn1c/constr_SET_OF.c
++++ b/src/asn/asn1c/constr_SET_OF.c
+@@ -1148,7 +1148,11 @@
+ 	do {
+ 		int i;
+ 		if(nelems < 0) {
+-			nelems = aper_get_length(pd, ct ? ct->upper_bound - ct->lower_bound + 1 : -1,
++			/* 5GC mod (0090): a SIZE whose effective_bits is -1 (e.g. SIZE(1..65536), ub not less than
++			 * 64K) takes the unconstrained length determinant, X.691 §11.9.4.1/§11.9.3.5. The encoder
++			 * (SEQUENCE_OF_encode_aper) already passes range -1 there; the decoder must do the same. */
++			nelems = aper_get_length(pd, (ct && ct->effective_bits >= 0) ?
++			                         ct->upper_bound - ct->lower_bound + 1 : -1,
+ 			                         ct ? ct->effective_bits : -1, &repeat);
+ 			ASN_DEBUG("Got to decode %d elements (eff %d)",
+ 			          (int)nelems, (int)(ct ? ct->effective_bits : -1));

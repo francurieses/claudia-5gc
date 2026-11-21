@@ -14,6 +14,8 @@ features:
     # it. Disabling URSP delivery removes the post-Registration-Complete DL NAS
     # Transport push entirely so PDU session establishment can be tested without it.
     # Re-enable once nf/pcf/internal/policy/ursp.go is fixed and re-verified.
+    # This value is the default: docker-compose no longer forces it, the env var
+    # URSP_ENABLED=true|false (or `make ueransim-ursp` / `ueransim-no-ursp`) overrides it.
     ursp_enabled: false
 metrics:
     address: 0.0.0.0:9101
@@ -58,6 +60,13 @@ snssais:
 # (debug only - integrity failures are logged and processed). Env: AMF_NAS_INTEGRITY_ENFORCEMENT.
 nas_security:
   integrity_enforcement: strict
+  # Operator-ordered NAS ciphering priority (TS 33.501 §6.7.1.1): the first entry the
+  # UE supports is selected. NEA0..NEA3, no duplicates. Env: AMF_NAS_CIPHERING_ORDER.
+  ciphering_order: "NEA2, NEA1, NEA3, NEA0"
+  # SEC-007: NAS integrity algorithm priority (TS 33.501 §6.7.1.1); the first one
+  # the UE supports is selected. NIA1..NIA3, no duplicates, NIA0 not allowed.
+  # Env: AMF_NAS_INTEGRITY_ORDER.
+  integrity_order: "NIA2, NIA1, NIA3"
 timers:
     implicit_detach_secs: 60
     mobile_reachable_guard_secs: 120
@@ -69,6 +78,13 @@ timers:
     t3570_secs: 6
 operator:
     default_rfsp: 1
+    # Operator name pushed to every UE in a Configuration Update Command after
+    # Registration Complete (TS 24.501 §8.2.19, IEIs 0x43 "Full name" / 0x45 "Short name").
+    # Single place to change the default name; env NETWORK_NAME / NETWORK_SHORT_NAME
+    # override it per run. Empty = send no name (and no Configuration Update Command).
+    # Some UEs/emulators (free-ran-ue) expect that command after Registration Complete.
+    network_full_name: "ClaudIA"
+    network_short_name: "ClaudIA"
     # 5GS network feature support IE (0x21) optional bits (REL19-5.5). All off by default
     # (Registration Accept stays byte-identical). A bit is advertised only if set here AND
     # the UE set the matching 5GMM capability bit. un_per/lcs_upp/supl/rslp/mlcsup/ef5l

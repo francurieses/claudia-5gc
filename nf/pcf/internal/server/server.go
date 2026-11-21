@@ -462,38 +462,9 @@ func (s *Server) handleCreateSmPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p := s.cfg.DefaultSMPolicy
-	response := map[string]interface{}{
-		// SmPolicyDecision (TS 29.512 §5.6.2.4) has no identifier attribute: the
-		// smPolicyId is conveyed only by the Location header (TS 29.501 §4.4.1).
-		// x5gcQosSource is a non-3GPP additive field reporting which input the
-		// PCF used for the QoS decision (consumed by SMF/MCP/portal).
-		"x5gcQosSource": qosSource,
-		"sessRules": map[string]interface{}{
-			"sr-1": map[string]interface{}{
-				"sessAmbr": map[string]string{
-					"uplink":   ambrUL,
-					"downlink": ambrDL,
-				},
-			},
-		},
-		"pccRules": map[string]interface{}{
-			"pr-1": map[string]interface{}{
-				"pccRuleId":  "pr-1",
-				"flowInfos":  []map[string]string{{"flowDesc": p.FlowDescription}},
-				"precedence": p.FlowPrecedence,
-			},
-		},
-		"qosDecs": map[string]interface{}{
-			"qd-1": map[string]interface{}{
-				"5qi": fiveQI,
-				"arp": map[string]interface{}{
-					"priorityLevel": arpPriority,
-					"preemptCap":    p.ARPPreemptCap,
-					"preemptVuln":   p.ARPPreemptVuln,
-				},
-			},
-		},
-	}
+	// SmPolicyDecision (TS 29.512 §5.6.2.4) has no identifier attribute: the
+	// smPolicyId is conveyed only by the Location header (TS 29.501 §4.4.1).
+	response := buildSmPolicyDecision(p, fiveQI, arpPriority, ambrUL, ambrDL, qosSource, true)
 
 	if suppAnswer != "" {
 		response["suppFeat"] = suppAnswer

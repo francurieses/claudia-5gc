@@ -199,3 +199,88 @@ Feature: Initial Context Setup — UE-AMBR conditional presence (TS 38.413 §8.3
     And the AMF sends a UE CONTEXT RELEASE COMMAND with radioNetwork cause "release-due-to-5gc-generated-reason"
     And the Unsuccessful Transfer of PDU session 5 is relayed to the SMF as PDU_RES_SETUP_FAIL and both sessions are kept
     And the ICS failure is logged with result "FAILURE" and spec_ref containing "TS 38.413 §8.3.1.3"
+
+  # --- AMF-010: mandatory Allowed NSSAI and ICS log procedure (TS 38.413 §9.2.2.1) -----------
+  # Table 9.2.2.1-1: Allowed NSSAI is mandatory (criticality reject). Decision: the AMF never
+  # sends an ICS Request with an empty allowed set (registration without Allowed NSSAI is rejected upstream).
+
+  @AMF-010 @happy @allowed-nssai
+  Scenario: ICS Request with a non-empty Allowed NSSAI carries the mandatory AllowedNSSAI IE with every S-NSSAI
+    Given the UE has an Allowed NSSAI of S-NSSAI SST 1 SD "000001" and SST 2 SD "000002"
+    And no PDU sessions are to be activated
+    When the AMF builds the INITIAL CONTEXT SETUP REQUEST with the Registration Accept NAS-PDU
+    Then the encoded PDU decodes cleanly with free5gc/ngap
+    And the message contains the "AllowedNSSAI" IE (id 0) with criticality reject
+    And the AllowedNSSAI IE lists exactly the S-NSSAI SST 1 SD "000001" and SST 2 SD "000002"
+
+  @AMF-010 @rejection @allowed-nssai
+  Scenario: ICS Request build with an empty Allowed NSSAI fails and nothing is sent to the gNB
+    Given the UE has an empty Allowed NSSAI
+    And no PDU sessions are to be activated
+    When the AMF builds the INITIAL CONTEXT SETUP REQUEST with the Registration Accept NAS-PDU
+    Then the build fails with an error mentioning "Allowed NSSAI" and yields no bytes
+    When the AMF sends the INITIAL CONTEXT SETUP REQUEST to the gNB
+    Then the send returns an error and no NGAP PDU is written to the gNB
+    And the send is logged with result "FAILURE" and procedure "InitialRegistration"
+
+  @AMF-010 @happy @log-procedure
+  Scenario Outline: The ICS send log procedure follows the pending ICS kind
+    Given the UE has an Allowed NSSAI of S-NSSAI SST 1 SD "000001" and SST 2 SD "000002"
+    And the UE pending ICS kind is "<kind>"
+    When the AMF sends the INITIAL CONTEXT SETUP REQUEST to the gNB
+    Then the ICS send log carries procedure "<procedure>"
+    And the ICS send log carries spec_ref containing "§9.2.2.1"
+
+    Examples:
+      | kind                       | procedure                  |
+      | ICSInitialRegistration     | InitialRegistration        |
+      | ICSServiceRequest          | ServiceRequest             |
+      | ICSRegistrationUpdate      | MobilityRegistrationUpdate |
+      | ICSNone                    | InitialContextSetup        |
+
+  # --- AMF-042: empty Allowed NSSAI no-ICS paths (TS 24.501 §5.5.1.3.4, §5.6.1.4.1; TS 38.413 §8.2.1; TS 23.502 §4.2.3.2 step 12)
+  # With an empty Allowed NSSAI no ICS Request can be sent (AMF-010), so no user plane is activated;
+  # the requested PSIs are reported as not re-established in the PDU session reactivation result IE (0x26).
+
+  @AMF-042 @rejection @allowed-nssai @registration-update
+  Scenario: CM-IDLE registration update with an empty Allowed NSSAI and Uplink data status activates no user plane
+    Given UE "imsi-001010000000001" is in 5GMM-REGISTERED state in CM-IDLE with PDU sessions 1 and 2
+    And the UE has an empty Allowed NSSAI
+    When the UE sends a Registration Request of type "mobility registration updating" on a new N2 connection with Uplink data status for PDU sessions 1 and 2
+    Then the AMF sends no Nsmf_PDUSession_UpdateSMContext request activating the user plane
+    And the AMF sends no PDU SESSION RESOURCE SETUP REQUEST
+    And the AMF sends the Registration Accept in a DOWNLINK NAS TRANSPORT
+    And the Registration Accept PDU session reactivation result IE (0x26) reports PDU sessions 1 and 2 as not re-established
+
+  @AMF-042 @happy @registration-update
+  Scenario: CM-CONNECTED registration update with a non-empty Allowed NSSAI still reactivates the requested PDU sessions
+    Given UE "imsi-001010000000001" is in 5GMM-REGISTERED state in CM-CONNECTED with PDU sessions 1 and 2
+    And the UE has an Allowed NSSAI of S-NSSAI SST 1 SD "000001"
+    When the UE sends a Registration Request of type "mobility registration updating" on the existing N2 connection with Uplink data status for PDU sessions 1 and 2
+    Then the AMF asks the SMF to activate the user plane of PDU sessions 1 and 2
+    And the AMF sends a PDU SESSION RESOURCE SETUP REQUEST for PDU sessions 1 and 2
+    And the Registration Accept PDU session reactivation result IE (0x26) reports PDU sessions 1 and 2 as re-established
+
+  @AMF-042 @rejection @allowed-nssai @service-request
+  Scenario: Service Request with an empty Allowed NSSAI drains the paged PDU sessions and logs them as not re-activated
+    Given UE "imsi-001010000000001" is in 5GMM-REGISTERED state in CM-IDLE with paged PDU sessions 1 and 2
+    And the UE has an empty Allowed NSSAI
+    When the UE answers the paging with a Service Request
+    Then the AMF sends no INITIAL CONTEXT SETUP REQUEST
+    And the paged PDU sessions of the UE are drained
+    And the paged PDU sessions 1 and 2 are logged as not re-activated
+    When the UE sends a later Service Request
+    Then the later Service Request sees no paged PDU sessions
+
+  @AMF-042 @happy @log-procedure
+  Scenario Outline: The ICS Response log procedure follows the pending ICS kind when the response carries no PDU sessions
+    Given the UE pending ICS kind is "<kind>"
+    When the gNB answers with an INITIAL CONTEXT SETUP RESPONSE carrying no PDU sessions
+    Then the ICS response log carries procedure "<procedure>"
+
+    Examples:
+      | kind                       | procedure                  |
+      | ICSInitialRegistration     | InitialRegistration        |
+      | ICSServiceRequest          | ServiceRequest             |
+      | ICSRegistrationUpdate      | MobilityRegistrationUpdate |
+      | ICSNone                    | InitialContextSetup        |

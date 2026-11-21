@@ -1,7 +1,9 @@
 package registry
 
 import (
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -30,6 +32,14 @@ type Subscription struct {
 	// the NRF's own set (TS 29.500 §6.6.2). Empty when the consumer sent none.
 	// In memory only (the store is never serialised).
 	Features features.Set
+	// ValidityTime is the subscription expiry (SubscriptionData.validityTime,
+	// TS 29.510 §6.1.6.2.16); notifications are not sent past it. Zero = no
+	// expiry (rel17 subscriptions).
+	ValidityTime time.Time
+	// InterPLMN marks a subscriber of a different PLMN (reqPlmnList without
+	// the NRF's PLMN); only intra-PLMN subscribers get interPlmnFqdn stripped
+	// (TS 29.510 §6.1.6.2.2).
+	InterPLMN bool
 }
 
 // NotificationData is the body of a NFStatusNotify POST (TS 29.510 §6.1.6.2.3).
@@ -49,6 +59,13 @@ type SubscriptionStore struct {
 // NewSubscriptionStore constructs an empty store.
 func NewSubscriptionStore() *SubscriptionStore {
 	return &SubscriptionStore{subs: make(map[string]*Subscription)}
+}
+
+// NewHyphenlessID returns a subscription ID without '-', as the
+// SubscriptionData.subscriptionId pattern requires (TS 29.510 §6.1.6.2.16:
+// ^([0-9]{5,6}-(x3Lf57A:nid=[A-Fa-f0-9]{11}:)?)?[^-]+$): a UUID, hyphens removed.
+func NewHyphenlessID() string {
+	return strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 // Add stores a subscription and returns its ID.

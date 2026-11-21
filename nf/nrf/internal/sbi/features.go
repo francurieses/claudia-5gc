@@ -3,7 +3,10 @@
 // §6.2.9, §6.3.7.
 package sbi
 
-import "github.com/francurieses/claudia-5gc/shared/sbi/features"
+import (
+	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/sbi/features"
+)
 
 // The API tables are transcribed once in shared/sbi/features (design note in
 // tables.go); this file only decides which bits the NRF implements.
@@ -14,12 +17,16 @@ import "github.com/francurieses/claudia-5gc/shared/sbi/features"
 //	1 Service-Map (M)   implemented: NFRegister / NFUpdate accept the
 //	                    "nfServiceList" map of NFProfile, the registry keeps
 //	                    it verbatim, the service-names discovery filter reads
-//	                    it (registry.allServices) and retrieval returns it.
-//	3 Inter-Plmn-Fqdn (M) NOT implemented: NFStatusNotify sends the stored
-//	                    profile, "interPlmnFqdn" included, to every matching
-//	                    subscriber, which the feature forbids for subscribers
-//	                    that did not indicate it. No NF of this stack
-//	                    registers the attribute.
+//	                    it (registry.allServices). Under rel19 retrieval,
+//	                    discovery and notification convert between the
+//	                    "nfServiceList" map and the deprecated "nfServices"
+//	                    array per the requester's / subscriber's negotiation.
+//	3 Inter-Plmn-Fqdn (M) implemented under the rel19 profile only (see
+//	                    NnrfNFManagementCatalogFor): NFStatusNotify strips
+//	                    "interPlmnFqdn" from the profile and every NFService of
+//	                    intra-PLMN notifications to a subscriber that did not
+//	                    indicate the feature. Under rel17 the stored profile is
+//	                    still sent verbatim (frozen wire behaviour).
 //	2, 4-10             not implemented (NRF-to-NRF registration, NRF sets,
 //	                    complete-profile subscription, rule sets, canary
 //	                    release, DNN list optimisation, shared data).
@@ -29,10 +36,9 @@ import "github.com/francurieses/claudia-5gc/shared/sbi/features"
 //
 //	6 Service-Map (M)   implemented, same behaviour as NFManagement bit 1:
 //	                    profiles with an "nfServiceList" are matched by
-//	                    service name and returned as registered. The NRF does
-//	                    not rewrite the map to the deprecated "nfServices"
-//	                    array for a requester that did not indicate the
-//	                    feature (pre-existing gap).
+//	                    service name; under rel19 the response carries the
+//	                    map only to a requester that negotiated the feature
+//	                    and the array otherwise (TS 29.510 §6.2.6.2.3 NOTE 10).
 //	others              not implemented: the query parameters of the
 //	                    Query-* groups (limit, max-payload-size,
 //	                    required-features, ...) are ignored, there is no
@@ -43,14 +49,28 @@ import "github.com/francurieses/claudia-5gc/shared/sbi/features"
 // Retrieve-Key is not implemented and the request / response data types carry
 // no supportedFeatures attribute.
 var (
-	nnrfNFManagementCatalog = features.MustCatalog(features.MustImplement(features.NnrfNFManagementEntries(), 1)...)
-	nnrfNFDiscoveryCatalog  = features.MustCatalog(features.MustImplement(features.NnrfNFDiscoveryEntries(), 6)...)
-	nnrfAccessTokenCatalog  = features.MustCatalog(features.NnrfAccessTokenEntries()...)
+	nnrfNFManagementCatalog = features.MustCatalog(features.MustImplement(features.NnrfNFManagementEntries(), 1, 3)...)
+	// nnrfNFManagementLegacyCatalog is the frozen rel17 set (bit 1 only):
+	// Inter-Plmn-Fqdn handling is a rel19-only wire change.
+	nnrfNFManagementLegacyCatalog = features.MustCatalog(features.MustImplement(features.NnrfNFManagementEntries(), 1)...)
+	nnrfNFDiscoveryCatalog        = features.MustCatalog(features.MustImplement(features.NnrfNFDiscoveryEntries(), 6)...)
+	nnrfAccessTokenCatalog        = features.MustCatalog(features.NnrfAccessTokenEntries()...)
 )
 
 // NnrfNFManagementCatalog returns the immutable Nnrf_NFManagement catalog
 // (producer role) of the NRF. TS 29.510 §6.1.9.
 func NnrfNFManagementCatalog() *features.Catalog { return nnrfNFManagementCatalog }
+
+// NnrfNFManagementCatalogFor returns the Nnrf_NFManagement catalog in force for
+// a release profile: Service-Map and Inter-Plmn-Fqdn (answer "5") under the
+// spec-literal rel19 profile, Service-Map only ("1") otherwise, so rel17 and
+// nil-profile bytes stay frozen. TS 29.510 §6.1.9.
+func NnrfNFManagementCatalogFor(p *capability.Profile) *features.Catalog {
+	if features.SpecLiteral(p) {
+		return nnrfNFManagementCatalog
+	}
+	return nnrfNFManagementLegacyCatalog
+}
 
 // NnrfNFDiscoveryCatalog returns the immutable Nnrf_NFDiscovery catalog
 // (producer role) of the NRF. TS 29.510 §6.2.9.

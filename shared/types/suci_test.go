@@ -1,6 +1,9 @@
 package types
 
 import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -116,5 +119,108 @@ func TestSUCIHelpers(t *testing.T) {
 		if (err != nil) != tc.wantErr || got != tc.want {
 			t.Errorf("NullSchemeMSIN(%x)=%q,%v", tc.in, got, err)
 		}
+	}
+}
+
+func TestParseSUCIAny_LegacyEqualsStandard(t *testing.T) {
+	pa := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefaabbccdd"
+	tests := []struct {
+		name, legacy, std string
+		keyID             uint8
+	}{
+		{"null", "suci-00101-0000-0-0-0000000010", "suci-0-001-01-0000-0-0-0000000001", 0},
+		{"null 3-digit MNC odd MSIN", "suci-310260-0-0-0-21436587f9", "suci-0-310-260-0-0-0-123456789", 0},
+		{"profile A", "suci-00101-0000-0-1-" + pa, "suci-0-001-01-0000-1-1-" + pa, 1},
+		{"profile B", "suci-00101-0000-0-2-" + strings.ToUpper(pa), "suci-0-001-01-0000-2-2-" + pa, 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, f, err := ParseSUCIAny(tc.legacy)
+			if err != nil || f != SUCIFormatLegacy {
+				t.Fatalf("legacy: f=%v err=%v", f, err)
+			}
+			want, f2, err := ParseSUCIAny(tc.std)
+			if err != nil || f2 != SUCIFormatStandard {
+				t.Fatalf("standard: f=%v err=%v", f2, err)
+			}
+			want.HNPublicKeyID = 0 // legacy form does not carry it
+			if got != want {
+				t.Fatalf("legacy %+v != standard %+v", got, want)
+			}
+			if tc.keyID == 0 {
+				a, _ := got.SUPI()
+				b, _ := want.SUPI()
+				if a != b || a == "" {
+					t.Fatalf("SUPI %q vs %q", a, b)
+				}
+			}
+		})
+	}
+}
+
+// TestParseSUCIAny_LegacyGolden pins the literal strings produced by the
+// v2.6.0-rel17-final AMF (registration.go / nas.go Sprintf).
+func TestParseSUCIAny_LegacyGolden(t *testing.T) {
+	prev := func(mcc, mnc, ri string, scheme int, out []byte) string {
+		return fmt.Sprintf("suci-%s%s-%s-0-%d-%s", mcc, mnc, ri, scheme, hex.EncodeToString(out))
+	}
+	pa := bytes.Repeat([]byte{0xab, 0x12}, 20)
+	tests := []struct {
+		name, got, lit string
+		msin, supi     string
+		scheme         uint8
+	}{
+		{"null", prev("001", "01", "0000", 0, []byte{0x00, 0x00, 0x00, 0x00, 0x10}),
+			"suci-00101-0000-0-0-0000000010", "0000000001", "imsi-001010000000001", 0},
+		{"null 3-digit MNC", prev("310", "260", "0", 0, []byte{0x21, 0x43, 0x65, 0x87, 0xf9}),
+			"suci-310260-0-0-0-21436587f9", "123456789", "imsi-310260123456789", 0},
+		{"profile A", prev("001", "01", "0000", 1, pa),
+			"suci-00101-0000-0-1-" + strings.Repeat("ab12", 20), "", "", 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.lit {
+				t.Fatalf("prev-tag string %q != literal %q", tc.got, tc.lit)
+			}
+			s, f, err := ParseSUCIAny(tc.lit)
+			if err != nil || f != SUCIFormatLegacy || s.ProtectionScheme != tc.scheme {
+				t.Fatalf("s=%+v f=%v err=%v", s, f, err)
+			}
+			if tc.scheme == 0 {
+				if s.SchemeOutput != tc.msin {
+					t.Fatalf("msin %q want %q", s.SchemeOutput, tc.msin)
+				}
+				if supi, _ := s.SUPI(); supi != tc.supi {
+					t.Fatalf("supi %q want %q", supi, tc.supi)
+				}
+			} else if s.SchemeOutput != strings.Repeat("ab12", 20) || s.HNPublicKeyID != 0 {
+				t.Fatalf("output/keyid wrong: %+v", s)
+			}
+		})
+	}
+}
+
+func TestParseSUCIAny_Malformed(t *testing.T) {
+	tests := map[string]string{
+		"field count":     "suci-00101-0000-0-0",
+		"odd hex":         "suci-00101-0000-0-0-000000001",
+		"non-hex":         "suci-00101-0000-0-1-zz",
+		"4-digit mcc+mnc": "suci-0010-0000-0-0-00",
+		"scheme 256":      "suci-00101-0000-0-256-aabb",
+		"empty output":    "suci-00101-0000-0-1-",
+		"oversized":       "suci-00101-0000-0-1-" + strings.Repeat("ab", MaxSUCILen),
+		"null bad BCD":    "suci-00101-0000-0-0-ab",
+		"supi":            "imsi-001010000000001",
+	}
+	for name, in := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := ParseSUCIAny(in)
+			if err == nil {
+				t.Fatal("want error")
+			}
+			if len(in) < 100 && strings.Contains(err.Error(), in) {
+				t.Fatalf("error embeds input: %v", err)
+			}
+		})
 	}
 }

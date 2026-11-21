@@ -234,6 +234,7 @@ func fmtRTS(t time.Time) string {
 // affected sessions (asynchronously) and re-associates.
 // Ref: TS 29.244 §6.2.6.2, §6.2.2; TS 23.527 §4.2.
 func (s *Server) RunPFCPNodeSupervisor(ctx context.Context) {
+	s.assocGateActive.Store(true)
 	backoff := s.pfcpTimers.assocRetryInitial
 	for ctx.Err() == nil {
 		s.setAssocState(assocSetupPending)
@@ -331,7 +332,7 @@ func (s *Server) pfcpTransact(ctx context.Context, log *slog.Logger, req pfcpmsg
 				}
 				break
 			}
-			msg, perr := pfcpmsg.Parse(buf[:n])
+			msg, perr := pfcpx.ParseMessage(buf[:n])
 			if perr != nil || msg.Sequence() != seq || msg.MessageType() != wantType {
 				continue // not our answer
 			}
@@ -422,6 +423,7 @@ func (s *Server) runAssociationSetup(ctx context.Context) bool {
 	s.assoc.associatedAt = time.Now()
 	s.assoc.missingRTSWarned = false
 	s.assoc.mu.Unlock()
+	s.firstAssocOnce.Do(func() { close(s.firstAssoc) })
 
 	log.InfoContext(ctx, "PFCP Association Setup accepted",
 		"interface", "N4", "direction", "IN", "spec_ref", specAssocSetup,
@@ -625,6 +627,7 @@ func (s *Server) markSessionsReleasing(cutoff time.Time, all, n4Stale bool) []re
 			continue
 		}
 		sess.State = sessionStateReleasing
+		s.clearDLPagingLocked(sess)
 		if n4Stale {
 			sess.N4Stale = true
 		}
@@ -668,7 +671,7 @@ func (s *Server) releaseOne(ctx, runCtx context.Context, t releaseTarget) {
 		"interface", "Namf-mgmt", "direction", "OUT", "spec_ref", specAMFRelease,
 		"supi", t.supi, "pdu_session_id", t.psi, "seid", t.seid,
 	}
-	err := s.requestAMFRelease(ctx, t.supi, t.psi)
+	err := s.requestAMFRelease(ctx, t.supi, t.psi, amfReleaseCause36)
 	if err == nil {
 		log.InfoContext(ctx, "AMF asked to release PDU session after UPF restart/failure",
 			append(attrs, "result", "OK")...)
@@ -722,34 +725,66 @@ func (s *Server) startReleaseGuard(runCtx, relCtx context.Context, t releaseTarg
 // on supervisor ctx cancellation or after firing); used by tests.
 func (s *Server) WaitReleaseGuards() { s.guardWG.Wait() }
 
-// requestAMFRelease calls DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}
+// amfReleaseCause36 is 5GSM cause #36 "regular deactivation" (TS 24.501
+// §9.11.4.2), kept by the operator/UPF-restart/handover release paths.
+const amfReleaseCause36 uint8 = 36
+
+// amfReleaseError is a failed AMF management release call; retryable is true
+// for transport errors and 5xx (the AMF may come back), false for other 4xx.
+type amfReleaseError struct {
+	status    int // 0 = transport error
+	retryable bool
+	err       error
+}
+
+func (e *amfReleaseError) Error() string { return e.err.Error() }
+func (e *amfReleaseError) Unwrap() error { return e.err }
+
+// requestAMFRelease calls DELETE /amf/v1/ue-contexts/{supi}/pdu-sessions/{psi}?cause=<n>
 // on the AMF management API (plain HTTP, non-3GPP) with the detection event's
-// X-Correlation-Id. 200/202/204 are success.
-func (s *Server) requestAMFRelease(ctx context.Context, supi string, psi uint8) error {
+// X-Correlation-Id. 200/202/204 are success. 404 (UE or PSI unknown in the AMF)
+// stays an error here: the UPF-restart and handover callers must then free the
+// SM context locally (TestPFCPNode_AMFFailureFallsBackToLocalRelease). The
+// restart-orphan path treats 404 as "already released" via amfReleaseCall.
+func (s *Server) requestAMFRelease(ctx context.Context, supi string, psi, cause uint8) error {
+	already, err := s.amfReleaseCall(ctx, supi, psi, cause)
+	if err == nil && already {
+		return &amfReleaseError{status: http.StatusNotFound,
+			err: fmt.Errorf("smf: AMF pdu session release: status %d", http.StatusNotFound)}
+	}
+	return err
+}
+
+// amfReleaseCall is requestAMFRelease that reports a 404 as success with
+// alreadyReleased=true. Other errors are *amfReleaseError.
+func (s *Server) amfReleaseCall(ctx context.Context, supi string, psi, cause uint8) (alreadyReleased bool, err error) {
 	if s.cfg.Peers.AMFMgmt == "" {
-		return fmt.Errorf("smf: amf_mgmt peer not configured")
+		return false, &amfReleaseError{err: fmt.Errorf("smf: amf_mgmt peer not configured")}
 	}
 	ctx, cancel := context.WithTimeout(ctx, amfReleaseTimeout)
 	defer cancel()
-	u := fmt.Sprintf("http://%s/amf/v1/ue-contexts/%s/pdu-sessions/%d",
-		s.cfg.Peers.AMFMgmt, url.PathEscape(supi), psi)
+	u := fmt.Sprintf("http://%s/amf/v1/ue-contexts/%s/pdu-sessions/%d?cause=%d",
+		s.cfg.Peers.AMFMgmt, url.PathEscape(supi), psi, cause)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
 	if err != nil {
-		return fmt.Errorf("smf: build AMF release request: %w", err)
+		return false, &amfReleaseError{err: fmt.Errorf("smf: build AMF release request: %w", err)}
 	}
 	if id := logging.CorrelationID(ctx); id != "" {
 		req.Header.Set("X-Correlation-Id", id)
 	}
 	resp, err := s.mgmtHTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("smf: AMF pdu session release: %w", err)
+		return false, &amfReleaseError{retryable: true, err: fmt.Errorf("smf: AMF pdu session release: %w", err)}
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
-		return nil
+		return false, nil
+	case http.StatusNotFound:
+		return true, nil
 	}
-	return fmt.Errorf("smf: AMF pdu session release: status %d", resp.StatusCode)
+	return false, &amfReleaseError{status: resp.StatusCode, retryable: resp.StatusCode >= 500,
+		err: fmt.Errorf("smf: AMF pdu session release: status %d", resp.StatusCode)}
 }
 
 // handlePFCPHeartbeatRequest answers an inbound Heartbeat Request on the
@@ -818,38 +853,5 @@ func (s *Server) warnIfNotAssociated(ctx context.Context, corrID string) {
 	select {
 	case s.assocKick <- struct{}{}:
 	default:
-	}
-}
-
-// restartOrphan is a PDU session persisted by a previous SMF run.
-type restartOrphan struct {
-	supi string
-	psi  uint8
-}
-
-// releaseOrphansOfPreviousRun asks the AMF to release, towards the UE, the PDU
-// sessions this SMF lost by restarting (the UPF drops its side on seeing the new
-// Recovery Time Stamp, TS 29.244 §6.2.6), so the UE re-establishes them. It runs
-// once, after the first successful Association Setup. Ref: TS 23.527 §4.3,
-// TS 23.502 §4.3.4.2 (via the AMF management API, see releaseOne).
-func (s *Server) releaseOrphansOfPreviousRun(ctx context.Context) {
-	s.sessionMu.Lock()
-	orphans := s.orphanedByRestart
-	s.orphanedByRestart = nil
-	s.sessionMu.Unlock()
-	if len(orphans) == 0 {
-		return
-	}
-	log := logging.NewProcedureLogger(ctx, s.logger, procRecovery)
-	for _, o := range orphans {
-		attrs := []any{"interface", "Namf-mgmt", "direction", "OUT", "spec_ref", specAMFRelease,
-			"supi", o.supi, "pdu_session_id", o.psi}
-		if err := s.requestAMFRelease(ctx, o.supi, o.psi); err != nil {
-			log.WarnContext(ctx, "SMF restart: AMF release of orphaned PDU session failed",
-				append(attrs, "result", "FAILURE", "cause", causeAMFReleaseFailed, "error", err)...)
-			continue
-		}
-		log.InfoContext(ctx, "SMF restart: AMF asked to release orphaned PDU session",
-			append(attrs, "result", "OK")...)
 	}
 }

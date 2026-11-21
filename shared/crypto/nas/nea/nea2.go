@@ -1,12 +1,13 @@
 // Package nea implements the 5G NAS ciphering algorithms.
 //
 // NEA0: Null ciphering (plaintext — acceptable in lab environments).
-// NEA1: SNOW 3G based — not implemented.
+// NEA1: SNOW 3G based (128-NEA1) — see nea1.go.
 // NEA2: AES-CTR (128-bit key) — THIS PACKAGE.
-// NEA3: ZUC based — not implemented.
+// NEA3: ZUC based (128-NEA3) — see nea3.go.
 //
-// Ref: TS 33.501 Annex D §D.3 (NEA2)
-//      TS 33.401 Annex B §B.1 (EEA2, identical algorithm)
+// Ref: TS 33.501 Annex D §D.2.1.2/D.2.1.4 (NEA1/NEA3), §D.3 (NEA2)
+//
+//	TS 33.401 Annex B §B.1 (EEA2, identical algorithm)
 package nea
 
 import (
@@ -19,11 +20,12 @@ import (
 // NEA2 encrypts (or decrypts — CTR is symmetric) a NAS message payload.
 //
 // Parameters:
-//   key     — 128-bit NAS ciphering key (KNASenc)
-//   count   — 32-bit NAS COUNT
-//   bearer  — 5-bit bearer identity (0 for NAS)
-//   dir     — 1-bit direction (0=uplink, 1=downlink)
-//   message — plaintext (encrypt) or ciphertext (decrypt)
+//
+//	key     — 128-bit NAS ciphering key (KNASenc)
+//	count   — 32-bit NAS COUNT
+//	bearer  — 5-bit bearer identity (0 for NAS)
+//	dir     — 1-bit direction (0=uplink, 1=downlink)
+//	message — plaintext (encrypt) or ciphertext (decrypt)
 //
 // Returns the XOR'd result.
 // Ref: TS 33.501 Annex D.3.3

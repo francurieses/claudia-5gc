@@ -345,12 +345,6 @@ type SeedResult struct {
 	Resynced int // subscribers re-derived (SeedAndResyncSliceDNNQoS only)
 }
 
-// defaultOperatorSlices is the fallback slice set when operator.yaml is absent
-// (identical to the fallback in cmd/udr/main.go).
-var defaultOperatorSlices = []SNSSAISubscribed{
-	{SST: 1, SD: "000001"}, {SST: 1, SD: "000002"}, {SST: 2, SD: "000001"}, {SST: 3, SD: "000001"},
-}
-
 // OperatorSeedEntries validates op.SliceDNNQoSList(): each entry needs sst
 // 0-255, sd "" or 6 hex, a DNN, a slice listed in op.snssais (when that list is
 // non-empty) and two valid TS 29.571 BitRates. Invalid entries are skipped with
@@ -464,15 +458,10 @@ func SeedSliceDNNQoSFromEntries(ctx context.Context, st Store, slices []SNSSAISu
 }
 
 // SeedSliceDNNQoSFromOperator seeds slice_dnn_qos from operator.yaml (op may be
-// nil: default 4-slice set x "internet" with DefaultAMBRForSlice).
+// nil: fallback 4-slice set with per-slice DNN with DefaultAMBRForSlice).
 func SeedSliceDNNQoSFromOperator(ctx context.Context, st Store, op *operatorcfg.OperatorConfig, logger *slog.Logger) (*SeedResult, error) {
-	slices := defaultOperatorSlices
-	if s := op.Slices(); len(s) > 0 {
-		slices = make([]SNSSAISubscribed, 0, len(s))
-		for _, e := range s {
-			slices = append(slices, SNSSAISubscribed{SST: uint8(e.SST), SD: e.SD})
-		}
-	}
+	// Per-slice DNN (UDR-002); warnings are emitted once by BuildSeedSliceProfiles.
+	slices := SeedSlices(op, slog.New(slog.DiscardHandler))
 	return SeedSliceDNNQoSFromEntries(ctx, st, slices, OperatorSeedEntries(op, logger))
 }
 

@@ -109,6 +109,51 @@ keys sends the unchanged one-octet `10 01 00` / `28 01 00`. The AMF/SMF only see
 ciphered NAS message container of Security Mode Complete (TS 24.501 §4.4.6); the 5GSM IE is inside UL
 NAS Transport.
 
+### Patch 0090 — gNB-initiated NG RESET (gNB)
+New gNB nr-cli command `ng-reset all` (ResetType nG-Interface/resetAll) and
+`ng-reset ue <ran-ue-ngap-id>[,<id>...]` (partOfNG-Interface, items carry AMF UE NGAP ID +
+RAN UE NGAP ID of the gNB's UE contexts). Cause radioNetwork unspecified; IE order Cause, ResetType
+(TS 38.413 §8.7.4, §9.2.6.1); sent non-UE-associated on stream 0 (PPID 60) with UERANSIM's own APER
+encoder. After sending, the gNB releases the reset UE contexts (all UEs of that AMF for `all`, the listed
+ones otherwise; TS 38.413 §8.7.4.2.2) via the UE CONTEXT RELEASE COMMAND local path (RRC AN_RELEASE + GTP
+release + NGAP context delete), so the UE goes RRC/CM-IDLE. NG RESET ACKNOWLEDGE is logged with the list size.
+Also fixes the stock asn1c APER SET OF decoder (`constr_SET_OF.c`): SIZE(1..65536) (effective_bits -1) was
+decoded with a 16-bit length instead of the unconstrained length determinant (X.691 §11.9.4.1), rejecting
+a spec-correct ACK that carries the UE-associated list. Used for PCAP validation of AMF NG RESET handling.
+
+### Patch 0095 — UE-AMBR / Session-AMBR enforcement fixes (gNB)
+UE-AMBR is enforced by NG-RAN (TS 23.501 §5.7.2.6), so with UERANSIM the subscribed UE-AMBR is only
+visible in iperf if the gNB applies it. Stock v3.2.8 read UE-AMBR only from Initial Context Setup; the AMF
+leaves it out of an ICS Request without PDU sessions and sends it in the first PDU Session Resource Setup
+Request (TS 38.413 §9.2.2.1, §9.2.1.1), so the UE-level limit was never set and only Session-AMBR applied.
+The gNB now applies UE-AMBR from PDU Session Resource Setup Request, parses the ICS UE-AMBR before creating
+the GTP UE context (stock pushed the stale value first), converts UE Context Modification UE-AMBR from bit/s
+to byte/s like the other paths, and applies a Session-AMBR changed by PDU Session Resource Modify
+(TS 38.413 §9.3.4.3) instead of keeping the setup-time value. gNB log lines: `UE-AMBR set from …` and
+`Session-AMBR of PDU session[n] set from PDU Session Resource Modify`. Check with `make ueransim-iperf`:
+each session is capped at min(UE-AMBR, Session-AMBR); the gNB token bucket starts full, so a 10 s run reads
+about 5-10 % above the limit.
+
+### Patch 0100 — gNB AMF reconnect + UE recovery (gNB, UE)
+After an AMF restart the stock gNB removed the AMF context and never reconnected, so UERANSIM had to be
+restarted. On SCTP association loss the patched gNB logs `[ngap] Association terminated for AMF[n]`, keeps the
+AMF context, locally drops the NGAP UE contexts of that AMF (no NG Reset is sent) and bars the cell
+(`RADIO_POWER_OFF`) while no AMF is CONNECTED; AMF selection only picks CONNECTED AMFs. It then logs
+`Reconnecting to AMF[n] <ip>:<port> in N s (attempt K)` with backoff 1/2/4/8/16 s then 30 s, unlimited
+(a simulator choice, not a 3GPP timer); SCTP connect/bind failures also schedule a retry and the backoff resets
+on NG Setup Response. NG Setup Request is built by the stock APER encoder, PPID 60 (TS 38.413 §8.7.1,
+TS 38.412 §7); the cell is unbarred on NG Setup Response. NG Setup Failure with Time To Wait
+(TS 38.413 §9.3.1.56) keeps the gNB in WAITING_NG_SETUP on the same association and retries NG Setup after the
+wait (`Retrying NG Setup ...`); if the association drops meanwhile the reconnect waits max(backoff, remaining
+Time To Wait). Independent of the NG Reset command of patch 0090.
+UE side: a serving-cell MIB turning barred is treated as radio link failure (simplified "cell off air" model;
+`cellBarred` is in the MIB, TS 38.304 §5.3.1). A UE that was 5GMM-CONNECTED with no signalling pending arms a
+Mobility Registration Update with cause CONNECTION_RECOVERY (TS 24.501 §5.5.1.3.2 item f)) sent once a suitable
+cell is camped again; the restarted AMF answers REGISTRATION REJECT #10 for the unknown 5G-GUTI, the stock UE
+goes 5GMM-DEREGISTERED (§5.5.1.3.5) and runs Initial Registration. Limitation: an idle UE at the time of the
+loss does not re-register on its own (waits for T3512 or uplink data). Design:
+`docs/procedures/NgSetupRecovery.md`. Live validation pending: `SERVICES=amf make services-restart-check`.
+
 ---
 
 ## Command Reference

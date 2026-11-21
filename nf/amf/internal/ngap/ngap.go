@@ -1051,7 +1051,7 @@ func (s *Server) dispatch(ctx context.Context, gnb *GNBContext, data []byte) {
 		s.handleNGSetup(ctx, gnb, msg)
 	case ProcNGReset:
 		if msg.Type == 0 {
-			s.observeNGReset(gnb)
+			s.handleNGReset(ctx, gnb, msg)
 		}
 	case ProcInitialUEMessage:
 		s.handleInitialUEMessage(ctx, gnb, msg)
@@ -1327,8 +1327,11 @@ func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNB
 		return
 	}
 
+	icsProc := "InitialContextSetup" // procedure that sent the ICS Request, for logs
 	if ue, found := s.mgr.GetByNGAPId(resp.AMFUENGAPId); found {
-		ue.TakePendingICS() // the ICS Request is answered
+		if k := ue.TakePendingICS(); k != amfctx.ICSNone { // the ICS Request is answered
+			icsProc = k.String()
+		}
 	}
 	// TS 38.413 §8.3.1.2: each PDU Session Resource Setup Unsuccessful Transfer
 	// of the response is transferred to the SMF (same leg as a failed PDU
@@ -1336,7 +1339,7 @@ func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNB
 	if len(resp.FailedPSIs) > 0 {
 		if ue, found := s.mgr.GetByNGAPId(resp.AMFUENGAPId); found {
 			s.relayFailedPDUSessions(ctx, ue, resp.AMFUENGAPId, resp.FailedPSIs, resp.FailedTransfers,
-				"ServiceRequest", "InitialContextSetupResponse", "TS 38.413 §8.3.1.2")
+				icsProc, "InitialContextSetupResponse", "TS 38.413 §8.3.1.2")
 		}
 	}
 	if len(resp.Setups) == 0 {
@@ -1346,7 +1349,7 @@ func (s *Server) handleInitialContextSetupResponse(ctx context.Context, gnb *GNB
 		// the UE's Registration Complete over Uplink NAS Transport.
 		// Ref: TS 38.413 §8.3.1, TS 23.502 §4.2.2.2.2 step 22.
 		s.logger.Info("Initial Context Setup Response received (registration)",
-			"procedure", "InitialRegistration",
+			"procedure", icsProc,
 			"interface", "N2",
 			"direction", "IN",
 			"message_type", "InitialContextSetupResponse",
@@ -1737,7 +1740,7 @@ func (s *Server) rejectInitialNASAndRelease(ctx context.Context, gnb *GNBContext
 	// is discarded, stalling the UE until T3510 expires (~16 s). Releasing here
 	// puts the UE in RRC-IDLE so its retry arrives as a fresh InitialUEMessage.
 	// PendingRemoval must be set BEFORE the command so the watchdog is armed and
-	// handleUEContextReleaseComplete removes the context (nf/amf/CLAUDE.md §9).
+	// handleUEContextReleaseComplete removes the context (nf/amf/internal/ngap/CLAUDE.md).
 	// The gNB is addressed directly rather than via SendUEContextReleaseCommandForUE:
 	// that resolves the gNB through ue.GNBAddr, which a temp context never has, so
 	// it would silently skip the release *and* return nil — leaking tempUE.
@@ -1786,7 +1789,7 @@ func (s *Server) handleInitialUEMessage(ctx context.Context, gnb *GNBContext, ms
 		req.NASPdu[2] == 0x41
 
 	if req.FiveGSTMSI != nil && !isPlainRegistrationRequest {
-		if ue, found := s.mgr.GetByTMSI(*req.FiveGSTMSI); found {
+		if ue, found := s.lookupOwnTMSI(ctx, req); found {
 			// Update N2 context for the new gNB radio connection.
 			ue.Lock()
 			ue.RANUENGAPId = req.RANUENGAPId
@@ -1964,6 +1967,21 @@ func (s *Server) handleUplinkNASTransport(ctx context.Context, gnb *GNBContext, 
 		return
 	}
 
+	// The (AMF, RAN) UE NGAP ID pair must be a live logical NG-connection of THIS gNB:
+	// after an NG RESET (or any local release) the association is gone even though the
+	// UE context (CM-IDLE, REGISTERED) keeps its AMF UE NGAP ID. Reject without
+	// processing the NAS and without touching the registered UE.
+	// Ref: TS 38.413 §8.7.4.2.2, §10.6 (unknown local UE NGAP ID).
+	if gnb.isReleasedAssociation(req.RANUENGAPId, ue) {
+		s.logger.Warn("UplinkNASTransport on a released UE-associated logical NG-connection",
+			"nf", "AMF", "procedure", "ErrorIndication", "interface", "N2", "direction", "IN",
+			"message_type", "UplinkNASTransport", "amf_ue_ngap_id", req.AMFUENGAPId,
+			"ran_ue_ngap_id", req.RANUENGAPId, "result", "REJECT",
+			"spec_ref", "TS 38.413 §10.6")
+		s.sendUnknownLocalUENGAPID(ctx, gnb, req.AMFUENGAPId, req.RANUENGAPId)
+		return
+	}
+
 	// Drop NAS messages on a context that is pending N2 release (deregistration
 	// in progress). The UE may send a new Registration Request immediately after
 	// receiving the Deregistration Accept but before the gNB issues RRC Release.
@@ -2085,6 +2103,7 @@ func (s *Server) SendInitialContextSetupRequest(
 	}
 	radioCap := append([]byte(nil), ue.UERadioCapability...)
 	ue.Unlock()
+	procName := icsProcedureName(ue.PendingICS())
 	pdu, encErr := buildInitialContextSetupRequest(
 		ue.AMFUENGAPId, ue.RANUENGAPId,
 		nasPDU, kgnb,
@@ -2103,7 +2122,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		// was or can be sent, so do not report it as sent.
 		s.logger.Error("Initial Context Setup Request encode failed",
 			"nf", "AMF",
-			"procedure", "InitialRegistration",
+			"procedure", procName,
 			"interface", "N2",
 			"direction", "OUT",
 			"message_type", "InitialContextSetupRequest",
@@ -2117,7 +2136,7 @@ func (s *Server) SendInitialContextSetupRequest(
 		return fmt.Errorf("%w: %w", errICSEncodeFailed, encErr)
 	}
 	s.logger.Info("Initial Context Setup Request",
-		"procedure", "InitialRegistration",
+		"procedure", procName,
 		"interface", "N2",
 		"direction", "OUT",
 		"message_type", "InitialContextSetupRequest",
@@ -2138,6 +2157,15 @@ func (s *Server) SendInitialContextSetupRequest(
 		ue.Unlock()
 	}
 	return err
+}
+
+// icsProcedureName maps the pending ICS kind to the `procedure` log field of the
+// ICS send path; ICSNone (sender recorded no kind) is the ICS procedure itself.
+func icsProcedureName(k amfctx.ICSKind) string {
+	if k == amfctx.ICSNone {
+		return "InitialContextSetup"
+	}
+	return k.String()
 }
 
 // errICSEncodeFailed is returned by SendInitialContextSetupRequest when the
@@ -2914,6 +2942,11 @@ type InitialUEMessage struct {
 	// The uint32 value is the 5G-TMSI extracted from the 5G-S-TMSI IE.
 	// Ref: TS 38.413 §9.3.3.5, TS 23.502 §4.2.3
 	FiveGSTMSI *uint32
+	// FiveGSTMSISetID / FiveGSTMSIPointer are the AMF Set ID (10 bits) and AMF
+	// Pointer (6 bits) of the 5G-S-TMSI; the 5G-TMSI is unique only within the
+	// AMF that allocated it. Ref: TS 38.413 §9.3.3.20, TS 23.003 §2.10.1.
+	FiveGSTMSISetID   uint16
+	FiveGSTMSIPointer byte
 }
 
 // UplinkNASTransport holds decoded fields from an Uplink NAS Transport.
@@ -2921,4 +2954,32 @@ type UplinkNASTransport struct {
 	AMFUENGAPId int64
 	RANUENGAPId int64
 	NASPdu      []byte
+}
+
+// lookupOwnTMSI resolves the 5G-S-TMSI of an INITIAL UE MESSAGE to a UE context
+// only when its AMF Set ID and AMF Pointer identify this AMF: a 5G-TMSI is unique
+// only within the AMF that allocated it, so a foreign identity with the same
+// 5G-TMSI value must be treated as unknown.
+// Ref: TS 38.413 §9.3.3.20, TS 23.003 §2.10.1.
+func (s *Server) lookupOwnTMSI(ctx context.Context, req *InitialUEMessage) (*amfctx.UEContext, bool) {
+	if req.FiveGSTMSI == nil {
+		return nil, false
+	}
+	id := s.mgr.AMFID
+	if req.FiveGSTMSISetID != id.AMFSetID || req.FiveGSTMSIPointer != id.AMFID {
+		s.logger.Warn("5G-S-TMSI belongs to another AMF — treating as unknown",
+			"nf", "AMF",
+			"procedure", "InitialUEMessage",
+			"correlation_id", logging.CorrelationID(ctx),
+			"interface", "N2",
+			"direction", "IN",
+			"ran_ue_ngap_id", req.RANUENGAPId,
+			"tmsi", fmt.Sprintf("%08x", *req.FiveGSTMSI),
+			"amf_set_id", req.FiveGSTMSISetID,
+			"amf_pointer", req.FiveGSTMSIPointer,
+			"spec_ref", "TS 38.413 §9.3.3.20, TS 23.003 §2.10.1",
+		)
+		return nil, false
+	}
+	return s.mgr.GetByTMSI(*req.FiveGSTMSI)
 }

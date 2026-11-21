@@ -61,6 +61,7 @@ type notifyPost struct {
 // Mandatory IEs with criticality ignore are deliberately not checked: a missing one is
 // silently ignored (§10.3.5). Only messages the AMF consumes are listed.
 var mandatoryRejectIEs = map[[2]int][]int64{
+	{0, int(ProcNGReset)}: {ngapType.ProtocolIEIDResetType}, // NG RESET, §9.2.6.11 (Cause is ignore)
 	{0, int(ProcUplinkNASTransport)}: {
 		ngapType.ProtocolIEIDAMFUENGAPID, ngapType.ProtocolIEIDRANUENGAPID, ngapType.ProtocolIEIDNASPDU,
 	},
@@ -75,13 +76,12 @@ var mandatoryRejectIEs = map[[2]int][]int64{
 }
 
 // hasResponseMessage reports whether the AMF answers the initiating message of this
-// procedure code with a response message it builds (NG SETUP, HANDOVER PREPARATION, PATH
-// SWITCH REQUEST): the Criticality Diagnostics of an "ignore and notify" IE then travel in
-// that response (§10.3.4.2) instead of an ERROR INDICATION. NG RESET has a response but the
-// AMF sends none (observe-only), so it keeps the ERROR INDICATION.
+// procedure code with a response message it builds (NG SETUP, NG RESET, HANDOVER
+// PREPARATION, PATH SWITCH REQUEST): the Criticality Diagnostics of an "ignore and notify"
+// IE then travel in that response (§10.3.4.2) instead of an ERROR INDICATION.
 func hasResponseMessage(pc ProcedureCode) bool {
 	switch pc {
-	case ProcNGSetup, ProcHandoverPreparation, ProcPathSwitchRequest:
+	case ProcNGSetup, ProcNGReset, ProcHandoverPreparation, ProcPathSwitchRequest:
 		return true
 	}
 	return false
@@ -324,6 +324,8 @@ func attachNotifyCD(msg *Message, cd *ngapType.CriticalityDiagnostics) {
 	switch v := msg.Value.(type) {
 	case *NGSetupRequest:
 		v.NotifyCD = cd
+	case *NGResetMsg:
+		v.NotifyCD = cd
 	case *HandoverRequiredMsg:
 		v.NotifyCD = cd
 	case *PathSwitchRequestMsg:
@@ -399,7 +401,11 @@ func (s *Server) checkAbstractSyntax(ctx context.Context, gnb *GNBContext, msg *
 			if amf != nil {
 				p.AMFUENGAPID, p.RANUENGAPID = amf, ran
 			}
-			s.sendErrorIndication(ctx, gnb, p, spec)
+			if err := s.sendErrorIndication(ctx, gnb, p, spec); err != nil {
+				logging.NewProcedureLogger(ctx, s.logger, procErrorIndication).With("nf", "AMF", "interface", "N2").Warn(
+					"ERROR INDICATION not sent", "direction", "OUT", "message_type", "ErrorIndication",
+					"result", "FAILURE", "error", err, "gnb_addr", gnb.remoteAddrString(), "spec_ref", spec)
+			}
 		}}
 	}
 	return true, nil
@@ -425,11 +431,15 @@ func (s *Server) handleUnknownProcedure(ctx context.Context, log interface {
 		return false, nil
 	}
 	cd := cdFor(msg, nil, true)
-	s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
+	if err := s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
 		CausePresent: ngapType.CausePresentProtocol,
 		CauseValue:   int64(cause),
 		CD:           &cd,
-	}, refProcedureCode)
+	}, refProcedureCode); err != nil {
+		logging.NewProcedureLogger(ctx, s.logger, procErrorIndication).With("nf", "AMF", "interface", "N2").Warn(
+			"ERROR INDICATION not sent", "direction", "OUT", "message_type", "ErrorIndication",
+			"result", "FAILURE", "error", err, "gnb_addr", gnb.remoteAddrString(), "spec_ref", refProcedureCode)
+	}
 	return false, nil
 }
 
@@ -516,7 +526,10 @@ func (s *Server) rejectAbstractSyntax(ctx context.Context, gnb *GNBContext, msg 
 	if amf != nil {
 		p.AMFUENGAPID, p.RANUENGAPID = amf, ran
 	}
-	s.sendErrorIndication(ctx, gnb, p, spec)
+	if err := s.sendErrorIndication(ctx, gnb, p, spec); err != nil {
+		log.Warn("ERROR INDICATION not sent", "direction", "OUT", "message_type", "ErrorIndication",
+			"result", "FAILURE", "error", err, "gnb_addr", gnb.remoteAddrString(), "spec_ref", spec)
+	}
 }
 
 // writeFailure sends a failure message built by rejectAbstractSyntax and logs it.
@@ -542,7 +555,7 @@ func (s *Server) writeFailure(log interface {
 
 // sendErrorIndication encodes and sends an ERROR INDICATION on gnb's association (SCTP PPID
 // 60) and logs / counts it. spec is the clause that triggered it. Ref: TS 38.413 §8.7.5.
-func (s *Server) sendErrorIndication(ctx context.Context, gnb *GNBContext, p ErrorIndicationParams, spec string) {
+func (s *Server) sendErrorIndication(ctx context.Context, gnb *GNBContext, p ErrorIndicationParams, spec string) error {
 	log := logging.NewProcedureLogger(ctx, s.logger, procErrorIndication).With(
 		"nf", "AMF", "interface", "N2", "direction", "OUT", "message_type", "ErrorIndication",
 		"gnb_addr", gnb.remoteAddrString())
@@ -553,21 +566,22 @@ func (s *Server) sendErrorIndication(ctx context.Context, gnb *GNBContext, p Err
 	if gnb.Conn == nil && gnb.sctpWrite == nil {
 		log.Error("ErrorIndication not sent: no N2 association", append(fields, "result", "FAILURE")...)
 		metrics.ProcedureTotal.WithLabelValues("AMF", procErrorIndication, "FAILURE").Inc()
-		return
+		return errors.New("ngap: send error indication: no N2 association")
 	}
 	pdu, err := BuildErrorIndication(p)
 	if err != nil {
 		log.Error("ErrorIndication build failed", append(fields, "result", "FAILURE", "error", err)...)
 		metrics.ProcedureTotal.WithLabelValues("AMF", procErrorIndication, "FAILURE").Inc()
-		return
+		return fmt.Errorf("ngap: send error indication: %w", err)
 	}
 	if _, err := gnb.writeNGAP(pdu); err != nil {
 		log.Error("ErrorIndication send failed", append(fields, "result", "FAILURE", "error", err)...)
 		metrics.ProcedureTotal.WithLabelValues("AMF", procErrorIndication, "FAILURE").Inc()
-		return
+		return fmt.Errorf("ngap: send error indication: %w", err)
 	}
 	log.Warn("ErrorIndication sent", append(fields, "result", "OK")...)
 	metrics.ProcedureTotal.WithLabelValues("AMF", procErrorIndication, "OK").Inc()
+	return nil
 }
 
 // causeName renders an NGAP Cause for logs.
@@ -619,10 +633,15 @@ func (s *Server) handleTransferSyntaxError(ctx context.Context, gnb *GNBContext,
 		"nf", "AMF", "procedure", procErrorIndication, "interface", "N2", "direction", "IN",
 		"error", decErr, "pdu_len", len(data), "result", "FAILURE", "gnb_addr", gnb.remoteAddrString(),
 		"spec_ref", refTransferSyntax)
-	s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
+	if err := s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
 		CausePresent: ngapType.CausePresentProtocol,
 		CauseValue:   int64(ngapType.CauseProtocolPresentTransferSyntaxError),
-	}, refTransferSyntax)
+	}, refTransferSyntax); err != nil {
+		s.logger.Warn("ERROR INDICATION not sent",
+			"procedure", procErrorIndication, "interface", "N2", "direction", "OUT",
+			"message_type", "ErrorIndication", "result", "FAILURE", "error", err,
+			"gnb_addr", gnb.remoteAddrString(), "spec_ref", refTransferSyntax)
+	}
 }
 
 // decodeNGAPPDUWithRaw is DecodeNGAPPDU that also returns the decoded ngapType PDU for the
@@ -639,11 +658,17 @@ func decodeNGAPPDUWithRaw(data []byte) (*Message, *ngapType.NGAPPDU, error) {
 // is unknown with an ERROR INDICATION carrying the received IDs and Cause radioNetwork
 // unknown-local-UE-NGAP-ID. Ref: TS 38.413 §10.6, §8.7.5.2.
 func (s *Server) sendUnknownLocalUENGAPID(ctx context.Context, gnb *GNBContext, amfID, ranID int64) {
-	s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
+	if err := s.sendErrorIndication(ctx, gnb, ErrorIndicationParams{
 		AMFUENGAPID: &amfID, RANUENGAPID: &ranID,
 		CausePresent: ngapType.CausePresentRadioNetwork,
 		CauseValue:   int64(ngapType.CauseRadioNetworkPresentUnknownLocalUENGAPID),
-	}, refUnknownLocalAPID)
+	}, refUnknownLocalAPID); err != nil {
+		s.logger.Warn("ERROR INDICATION not sent",
+			"procedure", procErrorIndication, "interface", "N2", "direction", "OUT",
+			"message_type", "ErrorIndication", "result", "FAILURE", "error", err,
+			"amf_ue_ngap_id", amfID, "ran_ue_ngap_id", ranID,
+			"gnb_addr", gnb.remoteAddrString(), "spec_ref", refUnknownLocalAPID)
+	}
 }
 
 // localReleaseByRANUENGAPID performs the local release of TS 38.413 §10.6: when a message

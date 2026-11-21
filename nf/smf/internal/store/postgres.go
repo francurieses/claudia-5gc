@@ -9,6 +9,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/shared/dbmigrate"
 	"github.com/francurieses/claudia-5gc/shared/jsoncompat"
+	"github.com/francurieses/claudia-5gc/shared/storewait"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,18 +22,27 @@ type Postgres struct {
 	pool *pgxpool.Pool
 }
 
-// NewPostgres opens a connection pool and runs embedded migrations.
+// NewPostgres opens a connection pool and runs embedded migrations. On any
+// error the pool is closed, so a caller may retry (shared/storewait) without
+// leaking pools. A migration error is marked storewait.Permanent (retrying
+// cannot fix a checksum mismatch or a lint failure) unless ctx ended during it.
 func NewPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("smf store: pgxpool.New: %w", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("smf store: postgres ping: %w", err)
 	}
 	p := &Postgres{pool: pool}
 	if err := p.migrate(ctx); err != nil {
-		return nil, fmt.Errorf("smf store: migrate: %w", err)
+		pool.Close()
+		err = fmt.Errorf("smf store: migrate: %w", err)
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return nil, storewait.Permanent(err)
 	}
 	return p, nil
 }

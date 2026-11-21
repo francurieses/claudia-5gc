@@ -142,5 +142,26 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("config: read file: %w", err)
 	}
 
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// Validate checks the default_sm_policy ARP enumerations (TS 29.571 §5.4.4.7
+// PreemptionCapability / PreemptionVulnerability). Empty values are allowed and
+// resolve to NOT_PREEMPT / NOT_PREEMPTABLE at decision time.
+func (c *Config) Validate() error {
+	switch c.DefaultSMPolicy.ARPPreemptCap {
+	case "", "NOT_PREEMPT", "MAY_PREEMPT":
+	default:
+		return fmt.Errorf("config: default_sm_policy.arp_preempt_cap %q invalid (want NOT_PREEMPT or MAY_PREEMPT)", c.DefaultSMPolicy.ARPPreemptCap)
+	}
+	switch c.DefaultSMPolicy.ARPPreemptVuln {
+	case "", "NOT_PREEMPTABLE", "PREEMPTABLE":
+	default:
+		return fmt.Errorf("config: default_sm_policy.arp_preempt_vuln %q invalid (want NOT_PREEMPTABLE or PREEMPTABLE)", c.DefaultSMPolicy.ARPPreemptVuln)
+	}
+	return nil
 }

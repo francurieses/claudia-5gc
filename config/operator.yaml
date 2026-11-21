@@ -27,13 +27,17 @@ plmn:
     mcc: "001"
     mnc: "01"
 snssais:
-    - sd: "000001"
+    - dnn: internet
+      sd: "000001"
       sst: 1
-    - sd: "000002"
+    - dnn: gaming
+      sd: "000002"
       sst: 1
-    - sd: "000001"
+    - dnn: ims
+      sd: "000001"
       sst: 2
-    - sd: "000001"
+    - dnn: bronze
+      sd: "000001"
       sst: 3
     - sd: "001234"
       sst: 1

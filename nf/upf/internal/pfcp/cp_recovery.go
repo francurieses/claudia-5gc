@@ -12,6 +12,7 @@ package pfcp
 // TS 23.007 §19A (restoration procedures).
 
 import (
+	"context"
 	"net"
 	"time"
 
@@ -100,6 +101,7 @@ func (s *Server) purgeCPSessions(peer string) int {
 			continue
 		}
 		sess.qos.Store(nil)
+		s.discardDLBuffer(context.Background(), sess, DLDropSessionDeleted)
 		s.sessions.delete(id)
 		metrics.UPFPFCPSessionsActive.Dec()
 		n++

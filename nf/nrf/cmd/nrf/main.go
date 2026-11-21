@@ -26,6 +26,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/nrf/internal/server"
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
+	"github.com/francurieses/claudia-5gc/shared/storewait"
 )
 
 const nfName = "NRF"
@@ -84,10 +85,25 @@ func main() {
 	// Construir registry: Redis si REDIS_URL está configurado, InMemory en otro caso.
 	evictionTimeout := time.Duration(cfg.HeartbeatTimeoutSec) * time.Second
 
+	// Wait for Redis at startup and exit if it stays down (OPS-002); a SIGTERM
+	// during the wait ends the process cleanly. NFs retry NFRegister in the
+	// background (shared/nrf), so they re-register once the NRF is back.
+	storePolicy, err := storewait.PolicyFromEnv()
+	if err != nil {
+		logger.Error("NRF: invalid store config", "error", err)
+		os.Exit(1)
+	}
+	waitCtx, stopWait := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	var reg registry.Registry
 	if redisAddr := getEnv("REDIS_URL", ""); redisAddr != "" {
-		rr, err := registry.NewRedis(redisAddr, evictionTimeout, logger)
+		opts := storewait.Options{Store: "redis", Interface: "Redis", Policy: storePolicy, Logger: logger}
+		rr, err := storewait.Open(waitCtx, opts, func(ctx context.Context) (*registry.RedisRegistry, error) {
+			return registry.NewRedis(ctx, redisAddr, evictionTimeout, logger)
+		})
 		if err != nil {
+			if fallback, code := storewait.Decide(waitCtx, opts, err); !fallback {
+				os.Exit(code)
+			}
 			logger.Warn("Redis unavailable — falling back to in-memory registry",
 				"addr", redisAddr, "error", err)
 			reg = registry.NewInMemory(logger)
@@ -99,6 +115,7 @@ func main() {
 	} else {
 		reg = registry.NewInMemory(logger)
 	}
+	stopWait()
 
 	// Construir HTTP server
 	srv, err := server.New(cfg, reg, logger)

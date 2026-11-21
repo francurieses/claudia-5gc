@@ -10,11 +10,19 @@ import (
 
 // TestDecipherNASContainer covers the algorithm choice and the no-silent-fallback
 // rule of TS 24.501 §4.4.6: NEA0 plain, NEA2 deciphered, a plain container under a
-// non-null cipher refused, NEA1/NEA3 (no shared implementation) an error.
+// non-null cipher refused, NEA1/NEA3 deciphered, an unknown id an error.
 func TestDecipherNASContainer(t *testing.T) {
 	key := bytes.Repeat([]byte{0x42}, 16)
 	inner := []byte{0x7E, 0x00, 0x41, 0x01, 0x02}
 	enc, err := nea.NEA2(key, 5, 0x01, 0x00, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc1, err := nea.NEA1(key, 5, 0x01, 0x00, inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc3, err := nea.NEA3(key, 5, 0x01, 0x00, inner)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,8 +42,10 @@ func TestDecipherNASContainer(t *testing.T) {
 		{"NEA2 ciphered", mk(2, key), enc, false},
 		{"NEA2 plaintext container refused", mk(2, key), inner, true},
 		{"NEA2 no key", mk(2, nil), enc, true},
-		{"NEA1 unsupported", mk(1, key), enc, true},
-		{"NEA3 unsupported", mk(3, key), enc, true},
+		{"NEA1 ciphered", mk(1, key), enc1, false},
+		{"NEA3 ciphered", mk(3, key), enc3, false},
+		{"NEA1 container ciphered with NEA2 refused", mk(1, key), enc, true},
+		{"unknown NEA5", mk(5, key), enc, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

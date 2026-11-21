@@ -36,6 +36,10 @@ n3:
     socket_buffer_bytes: 8388608
 n4:
     address: 0.0.0.0:8805
+    # DL buffering while a FAR is BUFF (SMF-011, TS 29.244 §5.2.3.1)
+    dl_buffer:
+        default_max_packets: 64
+        max_packets_cap: 256
 n6:
     l4_checksum_repair: true
     tcp_mss_clamp: true

@@ -11,6 +11,7 @@ import (
 
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
+	"github.com/francurieses/claudia-5gc/shared/oauth2"
 )
 
 // Config is the NRF runtime configuration. Mirrors the YAML schema in
@@ -30,7 +31,8 @@ type Config struct {
 
 	// OAuth2Secret is the HMAC-HS256 signing secret for JWT access tokens.
 	// Ref: TS 33.501 §13.4.1 — client_credentials grant for SBA.
-	// Defaults to a dev-only secret; MUST be overridden in production.
+	// Precedence: OAUTH2_SECRET env > this value > oauth2.DefaultDevSecret
+	// (dev-only; MUST be overridden in production).
 	OAuth2Secret string `yaml:"oauth2_secret"`
 
 	Metrics Metrics `yaml:"metrics"`
@@ -106,9 +108,7 @@ func (c *Config) validate() error {
 	if c.HeartbeatTimeoutSec == 0 {
 		c.HeartbeatTimeoutSec = 90
 	}
-	if c.OAuth2Secret == "" {
-		c.OAuth2Secret = "5gc-dev-oauth2-secret-change-in-production"
-	}
+	c.OAuth2Secret = oauth2.ResolveSecret(c.OAuth2Secret)
 	if c.Metrics.Address == "" {
 		c.Metrics.Address = ":9100"
 	}

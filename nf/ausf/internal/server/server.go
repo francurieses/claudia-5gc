@@ -441,7 +441,7 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 	// Ref: TS 29.509 §6.1.6.2.2 (AuthenticationInfo.supiOrSuci), TS 29.571 §5.3.2.
 	shownID := authInfo.SUPIUSUCI
 	if types.IsSUCI(authInfo.SUPIUSUCI) {
-		suci, perr := types.ParseSUCI(authInfo.SUPIUSUCI)
+		suci, sfmt, perr := types.ParseSUCIAny(authInfo.SUPIUSUCI)
 		if perr != nil {
 			log.Warn("malformed SUCI rejected",
 				"result", "REJECT", "cause", CauseMandatoryIEIncorrect,
@@ -451,7 +451,11 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 				[]map[string]string{{"param": "/supiOrSuci"}})
 			return
 		}
-		if suci.ProtectionScheme != types.SUCISchemeNull {
+		if suci.ProtectionScheme != types.SUCISchemeNull && sfmt == types.SUCIFormatLegacy {
+			// Legacy form carries no HN key id: show it as received, output concealed.
+			shownID = fmt.Sprintf("suci-%s%s-%s-0-%d-<concealed>",
+				suci.MCC, suci.MNC, suci.RoutingIndicator, suci.ProtectionScheme)
+		} else if suci.ProtectionScheme != types.SUCISchemeNull {
 			// Never log the concealed scheme output.
 			shownID = fmt.Sprintf("suci-%d-%s-%s-%s-%d-%d-<concealed>", suci.SUPIType,
 				suci.MCC, suci.MNC, suci.RoutingIndicator, suci.ProtectionScheme, suci.HNPublicKeyID)
@@ -459,6 +463,13 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 		log = log.With("suci_scheme", suci.ProtectionScheme,
 			"hn_public_key_id", suci.HNPublicKeyID,
 			"routing_indicator", suci.RoutingIndicator)
+		if sfmt == types.SUCIFormatLegacy {
+			// Rolling upgrade from v2.6.0-rel17-final AMFs: the legacy private
+			// SUCI string is accepted and forwarded unchanged to the UDM.
+			log.Info("legacy SUCI format accepted (rolling-upgrade compat)",
+				"suci_format", sfmt.String(), "direction", "IN",
+				"spec_ref", "TS 29.509 §6.1.6.2.2; TS 29.571 §5.3.2")
+		}
 	}
 	log = log.With("supi_or_suci", shownID)
 	span.SetAttributes(

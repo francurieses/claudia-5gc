@@ -43,6 +43,12 @@ func EncodeAuthenticationRequest(ar *AuthenticationRequest) ([]byte, error) {
 	out = append(out, 0x20, 0x10)
 	out = append(out, ar.AUTN[:]...)
 
+	// IEI 0x78 — EAP message (TLV-E, optional, last in Table 8.2.1.1.1). Written only when set,
+	// so the 5G-AKA encoding is unchanged; before CI-003 the field was decoded but never encoded.
+	if len(ar.EAPMessage) > 0 {
+		out = append(out, EncodeEAPMessageTLVE(ar.EAPMessage)...)
+	}
+
 	return out, nil
 }
 
@@ -60,12 +66,18 @@ func DecodeAuthenticationRequest(b []byte) (*AuthenticationRequest, error) {
 		Type:             (ngksi >> 3) & 0x01,
 	}
 
-	// ABBA: mandatory LV (no IEI) per TS 24.501 §8.2.1.1 Table 8.2.1.1.1.
-	if l, err := rdr.ReadByte(); err == nil {
-		if abbaBytes, err := rdr.ReadBytes(int(l)); err == nil && len(abbaBytes) >= 2 {
-			ar.ABBA = ABBA{abbaBytes[0], abbaBytes[1]}
-		}
+	// ABBA: mandatory LV (no IEI) per TS 24.501 §8.2.1.1 Table 8.2.1.1.1, contents >= 2
+	// octets (§9.11.3.10). Absent, short or truncated is a message error, not a zero ABBA
+	// (found by FuzzRoundTripAuthenticationRequest).
+	l, err := rdr.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("nas: AuthenticationRequest: ABBA missing")
 	}
+	abbaBytes, err := rdr.ReadBytes(int(l))
+	if err != nil || len(abbaBytes) < 2 {
+		return nil, fmt.Errorf("nas: AuthenticationRequest: ABBA length %d: invalid or truncated", l)
+	}
+	ar.ABBA = ABBA{abbaBytes[0], abbaBytes[1]}
 
 	// Optional IEs: RAND IEI=0x21 TV (no length), AUTN IEI=0x20 TLV, EAP IEI=0x78 TLV-E.
 	// Ref: TS 24.501 Table 8.2.1.1.1
@@ -299,9 +311,18 @@ func DecodeSecurityModeCommand(b []byte) (*SecurityModeCommand, error) {
 		KeySetIdentifier: ngksi & 0x07,
 		Type:             (ngksi >> 3) & 0x01,
 	}
+	// Replayed UE security capabilities is mandatory LV, contents 2..8 octets
+	// (TS 24.501 §8.2.25.1, §9.11.3.54): a truncated or short IE is a message
+	// error, not empty capabilities (found by FuzzRoundTripSecurityModeCommand).
 	capLen, _ := rdr.ReadByte()
-	capBytes, _ := rdr.ReadBytes(int(capLen))
-	cap, _ := DecodeUESecurityCapability(capBytes)
+	capBytes, err := rdr.ReadBytes(int(capLen))
+	if err != nil || capLen < 2 {
+		return nil, fmt.Errorf("nas: SecurityModeCommand: replayed UE security capabilities length %d: invalid or truncated", capLen)
+	}
+	cap, err := DecodeUESecurityCapability(capBytes)
+	if err != nil {
+		return nil, fmt.Errorf("nas: SecurityModeCommand: replayed UE security capabilities: %w", err)
+	}
 	smc.ReplayedUESecurityCapabilities = cap
 
 	for rdr.Len() > 0 {

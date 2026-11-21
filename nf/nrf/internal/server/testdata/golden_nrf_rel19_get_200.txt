@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"fqdn":"smf.5gc","heartBeatTimer":60,"nfInstanceId":"aaaaaaaa-0000-0000-0000-00000000000a","nfServices":[{"serviceInstanceId":"s1","serviceName":"nsmf-pdusession","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.0.0"}],"scheme":"https","nfServiceStatus":"REGISTERED","supportedFeatures":"8"}],"nfStatus":"REGISTERED","nfType":"SMF"}

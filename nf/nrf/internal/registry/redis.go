@@ -24,10 +24,13 @@ type RedisRegistry struct {
 }
 
 // NewRedis connects to Redis and returns a RedisRegistry.
-// ttl should be 2 × heartBeatTimer (TS 29.510 §5.2.2.3.4).
-func NewRedis(addr string, ttl time.Duration, logger *slog.Logger) (*RedisRegistry, error) {
+// ttl should be 2 × heartBeatTimer (TS 29.510 §5.2.2.3.4). The ping honours
+// ctx; on failure the client is closed, so a caller may retry
+// (shared/storewait) without leaking clients.
+func NewRedis(ctx context.Context, addr string, ttl time.Duration, logger *slog.Logger) (*RedisRegistry, error) {
 	rdb := redis.NewClient(&redis.Options{Addr: addr})
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("nrf redis: ping %s: %w", addr, err)
 	}
 	return &RedisRegistry{

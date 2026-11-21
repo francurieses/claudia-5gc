@@ -1,0 +1,5 @@
+status: OK
+Content-Type: application/json
+Location: 
+
+{"nfInstances":[{"heartBeatTimer":60,"nfInstanceId":"bbbbbbbb-0000-0000-0000-00000000000b","nfServices":[{"serviceInstanceId":"m1","serviceName":"nudm-sdm","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.0.0"}],"scheme":"https","nfServiceStatus":"REGISTERED"}],"nfStatus":"REGISTERED","nfType":"UDM"}],"nrfSupportedFeatures":"20","numNfInstComplete":1,"searchId":"<ULID>","validityPeriod":3600}

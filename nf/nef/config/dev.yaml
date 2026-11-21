@@ -16,8 +16,8 @@ peers:
   nrf: "nrf:8000"
   bsf: "bsf:8010"
 
-oauth2:
-  secret: "5gc-dev-secret"
+# oauth2.secret intentionally unset: resolved from OAUTH2_SECRET env or the shared
+# default (shared/oauth2.DefaultDevSecret) so it matches the NRF issuer.
 
 metrics:
   address: "0.0.0.0:9112"

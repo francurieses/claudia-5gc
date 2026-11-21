@@ -39,6 +39,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 	"github.com/francurieses/claudia-5gc/shared/sbi/features"
+	"github.com/francurieses/claudia-5gc/shared/storewait"
 
 	operatorcfg "github.com/francurieses/claudia-5gc/shared/config"
 )
@@ -257,11 +258,25 @@ func main() {
 	}
 
 	// ---- Persistent store (PostgreSQL) + cache (Redis) --------------------
+	// Wait for both at startup and exit if one stays down (OPS-002); a
+	// SIGTERM during the wait ends the process cleanly.
+	storePolicy, err := storewait.PolicyFromEnv()
+	if err != nil {
+		logger.Error("AMF: invalid store config", "error", err)
+		os.Exit(1)
+	}
+	waitCtx, stopWait := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	var ueStore store.Store
 	var ueCache store.Cache
 	if dsn := getEnvDefault("DATABASE_URL", cfg.DatabaseURL); dsn != "" {
-		pg, err := store.NewPostgres(context.Background(), dsn)
+		opts := storewait.Options{Store: "postgres", Interface: "Postgres", Policy: storePolicy, Logger: logger}
+		pg, err := storewait.Open(waitCtx, opts, func(ctx context.Context) (*store.Postgres, error) {
+			return store.NewPostgres(ctx, dsn)
+		})
 		if err != nil {
+			if fallback, code := storewait.Decide(waitCtx, opts, err); !fallback {
+				os.Exit(code)
+			}
 			logger.Warn("AMF PostgreSQL unavailable — running in-memory only",
 				"error", err, "dsn_hint", "set DATABASE_URL")
 		} else {
@@ -271,8 +286,14 @@ func main() {
 		}
 	}
 	if redisAddr := getEnvDefault("REDIS_URL", cfg.RedisURL); redisAddr != "" {
-		rc, err := store.NewRedisCache(redisAddr)
+		opts := storewait.Options{Store: "redis", Interface: "Redis", Policy: storePolicy, Logger: logger}
+		rc, err := storewait.Open(waitCtx, opts, func(ctx context.Context) (*store.RedisCache, error) {
+			return store.NewRedisCache(ctx, redisAddr)
+		})
 		if err != nil {
+			if fallback, code := storewait.Decide(waitCtx, opts, err); !fallback {
+				os.Exit(code)
+			}
 			logger.Warn("AMF Redis unavailable — using local TMSI counter",
 				"error", err, "addr", redisAddr)
 		} else {
@@ -281,6 +302,7 @@ func main() {
 			logger.Info("AMF Redis cache connected", "addr", redisAddr)
 		}
 	}
+	stopWait()
 
 	// ---- AMF context manager ----------------------------------------------
 	amfID := amfctx.AMFIdentity{
@@ -486,6 +508,19 @@ func main() {
 		smf:     smfClient,
 		nrfDisc: nrfDiscClient,
 	}
+	regHandler.WithCipheringOrder(cfg.NASSecurity.cipheringOrderIDs)
+	logger.Info("NAS ciphering order configured", "nf", "AMF", "procedure", "NASSecurity",
+		"ciphering_order", procedures.CipheringOrderNames(cfg.NASSecurity.cipheringOrderIDs),
+		"spec_ref", "TS 33.501 §6.7.1.1")
+	if w := procedures.CipheringOrderWarning(cfg.NASSecurity.cipheringOrderIDs); w != "" {
+		logger.Warn(w, "nf", "AMF", "procedure", "NASSecurity",
+			"ciphering_order", procedures.CipheringOrderNames(cfg.NASSecurity.cipheringOrderIDs),
+			"spec_ref", "TS 33.501 §6.7.1.1")
+	}
+	regHandler.WithIntegrityOrder(cfg.NASSecurity.integrityOrderIDs)
+	logger.Info("NAS integrity order configured", "nf", "AMF", "procedure", "NASSecurity",
+		"integrity_order", procedures.IntegrityOrderNames(cfg.NASSecurity.integrityOrderIDs),
+		"spec_ref", "TS 33.501 §6.7.1.1")
 	nasHandler := nasmsg.NewHandler(sender, regHandler, logger)
 	nasHandler.WithIntegrityEnforcement(nasmsg.IntegrityEnforcement(cfg.NASSecurity.IntegrityEnforcement))
 
@@ -536,6 +571,7 @@ func main() {
 	// Detach watchdogs. The NGAP layer re-arms them on AN Release (CM-IDLE).
 	// Also wake any pending paging-then-locate waiter in the SBI server.
 	// Ref: TS 23.501 §5.3.2, TS 24.501 §5.3.7, TS 23.273 §7.2 steps E2–E7.
+	nasHandler.SetPager(ngapSrv) // CM-IDLE #39 release pages the UE (TS 23.502 §4.3.4.2 step 4)
 	nasHandler.SetUEReachableHandler(func(ue *amfctx.UEContext) {
 		ngapSrv.StopUETimers(ue)
 		// Unblock any Namf_Location paging-then-locate waiter for this UE.
@@ -790,7 +826,13 @@ func main() {
 		// the subscription was withdrawn; on an AMF change (UE_REGISTRATION_AREA_CHANGE
 		// and similar) the PDU sessions move to the new AMF and must survive.
 		// Ref: TS 23.502 §4.2.2.2.2 step 14d, §4.2.2.3.3; TS 29.503 §6.2.6.3.x DeregistrationReason.
-		sbiSrv.SetDeregistrationHandler(func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error {
+		sbiSrv.SetDeregistrationHandler(func(ctx context.Context, ue *amfctx.UEContext, deregReason, accessType string) error {
+			// AMF-037: SUBSCRIPTION_WITHDRAWN / REREGISTRATION_REQUIRED / 5GS_TO_EPS_*
+			// and NON_3GPP_ACCESS are dispatched in internal/nas (explicit or implicit
+			// de-registration); every other reason keeps the local removal below.
+			if nasHandler.HandleUDMDeregistration(ctx, ue, deregReason, accessType) {
+				return nil
+			}
 			releaseSM := deregReason == "UE_INITIAL_REGISTRATION" || deregReason == "SUBSCRIPTION_WITHDRAWN"
 			removeUEContext(ctx, ue, releaseSM, false)
 			return nil
@@ -1212,42 +1254,11 @@ func main() {
 			return
 		}
 
-		// Check for /pdu-sessions/{psi} suffix
-		if idx := len(path) - len("/pdu-sessions/"); idx > 0 {
-			// path might be "{supi}/pdu-sessions/{psi}"
-			const pdusuffix = "/pdu-sessions/"
-			if sepIdx := len(path); sepIdx > 0 {
-				for i := 0; i < len(path)-len(pdusuffix); i++ {
-					if path[i:i+len(pdusuffix)] == pdusuffix {
-						supi := path[:i]
-						psiStr := path[i+len(pdusuffix):]
-						if supi == "" || psiStr == "" {
-							break
-						}
-						psi, err := strconv.ParseUint(psiStr, 10, 8)
-						if err != nil {
-							http.Error(w, "invalid pdu session id", http.StatusBadRequest)
-							return
-						}
-						ue, found := mgr.GetBySUPI(supi)
-						if !found {
-							http.Error(w, "UE not found", http.StatusNotFound)
-							return
-						}
-						if err := nasHandler.InitiateNetworkPDUSessionRelease(r.Context(), ue, uint8(psi)); err != nil {
-							http.Error(w, err.Error(), http.StatusInternalServerError)
-							return
-						}
-						logger.Info("NW-initiated PDU Session Release triggered",
-							"supi", supi, "pdu_session_id", psi,
-							"procedure", "NetworkPDUSessionRelease",
-							"spec_ref", "TS 23.502 §4.3.4.3",
-						)
-						w.WriteHeader(http.StatusAccepted)
-						return
-					}
-				}
-			}
+		// /{supi}/pdu-sessions/{psi}[?cause=]: network-initiated PDU session release
+		// (TS 23.502 §4.3.4.2); parsing and handling live in internal/mgmt.
+		if supi, psiText, ok := mgmt.SplitPDUSessionPath(path); ok {
+			mgmt.HandlePDUSessionRelease(w, r, mgr, nasHandler, supi, psiText, logger)
+			return
 		}
 
 		// Default: NW-initiated Deregistration
@@ -1430,6 +1441,15 @@ type Config struct {
 	// only: log and process). Env AMF_NAS_INTEGRITY_ENFORCEMENT overrides it.
 	NASSecurity struct {
 		IntegrityEnforcement string `yaml:"integrity_enforcement"`
+		// CipheringOrder: ordered NEA priority list (SEC-006, TS 33.501 §6.7.1.1),
+		// comma separated; default "NEA2, NEA1, NEA3, NEA0". Env AMF_NAS_CIPHERING_ORDER.
+		CipheringOrder    string `yaml:"ciphering_order"`
+		cipheringOrderIDs []byte `yaml:"-"`
+		// IntegrityOrder: ordered NIA priority list (SEC-007, TS 33.501 §6.7.1.1),
+		// comma separated, NIA1..NIA3 (NIA0 rejected); default "NIA2, NIA1, NIA3".
+		// Env AMF_NAS_INTEGRITY_ORDER.
+		IntegrityOrder    string `yaml:"integrity_order"`
+		integrityOrderIDs []byte `yaml:"-"`
 	} `yaml:"nas_security"`
 	// Timers configures UE lifecycle timers. All values in seconds.
 	// Ref: TS 23.501 §5.3.2 (Mobile Reachable / Implicit Detach),
@@ -1447,7 +1467,7 @@ type Config struct {
 		T3570Secs int `yaml:"t3570_secs"` // IDENTITY REQUEST
 	} `yaml:"timers"`
 	// Security overrides — for dev/debug only.
-	// null_ciphering: true forces NEA0+NIA0 so NAS PDUs travel in plain text.
+	// null_ciphering: true selects NEA0 (if the UE offers EA0; real NIA kept) so NAS PDUs travel in plain text.
 	// NEVER set in production. Ref: TS 33.501 §6.7.2
 	Security struct {
 		NullCiphering bool `yaml:"null_ciphering"`
@@ -1604,6 +1624,16 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	c.NASSecurity.IntegrityEnforcement = string(mode)
+	order, err := procedures.ResolveCipheringOrder(c.NASSecurity.CipheringOrder)
+	if err != nil {
+		return nil, err
+	}
+	c.NASSecurity.cipheringOrderIDs = order
+	integOrder, err := procedures.ResolveIntegrityOrder(c.NASSecurity.IntegrityOrder)
+	if err != nil {
+		return nil, err
+	}
+	c.NASSecurity.integrityOrderIDs = integOrder
 	return &c, nil
 }
 

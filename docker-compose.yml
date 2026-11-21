@@ -114,6 +114,9 @@ services:
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
       REDIS_URL: "redis:6379"
+      # OPS-002: store startup wait. Empty = built-in default (60s / required).
+      STORE_CONNECT_TIMEOUT: "${STORE_CONNECT_TIMEOUT:-}"
+      STORE_REQUIRED: "${STORE_REQUIRED:-}"
     depends_on:
       redis:
         condition: service_healthy
@@ -159,14 +162,20 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
       REDIS_URL: "redis:6379"
-      # URSP delivery toggle. Set URSP_ENABLED=false on the host to bring the
-      # core up without URSP (the AMF makes no N15 call and delivers no UE policy
-      # container). Default: enabled. See `make ueransim-ursp` / `make ueransim-no-ursp`.
-      URSP_ENABLED: "${URSP_ENABLED:-true}"
+      # OPS-002: store startup wait. Empty = built-in default (60s / required).
+      STORE_CONNECT_TIMEOUT: "${STORE_CONNECT_TIMEOUT:-}"
+      STORE_REQUIRED: "${STORE_REQUIRED:-}"
+      # URSP delivery toggle. Empty (default) = the AMF config decides
+      # (nf/amf/config/dev.yaml features.ursp_enabled). Set URSP_ENABLED=true|false
+      # on the host to override it for one run (the AMF makes no N15 call and
+      # delivers no UE policy container when false). See `make ueransim-ursp` /
+      # `make ueransim-no-ursp`.
+      URSP_ENABLED: "${URSP_ENABLED:-}"
       # Operator name pushed to every UE in a Configuration Update Command
       # after Registration Complete (TS 24.501 §8.2.19, IEIs 0x43 / 0x45).
-      # Empty = send no name, which is the historic behaviour. Falls back to
-      # operator.network_full_name / network_short_name in the AMF config file.
+      # Empty (default) = use operator.network_full_name / network_short_name from
+      # the AMF config file (nf/amf/config/dev.yaml, default "ClaudIA"). Set
+      # NETWORK_NAME / NETWORK_SHORT_NAME on the host to override it for one run.
       NETWORK_NAME: "${NETWORK_NAME:-}"
       NETWORK_SHORT_NAME: "${NETWORK_SHORT_NAME:-}"
     labels:
@@ -215,6 +224,9 @@ services:
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       REDIS_URL: "redis:6379"
+      # OPS-002: store startup wait. Empty = built-in default (60s / required).
+      STORE_CONNECT_TIMEOUT: "${STORE_CONNECT_TIMEOUT:-}"
+      STORE_REQUIRED: "${STORE_REQUIRED:-}"
     labels:
       logging.5gc/nf: "AUSF"
     depends_on:
@@ -361,6 +373,9 @@ services:
       LOG_LEVEL: info
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
       DATABASE_URL: "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable"
+      # OPS-002: store startup wait. Empty = built-in default (60s / required).
+      STORE_CONNECT_TIMEOUT: "${STORE_CONNECT_TIMEOUT:-}"
+      STORE_REQUIRED: "${STORE_REQUIRED:-}"
     labels:
       logging.5gc/nf: "SMF"
     depends_on:
@@ -1048,6 +1063,9 @@ services:
     image: postgres:16-alpine
     profiles: [core]
     container_name: postgres
+    # Come back after a Docker daemon restart like the NFs do (OPS-001). Without it the
+    # NFs restart, the data tier stays down and they fall back to in-memory stores.
+    restart: unless-stopped
     networks: [sbi-net]
     environment:
       POSTGRES_USER: 5gc
@@ -1067,6 +1085,9 @@ services:
     image: redis:7-alpine
     profiles: [core]
     container_name: redis
+    # Come back after a Docker daemon restart like the NFs do (OPS-001). Without it the
+    # NFs restart, the data tier stays down and they fall back to in-memory stores.
+    restart: unless-stopped
     networks: [sbi-net]
     volumes:
       - redis-data:/data

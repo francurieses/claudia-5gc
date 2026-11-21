@@ -185,16 +185,14 @@ func DecodeConfigurationUpdateCommand(b []byte) (*ConfigurationUpdateCommand, er
 			lo, _ := rdr.ReadByte()
 			length := int(hi)<<8 | int(lo)
 			gutiBytes, _ := rdr.ReadBytes(length)
-			mi, _ := DecodeMobileIdentity(gutiBytes)
-			c.FiveGGUTI = mi
+			c.FiveGGUTI = optionalGUTI(gutiBytes)
 		case 0x54: // TAI list — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			c.TAIList, _ = rdr.ReadBytes(int(l))
 		case 0x15: // Allowed NSSAI — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
-			nssai, _ := DecodeNSSAI(nssaiBytes)
-			c.AllowedNSSAI = &nssai
+			c.AllowedNSSAI = optionalNSSAI(nssaiBytes)
 		case 0x27: // Service area list — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			v, _ := rdr.ReadBytes(int(l))
@@ -216,8 +214,7 @@ func DecodeConfigurationUpdateCommand(b []byte) (*ConfigurationUpdateCommand, er
 		case 0x31: // Configured NSSAI — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
-			nssai, _ := DecodeNSSAI(nssaiBytes)
-			c.ConfiguredNSSAI = &nssai
+			c.ConfiguredNSSAI = optionalNSSAI(nssaiBytes)
 		case 0x11: // Rejected NSSAI — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			rejBytes, _ := rdr.ReadBytes(int(l))

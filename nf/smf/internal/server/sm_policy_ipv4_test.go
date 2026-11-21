@@ -42,7 +42,7 @@ func TestCreateSMPolicyIncludesUEIPv4(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"x5gcQosSource": "OPERATOR_DEFAULT",
 			"qosDecs":       map[string]any{"qd-1": map[string]any{"5qi": 9}},
-			"sessRules":     map[string]any{"sr-1": map[string]any{"sessAmbr": map[string]any{"uplink": "100 Mbps", "downlink": "100 Mbps"}}},
+			"sessRules":     map[string]any{"sr-1": map[string]any{"authSessAmbr": map[string]any{"uplink": "100 Mbps", "downlink": "100 Mbps"}}},
 		})
 	}))
 	t.Cleanup(mockPCF.Close)
@@ -86,7 +86,7 @@ func TestCreateSMPolicyOmitsIPv4WhenEmpty(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"x5gcQosSource": "OPERATOR_DEFAULT",
 			"qosDecs":       map[string]any{"qd-1": map[string]any{"5qi": 9}},
-			"sessRules":     map[string]any{"sr-1": map[string]any{"sessAmbr": map[string]any{"uplink": "100 Mbps", "downlink": "100 Mbps"}}},
+			"sessRules":     map[string]any{"sr-1": map[string]any{"authSessAmbr": map[string]any{"uplink": "100 Mbps", "downlink": "100 Mbps"}}},
 		})
 	}))
 	t.Cleanup(mockPCF.Close)

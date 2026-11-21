@@ -153,7 +153,7 @@ func TestNSSAADefaultAllowedInConfigUpdate(t *testing.T) {
 	t.Run("EAP-Failure", func(t *testing.T) {
 		h, sender, _, ue := nssaaTestHandler(t, true, &seqAAA{results: []*procedures.NSSAAAuthResult{eapFailure()}})
 		ue.PendingNSSAA = rejectedA()
-		ue.SubscribedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain, sliceN(1, "00000a")}
+		ue.DefaultNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain, sliceN(1, "00000a")}
 		startOnQueue(h, ue)
 		if err := h.handleNSSAAComplete(context.Background(), ue, completeMsg(ue, 1, 3)); err != nil {
 			t.Fatal(err)
@@ -175,7 +175,7 @@ func TestNSSAADefaultAllowedInConfigUpdate(t *testing.T) {
 	t.Run("revocation of the last allowed slice", func(t *testing.T) {
 		h, sender, _, ue := nssaaTestHandler(t, true, &nssaaScript{})
 		ue.AllowedNSSAI = rejectedA()
-		ue.SubscribedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain}
+		ue.DefaultNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain}
 		if !h.RevokeNSSAASlice(context.Background(), ue, 1, "000003") {
 			t.Fatal("not revoked")
 		}
@@ -187,7 +187,7 @@ func TestNSSAADefaultAllowedInConfigUpdate(t *testing.T) {
 	t.Run("rel17 never adds defaults", func(t *testing.T) {
 		h, sender, _, ue := nssaaTestHandler(t, false, &nssaaScript{})
 		ue.AllowedNSSAI = rejectedA()
-		ue.SubscribedNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain}
+		ue.DefaultNSSAI = []amfctx.SNSSAISubscribed{sliceN(1, "000003"), plain}
 		h.RevokeNSSAASlice(context.Background(), ue, 1, "000003")
 		c := decodeCUC(t, sender.ofType(t, ue, nas.MsgTypeConfigurationUpdateCommand)[0])
 		if c.AllowedNSSAI == nil || len(c.AllowedNSSAI.SNSSAIs) != 0 || len(c.RejectedNSSAI) != 0 {
@@ -204,7 +204,7 @@ func TestNSSAANoSignallingUnlessRegistered(t *testing.T) {
 			h, sender, clk, ue := nssaaTestHandler(t, true, &nssaaScript{})
 			ue.State = st
 			ue.RejectedNSSAI = rejectedA()
-			ue.SubscribedNSSAI = rejectedA()
+			ue.DefaultNSSAI = rejectedA()
 			h.deregisterForNSSAA(context.Background(), ue)
 			h.finishNSSAA(context.Background(), ue, &procedures.NSSAACompleteOutcome{Deregister: true})
 			h.finishNSSAA(context.Background(), ue, &procedures.NSSAACompleteOutcome{ConfigUpdate: true})

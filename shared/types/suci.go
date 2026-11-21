@@ -52,7 +52,29 @@ var (
 		`^suci-(?:0-([0-9]{3})-([0-9]{2,3})|([1-7])-(.+?))-([0-9]{1,4})-` +
 			`(?:(0)-(0)-(.*)|([a-fA-F1-9])-([0-9]{1,3})-([a-fA-F0-9]+))$`)
 	digitsRE = regexp.MustCompile(`^[0-9]+$`)
+	// Capture groups: 1 mcc, 2 mnc, 3 RI, 4 scheme (decimal), 5 output hex.
+	suciLegacyRE = regexp.MustCompile(
+		`^suci-([0-9]{3})([0-9]{2,3})-([0-9]{1,4})-0-([0-9]{1,3})-([a-fA-F0-9]+)$`)
 )
+
+// SUCIFormat identifies which text form a SUCI string was received in.
+type SUCIFormat uint8
+
+const (
+	// SUCIFormatStandard is the TS 29.571 §5.3.2 / TS 23.003 §2.2B form.
+	SUCIFormatStandard SUCIFormat = iota
+	// SUCIFormatLegacy is the project-private form emitted by the
+	// v2.6.0-rel17-final AMF: suci-<mcc><mnc>-<ri>-0-<scheme>-<hex of NAS output>.
+	SUCIFormatLegacy
+)
+
+// String returns "standard" or "legacy".
+func (f SUCIFormat) String() string {
+	if f == SUCIFormatLegacy {
+		return "legacy"
+	}
+	return "standard"
+}
 
 // SUCI is the decoded standard SUCI text form.
 type SUCI struct {
@@ -138,6 +160,51 @@ func ParseSUCI(s string) (SUCI, error) {
 	out.HNPublicKeyID = uint8(kid)
 	out.SchemeOutput = m[11]
 	return out, nil
+}
+
+// ParseSUCIAny parses a SUCI in the standard form (ParseSUCI) or, failing
+// that, in the legacy project-private form emitted by v2.6.0-rel17-final AMFs
+// (suci-<mcc><mnc>-<ri>-0-<scheme decimal>-<hex of the NAS scheme output>).
+//
+// Legacy acceptance exists only to support a rolling upgrade from rel17 AMFs
+// and may be removed after the support window. The legacy form carries no
+// Home Network Public Key Identifier, so HNPublicKeyID is 0 for every legacy
+// SUCI. For the legacy null scheme the NAS BCD output is converted to MSIN
+// digits, so the result equals ParseSUCI of the equivalent standard string.
+// Returned errors never embed the input.
+func ParseSUCIAny(s string) (SUCI, SUCIFormat, error) {
+	if len(s) > MaxSUCILen {
+		return SUCI{}, SUCIFormatStandard, fmt.Errorf("types: parse SUCI: input longer than %d bytes", MaxSUCILen)
+	}
+	if out, err := ParseSUCI(s); err == nil {
+		return out, SUCIFormatStandard, nil
+	}
+	m := suciLegacyRE.FindStringSubmatch(s)
+	if m == nil {
+		return SUCI{}, SUCIFormatStandard, fmt.Errorf("types: parse SUCI: input matches neither the standard nor the legacy SUCI form")
+	}
+	sch, err := strconv.ParseUint(m[4], 10, 8)
+	if err != nil {
+		return SUCI{}, SUCIFormatLegacy, fmt.Errorf("types: parse SUCI: legacy protection scheme out of range 0..255")
+	}
+	if len(m[5])%2 != 0 {
+		return SUCI{}, SUCIFormatLegacy, fmt.Errorf("types: parse SUCI: legacy scheme output has odd hex length %d", len(m[5]))
+	}
+	out := SUCI{MCC: m[1], MNC: m[2], RoutingIndicator: m[3], ProtectionScheme: uint8(sch)}
+	if sch == uint64(SUCISchemeNull) {
+		raw, err := hex.DecodeString(m[5])
+		if err != nil {
+			return SUCI{}, SUCIFormatLegacy, fmt.Errorf("types: parse SUCI: legacy scheme output is not hex")
+		}
+		msin, err := NullSchemeMSIN(raw)
+		if err != nil {
+			return SUCI{}, SUCIFormatLegacy, fmt.Errorf("types: parse SUCI: legacy null-scheme output is not packed BCD")
+		}
+		out.SchemeOutput = msin
+		return out, SUCIFormatLegacy, nil
+	}
+	out.SchemeOutput = strings.ToLower(m[5])
+	return out, SUCIFormatLegacy, nil
 }
 
 // SchemeOutputBytes hex-decodes the scheme output of a non-null scheme SUCI.

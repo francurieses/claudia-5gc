@@ -66,7 +66,7 @@ func newFixture(t *testing.T, profile string, mut ...func(*Config)) *fixture {
 			}
 			return PeerIdentity{FQDN: fq, PLMN: pl}, nil
 		},
-		ResponderIdentity: func(*http.Response) (PeerIdentity, error) {
+		ResponderIdentity: func(*tls.ConnectionState) (PeerIdentity, error) {
 			return PeerIdentity{FQDN: peer1FQDN, PLMN: plmn1}, nil
 		},
 		Terminator: func(_ context.Context, r PlmnId, reason string) {
@@ -703,7 +703,7 @@ func TestClientRejectsWhenResponderCertPLMNDiffers(t *testing.T) {
 	defer ts.Close()
 	f := newFixture(t, "rel17", func(c *Config) {
 		c.HTTPClient = ts.Client()
-		c.ResponderIdentity = func(*http.Response) (PeerIdentity, error) {
+		c.ResponderIdentity = func(*tls.ConnectionState) (PeerIdentity, error) {
 			return PeerIdentity{FQDN: peer3FQDN, PLMN: plmn3}, nil
 		}
 	})

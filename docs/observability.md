@@ -21,6 +21,7 @@ PCF 9106, UPF 9107, NSSF 9109, SMSF 9110, BSF 9111, NEF 9112, LMF 9113). Main fa
 |---|---|
 | `fivegc_sbi_requests_total`, `fivegc_sbi_request_duration_seconds` | SBI request count and latency (registered, not exported: SBI middleware not wired) |
 | `fivegc_procedure_total{procedure,result}` | procedure completions (`OK` / `REJECT` / `FAILURE`) |
+| `fivegc_ng_reset_ues_released_total{nf,reset_type}` | UEs released by a gNB-initiated NG Reset (`all` / `partial`) |
 | `fivegc_nas_messages_total`, `fivegc_ngap_messages_total` | NAS / NGAP message counts |
 | `fivegc_authentication_total` | authentication attempts and results |
 | `fivegc_pdu_session_total`, `fivegc_pdu_sessions_active` | PDU session events and gauge |

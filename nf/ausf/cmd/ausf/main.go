@@ -27,6 +27,7 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
+	"github.com/francurieses/claudia-5gc/shared/storewait"
 )
 
 func main() {
@@ -117,10 +118,28 @@ func main() {
 	serverCfg.TLS.CAFile = cfg.SBI.TLS.CAFile
 
 	// Auth context store: Redis when REDIS_URL is set, in-memory otherwise.
+	// Wait for Redis at startup and exit if it stays down (OPS-002); a SIGTERM
+	// during the wait ends the process cleanly. aka.NewRedisStore lives in
+	// shared/aka (crypto hard stop): it is only wrapped here, not changed. Its
+	// ping ignores the attempt context; storewait still bounds each attempt and
+	// closes a store that connects after its attempt was abandoned. A failed
+	// ping leaves one unused client object (no open socket) per attempt.
+	storePolicy, err := storewait.PolicyFromEnv()
+	if err != nil {
+		logger.Error("AUSF: invalid store config", "error", err)
+		os.Exit(1)
+	}
+	waitCtx, stopWait := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	var authStore aka.AuthStore
 	if redisAddr := getEnv("REDIS_URL", ""); redisAddr != "" {
-		rs, err := aka.NewRedisStore(redisAddr)
+		opts := storewait.Options{Store: "redis", Interface: "Redis", Policy: storePolicy, Logger: logger}
+		rs, err := storewait.Open(waitCtx, opts, func(context.Context) (*aka.RedisStore, error) {
+			return aka.NewRedisStore(redisAddr)
+		})
 		if err != nil {
+			if fallback, code := storewait.Decide(waitCtx, opts, err); !fallback {
+				os.Exit(code)
+			}
 			logger.Warn("Redis unavailable — using in-memory auth store", "addr", redisAddr, "error", err)
 		} else {
 			authStore = rs
@@ -128,6 +147,7 @@ func main() {
 			logger.Info("AUSF auth store backed by Redis", "addr", redisAddr, "ttl", "5m")
 		}
 	}
+	stopWait()
 
 	udmClient := &HTTPUDMClient{address: udmAddr, client: httpClient}
 	srv, err := ausfsrv.New(serverCfg, udmClient, authStore, logger)

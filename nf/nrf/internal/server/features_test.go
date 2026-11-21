@@ -130,11 +130,12 @@ func assertProblem(t *testing.T, rec *httptest.ResponseRecorder, cause, param st
 }
 
 func TestCatalogs(t *testing.T) {
-	// Service-Map is the only bit the NRF implements, in both services.
-	for _, name := range []string{"rel17", "rel19"} {
+	// NFManagement: Service-Map under rel17, plus Inter-Plmn-Fqdn under rel19;
+	// NFDiscovery: Service-Map only.
+	for name, want := range map[string]string{"rel17": "1", "rel19": "5"} {
 		p := profileNamed(t, name)
-		if got := nrfsbi.NnrfNFManagementCatalog().Supported(p).String(); got != "1" {
-			t.Errorf("%s: NFManagement offers %q, want 1", name, got)
+		if got := nrfsbi.NnrfNFManagementCatalogFor(p).Supported(p).String(); got != want {
+			t.Errorf("%s: NFManagement offers %q, want %s", name, got, want)
 		}
 		if got := nrfsbi.NnrfNFDiscoveryCatalog().Supported(p).String(); got != "20" {
 			t.Errorf("%s: NFDiscovery offers %q, want 20 (feature 6)", name, got)
@@ -164,12 +165,12 @@ func TestSubscribeNegotiationMatrix(t *testing.T) {
 		wantLog             string
 	}{
 		{"rel17 absent", "rel17", "", nil, "", "0", "absent"},
-		{"rel19 absent", "rel19", "", nil, "1", "0", "absent"},
+		{"rel19 absent", "rel19", "", nil, "5", "0", "absent"},
 		{"rel17 peer has Service-Map", "rel17", "1", nil, "1", "1", "1"},
-		{"rel19 peer has Service-Map", "rel19", "1", nil, "1", "1", "1"},
-		{"rel19 higher bits dropped", "rel19", "ff", nil, "1", "1", "ff"},
+		{"rel19 peer has Service-Map", "rel19", "1", nil, "5", "1", "1"},
+		{"rel19 higher bits dropped", "rel19", "ff", nil, "5", "5", "ff"},
 		{"rel17 peer lacks it, NRF set still answered", "rel17", "FE", nil, "1", "0", "FE"},
-		{"rel19 peer zero, NRF set still answered", "rel19", "0", nil, "1", "0", "0"},
+		{"rel19 peer zero, NRF set still answered", "rel19", "0", nil, "5", "0", "0"},
 		{"rel19 two bits implemented", "rel19", "f", implMgmt(), "9", "9", "f"},
 		{"rel19 NRF set exceeds the intersection", "rel19", "1", implMgmt(), "9", "1", "1"},
 		{"rel17 absent, catalog implements", "rel17", "", implMgmt(), "", "0", "absent"},
@@ -221,7 +222,7 @@ func TestSubscribeNegotiationMatrix(t *testing.T) {
 // value (absent semantics): rel17 omits the answer, rel19 includes the NRF set.
 func TestSubscribeEmptyRequesterFeatures(t *testing.T) {
 	for _, attr := range []string{`null`, `""`} {
-		for _, tc := range []struct{ profile, want string }{{"rel17", ""}, {"rel19", "1"}} {
+		for _, tc := range []struct{ profile, want string }{{"rel17", ""}, {"rel19", "5"}} {
 			t.Run(tc.profile+"/"+attr, func(t *testing.T) {
 				s, logs := newFeatureNRF(t, profileNamed(t, tc.profile), nil, nil)
 				rec := doReq(s, http.MethodPost, "/nnrf-nfm/v1/subscriptions",
@@ -291,18 +292,23 @@ func TestSubscribeOversizeBody(t *testing.T) {
 	}
 }
 
-// TestSubscribeLegacyErrorsKeepPrecedence: the legacy 400s are unchanged and
-// never reach the negotiation.
+// TestSubscribeLegacyErrorsKeepPrecedence: the 400s for a malformed body or a
+// missing nfStatusNotificationUri never reach the negotiation; rel17 keeps
+// text/plain, rel19 answers application/problem+json (NRF-003).
 func TestSubscribeLegacyErrorsKeepPrecedence(t *testing.T) {
-	s, logs := newFeatureNRF(t, profileNamed(t, "rel19"), nil, nil)
-	for _, body := range []string{`{`, `{"requesterFeatures":"zz"}`, `{"requesterFeatures":"1"}`} {
-		rec := doReq(s, http.MethodPost, "/nnrf-nfm/v1/subscriptions", body, "")
-		if rec.Code != http.StatusBadRequest || !strings.HasPrefix(rec.Result().Header.Get("Content-Type"), "text/plain") {
-			t.Errorf("%s: status %d ct %q", body, rec.Code, rec.Result().Header.Get("Content-Type"))
-		}
-	}
-	if n := len(negotiationRecords(logs)); n != 0 {
-		t.Errorf("FeatureNegotiation lines = %d, want 0", n)
+	for prof, wantCT := range map[string]string{"rel17": "text/plain", "rel19": "application/problem+json"} {
+		t.Run(prof, func(t *testing.T) {
+			s, logs := newFeatureNRF(t, profileNamed(t, prof), nil, nil)
+			for _, body := range []string{`{`, `{"requesterFeatures":"zz"}`, `{"requesterFeatures":"1"}`} {
+				rec := doReq(s, http.MethodPost, "/nnrf-nfm/v1/subscriptions", body, "")
+				if rec.Code != http.StatusBadRequest || !strings.HasPrefix(rec.Result().Header.Get("Content-Type"), wantCT) {
+					t.Errorf("%s: status %d ct %q", body, rec.Code, rec.Result().Header.Get("Content-Type"))
+				}
+			}
+			if n := len(negotiationRecords(logs)); n != 0 {
+				t.Errorf("FeatureNegotiation lines = %d, want 0", n)
+			}
+		})
 	}
 }
 
@@ -443,7 +449,9 @@ func TestEmptyRequesterFeaturesIsAbsent(t *testing.T) {
 // supportedFeatures attribute; a value is validated and logged only.
 func TestRetrieveRequesterFeatures(t *testing.T) {
 	const url = "/nnrf-nfm/v1/nf-instances/aaaaaaaa-0000-0000-0000-00000000000a"
-	s, logs := newFeatureNRF(t, profileNamed(t, "rel19"), nil, nil)
+	// rel17: the profile is returned as registered whatever is negotiated
+	// (rel19 Service-Map shaping is covered in shape_test.go).
+	s, logs := newFeatureNRF(t, profileNamed(t, "rel17"), nil, nil)
 	registerSMF(t, s)
 	plain := doReq(s, http.MethodGet, url, "", "")
 	if n := len(negotiationRecords(logs)); n != 0 {

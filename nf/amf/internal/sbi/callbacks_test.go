@@ -15,9 +15,9 @@ func TestUDMCallbacks(t *testing.T) {
 	s, mgr := newTestServer(t)
 	seedRegisteredUE(mgr, "imsi-001010000000001")
 	var deregistered, reasons []string
-	s.SetDeregistrationHandler(func(_ context.Context, ue *amfctx.UEContext, reason string) error {
+	s.SetDeregistrationHandler(func(_ context.Context, ue *amfctx.UEContext, reason, accessType string) error {
 		deregistered = append(deregistered, ue.SUPI)
-		reasons = append(reasons, reason)
+		reasons = append(reasons, reason+"/"+accessType)
 		return nil
 	})
 	tests := []struct {
@@ -42,8 +42,8 @@ func TestUDMCallbacks(t *testing.T) {
 		})
 	}
 	// The deregReason reaches the handler: it decides whether SM contexts are released.
-	if len(reasons) != 1 || reasons[0] != "SUBSCRIPTION_WITHDRAWN" {
-		t.Errorf("deregReason passed to the handler = %v, want [SUBSCRIPTION_WITHDRAWN]", reasons)
+	if len(reasons) != 1 || reasons[0] != "SUBSCRIPTION_WITHDRAWN/3GPP_ACCESS" {
+		t.Errorf("deregReason passed to the handler = %v, want [SUBSCRIPTION_WITHDRAWN/3GPP_ACCESS]", reasons)
 	}
 }
 
@@ -53,7 +53,7 @@ func TestUDMDeregNotifyRunsLocalDeregistration(t *testing.T) {
 	s, mgr := newTestServer(t)
 	seedRegisteredUE(mgr, "imsi-001010000000001")
 	var got []string
-	s.SetDeregistrationHandler(func(_ context.Context, ue *amfctx.UEContext, _ string) error {
+	s.SetDeregistrationHandler(func(_ context.Context, ue *amfctx.UEContext, _, _ string) error {
 		got = append(got, ue.SUPI)
 		return nil
 	})

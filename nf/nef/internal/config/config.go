@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/oauth2"
 )
 
 // Config holds all NEF configuration.
@@ -54,7 +55,8 @@ type Config struct {
 	// Ref: TS 29.522 §6, TS 29.510 §6.3 (NRF token model)
 	OAuth2 struct {
 		// Secret is the HMAC-SHA256 signing secret shared with the NRF issuer.
-		// In dev this matches the NRF's jwt_secret. In production: rotate per TS 33.501.
+		// Resolved via oauth2.ResolveSecret (OAUTH2_SECRET env > YAML >
+		// oauth2.DefaultDevSecret, the same value the NRF uses). Rotate per TS 33.501.
 		Secret string `yaml:"secret"`
 	} `yaml:"oauth2"`
 
@@ -89,6 +91,7 @@ func Load() (*Config, error) {
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("nef: config: read file: %w", err)
 	}
+	cfg.OAuth2.Secret = oauth2.ResolveSecret(cfg.OAuth2.Secret)
 	return cfg, nil
 }
 
@@ -120,7 +123,6 @@ func defaults() *Config {
 	cfg.SBI.TLS.KeyFile = "/etc/5gc/pki/nef.key"
 	cfg.Peers.NRF = "nrf:8000"
 	cfg.Peers.BSF = "bsf:8010"
-	cfg.OAuth2.Secret = "5gc-dev-secret"
 	cfg.Metrics.Address = "0.0.0.0:9112"
 	return cfg
 }

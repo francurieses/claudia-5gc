@@ -1,11 +1,10 @@
 package procedures
 
-// aud_registration_test.go — failing-by-design reproductions for the
-// registration spec audit (dev/campaigns/results/audit-registration.md).
-// Fixed findings (08, 10, 14) run as normal regression tests; the still-open ones
-// are skipped unless the opt-in flag is given:
+// aud_registration_test.go — regression tests for the registration spec audit
+// (dev/campaigns/results/audit-registration.md). All findings are fixed
+// (registration audit W1-W4 tasks), so every reproduction runs as a normal regression test:
 //
-//	GOWORK=off go test ./nf/amf/internal/procedures/ -run TestAUDRegistration -v -args -aud-registration-repro
+//	GOWORK=off go test ./nf/amf/internal/procedures/ -run TestAUDRegistration -v
 //
 // Ref: TS 24.501 §5.5.1.2.4, §5.5.1.2.5, §5.5.1.2.8; TS 23.003 §2.10.1;
 // TS 23.502 §4.2.2.2.2; TS 29.571 §5.3.2
@@ -14,7 +13,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"io"
 	"log/slog"
 	"regexp"
@@ -23,10 +21,6 @@ import (
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 )
-
-// regAudRepro opts in to the AUD-registration reproductions below; without it
-// they are skipped (command in the file header).
-var regAudRepro = flag.Bool("aud-registration-repro", false, "run the AUD-registration failing-by-design reproductions") //nolint:unused // no gated test left here; keeps -aud-registration-repro a valid flag for the campaign command
 
 // regAudAUSF records the identity of every authentication initiation.
 type regAudAUSF struct{ ids []string }
@@ -43,11 +37,19 @@ func (a *regAudAUSF) ConfirmAuth(context.Context, string, string) (*AUSFConfirmR
 }
 
 // regAudUDM answers UECM and SDM successfully with the given subscribed slices.
-type regAudUDM struct{ allowed []amfctx.SNSSAISubscribed }
+type regAudUDM struct {
+	allowed []amfctx.SNSSAISubscribed
+	// noDefault: the slices are subscribed but none is a default S-NSSAI.
+	noDefault bool
+}
 
 func (regAudUDM) RegisterAMF(context.Context, string, string, string) error { return nil }
 func (u regAudUDM) GetAMSubscriptionData(context.Context, string) (*UDMAMSubscription, error) {
-	return &UDMAMSubscription{AllowedNSSAI: u.allowed}, nil
+	sub := &UDMAMSubscription{AllowedNSSAI: u.allowed, DefaultNSSAI: u.allowed}
+	if u.noDefault {
+		sub.DefaultNSSAI = nil
+	}
+	return sub, nil
 }
 func (regAudUDM) DeregisterUECM(context.Context, string) error { return nil }
 
@@ -74,7 +76,7 @@ func regAudSUCIRequest(scheme, keyID byte) *nas.RegistrationRequest {
 // (encoded "15 00", below the 4-octet minimum of §9.11.3.37). TS 24.501
 // §5.5.1.2.5 requires REGISTRATION REJECT #62 with the rejected NSSAI.
 func TestAUDRegistration02_EmptyAllowedNSSAIRejected(t *testing.T) {
-	h, mgr := newRegAudRegistration(t, nil, regAudUDM{allowed: []amfctx.SNSSAISubscribed{{SST: 1}}})
+	h, mgr := newRegAudRegistration(t, nil, regAudUDM{allowed: []amfctx.SNSSAISubscribed{{SST: 1}}, noDefault: true})
 	ue := mgr.AllocateUEContext(1)
 	mgr.SetSUPI(ue, "imsi-001010000000001")
 	ue.RequestedNSSAI = []amfctx.SNSSAISubscribed{{SST: 2}} // not subscribed

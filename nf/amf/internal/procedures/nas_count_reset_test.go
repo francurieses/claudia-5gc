@@ -58,6 +58,8 @@ func newCountTestHandler() *RegistrationHandler {
 func TestPhase2_ResetsNASCountsOnNewSecurityContext(t *testing.T) {
 	h := newCountTestHandler()
 	ue := h.mgr.AllocateUEContext(1)
+	ue.UESecCapEA[0] = true
+	ue.UESecCapIA[2] = true // UE offers NEA0 only; Phase2 rejects a UE with no common cipher
 
 	// Simulate the abandoned first attempt: a security context was activated and
 	// several NAS messages were exchanged under it before the UE gave up.
@@ -93,6 +95,8 @@ func TestPhase2_ResetsNASCountsOnNewSecurityContext(t *testing.T) {
 func TestPhase2_FreshUEContextStartsAtZero(t *testing.T) {
 	h := newCountTestHandler()
 	ue := h.mgr.AllocateUEContext(1)
+	ue.UESecCapEA[0] = true
+	ue.UESecCapIA[2] = true // UE offers NEA0 only; Phase2 rejects a UE with no common cipher
 
 	if _, _, err := h.Phase2_ProcessAuthResponse(
 		context.Background(), ue, &nas.AuthenticationResponse{RES: []byte{0x01}}); err != nil {

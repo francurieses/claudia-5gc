@@ -21,9 +21,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -580,7 +582,7 @@ func shownSupiOrSuci(id string) string {
 	if !types.IsSUCI(id) {
 		return id
 	}
-	p, err := types.ParseSUCI(id)
+	p, _, err := types.ParseSUCIAny(id)
 	if err != nil {
 		return "suci-<malformed>"
 	}
@@ -601,15 +603,23 @@ func (s *Server) sidfProblem(w http.ResponseWriter, status int, cause, detail st
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// deconceal resolves a standard-format SUCI (TS 29.571 §5.3.2) to a SUPI
+// deconceal resolves a SUCI (standard form, TS 29.571 §5.3.2; or the legacy
+// private form of rel17 AMFs, accepted for rolling upgrade) to a SUPI
 // (SIDF, TS 33.501 §6.12). On failure it writes the ProblemDetails response
 // and returns ok=false. Error causes follow TS 29.503 Table 6.3.7.3-1.
 func (s *Server) deconceal(w http.ResponseWriter, log *slog.Logger, supi string) (string, bool) {
-	parsed, err := types.ParseSUCI(supi)
+	parsed, sfmt, err := types.ParseSUCIAny(supi)
 	if err != nil {
 		log.Error("SUCI parse failed", "error", err, "result", "REJECT")
 		s.sidfProblem(w, http.StatusBadRequest, causeMandatoryIEIncorrect, detailInvalidSUCI)
 		return "", false
+	}
+	legacy := sfmt == types.SUCIFormatLegacy
+	if legacy {
+		// Rolling upgrade from v2.6.0-rel17-final AMFs (legacy private SUCI form).
+		log.Info("legacy SUCI format accepted (rolling-upgrade compat)",
+			"suci_format", sfmt.String(), "direction", "IN",
+			"spec_ref", "TS 29.571 §5.3.2; TS 33.501 §6.12")
 	}
 	masked := maskSUCI(parsed)
 	log = log.With("scheme", parsed.ProtectionScheme, "hn_key_id", parsed.HNPublicKeyID,
@@ -635,7 +645,7 @@ func (s *Server) deconceal(w http.ResponseWriter, log *slog.Logger, supi string)
 			s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedProtectionScheme, detailSchemeNotConfigured)
 			return "", false
 		}
-		if !s.checkHNKeyID(w, log, parsed, s.hnKeyIDA) {
+		if !legacy && !s.checkHNKeyID(w, log, parsed, s.hnKeyIDA) {
 			return "", false
 		}
 		ls, err := toLegacySUCI(parsed)
@@ -655,7 +665,7 @@ func (s *Server) deconceal(w http.ResponseWriter, log *slog.Logger, supi string)
 			s.sidfProblem(w, http.StatusNotImplemented, causeUnsupportedProtectionScheme, detailSchemeNotConfigured)
 			return "", false
 		}
-		if !s.checkHNKeyID(w, log, parsed, s.hnKeyIDB) {
+		if !legacy && !s.checkHNKeyID(w, log, parsed, s.hnKeyIDB) {
 			return "", false
 		}
 		ls, err := toLegacySUCI(parsed)
@@ -678,6 +688,8 @@ func (s *Server) deconceal(w http.ResponseWriter, log *slog.Logger, supi string)
 
 // checkHNKeyID verifies the SUCI's Home Network Public Key Identifier against
 // the configured one (0 = any accepted). It writes the 403 answer on mismatch.
+// It is not called for legacy-format SUCIs, which carry no key id: the
+// configured key of the SUCI's protection scheme is used.
 func (s *Server) checkHNKeyID(w http.ResponseWriter, log *slog.Logger, p types.SUCI, want uint8) bool {
 	if want != 0 && p.HNPublicKeyID != want {
 		log.Error("SUCI home network public key id mismatch", "configured_key_id", want)
@@ -1898,6 +1910,9 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("udr: get am data: status %d", resp.StatusCode)
+	}
 	var result struct {
 		// SupportedFeatures: AccessAndMobilitySubscriptionData.supportedFeatures
 		// (TS 29.505), the UDR's answer to the supported-features query.
@@ -1906,6 +1921,12 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 		SupportedFeatures json.RawMessage `json:"supportedFeatures"`
 		// GPSIs: AccessAndMobilitySubscriptionData.gpsis (TS 29.503 §6.1.6.2.4).
 		GPSIs []string `json:"gpsis"`
+		// SubscribedUeAmbr: AmbrRm (Ambr or null, TS 29.503 §6.1.6.2.4). Raw
+		// directions so a non-string value is reported, not a decode failure.
+		SubscribedUeAmbr *struct {
+			Uplink   json.RawMessage `json:"uplink"`
+			Downlink json.RawMessage `json:"downlink"`
+		} `json:"subscribedUeAmbr"`
 		NSSAI struct {
 			DefaultSingleNssais []struct {
 				SST            int    `json:"sst"`
@@ -1918,10 +1939,20 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxUDRResponseBytes)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("udr: decode am data: %w", err)
 	}
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		c.negotiate(ctx, supi, offer, result.SupportedFeatures)
+	c.negotiate(ctx, supi, offer, result.SupportedFeatures)
+	amData := &UDRAMData{AMBRUplink: defaultUEAMBRKbps, AMBRDownlink: defaultUEAMBRKbps}
+	{
+		al := c.amLogger()
+		corr := logging.CorrelationID(ctx)
+		if a := result.SubscribedUeAmbr; a == nil {
+			al.Debug("UDR am-data has no subscribedUeAmbr, serving default",
+				"nf", "UDM", "procedure", "GetAMData", "interface", "Nudr", "direction", "IN",
+				"correlation_id", corr, "supi", supi, "ambr_source", "default", "spec_ref", "TS 29.503 §6.1.6.2.4")
+		} else {
+			amData.AMBRUplink = ambrDirection(al, corr, supi, "uplink", a.Uplink)
+			amData.AMBRDownlink = ambrDirection(al, corr, supi, "downlink", a.Downlink)
+		}
 	}
-	amData := &UDRAMData{AMBRUplink: 100000, AMBRDownlink: 100000}
 	// gpsis are only emitted under the spec-literal profile (AMF-020): filter
 	// and log only then; the answer is decoded either way (raw under rel17,
 	// where nothing is emitted).
@@ -1949,6 +1980,96 @@ func (c *HTTPUDRClient) GetAMData(ctx context.Context, supi string) (*UDRAMData,
 // maxUDRResponseBytes bounds the UDR response bodies decoded by the Nudr
 // client (same 1 MiB cap as features.MaxRequestBodyBytes).
 const maxUDRResponseBytes = features.MaxRequestBodyBytes
+
+// defaultUEAMBRKbps is the operator default subscribed UE-AMBR (per direction)
+// served when the UDR provides none or an unusable value. It is an operator
+// default, not a spec value. Ref: TS 23.501 §5.7.2.6.
+const defaultUEAMBRKbps uint64 = 100000
+
+// maxBitRateKbps is the largest accepted BitRate, 1 Pbps in Kbps (mirrors the
+// UDR qos.ValidateBitRate bound). Ref: TS 29.571 §5.5.2.
+const maxBitRateKbps uint64 = 1_000_000_000_000
+
+// maxBitRateLen bounds the BitRate input length (mirrors the UDR validator).
+const maxBitRateLen = 64
+
+var bitRateRe = regexp.MustCompile(bitRateKbpsPattern)
+
+// bitRateUnitKbps maps a BitRate unit to its kbit/s multiplier (SI, K = k).
+var bitRateUnitKbps = map[string]*big.Rat{
+	"bps":  big.NewRat(1, 1000),
+	"Kbps": big.NewRat(1, 1),
+	"Mbps": big.NewRat(1000, 1),
+	"Gbps": big.NewRat(1000000, 1),
+	"Tbps": big.NewRat(1000000000, 1),
+}
+
+// errBitRate is a BitRate that is malformed, zero or overflowing.
+var errBitRate = errors.New("udm: invalid bit rate")
+
+// parseBitRateKbps converts a TS 29.571 §5.5.2 BitRate ("<n>[.<d>] <unit>") to
+// an integer Kbps, exact decimal arithmetic, rounded up. The range is 1 Kbps to
+// 1 Pbps.
+func parseBitRateKbps(v string) (uint64, error) {
+	v = strings.TrimSpace(v)
+	if len(v) > maxBitRateLen || !bitRateRe.MatchString(v) {
+		return 0, errBitRate
+	}
+	num, unit, _ := strings.Cut(v, " ")
+	r, ok := new(big.Rat).SetString(num)
+	if !ok {
+		return 0, errBitRate
+	}
+	r.Mul(r, bitRateUnitKbps[unit])
+	q, m := new(big.Int).QuoRem(r.Num(), r.Denom(), new(big.Int))
+	if m.Sign() > 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	if q.Sign() == 0 || !q.IsUint64() || q.Uint64() > maxBitRateKbps {
+		return 0, errBitRate
+	}
+	return q.Uint64(), nil
+}
+
+// amLogger returns the client logger, or slog.Default when none is set.
+func (c *HTTPUDRClient) amLogger() *slog.Logger {
+	if c.logger != nil {
+		return c.logger
+	}
+	return slog.Default()
+}
+
+// maxLoggedRawBytes caps the raw_value attribute of the AMBR WARN.
+const maxLoggedRawBytes = 64
+
+// ambrDirection decodes one direction of subscribedUeAmbr, falling back to
+// defaultUEAMBRKbps with a WARN for any unusable value (absent, JSON null,
+// non-string, malformed, zero or out of range) per TS 29.571 §5.5.2.
+func ambrDirection(l *slog.Logger, corr, supi, dir string, raw json.RawMessage) uint64 {
+	warn := func(cause string, perr error) uint64 {
+		rv := raw
+		if len(rv) > maxLoggedRawBytes {
+			rv = rv[:maxLoggedRawBytes]
+		}
+		l.Warn("UDR am-data subscribedUeAmbr unusable, serving default for direction",
+			"nf", "UDM", "procedure", "GetAMData", "interface", "Nudr", "direction", "IN",
+			"correlation_id", corr, "supi", supi, "result", "REJECT", "cause", cause, "ambr_direction", dir,
+			"error", perr, "raw_value", string(rv), "spec_ref", "TS 29.571 §5.5.2")
+		return defaultUEAMBRKbps
+	}
+	if len(raw) == 0 {
+		return warn("MANDATORY_IE_MISSING", nil)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return warn("MANDATORY_IE_INCORRECT", err)
+	}
+	k, err := parseBitRateKbps(s)
+	if err != nil {
+		return warn("MANDATORY_IE_INCORRECT", err)
+	}
+	return k
+}
 
 // bitRateKbpsPattern is the TS 29.571 §5.5.2 BitRate regex (space mandatory).
 const bitRateKbpsPattern = `^\d+(\.\d+)? (bps|Kbps|Mbps|Gbps|Tbps)$`

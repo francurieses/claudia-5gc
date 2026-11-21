@@ -30,7 +30,7 @@ import (
 
 // ---- test constants ----------------------------------------------------------
 
-const testSecret = "5gc-dev-secret"
+const testSecret = oauth2pkg.DefaultDevSecret
 const testScope = "3gpp-as-session-with-qos"
 
 // ---- mock clients ------------------------------------------------------------
@@ -519,4 +519,40 @@ func TestDeleteUnknownSubscription(t *testing.T) {
 		t.Fatalf("expected 404, got %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+}
+
+// TestVerifyBearerDefaultSecret proves an NRF-style token signed with the shared
+// default secret is accepted under default config, and another secret is rejected.
+// Ref: TS 29.522 §6, TS 33.501 §13.4.1
+func TestVerifyBearerDefaultSecret(t *testing.T) {
+	t.Setenv(oauth2pkg.SecretEnv, "")
+	cfg := &config.Config{}
+	cfg.OAuth2.Secret = oauth2pkg.ResolveSecret(cfg.OAuth2.Secret)
+	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), defaultBSF(), &mockPCFClient{})
+
+	for _, tc := range []struct {
+		name   string
+		secret string
+		status int
+		cause  string
+	}{
+		{"default secret", oauth2pkg.DefaultDevSecret, 0, ""},
+		{"other secret", "another-secret", http.StatusUnauthorized, "UNAUTHORIZED"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tok, err := oauth2pkg.IssueToken([]byte(tc.secret), &oauth2pkg.Claims{
+				Issuer: "nrf", Subject: "af", Scope: testScope,
+				IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix(),
+			})
+			if err != nil {
+				t.Fatalf("issue: %v", err)
+			}
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Header.Set("Authorization", "Bearer "+tok)
+			_, status, cause := srv.verifyBearer(r)
+			if status != tc.status || cause != tc.cause {
+				t.Fatalf("got (%d,%q), want (%d,%q)", status, cause, tc.status, tc.cause)
+			}
+		})
+	}
 }

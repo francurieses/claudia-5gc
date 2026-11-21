@@ -656,7 +656,7 @@ func (w *nssaaWorld) onlySubscribed(slice string) error {
 	s := parseSNSSAI(slice)
 	s.SubjectToNSSAA = true
 	w.ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{s}
-	w.ue.SubscribedNSSAI = []amfctx.SNSSAISubscribed{s}
+	w.ue.DefaultNSSAI = []amfctx.SNSSAISubscribed{s}
 	return nil
 }
 
@@ -761,7 +761,7 @@ func (w *nssaaWorld) extendedHas(x *nas.ExtendedRejectedNSSAI, slice string, cau
 
 func (w *nssaaWorld) defaultSubscribed(slice string) error {
 	s := parseSNSSAI(slice) // not subject to NSSAA, not requested: a default S-NSSAI
-	w.ue.SubscribedNSSAI = append(w.ue.SubscribedNSSAI, s)
+	w.ue.DefaultNSSAI = append(w.ue.DefaultNSSAI, s)
 	return nil
 }
 

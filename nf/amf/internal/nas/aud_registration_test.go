@@ -1,11 +1,10 @@
 package nasmsg
 
-// aud_registration_test.go — failing-by-design reproductions for the
-// registration spec audit (dev/campaigns/results/audit-registration.md).
-// Fixed findings (incl. 08, 09, 13) run as normal regression tests; the still-open ones are
-// skipped unless the opt-in flag is given:
+// aud_registration_test.go — regression tests for the registration spec audit
+// (dev/campaigns/results/audit-registration.md). All findings are fixed
+// (registration audit W1-W4 tasks), so every reproduction runs as a normal regression test:
 //
-//	GOWORK=off go test ./nf/amf/internal/nas/ -run TestAUDRegistration -v -args -aud-registration-repro
+//	GOWORK=off go test ./nf/amf/internal/nas/ -run TestAUDRegistration -v
 //
 // Ref: TS 24.501 §4.4.4.3, §5.4.1.3.7, §5.4.2.5, §5.5.1.2.8, §5.5.1.3.4, §7.6.3, §7.7.1
 
@@ -13,7 +12,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"flag"
 	"io"
 	"log/slog"
 	"testing"
@@ -23,10 +21,6 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 )
-
-// regAudRepro opts in to the AUD-registration reproductions below; without it
-// they are skipped (command in the file header).
-var regAudRepro = flag.Bool("aud-registration-repro", false, "run the AUD-registration failing-by-design reproductions")
 
 // regAudSender records every DOWNLINK NAS TRANSPORT payload and the NAS-PDU of
 // every INITIAL CONTEXT SETUP REQUEST; the other Sender methods are fakeSender's.
@@ -52,7 +46,7 @@ type regAudUDM struct{ allowed []amfctx.SNSSAISubscribed }
 
 func (regAudUDM) RegisterAMF(context.Context, string, string, string) error { return nil }
 func (u regAudUDM) GetAMSubscriptionData(context.Context, string) (*procedures.UDMAMSubscription, error) {
-	return &procedures.UDMAMSubscription{AllowedNSSAI: u.allowed}, nil
+	return &procedures.UDMAMSubscription{AllowedNSSAI: u.allowed, DefaultNSSAI: u.allowed}, nil
 }
 func (regAudUDM) DeregisterUECM(context.Context, string) error { return nil }
 

@@ -484,12 +484,14 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 	}
 	ra := &RegistrationAccept{}
 	rdr := NewReader(b)
-	// IE4 (mandatory LV): length byte + value byte
+	// 5GS registration result (mandatory LV, contents 1 octet, TS 24.501 §9.11.3.6). A zero or
+	// truncated length is a message error (found by FuzzRoundTripRegistrationAccept).
 	l, _ := rdr.ReadByte()
-	valBytes, _ := rdr.ReadBytes(int(l))
-	if len(valBytes) > 0 {
-		ra.RegistrationResult = valBytes[0]
+	valBytes, err := rdr.ReadBytes(int(l))
+	if err != nil || len(valBytes) < 1 {
+		return nil, fmt.Errorf("nas: RegistrationAccept: 5GS registration result length %d: invalid or truncated", l)
 	}
+	ra.RegistrationResult = valBytes[0]
 
 	for rdr.Len() > 0 {
 		iei, err := rdr.ReadByte()
@@ -502,8 +504,7 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 			lo, _ := rdr.ReadByte()
 			length := int(hi)<<8 | int(lo)
 			gutiBytes, _ := rdr.ReadBytes(length)
-			mi, _ := DecodeMobileIdentity(gutiBytes)
-			ra.FiveGGUTI = mi
+			ra.FiveGGUTI = optionalGUTI(gutiBytes)
 		case 0x54: // TAI list — IE4 (1-byte length), raw value kept as-is
 			l, _ := rdr.ReadByte()
 			taiBytes, _ := rdr.ReadBytes(int(l))
@@ -511,13 +512,11 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 		case 0x15: // Allowed NSSAI — IE4 (1-byte length), UERANSIM uses 0x15
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
-			nssai, _ := DecodeNSSAI(nssaiBytes)
-			ra.AllowedNSSAI = &nssai
+			ra.AllowedNSSAI = optionalNSSAI(nssaiBytes)
 		case 0x31: // Configured NSSAI — IE4 (1-byte length)
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
-			nssai, _ := DecodeNSSAI(nssaiBytes)
-			ra.ConfiguredNSSAI = &nssai
+			ra.ConfiguredNSSAI = optionalNSSAI(nssaiBytes)
 		case 0x11: // Rejected NSSAI — TLV (1-byte length), raw value kept
 			l, _ := rdr.ReadByte()
 			ra.RejectedNSSAI, _ = rdr.ReadBytes(int(l))
@@ -536,8 +535,7 @@ func DecodeRegistrationAccept(b []byte) (*RegistrationAccept, error) {
 		case 0x39: // Pending NSSAI — TLV (1-byte length)
 			l, _ := rdr.ReadByte()
 			nssaiBytes, _ := rdr.ReadBytes(int(l))
-			nssai, _ := DecodeNSSAI(nssaiBytes)
-			ra.PendingNSSAI = &nssai
+			ra.PendingNSSAI = optionalNonEmptyNSSAI(nssaiBytes)
 		case IEIPDUSessionReactivationResultErrorCause: // TLV-E (2-byte length)
 			lb, err := rdr.ReadBytes(2)
 			if err != nil {

@@ -55,11 +55,16 @@ func NewGrouped(t uint16, children ...*ie.IE) (*ie.IE, error) {
 // ParseGrouped parses the payload of a grouped IE into its child IEs. It works
 // for any type, including those go-pfcp does not know, and rejects truncated
 // children.
-func ParseGrouped(i *ie.IE) ([]*ie.IE, error) {
+func ParseGrouped(i *ie.IE) (kids []*ie.IE, err error) {
+	defer func() { // go-pfcp v0.0.14 ParseMultiIEs panics on a truncated vendor-specific IE; see ParseMessage
+		if r := recover(); r != nil {
+			kids, err = nil, fmt.Errorf("pfcpx: parse grouped: malformed IE framing: %v: %w", r, ErrInvalidLength)
+		}
+	}()
 	if i == nil {
 		return nil, fmt.Errorf("pfcpx: parse grouped: %w", ErrInvalidLength)
 	}
-	kids, err := ie.ParseMultiIEs(i.Payload)
+	kids, err = ie.ParseMultiIEs(i.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("pfcpx: parse grouped type %d: %w", i.Type, err)
 	}

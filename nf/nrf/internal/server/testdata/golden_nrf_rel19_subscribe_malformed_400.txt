@@ -1,0 +1,5 @@
+status: Bad Request
+Content-Type: application/problem+json
+Location: 
+
+{"cause":"INVALID_MSG_FORMAT","detail":"SubscriptionData is not valid JSON","status":400}

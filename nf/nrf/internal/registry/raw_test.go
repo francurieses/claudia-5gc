@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -115,7 +116,7 @@ func TestRedisRoundTripRaw(t *testing.T) {
 		if addr == "" {
 			t.Skip("NRF_TEST_REDIS_ADDR not set")
 		}
-		r, err := NewRedis(addr, time.Minute, newLogger())
+		r, err := NewRedis(context.Background(), addr, time.Minute, newLogger())
 		if err != nil {
 			t.Fatal(err)
 		}

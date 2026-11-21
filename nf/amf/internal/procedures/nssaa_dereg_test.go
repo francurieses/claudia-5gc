@@ -30,13 +30,13 @@ func TestNSSAADeregistrationRequired(t *testing.T) {
 		wantEmergency bool
 	}{
 		{name: "all failed", spec: true, wantDereg: true, mk: func(ue *amfctx.UEContext) {
-			ue.RejectedNSSAI, ue.SubscribedNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003")}
+			ue.RejectedNSSAI, ue.DefaultNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003")}
 		}},
 		{name: "some slice still allowed", spec: true, mk: func(ue *amfctx.UEContext) {
 			ue.AllowedNSSAI, ue.RejectedNSSAI = snssais{nssaa("000004")}, snssais{nssaa("000003")}
 		}},
 		{name: "non-NSSAA default can be allowed", spec: true, mk: func(ue *amfctx.UEContext) {
-			ue.RejectedNSSAI, ue.SubscribedNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003"), plain}
+			ue.RejectedNSSAI, ue.DefaultNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003"), plain}
 		}},
 		{name: "exchange still queued", spec: true, mk: func(ue *amfctx.UEContext) {
 			ue.RejectedNSSAI, ue.PendingNSSAA = snssais{nssaa("000003")}, snssais{nssaa("000004")}
@@ -53,7 +53,7 @@ func TestNSSAADeregistrationRequired(t *testing.T) {
 			ue.EmergencyPDUSession, ue.RejectedNSSAI = true, snssais{nssaa("000003")}
 		}},
 		{name: "rel17 never de-registers", spec: false, mk: func(ue *amfctx.UEContext) {
-			ue.RejectedNSSAI, ue.SubscribedNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003")}
+			ue.RejectedNSSAI, ue.DefaultNSSAI = snssais{nssaa("000003")}, snssais{nssaa("000003")}
 		}},
 	}
 	for _, tc := range tests {
@@ -114,7 +114,7 @@ func TestNSSAADeregRequestBuilder(t *testing.T) {
 // Default S-NSSAIs that can be allowed: not subject to NSSAA, not rejected, <= 8.
 func TestAllowableDefaultNSSAI(t *testing.T) {
 	ue := &amfctx.UEContext{
-		SubscribedNSSAI: snssais{
+		DefaultNSSAI: snssais{
 			{SST: 1, SD: "000003", SubjectToNSSAA: true},
 			{SST: 1, SD: "000004"},
 			{SST: 1, SD: "000005"}, // rejected below
@@ -125,9 +125,9 @@ func TestAllowableDefaultNSSAI(t *testing.T) {
 	if len(got) != 1 || got[0].SD != "000004" {
 		t.Fatalf("defaults = %+v, want only 1-000004", got)
 	}
-	ue.SubscribedNSSAI = nil
+	ue.DefaultNSSAI = nil
 	for i := 0; i < 12; i++ {
-		ue.SubscribedNSSAI = append(ue.SubscribedNSSAI, amfctx.SNSSAISubscribed{SST: 1, SD: fmt.Sprintf("%06x", 0x100+i)})
+		ue.DefaultNSSAI = append(ue.DefaultNSSAI, amfctx.SNSSAISubscribed{SST: 1, SD: fmt.Sprintf("%06x", 0x100+i)})
 	}
 	if got := allowableDefaultNSSAI(ue); len(got) != maxAllowedSNSSAIs {
 		t.Fatalf("%d defaults, want the Allowed NSSAI limit %d", len(got), maxAllowedSNSSAIs)
@@ -138,8 +138,8 @@ func TestAllowableDefaultNSSAI(t *testing.T) {
 func TestDecideNSSAAEndAllowsDefaults(t *testing.T) {
 	mk := func() *amfctx.UEContext {
 		return &amfctx.UEContext{
-			RejectedNSSAI:   snssais{{SST: 1, SD: "000003", SubjectToNSSAA: true}},
-			SubscribedNSSAI: snssais{{SST: 1, SD: "000003", SubjectToNSSAA: true}, {SST: 1, SD: "000009"}},
+			RejectedNSSAI: snssais{{SST: 1, SD: "000003", SubjectToNSSAA: true}},
+			DefaultNSSAI:  snssais{{SST: 1, SD: "000003", SubjectToNSSAA: true}, {SST: 1, SD: "000009"}},
 		}
 	}
 	ue := mk()

@@ -95,7 +95,7 @@ func New(cfg *config.Config, reg registry.Registry, logger *slog.Logger) (*Serve
 	mux.HandleFunc("DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}", s.handleDeregister)
 	mux.HandleFunc("GET /nnrf-nfm/v1/nf-instances/{nfInstanceId}", s.handleGet)
 	mux.HandleFunc("GET /nnrf-disc/v1/nf-instances", s.handleDiscover)
-	// NFStatusSubscribe/Unsubscribe — TS 29.510 §5.2.2.7-9
+	// NFStatusSubscribe/Unsubscribe — TS 29.510 §5.2.2.5, §5.2.2.7
 	mux.HandleFunc("POST /nnrf-nfm/v1/subscriptions", s.handleSubscribe)
 	mux.HandleFunc("DELETE /nnrf-nfm/v1/subscriptions/{subscriptionId}", s.handleUnsubscribe)
 	// OAuth2 token endpoint — TS 33.501 §13.4.1
@@ -231,7 +231,15 @@ func (w *responseWriter) WriteHeader(c int) { w.status = c; w.ResponseWriter.Wri
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("nfInstanceId")
 	var p registry.NFProfile
+	if s.specLiteral() {
+		r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	}
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.payloadTooLarge(w, r, "NFRegister")
+			return
+		}
 		problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
 		return
 	}
@@ -260,8 +268,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 // heartbeat per TS 29.510 §5.2.2.3.4. Otherwise, full profile replace.
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("nfInstanceId")
+	if s.specLiteral() {
+		r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			s.payloadTooLarge(w, r, "NFUpdate")
+			return
+		}
 		problem(w, http.StatusBadRequest, "MANDATORY_IE_INCORRECT", err.Error())
 		return
 	}
@@ -305,7 +321,7 @@ func (s *Server) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleGet — TS 29.510 §5.2.2.5.
+// handleGet — TS 29.510 §5.2.2.9 (NFProfileRetrieval).
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("nfInstanceId")
 	// requester-features (Table 6.1.3.3.3.1-1): the NFProfile response has no
@@ -329,6 +345,32 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	if rf != "" {
 		s.logOK(r, "Nnrf", peerNF, neg)
+	}
+	if s.specLiteral() {
+		// nfServiceList iff Service-Map was negotiated, else nfServices
+		// (TS 29.510 §6.1.6.2.2 NOTE 15).
+		wantMap := neg.set.Has(featureNFMServiceMap)
+		out, skipped, err := shapedProfile(p, shapeOpts{serviceMap: wantMap})
+		if err != nil {
+			s.logger.Error("NFProfileRetrieve: shape profile", "procedure", "NFProfileRetrieve",
+				"interface", "Nnrf", "direction", "OUT", "result", "FAILURE", "error", err,
+				"correlation_id", r.Header.Get("X-Correlation-Id"), "spec_ref", "TS 29.510 §6.1.6.2.2 NOTE 15")
+			problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", "profile encoding failed")
+			return
+		}
+		if skipped > 0 {
+			s.logger.Warn("NFProfileRetrieve: services dropped while shaping", "procedure", "NFProfileRetrieve",
+				"interface", "Nnrf", "direction", "OUT", "result", "OK", "services_dropped", skipped,
+				"nfInstanceId", id, "correlation_id", r.Header.Get("X-Correlation-Id"),
+				"spec_ref", "TS 29.510 §5.2.2.9")
+		}
+		s.logger.Debug("NFProfileRetrieve shaped", "procedure", "NFProfileRetrieve",
+			"interface", "Nnrf", "direction", "OUT", "result", "OK", "service_map", wantMap,
+			"services_skipped", skipped, "correlation_id", r.Header.Get("X-Correlation-Id"),
+			"spec_ref", "TS 29.510 §6.1.6.2.2 NOTE 15")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(append(out, '\n'))
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(p)
@@ -367,7 +409,7 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 			// Schema check only (TS 29.571 §5.2.2 pattern, no length limit); an
 			// optional parameter with an incorrect value is
 			// OPTIONAL_QUERY_PARAM_INCORRECT (TS 29.500 Table 5.2.7.2-1) and the
-			// InvalidParam name is "query <name>" (TS 29.571 §5.2.4.2).
+			// InvalidParam name is "query <name>" (project rule; TS 29.571 §5.2.4.6).
 			if err := features.Validate(sf); err != nil {
 				problemParam(w, http.StatusBadRequest, "OPTIONAL_QUERY_PARAM_INCORRECT",
 					"supported-features is not a valid SupportedFeatures hex string",
@@ -408,9 +450,34 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		discResult = "OK"
 	}
 	metrics.NFDiscoveryTotal.WithLabelValues(target, discResult).Inc()
+	var instances any = results
+	if s.specLiteral() {
+		// nfServiceList iff Nnrf_NFDiscovery Service-Map (bit 6) was
+		// negotiated, else nfServices (TS 29.510 §6.2.6.2.3 NOTE 10).
+		wantMap := neg.set.Has(featureDiscServiceMap)
+		shaped := make([]json.RawMessage, 0, len(results))
+		for _, p := range results {
+			out, skipped, err := shapedProfile(p, shapeOpts{serviceMap: wantMap})
+			if skipped > 0 {
+				s.logger.Warn("NFDiscover: services dropped while shaping", "procedure", "NFDiscover",
+					"interface", "Nnrf", "direction", "OUT", "result", "OK", "services_dropped", skipped,
+					"nfInstanceId", p.NFInstanceID, "correlation_id", r.Header.Get("X-Correlation-Id"),
+					"spec_ref", "TS 29.510 §6.2.6.2.3 NOTE 10")
+			}
+			if err != nil {
+				s.logger.Error("NFDiscover: shape profile", "procedure", "NFDiscover",
+					"interface", "Nnrf", "direction", "OUT", "result", "FAILURE", "error", err,
+					"correlation_id", r.Header.Get("X-Correlation-Id"), "spec_ref", "TS 29.510 §6.2.6.2.3 NOTE 10")
+				problem(w, http.StatusInternalServerError, "SYSTEM_FAILURE", "profile encoding failed")
+				return
+			}
+			shaped = append(shaped, out)
+		}
+		instances = shaped
+	}
 	resp := map[string]any{
 		"validityPeriod":    3600,
-		"nfInstances":       results,
+		"nfInstances":       instances,
 		"searchId":          ulid.Make().String(),
 		"numNfInstComplete": len(results),
 	}
@@ -504,7 +571,7 @@ func problem(w http.ResponseWriter, status int, cause, detail string) {
 	})
 }
 
-// problemParam is problem() plus a single InvalidParam entry (TS 29.571 §5.2.4.2).
+// problemParam is problem() plus a single InvalidParam entry (TS 29.571 §5.2.4.6).
 func problemParam(w http.ResponseWriter, status int, cause, detail, param, reason string) {
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(status)
@@ -564,17 +631,19 @@ func loadTLSConfig(cfg config.TLS) (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-// ---- NFStatusSubscribe / NFStatusNotify (TS 29.510 §5.2.2.7-9) ----------
+// ---- NFStatusSubscribe / NFStatusNotify (TS 29.510 §5.2.2.5-7) ----------
 
 // handleSubscribe handles POST /nnrf-nfm/v1/subscriptions.
 // Creates an NF status subscription; NRF will POST NotificationData to
 // the given notificationUri when matching NF profiles change.
-// Ref: TS 29.510 §5.2.2.7
+// Under rel19 the 201 body is the full SubscriptionData and 400s are
+// ProblemDetails; rel17 keeps {"subscriptionId"} and text/plain.
+// Ref: TS 29.510 §5.2.2.5.2, §6.1.6.2.16
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	corrID := r.Header.Get("X-Correlation-Id")
 	log := s.logger.With("procedure", "NFStatusSubscribe", "correlation_id", corrID,
 		"interface", "Nnrf", "direction", "IN",
-		"spec_ref", "TS 29.510 §5.2.2.7")
+		"spec_ref", "TS 29.510 §5.2.2.5.2")
 
 	var req struct {
 		NotificationURI string `json:"nfStatusNotificationUri"`
@@ -583,31 +652,45 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		// RequesterFeatures is SubscriptionData.requesterFeatures (writeOnly,
 		// TS 29.510 §6.1.6.2.16): the consumer's Nnrf_NFManagement features.
 		RequesterFeatures string `json:"requesterFeatures,omitempty"`
+		// ValidityTime is SubscriptionData.validityTime (DateTime).
+		ValidityTime string `json:"validityTime,omitempty"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, features.MaxRequestBodyBytes)
 	cat := s.mgmtCatalog()
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			s.payloadTooLarge(w, r, "NFStatusSubscribe")
 			return
 		}
+		s.badRequest(w, features.CauseInvalidMsgFormat, err.Error(), "request body could not be read", "")
+		return
+	}
+	// Decoder (not Unmarshal): the rel17 text/plain 400 body is the decoder's
+	// error text, frozen by golden_nrf_subscribe_malformed_400.txt.
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&req); err != nil {
 		if features.IsTypeErrorOn(err, bodyRequesterFeatures) {
 			s.rejectBadFeatures(w, r, "Nnrf", peerNFType(r, ""), cat, "",
 				features.CauseInvalidMsgFormat, paramRequesterFeatures, err)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		s.badRequest(w, features.CauseInvalidMsgFormat, err.Error(), "SubscriptionData is not valid JSON", "")
 		return
 	}
 	if req.NotificationURI == "" {
-		http.Error(w, "nfStatusNotificationUri required", http.StatusBadRequest)
+		s.badRequest(w, "MANDATORY_IE_MISSING", "nfStatusNotificationUri required",
+			"nfStatusNotificationUri required", "/nfStatusNotificationUri")
 		return
 	}
 	peerNF := peerNFType(r, req.ReqNFType)
 	if err := features.Validate(req.RequesterFeatures); err != nil {
 		s.rejectBadFeatures(w, r, "Nnrf", peerNF, cat, req.RequesterFeatures,
 			features.CauseInvalidMsgFormat, paramRequesterFeatures, err)
+		return
+	}
+	if s.specLiteral() && req.ValidityTime != "" && !validDateTime(req.ValidityTime) {
+		s.badRequest(w, features.CauseInvalidMsgFormat, "", "validityTime is not a valid DateTime", "/"+keyValidityTime)
 		return
 	}
 	// Producer side: nrfSupportedFeatures is the NRF's own Nnrf_NFManagement set
@@ -621,6 +704,24 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		ReqNFInstanceID: req.ReqNFInstanceID,
 		Features:        neg.set,
 	}
+	var echo map[string]json.RawMessage
+	var validity string
+	if s.specLiteral() {
+		if err := json.Unmarshal(body, &echo); err != nil || echo == nil {
+			s.badRequest(w, features.CauseInvalidMsgFormat, "", "SubscriptionData is not a JSON object", "")
+			return
+		}
+		intra, err := intraPLMN(echo[keyReqPlmnList], s.cfg.PLMN.MCC, s.cfg.PLMN.MNC)
+		if err != nil {
+			s.badRequest(w, features.CauseInvalidMsgFormat, "", "reqPlmnList is not a valid PlmnId array", "/"+keyReqPlmnList)
+			return
+		}
+		sub.InterPLMN = !intra
+		sub.SubscriptionID = registry.NewHyphenlessID()
+		var vt time.Time
+		validity, vt = subscriptionValidity(req.ValidityTime, time.Now())
+		sub.ValidityTime = vt
+	}
 	subID := s.subs.Add(sub)
 	s.logOK(r, "Nnrf", peerNF, neg)
 
@@ -631,32 +732,77 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		"direction", "OUT", "result", "OK",
 	)
 
+	w.Header().Set("Content-Type", "application/json")
+	if s.specLiteral() {
+		// SubscriptionData: the request echoed (requesterFeatures and
+		// completeProfileSubscription are writeOnly) plus the NRF-assigned
+		// subscriptionId, validityTime and nrfSupportedFeatures.
+		delete(echo, bodyRequesterFeatures)
+		delete(echo, "completeProfileSubscription")
+		echo[keySubscriptionID] = mustRaw(subID)
+		echo[keyValidityTime] = mustRaw(validity)
+		if neg.answer != "" {
+			echo[keyNrfSupported] = mustRaw(neg.answer)
+		}
+		w.Header().Set("Location", s.apiRoot(r)+"/nnrf-nfm/v1/subscriptions/"+subID)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(echo)
+		return
+	}
 	resp := map[string]string{"subscriptionId": subID}
 	if neg.answer != "" {
 		resp["nrfSupportedFeatures"] = neg.answer
 	}
-	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Location", "/nnrf-nfm/v1/subscriptions/"+subID)
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// mustRaw marshals a string; a string cannot fail to marshal.
+func mustRaw(v string) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// apiRoot is the scheme and authority of this NRF's SBI as the client reached
+// it, used for the absolute Location of a created subscription
+// (TS 29.510 Table 6.1.3.4.3.1-4).
+func (s *Server) apiRoot(r *http.Request) string {
+	scheme := "http"
+	if s.sbiSrv.TLSConfig != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
 // handleUnsubscribe handles DELETE /nnrf-nfm/v1/subscriptions/{subscriptionId}.
-// Ref: TS 29.510 §5.2.2.9
+// Ref: TS 29.510 §5.2.2.7
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	subID := r.PathValue("subscriptionId")
 	s.subs.Delete(subID)
 	s.logger.Info("NFStatusSubscription deleted",
 		"procedure", "NFStatusUnsubscribe",
 		"subscriptionId", subID,
-		"spec_ref", "TS 29.510 §5.2.2.9",
+		"spec_ref", "TS 29.510 §5.2.2.7",
 	)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// notificationBody is the NFStatusNotify body with the profile as raw JSON
+// (TS 29.510 §6.1.6.2.17).
+type notificationBody struct {
+	Event         registry.NFEvent `json:"event"`
+	NFInstanceURI string           `json:"nfInstanceUri"`
+	NFProfile     json.RawMessage  `json:"nfProfile,omitempty"`
+}
+
 // notifySubscribers dispatches an NFStatusNotify to all matching subscribers.
-// Fire-and-forget — runs in a goroutine, logs failures.
-// Ref: TS 29.510 §5.2.2.8
+// Fire-and-forget — runs in a goroutine, logs failures. Under rel19 the body
+// is built per subscription: nfServiceList iff the subscriber negotiated
+// Service-Map (§6.1.6.2.16 NOTE 6), and interPlmnFqdn removed for intra-PLMN
+// subscribers that did not negotiate Inter-Plmn-Fqdn (Table 6.1.9-1 bit 3);
+// subscriptions past their validityTime are skipped.
+// Ref: TS 29.510 §5.2.2.6
 func (s *Server) notifySubscribers(event registry.NFEvent, profile *registry.NFProfile) {
 	subs := s.subs.Matching(profile.NFType, profile.NFInstanceID)
 	if len(subs) == 0 {
@@ -671,20 +817,68 @@ func (s *Server) notifySubscribers(event registry.NFEvent, profile *registry.NFP
 		data.NFProfile = profile
 	}
 
-	body, err := json.Marshal(data)
-	if err != nil {
-		s.logger.Error("NFStatusNotify: marshal failed", "error", err)
-		return
+	var legacyBody []byte
+	if !s.specLiteral() {
+		var err error
+		legacyBody, err = json.Marshal(data)
+		if err != nil {
+			s.logger.Error("NFStatusNotify: marshal failed", "error", err)
+			return
+		}
 	}
 
+	now := time.Now()
 	for _, sub := range subs {
 		sub := sub
+		body := legacyBody
+		shapeLog := []any{}
+		if s.specLiteral() {
+			if !sub.ValidityTime.IsZero() && !now.Before(sub.ValidityTime) {
+				s.logger.Info("NFStatusNotify skipped: subscription expired",
+					"procedure", "NFStatusNotify", "interface", "Nnrf", "direction", "OUT",
+					"result", "OK", "subscriptionId", sub.SubscriptionID,
+					"spec_ref", "TS 29.510 §6.1.6.2.16")
+				continue
+			}
+			nb := notificationBody{Event: data.Event, NFInstanceURI: data.NFInstanceURI}
+			if data.NFProfile != nil {
+				wantMap := sub.Features.Has(featureNFMServiceMap)
+				strip := !sub.InterPLMN && !sub.Features.Has(featureNFMInterPlmnFqdn)
+				out, skipped, err := shapedProfile(profile, shapeOpts{serviceMap: wantMap, stripInterPlmnFqdn: strip})
+				if skipped > 0 {
+					s.logger.Warn("NFStatusNotify: services dropped while shaping",
+						"procedure", "NFStatusNotify", "interface", "Nnrf", "direction", "OUT",
+						"result", "OK", "subscriptionId", sub.SubscriptionID, "services_dropped", skipped,
+						"nfInstanceId", profile.NFInstanceID, "spec_ref", "TS 29.510 §6.1.6.2.16 NOTE 6")
+				}
+				if err != nil {
+					s.logger.Error("NFStatusNotify: shape profile failed",
+						"procedure", "NFStatusNotify", "interface", "Nnrf", "direction", "OUT",
+						"result", "FAILURE", "subscriptionId", sub.SubscriptionID, "error", err,
+						"spec_ref", "TS 29.510 §6.1.6.2.16 NOTE 6")
+					metrics.ProcedureTotal.WithLabelValues("NRF", "NFStatusNotify", "FAILURE").Inc()
+					continue
+				}
+				nb.NFProfile = out
+				shapeLog = append(shapeLog, "service_map", wantMap, "inter_plmn_fqdn_stripped", strip)
+			}
+			var err error
+			if body, err = json.Marshal(nb); err != nil {
+				s.logger.Error("NFStatusNotify: marshal failed", "error", err)
+				continue
+			}
+		}
+		// Copy everything the goroutine reads: no shared pointer is touched
+		// after the handler returns.
+		subID, uri := sub.SubscriptionID, sub.NotificationURI
+		nfInstanceID, nfType := profile.NFInstanceID, profile.NFType
+		extra := append([]any(nil), shapeLog...)
 		go func() {
 			req, err := http.NewRequestWithContext(context.Background(),
-				http.MethodPost, sub.NotificationURI, bytes.NewReader(body))
+				http.MethodPost, uri, bytes.NewReader(body))
 			if err != nil {
 				s.logger.Warn("NFStatusNotify: build request failed",
-					"subscriptionId", sub.SubscriptionID, "error", err)
+					"subscriptionId", subID, "error", err)
 				return
 			}
 			req.Header.Set("Content-Type", "application/json")
@@ -692,24 +886,44 @@ func (s *Server) notifySubscribers(event registry.NFEvent, profile *registry.NFP
 			if err != nil {
 				s.logger.Warn("NFStatusNotify: POST failed",
 					"procedure", "NFStatusNotify",
-					"subscriptionId", sub.SubscriptionID,
-					"notificationUri", sub.NotificationURI,
+					"interface", "Nnrf", "direction", "OUT", "result", "FAILURE",
+					"subscriptionId", subID,
+					"notificationUri", uri,
 					"event", event,
-					"nfInstanceId", profile.NFInstanceID,
+					"nfInstanceId", nfInstanceID,
 					"error", err,
-					"spec_ref", "TS 29.510 §5.2.2.8",
+					"spec_ref", "TS 29.510 §5.2.2.6",
 				)
+				metrics.ProcedureTotal.WithLabelValues("NRF", "NFStatusNotify", "FAILURE").Inc()
 				return
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
+			if resp.StatusCode < 200 || resp.StatusCode > 299 {
+				s.logger.Warn("NFStatusNotify: subscriber answered non-2xx",
+					"procedure", "NFStatusNotify",
+					"interface", "Nnrf", "direction", "OUT", "result", "FAILURE",
+					"subscriptionId", subID,
+					"notificationUri", uri,
+					"event", event,
+					"nfInstanceId", nfInstanceID,
+					"status", resp.StatusCode,
+					"spec_ref", "TS 29.510 §5.2.2.6",
+				)
+				metrics.ProcedureTotal.WithLabelValues("NRF", "NFStatusNotify", "FAILURE").Inc()
+				return
+			}
+			metrics.ProcedureTotal.WithLabelValues("NRF", "NFStatusNotify", "OK").Inc()
 			s.logger.Info("NFStatusNotify sent",
-				"procedure", "NFStatusNotify",
-				"subscriptionId", sub.SubscriptionID,
-				"notificationUri", sub.NotificationURI,
-				"event", event,
-				"nfInstanceId", profile.NFInstanceID,
-				"nfType", profile.NFType,
-				"spec_ref", "TS 29.510 §5.2.2.8",
+				append([]any{
+					"procedure", "NFStatusNotify",
+					"interface", "Nnrf", "direction", "OUT", "result", "OK",
+					"subscriptionId", subID,
+					"notificationUri", uri,
+					"event", event,
+					"nfInstanceId", nfInstanceID,
+					"nfType", nfType,
+					"spec_ref", "TS 29.510 §5.2.2.6",
+				}, extra...)...,
 			)
 		}()
 	}

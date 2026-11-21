@@ -69,6 +69,11 @@ var (
 		out: "TS 23.502 §4.9.1.2.2 step 3; TS 29.244 §7.5.4",
 		in:  "TS 23.502 §4.9.1.2.2 step 4; TS 29.244 §7.5.5",
 	}
+	// specAnRelease: N4 leg of the AN release (UP deactivation to BUFF+NOCP).
+	specAnRelease = hoN4Spec{
+		out: "TS 23.502 §4.2.6 step 6a",
+		in:  "TS 23.502 §4.2.6 step 6b",
+	}
 	specDeactivate = hoN4Spec{
 		out: "TS 23.502 §4.3.7 step 3; TS 29.244 §7.5.4.3",
 		in:  "TS 29.244 §7.5.5",
@@ -81,7 +86,7 @@ var (
 // Ref: TS 29.244 §7.5.4.3, §8.2.26, §8.2.56.
 func buildDLSwitchFAR(dlTEID uint32, gnbIP net.IP) *pfcpie.IE {
 	return pfcpie.NewUpdateFAR(
-		pfcpie.NewFARID(1),
+		pfcpie.NewFARID(dlFARID),
 		pfcpie.NewApplyAction(0x02), // FORW
 		pfcpie.NewUpdateForwardingParameters(
 			// Outer header: GTP-U/UDP/IPv4 (desc=0x0100), DL TEID, gNB N3 IP
@@ -95,8 +100,32 @@ func buildDLSwitchFAR(dlTEID uint32, gnbIP net.IP) *pfcpie.IE {
 // Ref: TS 29.244 §7.5.4.3.
 func buildDLDropFAR() *pfcpie.IE {
 	return pfcpie.NewUpdateFAR(
-		pfcpie.NewFARID(1),
-		pfcpie.NewApplyAction(0x01), // DROP — UPF discards DL packets
+		pfcpie.NewFARID(dlFARID),
+		pfcpie.NewApplyAction(applyActionDROP), // DROP — UPF discards DL packets
+	)
+}
+
+// Apply Action octet bits (TS 29.244 §8.2.26, Figure 8.2.26-1).
+const (
+	// applyActionDROP: discard DL packets (bit 1).
+	applyActionDROP = 0x01
+	// applyActionBUFF: buffer DL packets (bit 3).
+	applyActionBUFF = 0x04
+	// applyActionNOCP: notify the CP function of the first buffered DL packet (bit 4).
+	applyActionNOCP = 0x08
+)
+
+// applyActionBuffNocpLabel is the apply_action log value of buildDLBuffNocpFAR.
+const applyActionBuffNocpLabel = "BUFF+NOCP"
+
+// buildDLBuffNocpFAR builds the Update FAR of the AN release (UP deactivation, UE CM-IDLE):
+// FAR 1, Apply Action BUFF|NOCP (0x0C), no forwarding parameters and no BAR, so the UPF
+// buffers DL data and sends a Downlink Data Report that triggers paging.
+// Ref: TS 23.502 §4.2.6 steps 6a/6b, §4.2.3.3; TS 29.244 §5.2.3, §7.5.4.3, §8.2.26.
+func buildDLBuffNocpFAR() *pfcpie.IE {
+	return pfcpie.NewUpdateFAR(
+		pfcpie.NewFARID(dlFARID),
+		pfcpie.NewApplyAction(applyActionBUFF|applyActionNOCP),
 	)
 }
 
@@ -133,7 +162,7 @@ func (s *Server) pfcpModifyFAR(ctx context.Context, base *slog.Logger, procedure
 	req := pfcpmsg.NewSessionModificationRequest(0, 0, sess.SEID, s.nextPFCPSeq(), 0, far)
 	log.InfoContext(ctx, "PFCP Session Modification Request sent", append([]any{
 		"direction", "OUT", "message_type", "PFCPSessionModificationRequest",
-		"far_id", 1, "apply_action", applyAction, "seq", req.Sequence(), "spec_ref", spec.out}, extra...)...)
+		"far_id", dlFARID, "apply_action", applyAction, "seq", req.Sequence(), "spec_ref", spec.out}, extra...)...)
 
 	start := time.Now()
 	msg, err := s.pfcpTransact(ctx, base, req, pfcpmsg.MsgTypeSessionModificationResponse)
@@ -245,7 +274,7 @@ func (s *Server) runTargetFailedAction(ctx context.Context, base *slog.Logger, p
 	log := base.With("procedure", procedure, "supi", sess.SUPI,
 		"pdu_session_id", sess.PDUSessionID, "seid", sess.SEID)
 	if release {
-		err := s.requestAMFRelease(ctx, sess.SUPI, sess.PDUSessionID)
+		err := s.requestAMFRelease(ctx, sess.SUPI, sess.PDUSessionID, amfReleaseCause36)
 		if err == nil {
 			metrics.ProcedureTotal.WithLabelValues("SMF", "HandoverTargetFailedRelease", "OK").Inc()
 			log.InfoContext(ctx, "target-failed PDU session release requested from AMF",

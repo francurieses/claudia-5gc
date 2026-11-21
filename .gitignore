@@ -78,3 +78,6 @@ specs/asn1/
 
 # PacketRusher image: build-time copy of shared codecs (scripts/packetrusher-vendor.sh)
 docker/packetrusher/claudia-vendor/
+
+# Claude Code agent worktrees (full repo copies: keep them out of grep/graphify results)
+.claude/worktrees/

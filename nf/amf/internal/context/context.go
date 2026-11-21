@@ -252,11 +252,21 @@ type UEContext struct {
 	// TS 24.501 Table 9.11.3.46.1); the legacy rel17 text called it "cause #3".
 	RejectedNSSAI []SNSSAISubscribed
 	// SubscribedNSSAI is the subscription's S-NSSAI list as read from am-data
-	// nssai.defaultSingleNssais (the only list the AMF reads), with the
-	// subjectToNetworkSliceSpecificAuthenticationAndAuthorization flag. It is
-	// what "default S-NSSAIs" means for the rel19 de-registration decision of
-	// TS 24.501 §4.6.2.4 c) / TS 23.502 §4.2.9.2 step 19b. Set at registration.
+	// nssai.defaultSingleNssais UNION nssai.singleNssais (TS 29.503 Nssai), with
+	// the subjectToNetworkSliceSpecificAuthenticationAndAuthorization flag. The
+	// Allowed NSSAI is a subset of it (TS 23.501 §5.15.5.2.1). Set at registration.
 	SubscribedNSSAI []SNSSAISubscribed
+	// DefaultNSSAI is the subset of the subscription marked as default S-NSSAI
+	// (am-data nssai.defaultSingleNssais). It is what "default S-NSSAIs" means for
+	// the Allowed NSSAI fallback (TS 23.501 §5.15.5.2.1, TS 24.501 §5.5.1.2.4,
+	// §5.5.1.3.4) and for the rel19 de-registration decision of TS 24.501 §4.6.2.4
+	// c) / TS 23.502 §4.2.9.2 step 19b. Not persisted. Set at registration.
+	DefaultNSSAI []SNSSAISubscribed
+	// NotAvailableNSSAI holds the requested S-NSSAIs that were rejected as "not
+	// available in the current PLMN or SNPN" (wire cause 0) although the registration was
+	// accepted through the default S-NSSAI fallback (TS 24.501 §5.5.1.2.4). They
+	// go to the REGISTRATION ACCEPT rejected NSSAI. Not persisted.
+	NotAvailableNSSAI []SNSSAISubscribed
 	// EmergencyPDUSession reports that the UE has (or is establishing) an
 	// emergency PDU session; it selects the Configuration Update exception of
 	// TS 24.501 §4.6.2.4 c). The AMF does not establish emergency PDU sessions
@@ -322,6 +332,11 @@ type UEContext struct {
 	// In-memory only; guarded by mu.
 	// Ref: TS 23.502 §4.2.3.3 step 6 → §4.2.3.2 steps 4/12, TS 24.501 §5.6.1.4.1
 	pagedPDUSessions map[uint8]struct{}
+
+	// pendingSMRelease holds the network-initiated PDU session releases (cause
+	// #39 after an SMF restart) waiting for the CM-IDLE UE to answer paging.
+	// In-memory only; guarded by mu. Ref: TS 23.502 §4.3.4.2 step 4.
+	pendingSMRelease map[uint8]*pendingSMEntry
 
 	// Timestamps
 	RegistrationTime time.Time
@@ -395,7 +410,10 @@ type UEContext struct {
 	// (one slow SBI call for one UE must not delay other UEs' NGAP messages).
 	// Guarded by taskMu — separate from mu because queued tasks themselves
 	// take mu. See EnqueueSerial.
-	taskMu       sync.Mutex
+	taskMu sync.Mutex
+	// dlNASMu serialises DL NAS COUNT allocation + encode + NGAP send for
+	// network-initiated messages. See LockDLNAS.
+	dlNASMu      sync.Mutex
 	taskQueue    []func()
 	taskDraining bool
 
@@ -417,6 +435,11 @@ type UEContext struct {
 	// its own leaf lock, never held across a call out.
 	nssaaT RetxTimer
 	deregT RetxTimer
+	// deregByUDM marks a network-initiated de-registration triggered by the UDM's
+	// DeregistrationNotification (AMF-037): the UDM already removed the AMF
+	// registration, so the teardown must not send Nudm_UECM_Deregistration.
+	// In-memory only. Ref: TS 23.502 §4.2.2.3.3 step 1, TS 29.503 §5.3.2.3
+	deregByUDM atomic.Bool
 
 	// regT supervises the one outstanding registration common-procedure message
 	// (T3550 / T3560 / T3570, see regproc.go); regProc is the pending-procedure
@@ -544,6 +567,16 @@ func (u *UEContext) NSSAATimerRunning() bool { return u.nssaaT.Running() }
 func (u *UEContext) ArmDeregTimer(req any, expiries int, start func(gen uint64) TimerStopper) {
 	u.deregT.Arm(req, expiries, start)
 }
+
+// MarkDeregByUDM flags the in-flight network-initiated de-registration as
+// UDM-triggered (no UECM DELETE back). Safe from any goroutine.
+func (u *UEContext) MarkDeregByUDM() { u.deregByUDM.Store(true) }
+
+// ClearDeregByUDM drops the UDM-trigger flag (the de-registration was superseded).
+func (u *UEContext) ClearDeregByUDM() { u.deregByUDM.Store(false) }
+
+// DeregByUDM reports whether the in-flight de-registration is UDM-triggered.
+func (u *UEContext) DeregByUDM() bool { return u.deregByUDM.Load() }
 
 // StopDeregTimer stops T3522 (DEREGISTRATION ACCEPT received, procedure aborted
 // or context removed) and invalidates callbacks already fired. Safe on a UE with
@@ -696,6 +729,13 @@ type SNSSAISubscribed struct {
 	// subjectToNetworkSliceSpecificAuthenticationAndAuthorization (TS 29.503 / TS 23.501
 	// §5.15.10). When true, the slice requires NSSAA before being added to Allowed NSSAI.
 	SubjectToNSSAA bool
+	// HasMapped reports that the UE sent a mapped HPLMN S-NSSAI for this entry
+	// of its Requested NSSAI (TS 24.501 §9.11.2.8); MappedSST/MappedSD carry it.
+	// Not persisted (json:"-"): kept only to echo it in the Extended rejected
+	// NSSAI IE (TS 24.501 §9.11.3.75).
+	HasMapped bool   `json:"-"`
+	MappedSST uint8  `json:"-"`
+	MappedSD  string `json:"-"`
 }
 
 // PDUSession represents an established PDU session in the AMF.
@@ -900,12 +940,42 @@ func (u *UEContext) StopAllTimers() {
 	}
 }
 
-// TransitionTo changes the 5GMM state and logs the transition.
+// TransitionTo changes the 5GMM state under the UE lock. Callers must NOT hold
+// u.mu (sync.Mutex is not reentrant); use TransitionToLocked when they do.
 func (u *UEContext) TransitionTo(newState GMM5State) {
-	old := u.State
+	u.mu.Lock()
 	u.State = newState
-	// Caller is responsible for logging with the procedure logger.
-	_ = old
+	u.mu.Unlock()
+}
+
+// TransitionToLocked changes the 5GMM state; the caller holds u.mu.
+func (u *UEContext) TransitionToLocked(newState GMM5State) {
+	u.State = newState
+}
+
+// UpdateTypeNGRANRCU is the NG-RAN-RCU bit (octet 3, bit 2) of the 5GS update
+// type IE value: "UE radio capability update needed". Ref: TS 24.501 §9.11.3.9A.
+const UpdateTypeNGRANRCU byte = 0x02
+
+// ApplyNGRANRCU deletes the stored UE radio capability information when the 5GS
+// update type IE value (REGISTRATION REQUEST) has the NG-RAN-RCU bit set, and
+// reports whether it did. Takes the UE lock. Ref: TS 24.501 §5.5.1.3.4,
+// §9.11.3.9A.
+func (u *UEContext) ApplyNGRANRCU(updateType []byte) bool {
+	if len(updateType) == 0 || updateType[0]&UpdateTypeNGRANRCU == 0 {
+		return false
+	}
+	u.mu.Lock()
+	u.UERadioCapability = nil
+	u.mu.Unlock()
+	return true
+}
+
+// SetCMState sets the CM state under the UE lock (caller must not hold u.mu).
+func (u *UEContext) SetCMState(s CMState) {
+	u.mu.Lock()
+	u.CMState = s
+	u.mu.Unlock()
 }
 
 // ---- Context Store -------------------------------------------------------
@@ -1354,6 +1424,7 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 	ue.StopNSSAATimer()
 	ue.StopDeregTimer()
 	ue.StopRegTimer() // T3550 / T3560 / T3570 die with the context
+	ue.ClearAllPendingSMReleases()
 
 	m.mu.Lock()
 	delete(m.uesByNGAPId, ue.AMFUENGAPId)
@@ -1556,3 +1627,13 @@ func (u *UEContext) TakeSDMSubscriptionID() string {
 	u.SDMSubscriptionID = ""
 	return id
 }
+
+// LockDLNAS serialises "allocate DL NAS COUNT, encode, hand to the gNB" for
+// network-initiated DL NAS from concurrent goroutines (e.g. two mgmt DELETEs):
+// without it the PDUs can reach the UE out of COUNT order and the UE drops one
+// with a MAC mismatch. It is independent of mu and of the serial queue, so it
+// never deadlocks with them. Ref: TS 24.501 §4.4.3.1.
+func (u *UEContext) LockDLNAS() { u.dlNASMu.Lock() }
+
+// UnlockDLNAS releases LockDLNAS.
+func (u *UEContext) UnlockDLNAS() { u.dlNASMu.Unlock() }

@@ -550,6 +550,7 @@ func newE2EEnv(t *testing.T, ausf *e2eAUSF, release string, subscribed []amfctx.
 		KAMF: kamf, KNASint: e.kint, KNASenc: e.kenc,
 	}
 	ue.SubscribedNSSAI = subscribed
+	ue.DefaultNSSAI = subscribed
 	ue.AllowedNSSAI = append([]amfctx.SNSSAISubscribed(nil), subscribed...)
 	e.ue = ue
 	// Registration step "slices withheld for NSSAA" (the real function).
@@ -764,7 +765,10 @@ func (e *e2eEnv) setER(on bool) { e.uePeek(func(ue *amfctx.UEContext) { ue.ERNSS
 
 // periodicUpdate sends a periodic REGISTRATION REQUEST (security context active,
 // TS 23.502 §4.2.2.2.4), with or without the ER-NSSAI bit in the 5GMM capability
-// IE (octet 5 bit 5), and returns the REGISTRATION ACCEPT of the answer.
+// IE (octet 5 bit 5), and returns the REGISTRATION ACCEPT of the answer. The UE
+// is CM-CONNECTED (the request travels on the existing N2 connection), so the
+// ACCEPT comes in a DL NAS TRANSPORT: an INITIAL CONTEXT SETUP REQUEST (new
+// KgNB) is sent only on a new N2 connection (TS 24.501 §5.5.1.3.4, AMF-030).
 func (e *e2eEnv) periodicUpdate(er bool) *nas.RegistrationAccept {
 	e.t.Helper()
 	guti := []byte{0xF2, 0x00, 0xF1, 0x10, 0x02, 0x00, 0x41, 0xDE, 0xAD, 0xBE, 0xEF}
@@ -775,8 +779,8 @@ func (e *e2eEnv) periodicUpdate(er bool) *nas.RegistrationAccept {
 	}
 	e.mustUL(nas.MsgTypeRegistrationRequest, body)
 	d := e.recv()
-	if d.mt != nas.MsgTypeRegistrationAccept || d.via != "InitialContextSetupRequest" {
-		e.t.Fatalf("got %#x via %s, want REGISTRATION ACCEPT in the InitialContextSetupRequest", byte(d.mt), d.via)
+	if d.mt != nas.MsgTypeRegistrationAccept || d.via != "DL NAS TRANSPORT" {
+		e.t.Fatalf("got %#x via %s, want REGISTRATION ACCEPT in a DL NAS TRANSPORT (CM-CONNECTED update)", byte(d.mt), d.via)
 	}
 	return d.msg.Body.(*nas.RegistrationAccept)
 }

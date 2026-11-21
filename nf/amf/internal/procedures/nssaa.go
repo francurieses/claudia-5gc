@@ -346,7 +346,7 @@ const NSSAADeregCause5GMM byte = 62
 //     keeps the registration alive: PENDING is an NSSAAF/AAA-side outage, not a
 //     failure, TS 23.502 §4.2.9.2), and at least one slice was rejected, and
 //   - no default S-NSSAI can be allowed. The AMF reads the subscription's
-//     defaultSingleNssais into ue.SubscribedNSSAI; a default S-NSSAI can be
+//     defaultSingleNssais into ue.DefaultNSSAI; a default S-NSSAI can be
 //     allowed when it is not subject to NSSAA and not rejected
 //     (allowableDefaultNSSAI). When every default is subject to NSSAA and none
 //     succeeded (Allowed NSSAI empty) there is none. When one exists the caller
@@ -379,14 +379,14 @@ func (h *RegistrationHandler) nssaaSettled(ue *amfctx.UEContext) bool {
 
 // allowableDefaultNSSAI returns the default S-NSSAIs that can be allowed to the
 // UE after NSSAA failed for every requested slice: the subscription's default
-// S-NSSAIs (ue.SubscribedNSSAI) that are not subject to NSSAA and not rejected,
+// S-NSSAIs (ue.DefaultNSSAI) that are not subject to NSSAA and not rejected,
 // at most nas.MaxRejectedSNSSAIs (8, the Allowed NSSAI limit of TS 24.501
 // §9.11.3.37). A default subject to NSSAA that was authenticated successfully
 // would already be in the Allowed NSSAI, which callers have checked to be empty.
 // Ref: TS 24.501 §4.6.2.4 b), TS 23.502 §4.2.9.2 step 19a
 func allowableDefaultNSSAI(ue *amfctx.UEContext) []amfctx.SNSSAISubscribed {
 	var out []amfctx.SNSSAISubscribed
-	for _, d := range ue.SubscribedNSSAI {
+	for _, d := range ue.DefaultNSSAI {
 		if len(out) == maxAllowedSNSSAIs {
 			break
 		}
@@ -727,6 +727,8 @@ const regResultNSSAAToBePerformed = 0x10
 
 func (h *RegistrationHandler) applyNSSAAAcceptIEs(ra *nas.RegistrationAccept, ue *amfctx.UEContext) {
 	if !h.nssaaSpec || h.nssaa == nil {
+		// No NSSAA: the only rejected NSSAI is the default-S-NSSAI-fallback one.
+		h.setAcceptRejectedNSSAI(ra, ue, false)
 		return
 	}
 	var pending []amfctx.SNSSAISubscribed
@@ -746,25 +748,7 @@ func (h *RegistrationHandler) applyNSSAAAcceptIEs(ra *nas.RegistrationAccept, ue
 		n := buildAllowedNSSAI(pending)
 		ra.PendingNSSAI = &n
 	}
-	rejectedIE := false
-	if rej, complete := NASRejectedNSSAI(ue.RejectedNSSAI); len(rej) > 0 {
-		if ue.ERNSSAISupported {
-			// The UE set the ER-NSSAI bit: the rejected NSSAI "shall be included in the
-			// Extended rejected NSSAI IE" (instead of the Rejected NSSAI IE). NSSAA
-			// failures are HPLMN S-NSSAIs: no mapped S-NSSAI, no back-off timer.
-			// Ref: TS 24.501 §5.5.1.2.4, §4.6.1, §9.11.3.75
-			ra.ExtendedRejectedNSSAI = nas.ExtendedRejectedNSSAIFromList(rej)
-			rejectedIE = true
-		} else if v, err := nas.RejectedNSSAIValue(rej); err == nil {
-			ra.RejectedNSSAI = v
-			rejectedIE = true
-		}
-		if !complete {
-			h.logger.Warn("Rejected NSSAI truncated to the IE maximum",
-				"procedure", "NSSAA", "supi", ue.SUPI, "max", nas.MaxRejectedSNSSAIs,
-				"spec_ref", "TS 24.501 §9.11.3.46")
-		}
-	}
+	rejectedIE := h.setAcceptRejectedNSSAI(ra, ue, true)
 	// TS 24.501 V19.8.0 §5.5.1.2.4 d) / §9.11.3.6: when no S-NSSAI is allowed the
 	// Allowed NSSAI IE is omitted (its minimum length is 4, Table 8.2.7.1.1) and,
 	// with a pending NSSAI, the "NSSAA to be performed" indicator (octet 3, bit 5)

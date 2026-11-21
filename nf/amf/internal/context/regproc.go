@@ -252,6 +252,15 @@ func (u *UEContext) SetPendingICS(k ICSKind) {
 	u.regProcMu.Unlock()
 }
 
+// PendingICS returns the pending ICS kind without clearing it (log attribution
+// by the ICS send path). ICSNone when no ICS Request is recorded.
+func (u *UEContext) PendingICS() ICSKind {
+	u.regProcMu.Lock()
+	k := u.pendingICS
+	u.regProcMu.Unlock()
+	return k
+}
+
 // TakePendingICS returns the pending ICS kind and clears it (ICS Response or
 // Failure received).
 func (u *UEContext) TakePendingICS() ICSKind {

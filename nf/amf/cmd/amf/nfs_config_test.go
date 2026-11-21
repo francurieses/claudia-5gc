@@ -28,6 +28,7 @@ func (nfsUDM) DeregisterUECM(context.Context, string) error              { retur
 func (nfsUDM) GetAMSubscriptionData(context.Context, string) (*procedures.UDMAMSubscription, error) {
 	return &procedures.UDMAMSubscription{
 		AllowedNSSAI: []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
+		DefaultNSSAI: []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
 		AMBRUplink:   1_000_000, AMBRDownlink: 2_000_000,
 	}, nil
 }

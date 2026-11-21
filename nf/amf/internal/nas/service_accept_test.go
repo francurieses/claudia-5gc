@@ -171,7 +171,7 @@ func TestBuildServiceAccept(t *testing.T) {
 				rel[p] = struct{}{}
 			}
 			sr := tc.sr
-			a := buildServiceAccept(ue, &sr, rel, tc.activated)
+			a := buildServiceAccept(ue, &sr, rel, tc.activated, nil)
 			checkMask(t, "PDUSessionStatus", a.PDUSessionStatus, tc.wantStatus)
 			checkMask(t, "PDUSessionReactivationResult", a.PDUSessionReactivationResult, tc.wantResult)
 		})

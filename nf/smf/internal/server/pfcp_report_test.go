@@ -172,16 +172,18 @@ func TestSendPFCPSessionEstablishmentInstallsURR(t *testing.T) {
 		t.Errorf("Measurement Period = %s, want 45s", gotPeriod)
 	}
 
-	// PDR must reference the same URR ID.
-	if len(req.CreatePDR) != 1 {
-		t.Fatalf("expected exactly 1 Create PDR, got %d", len(req.CreatePDR))
+	// Both PDRs (UL PDR 1, DL PDR 2 since SMF-011) must reference the same URR ID.
+	if len(req.CreatePDR) != 2 {
+		t.Fatalf("expected exactly 2 Create PDRs (UL+DL), got %d", len(req.CreatePDR))
 	}
-	pdrURRID, err := req.CreatePDR[0].URRID()
-	if err != nil {
-		t.Fatalf("PDR URR ID link missing: %v", err)
-	}
-	if pdrURRID != usageReportingURRID {
-		t.Errorf("PDR URR ID link = %d, want %d", pdrURRID, usageReportingURRID)
+	for _, pdr := range req.CreatePDR {
+		pdrURRID, err := pdr.URRID()
+		if err != nil {
+			t.Fatalf("PDR URR ID link missing: %v", err)
+		}
+		if pdrURRID != usageReportingURRID {
+			t.Errorf("PDR URR ID link = %d, want %d", pdrURRID, usageReportingURRID)
+		}
 	}
 }
 

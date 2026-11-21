@@ -2,6 +2,7 @@ package n32c
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,11 +70,11 @@ func CertPeerIdentity(r *http.Request) (PeerIdentity, error) {
 
 // CertResponderIdentity derives the responder identity from the verified TLS
 // server certificate SAN (TS 33.501 §13.1.2; TS 23.003 §28.5.1).
-func CertResponderIdentity(resp *http.Response) (PeerIdentity, error) {
-	if resp.TLS == nil || len(resp.TLS.PeerCertificates) == 0 {
+func CertResponderIdentity(cs *tls.ConnectionState) (PeerIdentity, error) {
+	if cs == nil || len(cs.PeerCertificates) == 0 {
 		return PeerIdentity{}, errors.New("n32c: responder identity: no server certificate")
 	}
-	for _, san := range resp.TLS.PeerCertificates[0].DNSNames {
+	for _, san := range cs.PeerCertificates[0].DNSNames {
 		if p, err := ParsePLMNFromFQDN(san); err == nil {
 			return PeerIdentity{FQDN: strings.ToLower(san), PLMN: p}, nil
 		}
@@ -101,7 +102,7 @@ type Config struct {
 	// ResponderIdentity authenticates the responder of an outgoing request
 	// from its verified server certificate (default CertResponderIdentity).
 	// TS 33.501 §13.1.2.
-	ResponderIdentity func(*http.Response) (PeerIdentity, error)
+	ResponderIdentity func(*tls.ConnectionState) (PeerIdentity, error)
 	// Terminator closes the N32-f TLS connections of a remote PLMN.
 	// reason is "teardown" or "replace". The N32-c HTTP/2 connection that
 	// carried the request is closed by the handler itself (Connection: close,

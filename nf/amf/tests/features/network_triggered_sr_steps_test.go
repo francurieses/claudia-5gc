@@ -19,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -93,7 +94,18 @@ func (s *ntsrSender) ActivateSMContext(ctx context.Context, ref string) ([]byte,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("smf: activate sm context: status %d", resp.StatusCode)
+		// Mirrors cmd/amf newSMFActivateError: typed error carrying the
+		// ProblemDetails cause so the nas package maps it via errors.As.
+		e := &ntsrActivateError{status: resp.StatusCode}
+		if strings.Contains(resp.Header.Get("Content-Type"), "json") {
+			var pd struct {
+				Cause string `json:"cause"`
+			}
+			if raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 4096)); rerr == nil && json.Unmarshal(raw, &pd) == nil {
+				e.cause = pd.Cause
+			}
+		}
+		return nil, e
 	}
 	var out struct {
 		N2SmInfo string `json:"n2SmInfo"`
@@ -108,7 +120,28 @@ func (s *ntsrSender) ActivateSMContext(ctx context.Context, ref string) ([]byte,
 	return b, nil
 }
 
+// ntsrActivateError is the non-200 ActivateSMContext error; it implements the
+// SMFApplicationCause() interface the nas package checks with errors.As.
+type ntsrActivateError struct {
+	status int
+	cause  string
+}
+
+func (e *ntsrActivateError) Error() string {
+	return fmt.Sprintf("smf: activate sm context: status %d cause %q", e.status, e.cause)
+}
+
+// SMFApplicationCause returns the ProblemDetails cause ("" when none).
+func (e *ntsrActivateError) SMFApplicationCause() string { return e.cause }
+
+// ntsrFailSpec is a scripted ActivateSMContext failure.
+type ntsrFailSpec struct {
+	status int
+	cause  string // "" = no body
+}
+
 type ntsrWorld struct {
+	failSpec map[string]ntsrFailSpec
 	// active is set once a Service Request has been driven in-process; it lets
 	// the ICS assertion steps shared with service_request.feature (E2E-gated)
 	// tell the two apart.
@@ -140,6 +173,7 @@ func (w *ntsrWorld) reset() {
 	w.active = false
 	w.n2sm = map[string][]byte{}
 	w.failRef = map[string]bool{}
+	w.failSpec = map[string]ntsrFailSpec{}
 	w.requests = map[string][]string{}
 	w.released = nil
 	w.relCh = make(chan string, 16)
@@ -171,7 +205,18 @@ func (w *ntsrWorld) reset() {
 		w.requests[ref] = append(w.requests[ref], body.UpCnxState)
 		fail := w.failRef[ref]
 		n2 := w.n2sm[ref]
+		spec, scripted := w.failSpec[ref]
 		w.mu.Unlock()
+		if scripted {
+			if spec.cause != "" {
+				rw.Header().Set("Content-Type", "application/problem+json")
+				rw.WriteHeader(spec.status)
+				_ = json.NewEncoder(rw).Encode(map[string]any{"status": spec.status, "cause": spec.cause})
+				return
+			}
+			rw.WriteHeader(spec.status)
+			return
+		}
 		if fail || len(n2) == 0 {
 			rw.WriteHeader(http.StatusInternalServerError)
 			return
@@ -278,6 +323,11 @@ func (w *ntsrWorld) sendRawServiceRequest(plain []byte) error {
 	ue.SecurityCtx.KNASint = bytes.Repeat([]byte{0x11}, 16)
 	ue.SecurityCtx.KNASenc = bytes.Repeat([]byte{0x22}, 16)
 	ue.UESecCapEA[2], ue.UESecCapIA[2] = true, true
+	if len(ue.AllowedNSSAI) == 0 {
+		// A registered UE holds a non-empty Allowed NSSAI; without one the AMF
+		// answers without ICS (AMF-010, TS 38.413 §9.2.2.1).
+		ue.AllowedNSSAI = []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}}
+	}
 	w.preDL = ue.SecurityCtx.DownlinkCount
 
 	pdu, err := protectUL(ue, plain)
@@ -390,6 +440,9 @@ func (w *ntsrWorld) icsCarries(psis string) error {
 }
 
 func (w *ntsrWorld) serviceAccept() error {
+	if smrW.active { // smf_restart_release.feature owns its own world
+		return smrW.serviceAccept()
+	}
 	if err := w.requireSR(); err != nil {
 		return err
 	}

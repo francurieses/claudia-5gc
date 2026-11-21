@@ -195,12 +195,12 @@ ueransim: ## Start core + obs + UERANSIM (gNB + N UEs). Use UE_COUNT=N (alias of
 	$(COMPOSE) --profile integration-ueransim up -d --build
 	@echo "UERANSIM started with $(UE_COUNT) UE(s). Monitor: make logs-ueransim"
 
-ueransim-ursp: docker ## Build + start full core + obs + UERANSIM WITH URSP delivery (default)
+ueransim-ursp: docker ## Build + start full core + obs + UERANSIM WITH URSP delivery (forces URSP_ENABLED=true)
 	URSP_ENABLED=true $(COMPOSE) --profile core --profile observability --profile integration-ueransim up -d --build
 	@echo "Core started WITH URSP delivery (URSP_ENABLED=true), $(UE_COUNT) UE(s)."
 	@echo "Verify: docker logs amf | grep 'UE policy container sent'"
 
-ueransim-no-ursp: docker ## Build + start full core + obs + UERANSIM WITHOUT URSP delivery
+ueransim-no-ursp: docker ## Build + start full core + obs + UERANSIM WITHOUT URSP delivery (forces URSP_ENABLED=false)
 	URSP_ENABLED=false $(COMPOSE) --profile core --profile observability --profile integration-ueransim up -d --build
 	@echo "Core started WITHOUT URSP delivery (URSP_ENABLED=false), $(UE_COUNT) UE(s)."
 	@echo "Verify: docker logs amf | grep 'URSP delivery disabled'"
@@ -258,7 +258,7 @@ ueransim-all: docker-nfs ueransim-build-only ## Start core + obs + EVERY UERANSI
 	$(COMPOSE) $(UERANSIM_ALL_PROFILES) up -d
 	@$(MAKE) --no-print-directory mcp-start
 	@echo ""
-	@echo "All UERANSIM scenarios started (URSP_ENABLED=$${URSP_ENABLED:-true}):"
+	@echo "All UERANSIM scenarios started (URSP_ENABLED=$${URSP_ENABLED:-<AMF config>}):"
 	@echo "  ueransim-gnb    gNB-ID 0x1  (N3 172.30.3.3)  <- ueransim-ue ($(UE_COUNT) UE(s), imsi-...001..), ueransim-ue-profile-a (imsi-...301)"
 	@echo "  ueransim-gnb-ms gNB-ID 0x10 (N3 172.30.3.4)  <- ueransim-ue-internet/gold/silver/bronze (imsi-...201..204)"
 	@echo "  Status   : make ueransim-status"
@@ -327,7 +327,7 @@ mixed-release-e2e: ## REL19-10.2: Rel-19 AMF vs Rel-17 SMF/PCF and the reverse: 
 rolling-upgrade-check: ## REL19-7.3: upgrade+downgrade AMF/SMF vs PREV tag: state gate, gNB re-attach, Service Request, PDU session (needs make ueransim UE_COUNT=1); vars [PREV=<git tag>] [BUILD_CURRENT=1] [GNB_GRACE=10] [SESSION_TIMEOUT=90] [UE_TIMEOUT=90] [SWAP_TIMEOUT=60]
 	@PREV="$(PREV)" BUILD_CURRENT="$(BUILD_CURRENT)" ./scripts/rolling-upgrade-check.sh
 
-validate-ursp: ## Validate URSP policy delivery (requires: make ueransim or make ueransim-all)
+validate-ursp: ## Validate URSP policy delivery (requires URSP on: make ueransim-ursp)
 	./scripts/validate-ursp.sh
 
 test-ursp-codec: ## Run URSP + NAS codec unit tests (no stack needed)
@@ -337,7 +337,7 @@ test-ursp-codec: ## Run URSP + NAS codec unit tests (no stack needed)
 ueransim-mod-e2e: ## Validate ALL modified-UERANSIM features E2E (requires: make ueransim or make ueransim-all)
 	./scripts/validate-ueransim-mod.sh all
 
-ursp-e2e: ## Validate URSP delivery COMPLETE round-trip (modded UE; requires: make ueransim)
+ursp-e2e: ## Validate URSP delivery COMPLETE round-trip (modded UE; requires URSP on: make ueransim-ursp)
 	./scripts/validate-ueransim-mod.sh ursp
 
 qos-mod-e2e: ## Validate NW-initiated QoS modification 0xCB->0xCC (requires: make ueransim)
@@ -423,7 +423,14 @@ full-down: ## Stop and clean volumes from complete stack
 ## token-audit: estimate context-token cost of instructions, agents, skills, big docs/code (scripts/token-audit.sh); fails if a budget is exceeded
 .PHONY: token-audit
 token-audit:
-	@./scripts/token-audit.sh --budget CLAUDE.md=4500 --budget AGENTS.md=3000 --budget nf/amf/CLAUDE.md=8500 --budget .claude/agents/orchestrator.md=3600
+	@./scripts/token-audit.sh --budget CLAUDE.md=4500 --budget AGENTS.md=3200 --budget nf/amf/CLAUDE.md=2500 \
+		--budget .claude/agents/orchestrator.md=3600 --budget LISTING=2600 \
+		--budget 'GLOB:nf/*/CLAUDE.md=4500' --budget 'GLOB:tools/*/CLAUDE.md=4500' --budget 'GLOB:mcp/CLAUDE.md=4500'
+
+## fuzz-smoke: run every Go fuzz target briefly (scripts/fuzz-smoke.sh; FUZZTIME=5s per target, FUZZ=<regex> filters)
+.PHONY: fuzz-smoke
+fuzz-smoke:
+	@FUZZTIME=$${FUZZTIME:-5s} ./scripts/fuzz-smoke.sh '$(or $(FUZZ),.)'
 
 ## docs-check: docs drift linter (code vs docs; rules in docs/DOC_MAP.md). STRICT=1 fails on warnings, BASE=<ref> adds a changed-code-without-docs check
 .PHONY: docs-check

@@ -15,11 +15,19 @@
 package features_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/ishidawataru/sctp"
+	"io"
+	"log/slog"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/cucumber/godog"
 	libngap "github.com/francurieses/claudia-5gc/shared/ngap"
@@ -58,12 +66,26 @@ type icsWorld struct {
 	hasAMBR  bool
 	icsItems []int64 // PDU session ids in IE 71
 	suItems  []int64 // PDU session ids in IE 74
+
+	allowedItems []string // "SST/SD" of the decoded AllowedNSSAI IE (id 0)
+
+	// AMF-010: real Server.SendInitialContextSetupRequest through the transport seam.
+	buildErr error
+	sendErr  error
+	sent     bool
+	writes   [][]byte
+	logBuf   *bytes.Buffer
+	pendKind amfctx.ICSKind
+	haveKind bool
 }
 
 var icsW icsWorld
 
 func (w *icsWorld) reset() {
-	*w = icsWorld{ue: &amfctx.UEContext{}}
+	// A UE reaching INITIAL CONTEXT SETUP always has an Allowed NSSAI: it is a
+	// mandatory IE and the builder refuses an empty one (TS 38.413 §9.2.2.1,
+	// §9.3.1.31; AMF-030 sends REGISTRATION REJECT #62 instead).
+	*w = icsWorld{ue: &amfctx.UEContext{}, allowed: []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}}}
 }
 
 var nasStub = []byte{0x7E, 0x02, 0x01, 0x02, 0x03}
@@ -79,6 +101,10 @@ func (w *icsWorld) buildICS() error {
 		w.region, w.setID, w.ptr, w.allowed,
 		int64(w.kbpsUL)*1000, int64(w.kbpsDL)*1000, w.rfsp, w.sessions, capability.PeerRAN{})
 	if len(w.raw) == 0 {
+		if len(w.allowed) == 0 {
+			// Mandatory Allowed NSSAI missing: the contract is a nil PDU (AMF-010).
+			return nil
+		}
 		return fmt.Errorf("BuildInitialContextSetupRequest returned empty PDU")
 	}
 	w.ue.UEAMBRSentToRAN = len(w.sessions) > 0
@@ -108,7 +134,7 @@ func (w *icsWorld) decode() error {
 		return fmt.Errorf("free5gc/ngap decode: %w", err)
 	}
 	w.pdu = pdu
-	w.ies, w.hasAMBR, w.icsItems, w.suItems = nil, false, nil, nil
+	w.ies, w.hasAMBR, w.icsItems, w.suItems, w.allowedItems = nil, false, nil, nil, nil
 	im := pdu.InitiatingMessage
 	if im == nil {
 		return fmt.Errorf("not an initiatingMessage")
@@ -118,6 +144,14 @@ func (w *icsWorld) decode() error {
 		for _, ie := range im.Value.InitialContextSetupRequest.ProtocolIEs.List {
 			w.ies = append(w.ies, icsIE{ie.Id.Value, ie.Criticality.Value})
 			switch ie.Id.Value {
+			case ngapType.ProtocolIEIDAllowedNSSAI:
+				for _, it := range ie.Value.AllowedNSSAI.List {
+					sd := ""
+					if it.SNSSAI.SD != nil {
+						sd = fmt.Sprintf("%x", it.SNSSAI.SD.Value)
+					}
+					w.allowedItems = append(w.allowedItems, fmt.Sprintf("%02x/%s", it.SNSSAI.SST.Value, sd))
+				}
 			case ngapType.ProtocolIEIDUEAggregateMaximumBitRate:
 				w.hasAMBR = true
 				w.ambrUL = ie.Value.UEAggregateMaximumBitRate.UEAggregateMaximumBitRateUL.Value
@@ -294,6 +328,105 @@ func initICSSteps(sc *godog.ScenarioContext) {
 			return nil
 		})
 
+	// ---- AMF-010: mandatory Allowed NSSAI, ICS log procedure (TS 38.413 §9.2.2.1) ----
+	sc.Step(`^the UE has an Allowed NSSAI of S-NSSAI SST (\d+) SD "([0-9a-f]{6})" and SST (\d+) SD "([0-9a-f]{6})"$`,
+		func(s1 int, d1 string, s2 int, d2 string) error {
+			w.allowed = []amfctx.SNSSAISubscribed{{SST: uint8(s1), SD: d1}, {SST: uint8(s2), SD: d2}}
+			return nil
+		})
+	sc.Step(`^the UE has an empty Allowed NSSAI$`,
+		func() error { w.allowed = nil; return nil })
+	sc.Step(`^the AllowedNSSAI IE lists exactly the S-NSSAI SST (\d+) SD "([0-9a-f]{6})" and SST (\d+) SD "([0-9a-f]{6})"$`,
+		func(s1 int, d1 string, s2 int, d2 string) error {
+			want := []string{fmt.Sprintf("%02x/%s", s1, d1), fmt.Sprintf("%02x/%s", s2, d2)}
+			if strings.Join(w.allowedItems, ",") != strings.Join(want, ",") {
+				return fmt.Errorf("AllowedNSSAI items = %v, want %v", w.allowedItems, want)
+			}
+			return nil
+		})
+	sc.Step(`^the build fails with an error mentioning "([^"]+)" and yields no bytes$`,
+		func(frag string) error {
+			if len(w.raw) != 0 {
+				return fmt.Errorf("builder returned %d bytes for an empty Allowed NSSAI", len(w.raw))
+			}
+			// The error-returning encode path is the one SendInitialContextSetupRequest uses.
+			if err := w.send(); err == nil {
+				return fmt.Errorf("send with empty Allowed NSSAI returned nil error")
+			}
+			if !strings.Contains(w.sendErr.Error(), frag) {
+				return fmt.Errorf("error %q does not mention %q", w.sendErr, frag)
+			}
+			return nil
+		})
+	sc.Step(`^the UE pending ICS kind is "([^"]+)"$`, func(k string) error {
+		kinds := map[string]amfctx.ICSKind{
+			"ICSInitialRegistration": amfctx.ICSInitialRegistration,
+			"ICSServiceRequest":      amfctx.ICSServiceRequest,
+			"ICSRegistrationUpdate":  amfctx.ICSRegistrationUpdate,
+			"ICSNone":                amfctx.ICSNone,
+		}
+		v, ok := kinds[k]
+		if !ok {
+			return fmt.Errorf("unknown ICS kind %q", k)
+		}
+		w.pendKind, w.haveKind = v, true
+		return nil
+	})
+	sc.Step(`^the AMF sends the INITIAL CONTEXT SETUP REQUEST to the gNB$`, func() error {
+		// Build-error path already sent once in the same scenario: do not resend.
+		if w.sent {
+			return nil
+		}
+		w.send()
+		return nil
+	})
+	sc.Step(`^the send returns an error and no NGAP PDU is written to the gNB$`, func() error {
+		if w.sendErr == nil {
+			return fmt.Errorf("send returned nil error")
+		}
+		if len(w.writes) != 0 {
+			return fmt.Errorf("%d NGAP PDUs written to the gNB, want 0", len(w.writes))
+		}
+		return nil
+	})
+	sc.Step(`^the send is logged with result "([^"]+)" and procedure "([^"]+)"$`,
+		func(result, proc string) error {
+			rec, err := w.icsLog(false)
+			if err != nil {
+				return err
+			}
+			if rec["result"] != result || rec["procedure"] != proc {
+				return fmt.Errorf("log result=%v procedure=%v, want %s/%s", rec["result"], rec["procedure"], result, proc)
+			}
+			return nil
+		})
+	sc.Step(`^the ICS send log carries procedure "([^"]+)"$`, func(proc string) error {
+		if w.sendErr != nil {
+			return fmt.Errorf("send failed: %w", w.sendErr)
+		}
+		if len(w.writes) != 1 {
+			return fmt.Errorf("%d NGAP PDUs written, want 1", len(w.writes))
+		}
+		rec, err := w.icsLog(true)
+		if err != nil {
+			return err
+		}
+		if rec["procedure"] != proc || rec["nf"] != "AMF" {
+			return fmt.Errorf("log procedure=%v nf=%v, want %s/AMF", rec["procedure"], rec["nf"], proc)
+		}
+		return nil
+	})
+	sc.Step(`^the ICS send log carries spec_ref containing "([^"]+)"$`, func(frag string) error {
+		rec, err := w.icsLog(true)
+		if err != nil {
+			return err
+		}
+		if v, _ := rec["spec_ref"].(string); !strings.Contains(v, frag) {
+			return fmt.Errorf("spec_ref %q does not contain %q", v, frag)
+		}
+		return nil
+	})
+
 	// Whens
 	sc.Step(`^the AMF builds the INITIAL CONTEXT SETUP REQUEST with the (?:Registration|Service) Accept NAS-PDU$`,
 		w.buildICS)
@@ -461,4 +594,57 @@ func hexBytes(s string) ([]byte, error) {
 		out[i] = byte(v)
 	}
 	return out, nil
+}
+
+// send drives the real Server.SendInitialContextSetupRequest over the gNB
+// transport seam and captures the written PDUs and the JSON log output.
+func (w *icsWorld) send() error {
+	w.logBuf = &bytes.Buffer{}
+	lg := slog.New(slog.NewJSONHandler(w.logBuf, nil)).With("nf", "AMF") // as cmd/amf/main.go
+	mgr := amfctx.NewManager(amfctx.AMFIdentity{}, nil, nil, lg)
+	s := amfngap.NewServer("", mgr, nil, amfngap.AMFConfig{}, lg)
+	const addr = "10.0.0.9:38412"
+	gnb := &amfngap.GNBContext{UEs: map[int64]*amfctx.UEContext{}, IdleUEs: map[int64]*amfctx.UEContext{}}
+	w.writes = nil
+	gnb.SetTransportForTest(addr, func(p []byte, _ *sctp.SndRcvInfo) (int, error) {
+		w.writes = append(w.writes, append([]byte(nil), p...))
+		return len(p), nil
+	})
+	s.AddGNBForTest(addr, gnb)
+	ue := mgr.AllocateUEContext(7)
+	ue.GNBAddr = addr
+	ue.AllowedNSSAI = w.allowed
+	if w.haveKind {
+		ue.SetPendingICS(w.pendKind)
+	} else {
+		// Registration Accept path of the feature: pending kind InitialRegistration.
+		ue.SetPendingICS(amfctx.ICSInitialRegistration)
+	}
+	var k [32]byte
+	w.sent = true
+	w.sendErr = s.SendInitialContextSetupRequest(ue, nasStub, k, 0, 0, 0xE000, 0xE000, w.sessions)
+	return w.sendErr
+}
+
+// icsLog returns the JSON log record of the ICS send path (Info when sent,
+// Error when the encode failed).
+func (w *icsWorld) icsLog(wantInfo bool) (map[string]any, error) {
+	if w.logBuf == nil {
+		return nil, errors.New("the ICS send path did not run")
+	}
+	sc := bufio.NewScanner(io.Reader(bytes.NewReader(w.logBuf.Bytes())))
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		var rec map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			return nil, fmt.Errorf("log line is not JSON: %w (%q)", err, sc.Text())
+		}
+		if rec["message_type"] == "InitialContextSetupRequest" {
+			if wantInfo && rec["level"] != "INFO" {
+				return nil, fmt.Errorf("ICS log level %v, want INFO", rec["level"])
+			}
+			return rec, nil
+		}
+	}
+	return nil, fmt.Errorf("no InitialContextSetupRequest log record in %q", w.logBuf.String())
 }

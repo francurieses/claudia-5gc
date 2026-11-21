@@ -87,7 +87,7 @@ func TestActivatePDUSessions_Paged(t *testing.T) {
 				ue.AddPagedPDUSession(p)
 			}
 			log := slog.New(slog.NewTextHandler(io.Discard, nil))
-			items := h.activatePDUSessions(context.Background(), ue, tc.ulds, nil, log)
+			items, _ := h.activatePDUSessions(context.Background(), ue, tc.ulds, nil, log)
 			if got := psiList(items); !equalPSIs(got, tc.wantItems) {
 				t.Errorf("items = %v, want %v", got, tc.wantItems)
 			}
@@ -138,7 +138,7 @@ func TestActivatePDUSessions_PagedPDUSessionStatus(t *testing.T) {
 			}
 			log := slog.New(slog.NewTextHandler(io.Discard, nil))
 			released := h.releaseInactivePDUSessions(context.Background(), ue, tc.status)
-			items := h.activatePDUSessions(context.Background(), ue, tc.ulds, released, log)
+			items, _ := h.activatePDUSessions(context.Background(), ue, tc.ulds, released, log)
 			if got := psiList(items); !equalPSIs(got, tc.wantItems) {
 				t.Errorf("items = %v, want %v", got, tc.wantItems)
 			}

@@ -87,6 +87,16 @@ func srWithIEs(svcName, uldsList, statusList string) error {
 // decodedServiceAccept deciphers the Service Accept carried in the ICS
 // Request (NEA2, DL COUNT = value before the SR) and decodes its IEs.
 func decodedServiceAccept() (*nas.ServiceAccept, error) {
+	raw, err := rawServiceAcceptIEs()
+	if err != nil {
+		return nil, err
+	}
+	return nas.DecodeServiceAccept(raw)
+}
+
+// rawServiceAcceptIEs returns the Service Accept IE bytes (after the 3-octet
+// EPD/SHT/message type header) of the NAS PDU sent to the gNB.
+func rawServiceAcceptIEs() ([]byte, error) {
 	w := ntsrW
 	if err := w.serviceAccept(); err != nil { // also verifies SHT and MAC
 		return nil, err
@@ -95,7 +105,102 @@ func decodedServiceAccept() (*nas.ServiceAccept, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nas.DecodeServiceAccept(inner[3:])
+	if len(inner) < 3 {
+		return nil, fmt.Errorf("Service Accept too short (%d octets)", len(inner))
+	}
+	return inner[3:], nil
+}
+
+func (w *ntsrWorld) smfFailsWith(psi, status int, cause string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.failSpec[ntsrRef(psi)] = ntsrFailSpec{status: status, cause: cause}
+	return nil
+}
+
+func smfFailsWithCause(psi, status int, cause string) error {
+	return ntsrW.smfFailsWith(psi, status, cause)
+}
+
+func smfFailsNoBody(psi, status int) error { return ntsrW.smfFailsWith(psi, status, "") }
+
+func errCauseString(l []nas.PDUSessionErrorCause) string {
+	var out []string
+	for _, e := range l {
+		out = append(out, fmt.Sprintf("%d:%d", e.PDUSessionID, e.Cause5GMM))
+	}
+	return strings.Join(out, ",")
+}
+
+func saCarriesErrorCause(entries string) error {
+	sa, err := decodedServiceAccept()
+	if err != nil {
+		return err
+	}
+	if sa.PDUSessionReactivationResultErrorCause == nil {
+		return fmt.Errorf("Service Accept has no PDU session reactivation result error cause IE (0x72)")
+	}
+	if got := errCauseString(sa.PDUSessionReactivationResultErrorCause); got != entries {
+		return fmt.Errorf("PDU session reactivation result error cause entries = %q, want %q", got, entries)
+	}
+	return nil
+}
+
+func saNoErrorCause() error {
+	sa, err := decodedServiceAccept()
+	if err != nil {
+		return err
+	}
+	if sa.PDUSessionReactivationResultErrorCause != nil {
+		return fmt.Errorf("unexpected PDU session reactivation result error cause IE: %s",
+			errCauseString(sa.PDUSessionReactivationResultErrorCause))
+	}
+	return nil
+}
+
+// saIEOrder walks the raw Service Accept IEs: 0x50 / 0x26 are TLV (1-octet
+// length), 0x72 is TLV-E (2-octet length) per TS 24.501 §8.2.17.
+func saIEOrder(want string) error {
+	raw, err := rawServiceAcceptIEs()
+	if err != nil {
+		return err
+	}
+	var got []string
+	for i := 0; i < len(raw); {
+		iei := raw[i]
+		var l, hdr int
+		switch iei {
+		case 0x72:
+			if i+3 > len(raw) {
+				return fmt.Errorf("truncated TLV-E IE 0x72 at offset %d", i)
+			}
+			hdr, l = 3, int(raw[i+1])<<8|int(raw[i+2])
+		case 0x50, 0x26:
+			if i+2 > len(raw) {
+				return fmt.Errorf("truncated IE 0x%02X at offset %d", iei, i)
+			}
+			hdr, l = 2, int(raw[i+1])
+		default:
+			return fmt.Errorf("unexpected IEI 0x%02X at offset %d in Service Accept %x", iei, i, raw)
+		}
+		if i+hdr+l > len(raw) {
+			return fmt.Errorf("IE 0x%02X overruns the Service Accept %x", iei, raw)
+		}
+		got = append(got, fmt.Sprintf("0x%02x", iei))
+		i += hdr + l
+	}
+	var wantList []string
+	for _, f := range strings.Split(want, ",") {
+		n, err := strconv.ParseUint(strings.TrimSpace(f), 0, 8)
+		if err != nil {
+			return fmt.Errorf("bad IEI %q", f)
+		}
+		wantList = append(wantList, fmt.Sprintf("0x%02x", n))
+	}
+	if g, w := strings.Join(got, ","), strings.Join(wantList, ","); g != w {
+		return fmt.Errorf("Service Accept IE order = %s, want %s", g, w)
+	}
+	return nil
 }
 
 func maskString(m uint16) string {
@@ -233,6 +338,11 @@ func sessionStill(psi int) error {
 }
 
 func initServiceAcceptSteps(sc *godog.ScenarioContext) {
+	sc.Step(`^the SMF will fail the activation of PDU session (\d+) with status (\d+) and cause "([^"]+)"$`, smfFailsWithCause)
+	sc.Step(`^the SMF will fail the activation of PDU session (\d+) with status (\d+) and no body$`, smfFailsNoBody)
+	sc.Step(`^the Service Accept carries a PDU session reactivation result error cause IE with entries "([^"]*)"$`, saCarriesErrorCause)
+	sc.Step(`^the Service Accept carries no PDU session reactivation result error cause IE$`, saNoErrorCause)
+	sc.Step(`^the Service Accept IEs are in the order "([^"]+)"$`, saIEOrder)
 	sc.Step(`^the UE sends a Service Request with service type "([^"]+)", Uplink Data Status "([^"]*)" and PDU session status "([^"]*)"$`, srWithIEs)
 	sc.Step(`^the Service Accept carries a PDU session status IE flagging PDU sessions "([^"]*)"$`, saCarriesStatus)
 	sc.Step(`^the Service Accept carries no PDU session status IE$`, saNoStatus)

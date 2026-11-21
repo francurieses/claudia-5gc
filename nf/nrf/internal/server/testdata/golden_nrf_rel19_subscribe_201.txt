@@ -1,0 +1,5 @@
+status: Created
+Content-Type: application/json
+Location: http://example.com/nnrf-nfm/v1/subscriptions/<SUBSCRIPTION_ID>
+
+{"nfStatusNotificationUri":"http://amf.5gc/cb","nrfSupportedFeatures":"5","reqNfType":"AMF","subscriptionId":"<SUBSCRIPTION_ID>","validityTime":"2030-01-01T00:00:00Z"}

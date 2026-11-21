@@ -177,6 +177,9 @@ func main() {
 		DNNIPv6Prefixes: dnnIPv6Prefixes,
 		// MBR / Session-AMBR enforcement (UPF-005): TS 23.501 §5.7.1.8.
 		QoS: pfcp.QoSConfig{MBRDisabled: !cfg.QoSMBREnforcement(), BurstMs: cfg.QoSBurstMs()},
+		// DL buffering for BUFF FARs (SMF-011): TS 29.244 §5.2.3.1.
+		DLBufferDefaultPackets: cfg.N4.DLBuffer.DefaultMaxPackets,
+		DLBufferMaxPackets:     cfg.N4.DLBuffer.MaxPacketsCap,
 	}
 	pfcpSrv, err := pfcp.New(pfcpCfg, logger, sessionTable)
 	if err != nil {
@@ -228,6 +231,7 @@ func main() {
 	// solicited RA back into PFCP when it decapsulates a Router Solicitation
 	// on the uplink.
 	pfcpSrv.SetRASender(gtpuSrv)
+	pfcpSrv.SetDLFlusher(gtpuSrv)
 	gtpuSrv.SetPFCPServer(pfcpSrv)
 
 	go func() {

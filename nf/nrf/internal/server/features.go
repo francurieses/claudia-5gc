@@ -62,7 +62,7 @@ func (s *Server) SetCatalogs(mgmt, disc *features.Catalog) { s.mgmtCat, s.discCa
 
 func (s *Server) mgmtCatalog() *features.Catalog {
 	if s.mgmtCat == nil {
-		return nrfsbi.NnrfNFManagementCatalog()
+		return nrfsbi.NnrfNFManagementCatalogFor(s.profile)
 	}
 	return s.mgmtCat
 }
@@ -149,12 +149,12 @@ func (s *Server) rejectBadFeatures(w http.ResponseWriter, r *http.Request, iface
 
 // payloadTooLarge answers a body over features.MaxRequestBodyBytes with 413
 // and a ProblemDetails without a cause (the spec defines no 413 cause), after
-// logging one WARN record. Ref: TS 29.500 §5.2.7.1; TS 29.571 §5.2.4.1.
+// logging one WARN record. Ref: TS 29.500 §5.2.7.2; TS 29.571 §5.2.4.1.
 func (s *Server) payloadTooLarge(w http.ResponseWriter, r *http.Request, procedure string) {
 	s.logger.WarnContext(featureCtx(r), "request body too large",
 		"procedure", procedure, "correlation_id", r.Header.Get("X-Correlation-Id"),
 		"interface", "Nnrf", "direction", "IN", "result", "REJECT", "cause", "PAYLOAD_TOO_LARGE",
-		"spec_ref", "TS 29.500 §5.2.7.1")
+		"spec_ref", "TS 29.500 §5.2.7.2")
 	w.Header().Set("Content-Type", "application/problem+json")
 	w.WriteHeader(http.StatusRequestEntityTooLarge)
 	if err := json.NewEncoder(w).Encode(map[string]any{

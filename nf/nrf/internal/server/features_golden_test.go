@@ -21,6 +21,8 @@ import (
 var (
 	reSearchID = regexp.MustCompile(`"searchId":"[0-9A-Z]{26}"`)
 	reSubID    = regexp.MustCompile(`(subscriptions/|"subscriptionId":")[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	// reSubIDHyphenless masks the rel19 TS 29.510 §6.1.6.2.16 id (UUID, hyphens removed).
+	reSubIDHyphenless = regexp.MustCompile(`(subscriptions/|"subscriptionId":")[0-9a-f]{32}`)
 )
 
 // checkGolden compares got with testdata/<name>. UPDATE_GOLDEN=1 rewrites the
@@ -45,14 +47,17 @@ func checkGolden(t *testing.T, name, got string) {
 
 // render serialises a recorded response: status, content type, Location and
 // the body, with the generated ids masked.
-func render(rec *httptest.ResponseRecorder) string {
+func render(rec *httptest.ResponseRecorder) string { return renderWith(rec, reSubID) }
+
+// renderWith is render with a caller-chosen subscription-id mask.
+func renderWith(rec *httptest.ResponseRecorder, re *regexp.Regexp) string {
 	resp := rec.Result()
 	body := reSearchID.ReplaceAllString(rec.Body.String(), `"searchId":"<ULID>"`)
 	loc := resp.Header.Get("Location")
 	out := "status: " + http.StatusText(resp.StatusCode) + "\n" +
 		"Content-Type: " + resp.Header.Get("Content-Type") + "\n" +
 		"Location: " + loc + "\n\n" + body
-	return reSubID.ReplaceAllString(out, "${1}<SUBSCRIPTION_ID>")
+	return re.ReplaceAllString(out, "${1}<SUBSCRIPTION_ID>")
 }
 
 const goldenSMF = `{"nfType":"SMF","fqdn":"smf.5gc","nfServices":[{"serviceInstanceId":"s1","serviceName":"nsmf-pdusession",` +

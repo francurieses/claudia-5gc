@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/francurieses/claudia-5gc/nf/pcf/internal/config"
 )
 
 // smPolicyUpdateSpecRef is the clause of the SM Policy Association modification
@@ -126,7 +128,7 @@ func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 		log.Info("SmPolicyUpdate: per-subscriber override applied — request superseded",
 			"supi", supi, "dnn", dnn, "requested_5qi", reqFiveQI, "granted_5qi", grantedFiveQI,
 			"result", "OK")
-		writeSmPolicyDecision(log, w, grantedFiveQI, arpPriority, grantedUL, grantedDL, QoSSourcePCFOverride)
+		writeSmPolicyDecision(log, w, s.cfg.DefaultSMPolicy, grantedFiveQI, arpPriority, grantedUL, grantedDL, QoSSourcePCFOverride)
 		return
 	}
 
@@ -154,7 +156,7 @@ func (s *Server) handleUpdateSmPolicy(w http.ResponseWriter, r *http.Request) {
 		"supi", supi, "dnn", dnn, "granted_5qi", reqFiveQI,
 		"granted_ul", reqUL, "granted_dl", reqDL,
 		"result", "OK")
-	writeSmPolicyDecision(log, w, reqFiveQI, arpPriority, reqUL, reqDL, "PCF_AUTHORIZED")
+	writeSmPolicyDecision(log, w, s.cfg.DefaultSMPolicy, reqFiveQI, arpPriority, reqUL, reqDL, "PCF_AUTHORIZED")
 }
 
 // is5QIAuthorized reports whether the PCF policy permits the given 5QI on an update.
@@ -176,26 +178,8 @@ func (s *Server) is5QIAuthorized(fiveQI int) bool {
 const QoSSourcePCFOverride = "PCF_OVERRIDE"
 
 // writeSmPolicyDecision emits a 200 SmPolicyDecision with the granted QoS.
-func writeSmPolicyDecision(out *slog.Logger, w http.ResponseWriter, fiveQI, arpPriority int, ambrUL, ambrDL, qosSource string) {
-	resp := map[string]interface{}{
-		"x5gcQosSource": qosSource,
-		"sessRules": map[string]interface{}{
-			"sr-1": map[string]interface{}{
-				"sessAmbr": map[string]string{
-					"uplink":   ambrUL,
-					"downlink": ambrDL,
-				},
-			},
-		},
-		"qosDecs": map[string]interface{}{
-			"qd-1": map[string]interface{}{
-				"5qi": fiveQI,
-				"arp": map[string]interface{}{
-					"priorityLevel": arpPriority,
-				},
-			},
-		},
-	}
+func writeSmPolicyDecision(out *slog.Logger, w http.ResponseWriter, p config.SMPolicyDefaults, fiveQI, arpPriority int, ambrUL, ambrDL, qosSource string) {
+	resp := buildSmPolicyDecision(p, fiveQI, arpPriority, ambrUL, ambrDL, qosSource, false)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	encodeBody(out, w, resp)

@@ -30,6 +30,9 @@ type n2HandoverState struct {
 	sourceGNB         *GNBContext
 	sourceRANUENGAPId int64
 	targetGNB         *GNBContext // set after HandoverRequest is sent
+	// targetRANUENGAPId is the RAN UE NGAP ID the target gNB allocated (HANDOVER REQUEST
+	// ACKNOWLEDGE); an NG RESET of the target gNB matches it. Guarded by Server.pendingN2HOMu.
+	targetRANUENGAPId int64
 	handoverType      int
 	causePresent      int
 	causeValue        int64
@@ -243,7 +246,7 @@ func (s *Server) handlePathSwitchRequest(ctx context.Context, targetGNB *GNBCont
 	}
 
 	// The SMF leg blocks: run it on the UE's serial queue so the target gNB association's
-	// read loop keeps serving other UEs (nf/amf/CLAUDE.md §6, doc §7.4.1).
+	// read loop keeps serving other UEs (nf/amf/internal/ngap/CLAUDE.md, doc §7.4.1).
 	plan := pathSwitchPlan{requested: requested, transfers: transfers, smRefs: smRefs, failed: failedItems}
 	ue.EnqueueSerial(func() {
 		s.completePathSwitch(ctx, base, ue, targetGNB, req, plan)
@@ -781,7 +784,7 @@ func (s *Server) handleHandoverRequired(ctx context.Context, sourceGNB *GNBConte
 	}
 
 	// The SMF leg blocks: run it on the UE's serial queue so the source gNB association's
-	// read loop keeps serving other UEs (nf/amf/CLAUDE.md §6).
+	// read loop keeps serving other UEs (nf/amf/internal/ngap/CLAUDE.md).
 	ue.EnqueueSerial(func() {
 		s.continueHandoverPreparation(ctx, log, ue, sourceGNB, targetGNB, req)
 	})
@@ -1120,6 +1123,7 @@ func (s *Server) handleHandoverRequestAcknowledge(ctx context.Context, targetGNB
 	state, ok2 := s.pendingN2HO[ack.AMFUENGAPId]
 	if ok2 {
 		state.tgtToSrcContainer = ack.TargetToSourceTransparentContainer
+		state.targetRANUENGAPId = ack.RANUENGAPId
 	}
 	s.pendingN2HOMu.Unlock()
 	ctx = n2HandoverContext(ctx, state)

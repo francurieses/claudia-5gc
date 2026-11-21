@@ -57,6 +57,11 @@ RUN wget -qO- \
 #          capability (IEI 0x28, §9.11.4.1) bits from ue.yaml
 #          mmCapabilityBits / smCapabilityBits ("octet.bit" lists); absent =
 #          byte-identical stock encoding
+#   0100 — gNB reconnects to the AMF after SCTP association loss (bars the
+#          cell, drops UE contexts locally, retries NG Setup, Time To Wait
+#          honoured); UE treats a barred MIB as radio link failure and sends
+#          a Mobility Registration Update (TS 38.413 §8.7.1, TS 24.501
+#          §5.5.1.3.2 f))
 COPY tools/ueransim/patches/ /patches/
 RUN set -e; for p in /patches/*.patch; do \
         echo "Applying $p"; \

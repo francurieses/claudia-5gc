@@ -579,10 +579,10 @@ func TestUnknownIENotifyWithResponseMessage(t *testing.T) {
 			}
 		})
 	}
-	t.Run("NG RESET keeps the ERROR INDICATION", func(t *testing.T) {
+	t.Run("NG RESET has an AMF-built response (NG RESET ACKNOWLEDGE)", func(t *testing.T) {
 		msg := &Message{Type: 0, ProcedureCode: ProcNGReset}
-		if hasResponseMessage(msg.ProcedureCode) {
-			t.Error("NG RESET has no AMF-built response")
+		if !hasResponseMessage(msg.ProcedureCode) {
+			t.Error("NG RESET is answered by NG RESET ACKNOWLEDGE")
 		}
 	})
 }

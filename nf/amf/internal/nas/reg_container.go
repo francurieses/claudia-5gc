@@ -13,7 +13,6 @@ import (
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
-	"github.com/francurieses/claudia-5gc/shared/crypto/nas/nea"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 )
 
@@ -36,8 +35,7 @@ const (
 // decipherNASContainer deciphers the value part of a NAS message container IE with
 // the 5G NAS security context in use and the NAS COUNT of the REGISTRATION REQUEST
 // that carried it. The algorithm is the one of the context (CipheringAlgID): NEA0
-// is the identity, NEA2 uses the shared helper. NEA1/NEA3 have no implementation in
-// shared/crypto, and a failing cipher returns (nil, err) - there is no silent
+// is the identity, NEA1/2/3 go through cipherNAS, and a failing cipher returns (nil, err) - there is no silent
 // fallback to the raw bytes. With a non-null cipher a container whose first octet
 // is the plain 5GMM EPD is NOT accepted as cleartext: a UE must have ciphered it
 // (TS 24.501 §4.4.6), so it is treated as undecipherable.
@@ -50,18 +48,9 @@ func decipherNASContainer(ue *amfctx.UEContext, container []byte, count uint32) 
 	if len(ue.SecurityCtx.KNASenc) == 0 {
 		return nil, fmt.Errorf("nas: decipher container: no KNASenc for NEA%d", alg)
 	}
-	var plain []byte
-	switch alg {
-	case nea2ID:
-		var err error
-		plain, err = nea.NEA2(ue.SecurityCtx.KNASenc, count, 0x01, 0x00, container)
-		if err != nil {
-			return nil, fmt.Errorf("nas: decipher container NEA2: %w", err)
-		}
-	case nea1ID, nea3ID:
-		return nil, fmt.Errorf("nas: decipher container: NEA%d not implemented", alg)
-	default:
-		return nil, fmt.Errorf("nas: decipher container: unknown NEA%d", alg)
+	plain, err := cipherNAS(alg, ue.SecurityCtx.KNASenc, count, nasDirUL, container)
+	if err != nil {
+		return nil, fmt.Errorf("nas: decipher container: %w", err)
 	}
 	if len(plain) == 0 || plain[0] != nasEPD5GMM {
 		return nil, fmt.Errorf("nas: decipher container NEA%d: result is not a 5GMM message", alg)
@@ -177,9 +166,36 @@ func (h *Handler) syncPDUSessions(ctx context.Context, ue *amfctx.UEContext,
 		z := uint16(0) // empty mask: nothing to activate; ulds keeps the request
 		activateMask = &z
 	}
-	items := h.activatePDUSessions(ctx, ue, activateMask, released, log)
+	// Empty Allowed NSSAI on a new N2 connection: the update is answered without
+	// ICS (TS 38.413 §9.2.2.1), so no user plane may be activated (a PDU SESSION
+	// RESOURCE SETUP REQUEST would open a connection without an ICS). Empty mask:
+	// the ULDS PSIs are reported not re-established in the reactivation result IE.
+	// No 0x72 error cause: §9.11.3.43 has no cause for this case.
+	// Ref: TS 24.501 §5.5.1.3.4; TS 38.413 §8.2.1; TS 23.502 §4.2.3.2 step 12
+	ue.Lock()
+	noICS := ue.NASOnNewN2Connection && len(ue.AllowedNSSAI) == 0
+	ue.Unlock()
+	if noICS && activateMask != nil && *activateMask != 0 {
+		log.WarnContext(ctx, "empty Allowed NSSAI without ICS - uplink data status PDU sessions not re-activated",
+			"result", "REJECT", "cause", "empty_allowed_nssai_no_ics",
+			"spec_ref", "TS 24.501 §5.5.1.3.4; TS 23.502 §4.2.3.2 step 12")
+	}
+	var items []ngap.PDUSessionSetupItemCxtReq
+	var failCauses map[uint8]uint8
+	if noICS {
+		// Nothing is activated, paged PSIs included: drain them (log only).
+		drainPagedNoICS(ue, log)
+	} else {
+		items, failCauses = h.activatePDUSessions(ctx, ue, activateMask, released, log)
+	}
 	out := regSessionSync{Items: items, ErrorCauses: errCauses}
-	acc := buildServiceAccept(ue, &nas.ServiceRequest{PDUSessionStatus: status, UplinkDataStatus: ulds}, released, items)
+	acc := buildServiceAccept(ue, &nas.ServiceRequest{PDUSessionStatus: status, UplinkDataStatus: ulds}, released, items, failCauses)
+	if len(out.ErrorCauses) == 0 && !noICS {
+		// Not restricted, ICS sent (no 0x72 without ICS, see above): the error causes of the PSIs the AMF could not
+		// re-establish (SMF failure #92/#43/#28/#69, unknown PSI #111).
+		// Ref: TS 24.501 §5.5.1.3.4, §5.6.1.4.1
+		out.ErrorCauses = acc.PDUSessionReactivationResultErrorCause
+	}
 	if acc.PDUSessionStatus != nil {
 		m := *acc.PDUSessionStatus
 		out.StatusIE = []byte{byte(m >> 8), byte(m)}

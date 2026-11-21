@@ -219,7 +219,10 @@ func TestRegistrationNonAllowedAreaReactivationResult(t *testing.T) {
 	// Inside the allowed area nothing is flagged.
 	ue.ServAreaRes.NotAllowedTACs = []string{"000009"}
 	sync = h.syncPDUSessions(context.Background(), ue, req, h.logger)
-	if len(sync.ErrorCauses) != 0 {
-		t.Fatalf("error causes %v outside a Non-Allowed Area", sync.ErrorCauses)
+	// AMF-016: no #28 outside the area; the PSIs have no SM context here, so
+	// they are reported with #111 (TS 24.501 §5.6.1.4.1).
+	wantUnk := []nas.PDUSessionErrorCause{{PDUSessionID: 1, Cause5GMM: 111}, {PDUSessionID: 5, Cause5GMM: 111}}
+	if len(sync.ErrorCauses) != 2 || sync.ErrorCauses[0] != wantUnk[0] || sync.ErrorCauses[1] != wantUnk[1] {
+		t.Fatalf("error causes %v outside a Non-Allowed Area, want %v", sync.ErrorCauses, wantUnk)
 	}
 }

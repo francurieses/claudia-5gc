@@ -97,12 +97,37 @@ func (w *bitWriter) writeConstrained(v int64, lb, ub int64) error {
 	return nil
 }
 
-// writeEnumExt appends an extensible ENUMERATED root value (X.691 §14.3:
-// extension bit 0 + index in ceil(log2(rootCount)) bits). This codec never
-// encodes extension values.
+// writeEnumExt appends an extensible ENUMERATED value (X.691 §14.3): a root
+// value is extension bit 0 + index in ceil(log2(rootCount)) bits; an extension
+// value (v >= rootCount) is extension bit 1 + normally-small (v - rootCount),
+// the inverse of readEnumExt. Before CI-003 an extension value was silently
+// truncated to the root width (found by FuzzDecode in roundtrip_fuzz_test.go).
 func (w *bitWriter) writeEnumExt(v uint64, rootCount uint64) {
-	w.writeBit(0)
-	w.writeBits(v, bitWidth(rootCount))
+	if v < rootCount {
+		w.writeBit(0)
+		w.writeBits(v, bitWidth(rootCount))
+		return
+	}
+	w.writeBit(1)
+	w.writeNormallySmall(v - rootCount)
+}
+
+// writeNormallySmall appends a normally-small non-negative whole number
+// (X.691 §11.6): bit 0 + 6-bit value for n < 64, else bit 1 + a
+// semi-constrained whole number (8-bit length determinant + minimal octets).
+func (w *bitWriter) writeNormallySmall(n uint64) {
+	if n < 64 {
+		w.writeBit(0)
+		w.writeBits(n, 6)
+		return
+	}
+	octets := 1
+	for n>>(8*octets) != 0 {
+		octets++
+	}
+	w.writeBit(1)
+	w.writeBits(uint64(octets), 8)
+	w.writeBits(n, 8*octets)
 }
 
 // bytes returns the accumulated stream padded with zero bits to a whole

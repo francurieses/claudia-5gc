@@ -64,6 +64,14 @@ var (
 		Help: "Total NGAP messages processed, labeled by type, direction, and result.",
 	}, []string{"nf", "message_type", "direction", "result"})
 
+	// NGResetUEsReleasedTotal counts UE-associated logical NG-connections released locally
+	// by an NG RESET from the gNB (TS 38.413 §8.7.4.2.2).
+	// Labels: nf, reset_type (all|partial).
+	NGResetUEsReleasedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fivegc_ng_reset_ues_released_total",
+		Help: "UE NG-connections released by NG Reset, labeled by reset type.",
+	}, []string{"nf", "reset_type"})
+
 	// --- Session Management (SMF) ---
 
 	// PDUSessionsActive is the number of active PDU sessions per DNN.

@@ -51,7 +51,8 @@ func TestInitAuth_SUCIForms(t *testing.T) {
 		{"profile A", "suci-0-001-01-0-1-1-" + eph + body, http.StatusCreated},
 		{"profile B", "suci-0-001-01-0-2-2-" + "02" + eph + body, http.StatusCreated},
 		{"supi passthrough", "imsi-001010000000001", http.StatusCreated},
-		{"old private format", "suci-00101-0000-0-0-0000000001", http.StatusBadRequest},
+		{"legacy-looking odd hex", "suci-00101-0000-0-0-000000001", http.StatusBadRequest},
+		{"legacy-looking non-hex", "suci-00101-0000-0-1-zz", http.StatusBadRequest},
 		{"truncated", "suci-0-001-01", http.StatusBadRequest},
 		{"bad scheme output", "suci-0-001-01-0-1-1-zz", http.StatusBadRequest},
 		{"oversized", "suci-0-001-01-0-1-1-" + strings.Repeat("ab", 3000), http.StatusBadRequest},
@@ -77,6 +78,26 @@ func TestInitAuth_SUCIForms(t *testing.T) {
 			}
 			if strings.Contains(resp, tc.id) || strings.Contains(resp, "0000000001") {
 				t.Fatalf("body leaks the SUCI: %s", resp)
+			}
+		})
+	}
+}
+
+// TestInitAuth_LegacySUCI: the legacy private SUCI of v2.6.0-rel17-final AMFs
+// is accepted and forwarded unchanged to the UDM (rolling upgrade).
+func TestInitAuth_LegacySUCI(t *testing.T) {
+	for name, id := range map[string]string{
+		"null":      "suci-00101-0000-0-0-0000000010",
+		"profile A": "suci-00101-0000-0-1-" + strings.Repeat("ab", 32) + strings.Repeat("cd", 20),
+	} {
+		t.Run(name, func(t *testing.T) {
+			udm := &suciUDM{}
+			code, resp := postInitAuth(t, newGoldenAuthServer(t, udm), id)
+			if code != http.StatusCreated {
+				t.Fatalf("status = %d (%s)", code, resp)
+			}
+			if udm.calls != 1 || udm.gotID != id {
+				t.Fatalf("udm calls=%d id=%q, want 1 verbatim %q", udm.calls, udm.gotID, id)
 			}
 		})
 	}

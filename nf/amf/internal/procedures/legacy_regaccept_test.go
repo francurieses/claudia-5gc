@@ -33,6 +33,7 @@ func (legacyUDM) DeregisterUECM(context.Context, string) error              { re
 func (legacyUDM) GetAMSubscriptionData(context.Context, string) (*UDMAMSubscription, error) {
 	return &UDMAMSubscription{
 		AllowedNSSAI: []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
+		DefaultNSSAI: []amfctx.SNSSAISubscribed{{SST: 1, SD: "000001"}},
 		AMBRUplink:   1_000_000, AMBRDownlink: 2_000_000,
 	}, nil
 }

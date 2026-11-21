@@ -22,7 +22,7 @@ package server
 // unconditionally wraps whatever bytes the SMF returns as n1SmMsg with the
 // PDU SESSION ESTABLISHMENT ACCEPT header (WrapPDUSessionEstablishmentAcceptBody),
 // and the AMF's N1N2MessageTransfer producer does not yet forward the N1/N2
-// payload to a CM-CONNECTED UE (see nf/amf/CLAUDE.md §15). Live delivery of
+// payload to a CM-CONNECTED UE (see nf/amf/internal/sbi/CLAUDE.md). Live delivery of
 // the AUTH COMMAND/RESULT/REJECT to a real UE therefore needs a follow-up AMF
 // change; UERANSIM v3.2.8 has no secondary-auth UE peer to exercise it
 // against in the meantime, so this SMF-side implementation is validated by

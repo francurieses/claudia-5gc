@@ -142,13 +142,13 @@ type Server struct {
 	namfCat *features.Catalog
 	// onUDMDereg performs the local deregistration of a UE the UDM asked to
 	// deregister (DeregistrationNotification); wired by SetDeregistrationHandler.
-	onUDMDereg func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error
+	onUDMDereg func(ctx context.Context, ue *amfctx.UEContext, deregReason, accessType string) error
 }
 
 // SetDeregistrationHandler wires the local deregistration run when the UDM sends
 // a DeregistrationNotification (same path as the implicit detach). Must be
 // called before Start(). Ref: TS 29.503 §5.3.2.2; TS 23.502 §4.2.2.3.3.
-func (s *Server) SetDeregistrationHandler(fn func(ctx context.Context, ue *amfctx.UEContext, deregReason string) error) {
+func (s *Server) SetDeregistrationHandler(fn func(ctx context.Context, ue *amfctx.UEContext, deregReason, accessType string) error) {
 	s.onUDMDereg = fn
 }
 

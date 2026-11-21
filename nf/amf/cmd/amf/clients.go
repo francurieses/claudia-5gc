@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
 	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
@@ -1010,6 +1011,15 @@ func (c *HTTPUDMClient) UnsubscribeSDM(ctx context.Context, supi, subscriptionID
 	return nil
 }
 
+// amSnssai is an Snssai of am-data nssai.defaultSingleNssais / singleNssais
+// (TS 29.571 §5.4.4.2 plus the portal-assigned preferred DNN and the NSSAA flag).
+type amSnssai struct {
+	SST            int    `json:"sst"`
+	SD             string `json:"sd,omitempty"`
+	DNN            string `json:"dnn,omitempty"` // portal-assigned preferred DNN
+	SubjectToNSSAA bool   `json:"subjectToNetworkSliceSpecificAuthenticationAndAuthorization,omitempty"`
+}
+
 func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) (*procedures.UDMAMSubscription, error) {
 	reqURL := fmt.Sprintf("https://%s/nudm-sdm/v2/%s/am-data", c.address, supi)
 	// The supported-features query parameter is optional for a GET ("may
@@ -1030,12 +1040,9 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 
 	var result struct {
 		NSSAI struct {
-			DefaultSingleNssais []struct {
-				SST            int    `json:"sst"`
-				SD             string `json:"sd,omitempty"`
-				DNN            string `json:"dnn,omitempty"` // portal-assigned preferred DNN
-				SubjectToNSSAA bool   `json:"subjectToNetworkSliceSpecificAuthenticationAndAuthorization,omitempty"`
-			} `json:"defaultSingleNssais"`
+			DefaultSingleNssais []amSnssai `json:"defaultSingleNssais"`
+			// SingleNssais: non-default subscribed S-NSSAIs (TS 29.503 Nssai, O).
+			SingleNssais []amSnssai `json:"singleNssais"`
 		} `json:"nssai"`
 		SubscribedUEAMBR struct {
 			Uplink   string `json:"uplink"`
@@ -1065,14 +1072,20 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 		AMBRDownlink: parseBitRateKbps(result.SubscribedUEAMBR.Downlink),
 		GPSI:         pickGPSI(result.GPSIs),
 	}
-	for _, s := range result.NSSAI.DefaultSingleNssais {
-		sub.AllowedNSSAI = append(sub.AllowedNSSAI, amfctx.SNSSAISubscribed{
-			SST:            uint8(s.SST),
-			SD:             s.SD,
-			DNN:            s.DNN,
-			SubjectToNSSAA: s.SubjectToNSSAA,
-		})
+	toCtx := func(in []amSnssai) []amfctx.SNSSAISubscribed {
+		var out []amfctx.SNSSAISubscribed
+		for _, s := range in {
+			out = append(out, amfctx.SNSSAISubscribed{
+				SST:            uint8(s.SST),
+				SD:             s.SD,
+				DNN:            s.DNN,
+				SubjectToNSSAA: s.SubjectToNSSAA,
+			})
+		}
+		return out
 	}
+	sub.DefaultNSSAI = toCtx(result.NSSAI.DefaultSingleNssais)
+	sub.AllowedNSSAI = procedures.MergeSubscribedNSSAI(sub.DefaultNSSAI, toCtx(result.NSSAI.SingleNssais))
 	return sub, nil
 }
 
@@ -1486,6 +1499,46 @@ func (c *HTTPSMFClient) NotifyANRelease(ctx context.Context, smContextRef string
 	return nil
 }
 
+// smfActivateError is a non-200 UpdateSMContext (upCnxState=ACTIVATING) answer.
+// It carries the ProblemDetails application cause (TS 29.571 §5.2.4.1, TS 29.502
+// §5.2.2.3.2.2) so the AMF can map it to the 5GMM cause of the Service Accept
+// PDU session reactivation result error cause IE (TS 24.501 §5.6.1.4.1).
+type smfActivateError struct {
+	status int
+	cause  string
+}
+
+// Error keeps the HTTP status (and the cause when present) in the message.
+func (e *smfActivateError) Error() string {
+	if e.cause == "" {
+		return fmt.Sprintf("smf: activate sm context: status %d", e.status)
+	}
+	return fmt.Sprintf("smf: activate sm context: status %d cause %s", e.status, e.cause)
+}
+
+// SMFApplicationCause returns the ProblemDetails cause ("" when none).
+func (e *smfActivateError) SMFApplicationCause() string { return e.cause }
+
+// newSMFActivateError builds the typed error from a non-200 response, reading
+// ProblemDetails.cause from a bounded JSON (application/problem+json) body.
+func newSMFActivateError(resp *http.Response) *smfActivateError {
+	e := &smfActivateError{status: resp.StatusCode}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "json") {
+		return e
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxNegotiationBodyBytes))
+	if err != nil {
+		return e
+	}
+	var pd struct {
+		Cause string `json:"cause"`
+	}
+	if json.Unmarshal(raw, &pd) == nil {
+		e.cause = pd.Cause
+	}
+	return e
+}
+
 // ActivateSMContext calls Nsmf_PDUSession_UpdateSMContext with upCnxState=ACTIVATING.
 // The SMF rebuilds the PDUSessionResourceSetupRequestTransfer (UL TEID + QoS) for the
 // session so the AMF can carry it as N2SM info in InitialContextSetupRequest during
@@ -1503,8 +1556,12 @@ func (c *HTTPSMFClient) ActivateSMContext(ctx context.Context, smContextRef stri
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		// CONTEXT_NOT_FOUND: the SMF restarted and lost the context (SMF-012).
+		return nil, fmt.Errorf("smf: activate sm context: status %d: %w", resp.StatusCode, nasmsg.ErrSMContextNotFound)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("smf: activate sm context: status %d", resp.StatusCode)
+		return nil, newSMFActivateError(resp)
 	}
 
 	var result struct {
@@ -1599,6 +1656,9 @@ func (c *HTTPSMFClient) DeleteSMContext(ctx context.Context, smContextRef string
 		return fmt.Errorf("smf: delete sm context: %w", err)
 	}
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("smf: delete sm context: status %d: %w", resp.StatusCode, nasmsg.ErrSMContextNotFound)
+	}
 	if resp.StatusCode != 204 && resp.StatusCode != 200 {
 		return fmt.Errorf("smf: delete sm context: status %d", resp.StatusCode)
 	}

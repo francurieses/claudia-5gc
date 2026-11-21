@@ -1,0 +1,570 @@
+diff --git a/src/gnb/ngap/interface.cpp b/src/gnb/ngap/interface.cpp
+index 6add822..6d0dbfb 100644
+--- a/src/gnb/ngap/interface.cpp
++++ b/src/gnb/ngap/interface.cpp
+@@ -37,6 +37,7 @@
+ #include <asn/ngap/ASN_NGAP_ServedGUAMIItem.h>
+ #include <asn/ngap/ASN_NGAP_SliceSupportItem.h>
+ #include <asn/ngap/ASN_NGAP_SupportedTAItem.h>
++#include <asn/ngap/ASN_NGAP_TimeToWait.h>
+ 
+ namespace nr::gnb
+ {
+@@ -95,22 +96,177 @@ void NgapTask::handleAssociationSetup(int amfId, int ascId, int inCount, int out
+     }
+ }
+ 
++// Backoff delay for the n-th consecutive attempt (n >= 1): 1, 2, 4, 8, 16, then capped at 30 s.
++// Simulator choice, not a 3GPP timer.
++static int BackoffSeconds(int attempt, int initialS, int maxS)
++{
++    int delay = initialS;
++    for (int i = 1; i < attempt && delay < maxS; i++)
++        delay *= 2;
++    return delay > maxS ? maxS : delay;
++}
++
++// NG SETUP FAILURE Time To Wait IE (TS 38.413 §9.3.1.56) in seconds.
++static int TimeToWaitSeconds(ASN_NGAP_TimeToWait_t v)
++{
++    switch (v)
++    {
++    case ASN_NGAP_TimeToWait_v1s:
++        return 1;
++    case ASN_NGAP_TimeToWait_v2s:
++        return 2;
++    case ASN_NGAP_TimeToWait_v5s:
++        return 5;
++    case ASN_NGAP_TimeToWait_v10s:
++        return 10;
++    case ASN_NGAP_TimeToWait_v20s:
++        return 20;
++    case ASN_NGAP_TimeToWait_v60s:
++        return 60;
++    default:
++        return 60;
++    }
++}
++
++// 5GC Rel-17 mod (0100): stock UERANSIM deletes the AMF context on association loss and never reconnects.
++// The context is now kept, the UEs of that AMF are dropped locally (no NGAP message can be sent), and an SCTP
++// re-connection followed by a fresh NG Setup (TS 38.413 §8.7.1) is scheduled with bounded exponential backoff.
+ void NgapTask::handleAssociationShutdown(int amfId)
+ {
+     auto *amf = findAmfContext(amfId);
+     if (amf == nullptr)
+         return;
+ 
++    // SCTP may report the same loss twice (SHUTDOWN_EVENT then COMM_LOST / ECONNRESET): handle it once.
++    if (amf->state == EAmfState::NOT_CONNECTED && amf->retryPending)
++    {
++        m_logger->debug("Duplicate association shutdown for AMF[%d] ignored", amfId);
++        return;
++    }
++
+     m_logger->err("Association terminated for AMF[%d]", amfId);
+-    m_logger->debug("Removing AMF context[%d]", amfId);
+ 
+     amf->state = EAmfState::NOT_CONNECTED;
++    amf->association = {};
++    amf->nextStream = 0;
++    amf->overloadInfo = {};
++    // NG Setup derived data is stale and is learned again from the next NG Setup Response. It also keeps
++    // selectAmf() from matching this AMF while it is down.
++    utils::ClearAndDelete(amf->servedGuamiList);
++    utils::ClearAndDelete(amf->plmnSupportList);
+ 
+     auto w = std::make_unique<NmGnbSctp>(NmGnbSctp::CONNECTION_CLOSE);
+     w->clientId = amfId;
+     m_base->sctpTask->push(std::move(w));
+ 
+-    deleteAmfContext(amfId);
++    bool anyConnected = std::any_of(m_amfCtx.begin(), m_amfCtx.end(),
++                                    [](auto &item) { return item.second->state == EAmfState::CONNECTED; });
++
++    dropAmfUeContexts(amfId, !anyConnected);
++
++    if (!anyConnected && m_isInitialized)
++    {
++        m_isInitialized = false;
++
++        auto update = std::make_unique<NmGnbStatusUpdate>(NmGnbStatusUpdate::NGAP_IS_UP);
++        update->isNgapUp = false;
++        m_base->appTask->push(std::move(update));
++
++        // Bar the cell: connected UEs see the serving cell as barred (RRC connection failure) and idle UEs
++        // cannot camp until the NG Setup procedure succeeds again.
++        m_base->rrcTask->push(std::make_unique<NmGnbNgapToRrc>(NmGnbNgapToRrc::RADIO_POWER_OFF));
++    }
++
++    scheduleSctpReconnect(amf);
++}
++
++void NgapTask::dropAmfUeContexts(int amfId, bool cellWillBeBarred)
++{
++    std::vector<int> ueIds;
++    for (auto &item : m_ueCtx)
++        if (item.second->associatedAmfId == amfId)
++            ueIds.push_back(item.first);
++
++    for (int ueId : ueIds)
++    {
++        m_logger->debug("Dropping UE[%d] locally, AMF[%d] is lost", ueId, amfId);
++
++        auto w1 = std::make_unique<NmGnbNgapToGtp>(NmGnbNgapToGtp::UE_CONTEXT_RELEASE);
++        w1->ueId = ueId;
++        m_base->gtpTask->push(std::move(w1));
++
++        // No NGAP message is possible. If the cell is going to be barred the UE learns about the loss from
++        // the barred MIB while RRC-connected (lower-layer failure); otherwise release the RRC connection.
++        auto w2 = std::make_unique<NmGnbNgapToRrc>(cellWillBeBarred ? NmGnbNgapToRrc::CONNECTION_FAILURE
++                                                                    : NmGnbNgapToRrc::AN_RELEASE);
++        w2->ueId = ueId;
++        m_base->rrcTask->push(std::move(w2));
++
++        deleteUeContext(ueId);
++    }
++}
++
++void NgapTask::requestSctpConnection(NgapAmfContext *amf)
++{
++    auto msg = std::make_unique<NmGnbSctp>(NmGnbSctp::CONNECTION_REQUEST);
++    msg->clientId = amf->ctxId;
++    msg->localAddress = m_base->config->ngapIp;
++    msg->localPort = 0;
++    msg->remoteAddress = amf->address;
++    msg->remotePort = amf->port;
++    msg->ppid = sctp::PayloadProtocolId::NGAP;
++    msg->associatedTask = this;
++    m_base->sctpTask->push(std::move(msg));
++}
++
++void NgapTask::handleSctpConnectionFailure(int amfId)
++{
++    auto *amf = findAmfContext(amfId);
++    if (amf == nullptr)
++        return;
++
++    amf->state = EAmfState::NOT_CONNECTED;
++    scheduleSctpReconnect(amf);
++}
++
++void NgapTask::scheduleSctpReconnect(NgapAmfContext *amf)
++{
++    amf->retryAttempts++;
++    int delay = BackoffSeconds(amf->retryAttempts, AMF_RETRY_BACKOFF_INITIAL_S, AMF_RETRY_BACKOFF_MAX_S);
++
++    // TS 38.413 §8.7.1.3: NG SETUP must not be sent before a previously received Time To Wait has expired.
++    int64_t remainingMs = amf->noSetupBeforeMs - utils::CurrentTimeMillis();
++    if (remainingMs > 0)
++        delay = std::max(delay, static_cast<int>((remainingMs + 999) / 1000));
++
++    m_logger->info("Reconnecting to AMF[%d] %s:%d in %d s (attempt %d)", amf->ctxId, amf->address.c_str(), amf->port,
++                   delay, amf->retryAttempts);
++
++    amf->retryPending = true;
++    setTimer(AMF_RETRY_TIMER_BASE_ID + amf->ctxId, static_cast<int64_t>(delay) * 1000);
++}
++
++void NgapTask::scheduleNgSetupRetry(NgapAmfContext *amf, int delaySeconds)
++{
++    m_logger->info("Retrying NG Setup with AMF[%d] in %d s", amf->ctxId, delaySeconds);
++
++    amf->retryPending = true;
++    setTimer(AMF_RETRY_TIMER_BASE_ID + amf->ctxId, static_cast<int64_t>(delaySeconds) * 1000);
++}
++
++void NgapTask::onAmfRetryTimer(int amfId)
++{
++    auto it = m_amfCtx.find(amfId);
++    if (it == m_amfCtx.end() || it->second == nullptr || !it->second->retryPending)
++        return;
++
++    auto *amf = it->second;
++    amf->retryPending = false;
++
++    if (amf->state == EAmfState::NOT_CONNECTED)
++        requestSctpConnection(amf);
++    else if (amf->state == EAmfState::WAITING_NG_SETUP)
++        sendNgSetupRequest(amfId);
+ }
+ 
+ void NgapTask::sendNgSetupRequest(int amfId)
+@@ -122,6 +278,7 @@ void NgapTask::sendNgSetupRequest(int amfId)
+         return;
+ 
+     amf->state = EAmfState::WAITING_NG_SETUP;
++    amf->retryPending = false;
+ 
+     // TODO: this procedure also re-initialises the NGAP UE-related contexts (if any)
+     //  and erases all related signalling connections in the two nodes like an NG Reset procedure would do.
+@@ -195,6 +352,8 @@ void NgapTask::receiveNgSetupResponse(int amfId, ASN_NGAP_NGSetupResponse *msg)
+     AssignDefaultAmfConfigs(amf, msg);
+ 
+     amf->state = EAmfState::CONNECTED;
++    amf->retryAttempts = 0;
++    amf->retryPending = false;
+     m_logger->info("NG Setup procedure is successful");
+ 
+     if (!m_isInitialized && std::all_of(m_amfCtx.begin(), m_amfCtx.end(),
+@@ -223,6 +382,20 @@ void NgapTask::receiveNgSetupFailure(int amfId, ASN_NGAP_NGSetupFailure *msg)
+         m_logger->err("NG Setup procedure is failed. Cause: %s", ngap_utils::CauseToString(ie->Cause).c_str());
+     else
+         m_logger->err("NG Setup procedure is failed.");
++
++    // 5GC Rel-17 mod (0100): TS 38.413 §8.7.1.3 - when Time To Wait is present the NG-RAN node shall wait at
++    // least that long before repeating NG SETUP; otherwise use the simulator backoff.
++    amf->retryAttempts++;
++    int delay;
++    auto *ieWait = asn::ngap::GetProtocolIe(msg, ASN_NGAP_ProtocolIE_ID_id_TimeToWait);
++    if (ieWait)
++    {
++        delay = TimeToWaitSeconds(ieWait->TimeToWait);
++        amf->noSetupBeforeMs = utils::CurrentTimeMillis() + static_cast<int64_t>(delay) * 1000;
++    }
++    else
++        delay = BackoffSeconds(amf->retryAttempts, AMF_RETRY_BACKOFF_INITIAL_S, AMF_RETRY_BACKOFF_MAX_S);
++    scheduleNgSetupRetry(amf, delay);
+ }
+ 
+ void NgapTask::receiveErrorIndication(int amfId, ASN_NGAP_ErrorIndication *msg)
+diff --git a/src/gnb/ngap/nnsf.cpp b/src/gnb/ngap/nnsf.cpp
+index 3ea4253..ebd520e 100644
+--- a/src/gnb/ngap/nnsf.cpp
++++ b/src/gnb/ngap/nnsf.cpp
+@@ -14,6 +14,10 @@ namespace nr::gnb
+ NgapAmfContext *NgapTask::selectAmf(int ueId, int32_t &requestedSliceType)
+ {
+     for (auto &amf : m_amfCtx) {
++        // 5GC mod (0100): an AMF that lost its association (or has not completed NG Setup) is not selectable.
++        if (amf.second->state != EAmfState::CONNECTED)
++            continue;
++
+         // 5GC mod (0051): initial NAS messages other than REGISTRATION REQUEST
+         // (Service Request, secured Registration Update, Deregistration Request)
+         // carry no Requested NSSAI IE, so extractSliceInfoAndModifyPdu leaves
+diff --git a/src/gnb/ngap/task.cpp b/src/gnb/ngap/task.cpp
+index b0abae9..dabf6cd 100644
+--- a/src/gnb/ngap/task.cpp
++++ b/src/gnb/ngap/task.cpp
+@@ -29,17 +29,7 @@ void NgapTask::onStart()
+         m_logger->warn("No AMF configuration is provided");
+ 
+     for (auto &amfCtx : m_amfCtx)
+-    {
+-        auto msg = std::make_unique<NmGnbSctp>(NmGnbSctp::CONNECTION_REQUEST);
+-        msg->clientId = amfCtx.second->ctxId;
+-        msg->localAddress = m_base->config->ngapIp;
+-        msg->localPort = 0;
+-        msg->remoteAddress = amfCtx.second->address;
+-        msg->remotePort = amfCtx.second->port;
+-        msg->ppid = sctp::PayloadProtocolId::NGAP;
+-        msg->associatedTask = this;
+-        m_base->sctpTask->push(std::move(msg));
+-    }
++        requestSctpConnection(amfCtx.second);
+ }
+ 
+ void NgapTask::onLoop()
+@@ -82,12 +72,21 @@ void NgapTask::onLoop()
+         case NmGnbSctp::ASSOCIATION_SHUTDOWN:
+             handleAssociationShutdown(w.clientId);
+             break;
++        case NmGnbSctp::CONNECTION_FAILURE:
++            handleSctpConnectionFailure(w.clientId);
++            break;
+         default:
+             m_logger->unhandledNts(*msg);
+             break;
+         }
+         break;
+     }
++    case NtsMessageType::TIMER_EXPIRED: {
++        auto &w = dynamic_cast<NmTimerExpired &>(*msg);
++        if (w.timerId >= AMF_RETRY_TIMER_BASE_ID)
++            onAmfRetryTimer(w.timerId - AMF_RETRY_TIMER_BASE_ID);
++        break;
++    }
+     default: {
+         m_logger->unhandledNts(*msg);
+         break;
+diff --git a/src/gnb/ngap/task.hpp b/src/gnb/ngap/task.hpp
+index 2da529d..b345389 100644
+--- a/src/gnb/ngap/task.hpp
++++ b/src/gnb/ngap/task.hpp
+@@ -64,6 +64,12 @@ class NgapTask : public NtsTask
+ 
+     friend class GnbCmdHandler;
+ 
++    // 5GC Rel-17 mod (0100): AMF (re)connection backoff. These are simulator choices, not 3GPP timers:
++    // TS 38.413 §8.7.1 defines no gNB-side retry timing other than the NG SETUP FAILURE Time To Wait IE.
++    static constexpr int AMF_RETRY_TIMER_BASE_ID = 0x4000; // NTS timer id = base + AMF context id
++    static constexpr int AMF_RETRY_BACKOFF_INITIAL_S = 1;  // 1, 2, 4, 8, 16 s ...
++    static constexpr int AMF_RETRY_BACKOFF_MAX_S = 30;     // ... capped at 30 s, unlimited attempts
++
+   public:
+     explicit NgapTask(TaskBase *base);
+     ~NgapTask() override = default;
+@@ -89,6 +95,12 @@ class NgapTask : public NtsTask
+     void handleAssociationSetup(int amfId, int ascId, int inCount, int outCount);
+     void handleAssociationShutdown(int amfId);
+     void sendNgSetupRequest(int amfId);
++    void requestSctpConnection(NgapAmfContext *amf);
++    void handleSctpConnectionFailure(int amfId);
++    void scheduleSctpReconnect(NgapAmfContext *amf);
++    void scheduleNgSetupRetry(NgapAmfContext *amf, int delaySeconds);
++    void onAmfRetryTimer(int amfId);
++    void dropAmfUeContexts(int amfId, bool cellWillBeBarred);
+     void sendErrorIndication(int amfId, NgapCause cause = NgapCause::Protocol_unspecified, int ueId = 0);
+     void receiveNgSetupResponse(int amfId, ASN_NGAP_NGSetupResponse *msg);
+     void receiveNgSetupFailure(int amfId, ASN_NGAP_NGSetupFailure *msg);
+diff --git a/src/gnb/nts.hpp b/src/gnb/nts.hpp
+index 3523b50..dd725fd 100644
+--- a/src/gnb/nts.hpp
++++ b/src/gnb/nts.hpp
+@@ -166,10 +166,13 @@ struct NmGnbNgapToRrc : NtsMessage
+         NAS_DELIVERY,
+         AN_RELEASE,
+         PAGING,
++        RADIO_POWER_OFF,    // 5GC Rel-17 mod (0100): bar the cell again (no AMF is NG_READY)
++        CONNECTION_FAILURE, // 5GC Rel-17 mod (0100): drop the UE's RRC context silently (AMF lost)
+     } present;
+ 
+     // NAS_DELIVERY
+     // AN_RELEASE
++    // CONNECTION_FAILURE
+     int ueId{};
+ 
+     // NAS_DELIVERY
+@@ -250,6 +253,7 @@ struct NmGnbSctp : NtsMessage
+     {
+         CONNECTION_REQUEST,
+         CONNECTION_CLOSE,
++        CONNECTION_FAILURE, // 5GC Rel-17 mod (0100): SCTP task -> NGAP, connect()/bind() failed
+         ASSOCIATION_SETUP,
+         ASSOCIATION_SHUTDOWN,
+         RECEIVE_MESSAGE,
+@@ -259,6 +263,7 @@ struct NmGnbSctp : NtsMessage
+ 
+     // CONNECTION_REQUEST
+     // CONNECTION_CLOSE
++    // CONNECTION_FAILURE
+     // ASSOCIATION_SETUP
+     // ASSOCIATION_SHUTDOWN
+     // RECEIVE_MESSAGE
+diff --git a/src/gnb/rrc/connection.cpp b/src/gnb/rrc/connection.cpp
+index 0020ac6..1091d3c 100644
+--- a/src/gnb/rrc/connection.cpp
++++ b/src/gnb/rrc/connection.cpp
+@@ -41,6 +41,14 @@ namespace nr::gnb
+ 
+ void GnbRrcTask::receiveRrcSetupRequest(int ueId, const ASN_RRC_RRCSetupRequest &msg)
+ {
++    // 5GC Rel-17 mod (0100): a barred cell (no AMF is NG ready) does not accept new RRC connections. Without
++    // this, an RRC Setup would be answered while NGAP has no AMF to deliver the initial NAS message to.
++    if (m_isBarred)
++    {
++        m_logger->warn("Discarding RRC Setup Request of UE[%d], cell is barred", ueId);
++        return;
++    }
++
+     auto *ue = tryFindUe(ueId);
+     if (ue)
+     {
+diff --git a/src/gnb/rrc/task.cpp b/src/gnb/rrc/task.cpp
+index 1250cea..0677077 100644
+--- a/src/gnb/rrc/task.cpp
++++ b/src/gnb/rrc/task.cpp
+@@ -58,6 +58,24 @@ void GnbRrcTask::onLoop()
+             triggerSysInfoBroadcast();
+             break;
+         }
++        case NmGnbNgapToRrc::RADIO_POWER_OFF: {
++            // 5GC Rel-17 mod (0100): AMF lost, bar the cell again. UEs notice it through the broadcast MIB.
++            m_isBarred = true;
++            triggerSysInfoBroadcast();
++            break;
++        }
++        case NmGnbNgapToRrc::CONNECTION_FAILURE: {
++            // 5GC Rel-17 mod (0100): drop the RRC context silently (no RRC Release); the UE is made aware by
++            // the cell becoming barred, i.e. a lower-layer connection failure, not by a release.
++            auto *ue = tryFindUe(w.ueId);
++            if (ue != nullptr)
++            {
++                m_logger->info("Dropping RRC connection of UE[%d], AMF lost", w.ueId);
++                delete ue;
++                m_ueCtx.erase(w.ueId);
++            }
++            break;
++        }
+         case NmGnbNgapToRrc::NAS_DELIVERY: {
+             handleDownlinkNasDelivery(w.ueId, w.pdu);
+             break;
+diff --git a/src/gnb/sctp/task.cpp b/src/gnb/sctp/task.cpp
+index 06a59f0..aa771d7 100644
+--- a/src/gnb/sctp/task.cpp
++++ b/src/gnb/sctp/task.cpp
+@@ -91,7 +91,9 @@ class SctpHandler : public sctp::ISctpHandler
+ 
+     void onConnectionReset() override
+     {
+-        auto w = std::make_unique<NmGnbSctp>(NmGnbSctp::UNHANDLED_NOTIFICATION);
++        // 5GC Rel-17 mod (0100): ECONNRESET means the association was aborted by the peer (e.g. AMF killed).
++        // Report it as an association loss so that the NGAP task can reconnect; duplicates are ignored there.
++        auto w = std::make_unique<NmGnbSctp>(NmGnbSctp::ASSOCIATION_SHUTDOWN);
+         w->clientId = clientId;
+         sctpTask->push(std::move(w));
+     }
+@@ -195,7 +197,40 @@ void SctpTask::receiveSctpConnectionSetupRequest(int clientId, const std::string
+ {
+     m_logger->info("Trying to establish SCTP connection... (%s:%d)", remoteAddress.c_str(), remotePort);
+ 
+-    auto *client = new sctp::SctpClient(ppid, localAddress);
++    // 5GC Rel-17 mod (0100): a client id is reused on every reconnect attempt. Make sure no stale entry
++    // (closed association whose entry was not removed) is left behind for it.
++    {
++        auto stale = m_clients.find(clientId);
++        if (stale != m_clients.end())
++        {
++            if (stale->second != nullptr)
++                DeleteClientEntry(stale->second);
++            m_clients.erase(stale);
++        }
++    }
++
++    auto notifyFailure = [this, clientId, associatedTask]() {
++        // Let the associated task schedule a retry; the failed client has already been deleted.
++        if (associatedTask != nullptr)
++        {
++            auto failure = std::make_unique<NmGnbSctp>(NmGnbSctp::CONNECTION_FAILURE);
++            failure->clientId = clientId;
++            associatedTask->push(std::move(failure));
++        }
++    };
++
++    sctp::SctpClient *client = nullptr;
++
++    try
++    {
++        client = new sctp::SctpClient(ppid, localAddress);
++    }
++    catch (const std::exception &exc)
++    {
++        m_logger->err("SCTP socket creation failed. %s", exc.what());
++        notifyFailure();
++        return;
++    }
+ 
+     try
+     {
+@@ -205,6 +240,7 @@ void SctpTask::receiveSctpConnectionSetupRequest(int clientId, const std::string
+     {
+         m_logger->err("Binding to %s:%d failed. %s", localAddress.c_str(), localPort, exc.what());
+         delete client;
++        notifyFailure();
+         return;
+     }
+ 
+@@ -216,6 +252,7 @@ void SctpTask::receiveSctpConnectionSetupRequest(int clientId, const std::string
+     {
+         m_logger->err("Connecting to %s:%d failed. %s", remoteAddress.c_str(), remotePort, exc.what());
+         delete client;
++        notifyFailure();
+         return;
+     }
+ 
+@@ -308,6 +345,9 @@ void SctpTask::receiveConnectionClose(int clientId)
+     }
+ 
+     DeleteClientEntry(entry);
++
++    // 5GC Rel-17 mod (0100): do not keep a dangling pointer; the client id is reused by the reconnect.
++    m_clients.erase(clientId);
+ }
+ 
+ void SctpTask::receiveSendMessage(int clientId, uint16_t stream, UniqueBuffer &&buffer)
+diff --git a/src/gnb/types.hpp b/src/gnb/types.hpp
+index 7cfc2e1..ab0f79c 100644
+--- a/src/gnb/types.hpp
++++ b/src/gnb/types.hpp
+@@ -104,6 +104,11 @@ struct NgapAmfContext
+     OverloadInfo overloadInfo{};
+     std::vector<ServedGuami *> servedGuamiList{};
+     std::vector<PlmnSupport *> plmnSupportList{};
++
++    // 5GC Rel-17 mod (0100): NG-RAN-side retry bookkeeping. Simulator behaviour, not a 3GPP procedure.
++    int retryAttempts{};      // consecutive failed (re)connect / NG Setup attempts since last success
++    bool retryPending{};      // a retry timer is armed for this AMF
++    int64_t noSetupBeforeMs{}; // TS 38.413 §8.7.1.3: no NG SETUP before this time (NG SETUP FAILURE Time To Wait)
+ };
+ 
+ struct RlsUeContext
+diff --git a/src/lib/rls/rls_base.hpp b/src/lib/rls/rls_base.hpp
+index ea4762b..b738ec8 100644
+--- a/src/lib/rls/rls_base.hpp
++++ b/src/lib/rls/rls_base.hpp
+@@ -26,7 +26,8 @@ enum class ERlfCause
+ {
+     PDU_ID_EXISTS,
+     PDU_ID_FULL,
+-    SIGNAL_LOST_TO_CONNECTED_CELL
++    SIGNAL_LOST_TO_CONNECTED_CELL,
++    SERVING_CELL_BARRED // 5GC Rel-17 mod (0100)
+ };
+ 
+ } // namespace rls
+\ No newline at end of file
+diff --git a/src/ue/nas/mm/radio.cpp b/src/ue/nas/mm/radio.cpp
+index f61e4e4..a0166f3 100644
+--- a/src/ue/nas/mm/radio.cpp
++++ b/src/ue/nas/mm/radio.cpp
+@@ -260,8 +260,18 @@ void NasMm::handleRadioLinkFailure()
+         m_logger->err("Radio link failure detected");
+     }
+ 
++    bool wasConnected = m_cmState == ECmState::CM_CONNECTED;
++    EMmState prevMmState = m_mmState;
++
+     handleRrcConnectionRelease();
+ 
++    // 5GC Rel-17 mod (0100): TS 24.501 §5.5.1.3.2 f) - only a registered UE in 5GMM-CONNECTED mode with no
++    // signalling pending initiates the registration procedure for mobility and periodic registration update
++    // (connection recovery). invokeProcedures() keeps it pending until a cell is camped again.
++    if (wasConnected && m_rmState == ERmState::RM_REGISTERED && prevMmState != EMmState::MM_REGISTERED_INITIATED &&
++        prevMmState != EMmState::MM_SERVICE_REQUEST_INITIATED && prevMmState != EMmState::MM_DEREGISTERED_INITIATED)
++        mobilityUpdatingRequired(ERegUpdateCause::CONNECTION_RECOVERY);
++
+     if (m_mmState == EMmState::MM_REGISTERED)
+         switchMmState(EMmSubState::MM_REGISTERED_PS);
+     else if (m_mmState == EMmState::MM_DEREGISTERED)
+diff --git a/src/ue/rrc/sysinfo.cpp b/src/ue/rrc/sysinfo.cpp
+index 6ee9c6e..2b62b39 100644
+--- a/src/ue/rrc/sysinfo.cpp
++++ b/src/ue/rrc/sysinfo.cpp
+@@ -26,11 +26,26 @@ void UeRrcTask::receiveMib(int cellId, const ASN_RRC_MIB &msg)
+ {
+     auto &desc = m_cellDesc[cellId];
+ 
++    bool wasBarred = desc.mib.hasMib && desc.mib.isBarred;
++    bool hadMib = desc.mib.hasMib;
++
+     desc.mib.isBarred = msg.cellBarred == ASN_RRC_MIB__cellBarred_barred;
+     desc.mib.isIntraFreqReselectAllowed = msg.intraFreqReselection == ASN_RRC_MIB__intraFreqReselection_allowed;
+ 
+     desc.mib.hasMib = true;
+ 
++    // 5GC Rel-17 mod (0100): the serving cell turned barred (the gNB lost its AMF). While RRC-connected this is a
++    // lower-layer RRC connection failure; while idle it is a loss of the serving cell. Either way NAS is told, and
++    // it arms a registration update for the time a suitable cell is camped again (TS 24.501 §5.5.1.3.2).
++    if (hadMib && !wasBarred && desc.mib.isBarred && isActiveCell(cellId))
++    {
++        m_logger->warn("Serving cell[%d] became barred", cellId);
++        if (m_state == ERrcState::RRC_CONNECTED)
++            declareRadioLinkFailure(rls::ERlfCause::SERVING_CELL_BARRED);
++        else
++            m_base->nasTask->push(std::make_unique<NmUeRrcToNas>(NmUeRrcToNas::RADIO_LINK_FAILURE));
++    }
++
+     updateAvailablePlmns();
+ }
+ 

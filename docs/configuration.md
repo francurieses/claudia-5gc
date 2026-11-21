@@ -51,10 +51,14 @@ back to the operator-default QoS. Details on slices: [`getting-started.md`](gett
 | `DATABASE_URL` | DSN | AMF, SMF, UDR | PostgreSQL connection |
 | `REDIS_URL` | URL | NRF, AMF, AUSF | Redis connection |
 | `OPERATOR_CONFIG_PATH` / `NF_CONFIGS_PATH` | path | NFs, portal | Path to `config/operator.yaml` / per-NF configs |
+| `OAUTH2_SECRET` | string (default lab secret) | NRF, NEF | HS256 secret for NRF-issued OAuth2 access tokens; overrides the NRF YAML `oauth2_secret` and NEF YAML `oauth2.secret`. Must match on both NFs; override outside development. docker-compose does not forward it. |
 | `NF_RELEASE_PROFILE` | enum `rel17`\|`rel19` (default `rel19`) | AMF, SMF, AUSF, UDM, NEF, BSF, SMSF, LMF, NSSF, PCF, NRF, UDR | Release profile; overrides the YAML `release.profile`. docker-compose forwards it to every core NF (`NF_RELEASE_PROFILE=rel17 make up` switches the stack; empty = YAML/`rel19`). `rel19` enables spec-literal SBI `supportedFeatures` negotiation (TS 29.500 §6.6.2); `rel17` keeps the frozen wire baseline. Unknown value = startup error. Also read by BSF, SMSF, LMF, NSSF, PCF, NRF and UDR. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` / `JAEGER_ADDR` | URL | all NFs | OTLP→Jaeger exporter |
 | `PROMETHEUS_ADDR` / `PROMETHEUS_URL` | URL | MCP, portal | Prometheus query endpoint |
-| `URSP_ENABLED` | bool | PCF/AMF | Toggle URSP delivery |
+| `STORE_CONNECT_TIMEOUT` | Go duration (empty = `60s`; `0` = one attempt) | AMF, SMF, AUSF, NRF | How long the NF retries its Postgres/Redis at startup (backoff 1 s → 5 s, each attempt bounded to 10 s, SIGTERM stops the wait cleanly). A reachable store adds no delay. Invalid value = startup error. `shared/storewait` (OPS-002) |
+| `STORE_REQUIRED` | bool (empty = `true`) | AMF, SMF, AUSF, NRF | When the store stays unreachable for the whole timeout: `true` = log ERROR `<store> unavailable after …, exiting so the container restart policy retries` and exit 1 (compose restarts the NF); `false` = keep the old in-memory fallback (same WARN text as before). Unset `DATABASE_URL` / `REDIS_URL` = in-memory dev mode as before, no wait. A migration error is never retried and also exits when required |
+| `URSP_ENABLED` | bool (empty = AMF config) | AMF | Toggle URSP delivery. Empty (default) = `features.ursp_enabled` in `nf/amf/config/dev.yaml` (shipped `false`); `true`/`false` overrides it for the run |
+| `NETWORK_NAME` / `NETWORK_SHORT_NAME` | string (empty = AMF config) | AMF | Operator name pushed to every UE in a Configuration Update Command after Registration Complete (TS 24.501 §8.2.19). Empty (default) = `operator.network_full_name` / `network_short_name` in `nf/amf/config/dev.yaml` (shipped `ClaudIA`); short name falls back to the full name |
 | `UE_COUNT` | int (default 1) | UERANSIM / UDR seeding | Number of UEs to simulate/seed |
 | `RAN` | enum `none`\|`ueransim`\|`packetrusher`\|`both` (default `none`) | root Makefile | Which RAN simulators start next to the core |
 | `PR_SCENARIO` | enum `xn`\|`n2`\|`none` (default `xn`) | root Makefile | PacketRusher scenario started by `RAN=packetrusher\|both` (`none` = create only) |
@@ -91,6 +95,7 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`.
 | `n4.measurement_period_seconds` (default `60`) | `nf/smf/config/dev.yaml` | Measurement Period installed in the URR — UPF emits a PERIO Usage Report every N seconds. Ref: TS 29.244 §8.2.42 |
 | `UPF_PPROF_ADDR` (default empty = off, e.g. `0.0.0.0:6060`) | env of `upf` | Optional pprof HTTP listener (`/debug/pprof/`), not published to the host: fetch from inside the UPF netns. `LOG_LEVEL` is also honoured by the UPF. |
 | `GOGC` (optional, read by the Go runtime) | env of `upf` | Go GC target; only reported in the `UPF runtime` startup log |
+| `n4.dl_buffer.default_max_packets` (default `64`), `n4.dl_buffer.max_packets_cap` (default `256`) | `nf/upf/config/dev.yaml` | UPF per-session downlink FIFO while the FAR is BUFF (idle UE): default size and hard cap. Ref: TS 29.244 §5.2.3.1 |
 | `n3.socket_buffer_bytes` (code default `0` = kernel default; `dev.yaml` `8388608`) | `nf/upf/config/dev.yaml` | SO_RCVBUF/SO_SNDBUF of the GTP-U UDP socket; absorbs bursts (drops show as Udp RcvbufErrors). |
 | `n6.tun_mtu` (code default `0` = kernel default 1500; `dev.yaml` `1456`), `n6.tun_txqueuelen` (`0` = kernel default; `dev.yaml` `1000`), `n6.tcp_mss_clamp` (code default `false`; `dev.yaml` `true`) | `nf/upf/config/dev.yaml` | N6 TUN MTU (1500 - 44 B N3 overhead so DL never fragments), TUN tx queue length, TCP MSS clamp on the TUN. |
 | `slice_dnn_qos` (list of `{sst, sd, dnn, session_ambr{uplink,downlink}}`, optional, top-level) | `config/operator.yaml` | Seed of the UDR table `slice_dnn_qos` (per-slice/DNN subscribed Session-AMBR, BitRate strings e.g. `100 Mbps`); absent entries fall back to `DefaultAMBRForSlice`; never overwrites portal-edited rows |
@@ -107,6 +112,8 @@ Per-NF YAML config lives in `nf/<nf>/config/dev.yaml`.
 - **URSP delivery** is a build-time switch — see [`getting-started.md`](getting-started.md) → *Compile with / without URSP policy delivery*.
 - **AMF `null_ciphering`** (NEA0) is a development switch for simulators that require it — see
   [`getting-started.md`](getting-started.md) → *Security debug flags (AMF)*. Never enable it outside a lab.
+- **AMF NAS ciphering order**: `nas_security.ciphering_order` in `nf/amf/config/dev.yaml` (default `NEA2, NEA1, NEA3, NEA0`), overridden by env `AMF_NAS_CIPHERING_ORDER`. The first algorithm the UE supports is selected; NEA0..NEA3, no duplicates; an invalid value stops the AMF at start; NEA0 first logs a Warn. A UE with no common algorithm is rejected (#23).
+- **AMF NAS integrity order**: `nas_security.integrity_order` in `nf/amf/config/dev.yaml` (default `NIA2, NIA1, NIA3`), overridden by env `AMF_NAS_INTEGRITY_ORDER`. The first algorithm the UE supports is selected; NIA1..NIA3 only (NIA0, NIA4-7, duplicates, empty stop the AMF at start). A UE with no common algorithm is rejected (#23).
 - **AMF uplink NAS integrity enforcement**: `nas_security.integrity_enforcement: strict|relaxed` in `nf/amf/config/dev.yaml` (default `strict`), overridden by env `AMF_NAS_INTEGRITY_ENFORCEMENT`. `strict` discards unprotected or integrity-failing uplink NAS after the first verified message (TS 24.501 §4.4.4.3); `relaxed` only logs and processes them (debug only, startup Warn). Any other value stops the AMF at start-up.
 
 ## TLS / PKI
@@ -120,3 +127,10 @@ development PKI. OAuth2 access tokens are issued by the NRF.
 `core`, `obs`, `tools`, `multi-slice`, `suci-profile-a`, `integration-ueransim`, `handover`,
 `perf` (opt-in benchmarking; always combine with `core`). Most users just run the `make` targets
 listed in [`getting-started.md`](getting-started.md).
+
+**Restart behaviour.** Every core NF, the portal, `postgres` and `redis` use `restart: unless-stopped`, so after a
+Docker daemon restart (Docker Desktop update, sleep/wake, host reboot) or a crash the whole core including its data
+tier comes back by itself. `depends_on` ordering is **not** applied on a daemon restart, so AMF, SMF, AUSF and NRF
+wait for their store at startup (`STORE_CONNECT_TIMEOUT`, default 60 s) and exit if it stays down, letting the restart
+policy try again (`STORE_REQUIRED`); they no longer fall back to in-memory stores silently. A container you stop yourself
+(`docker stop`, `docker kill`, `make down`) stays stopped: Docker ignores the restart policy for manual stops.

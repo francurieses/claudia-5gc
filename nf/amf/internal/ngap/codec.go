@@ -44,6 +44,10 @@ func buildMessage(pdu *ngapType.NGAPPDU) *Message {
 			if im.Value.NGSetupRequest != nil {
 				msg.Value = extractNGSetupRequest(im.Value.NGSetupRequest)
 			}
+		case ngapType.ProcedureCodeNGReset: // proc=20 (gNB→AMF)
+			if im.Value.NGReset != nil {
+				msg.Value = extractNGReset(im.Value.NGReset)
+			}
 		case ngapType.ProcedureCodeInitialUEMessage:
 			if im.Value.InitialUEMessage != nil {
 				msg.Value = extractInitialUEMessage(im.Value.InitialUEMessage)
@@ -283,11 +287,30 @@ func extractInitialUEMessage(msg *ngapType.InitialUEMessage) *InitialUEMessage {
 					tmsi := uint32(tmsiBytes[0])<<24 | uint32(tmsiBytes[1])<<16 |
 						uint32(tmsiBytes[2])<<8 | uint32(tmsiBytes[3])
 					out.FiveGSTMSI = &tmsi
+					// AMF Set ID (10b) and AMF Pointer (6b): the 5G-TMSI is unique only
+					// within the AMF that allocated it. Ref: TS 38.413 §9.3.3.20, TS 23.003 §2.10.1
+					out.FiveGSTMSISetID, out.FiveGSTMSIPointer = decodeAMFSetIDPointer(
+						ie.Value.FiveGSTMSI.AMFSetID.Value, ie.Value.FiveGSTMSI.AMFPointer.Value)
 				}
 			}
 		}
 	}
 	return out
+}
+
+// decodeAMFSetIDPointer is the inverse of the BIT STRING encoding in BuildPaging:
+// AMF Set ID is the top 10 bits of two bytes, AMF Pointer the top 6 bits of one.
+// Ref: TS 23.003 §2.10.1, TS 38.413 §9.3.3.20.
+func decodeAMFSetIDPointer(set, ptr aper.BitString) (uint16, byte) {
+	var setID uint16
+	var amfPtr byte
+	if len(set.Bytes) >= 2 {
+		setID = (uint16(set.Bytes[0])<<2 | uint16(set.Bytes[1])>>6) & 0x3FF
+	}
+	if len(ptr.Bytes) >= 1 {
+		amfPtr = ptr.Bytes[0] >> 2
+	}
+	return setID, amfPtr
 }
 
 func extractTAIFromULI(uli *ngapType.UserLocationInformation) *TAI {

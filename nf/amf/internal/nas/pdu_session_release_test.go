@@ -87,7 +87,7 @@ func TestNetworkPDUSessionRelease_DefersSMContextDeleteUntilComplete(t *testing.
 	sender := newReleaseSender()
 	h, ue := newReleaseTestHandler(t, sender)
 
-	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3); err != nil {
+	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3, nas.Cause5GSMRegularDeactivation); err != nil {
 		t.Fatalf("InitiateNetworkPDUSessionRelease: %v", err)
 	}
 
@@ -126,7 +126,7 @@ func TestNetworkPDUSessionRelease_SurvivesTriggerContextCancel(t *testing.T) {
 
 	// Mirror the mgmt API: the trigger's context dies as soon as it responds.
 	trigger, cancel := context.WithCancel(context.Background())
-	if err := h.InitiateNetworkPDUSessionRelease(trigger, ue, 3); err != nil {
+	if err := h.InitiateNetworkPDUSessionRelease(trigger, ue, 3, nas.Cause5GSMRegularDeactivation); err != nil {
 		t.Fatalf("InitiateNetworkPDUSessionRelease: %v", err)
 	}
 	cancel()
@@ -149,7 +149,7 @@ func TestNetworkPDUSessionRelease_GuardReleasesWhenUESilent(t *testing.T) {
 	sender := newReleaseSender()
 	h, ue := newReleaseTestHandler(t, sender)
 
-	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3); err != nil {
+	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3, nas.Cause5GSMRegularDeactivation); err != nil {
 		t.Fatalf("InitiateNetworkPDUSessionRelease: %v", err)
 	}
 
@@ -191,7 +191,7 @@ func TestNetworkPDUSessionRelease_CompleteIsIdempotent(t *testing.T) {
 		t.Fatalf("deleted an SM context for a session never NW-released: %v", refs)
 	}
 
-	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3); err != nil {
+	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3, nas.Cause5GSMRegularDeactivation); err != nil {
 		t.Fatalf("InitiateNetworkPDUSessionRelease: %v", err)
 	}
 	h.completeNetworkPDUSessionRelease(context.Background(), ue, 3, "RELEASE_COMPLETE")
@@ -209,7 +209,7 @@ func TestPDUSessionReleaseComplete_DrivesCompletion(t *testing.T) {
 	sender := newReleaseSender()
 	h, ue := newReleaseTestHandler(t, sender)
 
-	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3); err != nil {
+	if err := h.InitiateNetworkPDUSessionRelease(context.Background(), ue, 3, nas.Cause5GSMRegularDeactivation); err != nil {
 		t.Fatalf("InitiateNetworkPDUSessionRelease: %v", err)
 	}
 
