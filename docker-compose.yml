@@ -3,7 +3,7 @@
 #   core            → Implemented NFs
 #   observability   → Loki + Promtail + Grafana + Prometheus + Jaeger
 #   integration-ueransim → UERANSIM gNB + UE for E2E tests
-#   roaming         → hSEPP + hNRF (home PLMN 001/02); use with core: --profile core --profile roaming
+#   roaming         → test peer hSEPP + hNRF + hAUSF/hUDM/hUDR (+ hudr-db) (PLMN 001/02); use with core: --profile core --profile roaming
 #   handover        → PacketRusher dual-gNB Xn handover test (make handover-test)
 
 # Compose project name (REL19-0.4). Renaming it orphans the previous project's
@@ -62,13 +62,32 @@ networks:
         - subnet: 172.30.7.0/24
         - subnet: fd00:7::/64
           gateway: fd00:7::1
-  # N32 (inter-PLMN, vSEPP <-> hSEPP) + home-PLMN SBI for the roaming profile (TS 29.573).
+  # N32 (inter-PLMN, local SEPP <-> roaming-partner SEPP) + home-PLMN SBI for the roaming profile (TS 29.573).
   n32-net:
     name: 5gc-n32
     driver: bridge
     ipam:
       config:
         - subnet: 172.30.5.0/24
+  # ROAM-002 (roaming profile): N9 between V-UPF (upf) and H-UPF (hupf), home-PLMN N4 and N6 (TS 23.501 §4.2.4).
+  n9-net:
+    name: 5gc-n9
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+  hn4-net:
+    name: 5gc-hn4
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.21.0/24
+  hn6-net:
+    name: 5gc-hn6
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.22.0/24
   obs-net:
     name: 5gc-obs
     driver: bridge
@@ -78,6 +97,7 @@ volumes:
   prometheus-data:
   grafana-data:
   postgres-data:
+  hudr-db-data:
   redis-data:
 
 services:
@@ -153,6 +173,7 @@ services:
       - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
       - ./pki/amf.crt:/etc/5gc/pki/amf.crt:ro
       - ./pki/amf.key:/etc/5gc/pki/amf.key:ro
+      - ./config/roaming:/etc/5gc/roaming:ro
       - ./nf/amf/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
       # Release profile (rel17|rel19); empty = config file value, else default rel19. One variable for the whole stack.
@@ -178,6 +199,8 @@ services:
       # NETWORK_NAME / NETWORK_SHORT_NAME on the host to override it for one run.
       NETWORK_NAME: "${NETWORK_NAME:-}"
       NETWORK_SHORT_NAME: "${NETWORK_SHORT_NAME:-}"
+      # Roaming partners file (partners[].home_nfs become home PLMNs); empty = default path, missing = none.
+      ROAMING_PARTNERS_FILE: "${ROAMING_PARTNERS_FILE:-}"
     labels:
       logging.5gc/nf: "AMF"
     depends_on:
@@ -464,6 +487,10 @@ services:
         aliases: [upf-n4.5gc.local]
       n6-net: {}       # internet DNN — TUN upfgtp0 → 172.30.6.1 gateway
       n6-ims-net: {}   # ims DNN     — TUN upfgtp1 → 172.30.7.1 gateway
+      # N9 to the home UPF (ROAM-002); network exists in every profile, idle without roaming.
+      n9-net:
+        ipv4_address: 172.30.20.100
+        aliases: [upf-n9.5gc.local]
       obs-net: {}
     ports:
       - "8805:8805/udp"   # N4 PFCP
@@ -579,23 +606,23 @@ services:
     command: sleep infinity
 
   # ============================================================
-  # ROAMING — vSEPP (profile core) / hSEPP + hNRF (profile roaming), TS 29.573
+  # ROAMING — SEPP of the local core (profile core) / test peer hSEPP + hNRF (profile roaming), TS 29.573
   # ============================================================
 
-  vsepp:
+  sepp:
     image: 5gc/sepp:dev
     profiles: [core]
     build:
       context: .
       dockerfile: nf/sepp/Dockerfile
-    container_name: vsepp
-    hostname: vsepp.local
+    container_name: sepp
+    hostname: sepp.local
     restart: unless-stopped
     networks:
       sbi-net:
-        aliases: [vsepp, sepp.5gc.local]
+        aliases: [sepp, sepp.5gc.local]
       n32-net:
-        aliases: [vsepp.n32, sepp.5gc.mnc001.mcc001.3gppnetwork.org]
+        aliases: [sepp.n32, sepp.5gc.mnc001.mcc001.3gppnetwork.org]
       obs-net: {}
     ports:
       - "8014:8014"   # SBI HTTPS
@@ -604,8 +631,11 @@ services:
     volumes:
       - ./pcaps/sepp-keys:/keylog
       - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
-      - ./pki/vsepp.crt:/etc/5gc/pki/sepp.crt:ro
-      - ./pki/vsepp.key:/etc/5gc/pki/sepp.key:ro
+      - ./pki/sepp.crt:/etc/5gc/pki/sepp.crt:ro
+      - ./pki/sepp.key:/etc/5gc/pki/sepp.key:ro
+      # N32 PKI (own cert + per-partner trust anchors) and roaming partners file (SEPP-005 / SEPP-004).
+      - ./pki/n32:/etc/5gc/pki/n32:ro
+      - ./config/roaming:/etc/5gc/roaming:ro
       - ./nf/sepp/config/dev.yaml:/etc/5gc/config.yaml:ro
     environment:
       LOG_LEVEL: info
@@ -613,7 +643,9 @@ services:
       # Release profile of the run (rel17|rel19); empty = the config file value. make sepp-e2e PROFILE=...
       NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
       # Opt-in TLS key log for pcap decryption (set SEPP_KEYLOG_DIR=1; written under ./pcaps/sepp-keys).
-      SSLKEYLOGFILE: "${SEPP_KEYLOG_DIR:+/keylog/vsepp.keys}"
+      SSLKEYLOGFILE: "${SEPP_KEYLOG_DIR:+/keylog/sepp.keys}"
+      # Roaming partners file; empty = the default /etc/5gc/roaming/partners.yaml (missing = no partners).
+      ROAMING_PARTNERS_FILE: "${ROAMING_PARTNERS_FILE:-}"
     depends_on: [nrf]
     healthcheck:
       test: ["CMD", "/bin/sepp", "healthcheck"]
@@ -645,6 +677,7 @@ services:
       - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
       - ./pki/hsepp.crt:/etc/5gc/pki/sepp.crt:ro
       - ./pki/hsepp.key:/etc/5gc/pki/sepp.key:ro
+      - ./pki/n32:/etc/5gc/pki/n32:ro
       - ./nf/sepp/config/hsepp.yaml:/etc/5gc/config.yaml:ro
     environment:
       LOG_LEVEL: info
@@ -698,17 +731,17 @@ services:
     labels:
       logging.5gc/nf: "NRF"
 
-  vsepp-pcap:
+  sepp-pcap:
     image: nicolaka/netshoot
     profiles: [core]
-    container_name: vsepp-pcap
-    network_mode: "service:vsepp"
+    container_name: sepp-pcap
+    network_mode: "service:sepp"
     cap_add: [NET_ADMIN, NET_RAW]
     init: true
     restart: unless-stopped
-    depends_on: [vsepp]
+    depends_on: [sepp]
     volumes:
-      - ./pcaps/vsepp:/pcaps
+      - ./pcaps/sepp:/pcaps
     command: sleep infinity
 
   hsepp-pcap:
@@ -722,6 +755,248 @@ services:
     depends_on: [hsepp]
     volumes:
       - ./pcaps/hsepp:/pcaps
+    command: sleep infinity
+
+  # ---- Home-PLMN core subset (001/02) for roaming registration (ROAM-001) ----
+  hudr-db:
+    image: postgres:16-alpine
+    profiles: [roaming]
+    container_name: hudr-db
+    restart: unless-stopped
+    networks: [n32-net]
+    environment:
+      POSTGRES_USER: 5gc
+      POSTGRES_PASSWORD: 5gc-dev
+      POSTGRES_DB: 5gc
+    volumes:
+      - hudr-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U 5gc -d 5gc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  hudr:
+    image: 5gc/udr:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/udr/Dockerfile
+    container_name: hudr
+    hostname: hudr.local
+    restart: unless-stopped
+    depends_on:
+      hudr-db:
+        condition: service_healthy
+      hnrf:
+        condition: service_healthy
+    networks:
+      n32-net:
+        aliases: [hudr, udr.5gc.mnc002.mcc001.3gppnetwork.org]
+      obs-net: {}
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hudr.crt:/etc/5gc/pki/udr.crt:ro
+      - ./pki/hudr.key:/etc/5gc/pki/udr.key:ro
+      - ./nf/udr/config/hudr.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      # Home subscribers only: no 00101 range, one roaming UE of PLMN 001/02.
+      UE_COUNT: "0"
+      SEED_EXTRA_SUPIS: "${ROAMING_SEED_SUPIS:-imsi-001020000000001}"
+      DATABASE_URL: "postgres://5gc:5gc-dev@hudr-db:5432/5gc?sslmode=disable"
+    labels:
+      logging.5gc/nf: "UDR"
+
+  hudm:
+    image: 5gc/udm:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/udm/Dockerfile
+    container_name: hudm
+    hostname: hudm.local
+    restart: unless-stopped
+    depends_on: [hudr, hnrf]
+    networks:
+      n32-net:
+        aliases: [hudm, udm.5gc.mnc002.mcc001.3gppnetwork.org]
+      obs-net: {}
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hudm.crt:/etc/5gc/pki/udm.crt:ro
+      - ./pki/hudm.key:/etc/5gc/pki/udm.key:ro
+      - ./nf/udm/config/hudm.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "UDM"
+
+  hausf:
+    image: 5gc/ausf:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/ausf/Dockerfile
+    container_name: hausf
+    hostname: hausf.local
+    restart: unless-stopped
+    depends_on: [hudm, hnrf]
+    networks:
+      n32-net:
+        aliases: [hausf, ausf.5gc.mnc002.mcc001.3gppnetwork.org]
+      obs-net: {}
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hausf.crt:/etc/5gc/pki/ausf.crt:ro
+      - ./pki/hausf.key:/etc/5gc/pki/ausf.key:ro
+      - ./nf/ausf/config/hausf.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      # No REDIS_URL: in-memory auth-context store (the visited Redis is not home-PLMN state).
+    labels:
+      logging.5gc/nf: "AUSF"
+
+  hausf-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hausf-pcap
+    network_mode: "service:hausf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hausf]
+    volumes:
+      - ./pcaps/hausf:/pcaps
+    command: sleep infinity
+
+  hudm-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hudm-pcap
+    network_mode: "service:hudm"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hudm]
+    volumes:
+      - ./pcaps/hudm:/pcaps
+    command: sleep infinity
+
+  hudr-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hudr-pcap
+    network_mode: "service:hudr"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hudr]
+    volumes:
+      - ./pcaps/hudr:/pcaps
+    command: sleep infinity
+
+  # ---- Home-PLMN session management for home-routed PDU sessions (ROAM-002) ----
+  hsmf:
+    image: 5gc/smf:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/smf/Dockerfile
+    container_name: hsmf
+    hostname: hsmf.local
+    restart: unless-stopped
+    depends_on:
+      hnrf:
+        condition: service_healthy
+      hupf:
+        condition: service_started
+    networks:
+      n32-net:
+        aliases: [hsmf, smf.5gc.mnc002.mcc001.3gppnetwork.org]
+      hn4-net:
+        aliases: [hsmf-n4.5gc.local]
+      obs-net: {}
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./pki/hsmf.crt:/etc/5gc/pki/smf.crt:ro
+      - ./pki/hsmf.key:/etc/5gc/pki/smf.key:ro
+      - ./nf/smf/config/hsmf.yaml:/etc/5gc/config.yaml:ro
+    environment:
+      NF_RELEASE_PROFILE: "${NF_RELEASE_PROFILE:-}"
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      # No DATABASE_URL: in-memory session store (the visited PostgreSQL is not home-PLMN state).
+    labels:
+      logging.5gc/nf: "SMF"
+
+  hupf:
+    image: 5gc/upf:dev
+    profiles: [roaming]
+    build:
+      context: .
+      dockerfile: nf/upf/Dockerfile
+    container_name: hupf
+    hostname: hupf.local
+    restart: unless-stopped
+    networks:
+      n9-net:
+        ipv4_address: 172.30.20.200
+        aliases: [hupf-n9.5gc.local]
+      hn4-net:
+        aliases: [hupf-n4.5gc.local]
+      hn6-net: {}      # home N6 — TUN upfgtp0 MASQUERADEs through 172.30.22.1
+      obs-net: {}
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    volumes:
+      - ./config/operator.yaml:/etc/5gc/operator.yaml:ro
+      - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro
+      - ./nf/upf/config/hupf.yaml:/etc/5gc/config.yaml:ro
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      LOG_LEVEL: info
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+    labels:
+      logging.5gc/nf: "UPF"
+
+  hsmf-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hsmf-pcap
+    network_mode: "service:hsmf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hsmf]
+    volumes:
+      - ./pcaps/hsmf:/pcaps
+    command: sleep infinity
+
+  hupf-pcap:
+    image: nicolaka/netshoot
+    profiles: [roaming]
+    container_name: hupf-pcap
+    network_mode: "service:hupf"
+    cap_add: [NET_ADMIN, NET_RAW]
+    init: true
+    restart: unless-stopped
+    depends_on: [hupf]
+    volumes:
+      - ./pcaps/hupf:/pcaps
     command: sleep infinity
 
   # AMF PCAP sidecar — stays idle until the portal starts tcpdump via docker exec
@@ -1121,6 +1396,7 @@ services:
       - ./nf:/app/nf-configs
       - ./pcaps:/pcaps
       - ./config/operator.yaml:/etc/5gc/operator.yaml  # RW — portal can add/remove DNNs
+      - ./config/roaming:/etc/5gc/roaming  # RW — portal edits partners.yaml, then restarts sepp + amf
       - ./pki/mgmt-portal.crt:/etc/5gc/pki/portal.crt:ro
       - ./pki/mgmt-portal.key:/etc/5gc/pki/portal.key:ro
       - ./pki/ca.crt:/etc/5gc/pki/ca.crt:ro

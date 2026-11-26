@@ -33,19 +33,19 @@ type exchanger interface {
 // initiator timing; tests shorten it.
 type initiatorTiming struct{ startDelay, initial, max time.Duration }
 
-// StartInitiator runs the N32-c initiator towards every configured n32.peers
-// entry in the background, with exponential backoff, until ctx is cancelled.
+// StartInitiator runs the N32-c initiator towards every partner with an
+// n32.address in the background, with exponential backoff, until ctx is cancelled.
 // A failure is logged and never stops the SEPP. It returns a WaitGroup-style
 // wait function for tests and shutdown.
 func (s *Server) StartInitiator(ctx context.Context) (wait func()) {
-	if s.n32 == nil || len(s.cfg.N32.Peers) == 0 {
+	if s.n32 == nil || len(s.cfg.Initiators()) == 0 {
 		return func() {}
 	}
 	t := initiatorTiming{initiatorStartDelay, initiatorInitialBackoff, initiatorMaxBackoff}
-	return s.runInitiator(ctx, s.n32, s.cfg.N32.Peers, t)
+	return s.runInitiator(ctx, s.n32, s.cfg.Initiators(), t)
 }
 
-func (s *Server) runInitiator(ctx context.Context, ex exchanger, peers []config.N32Peer, t initiatorTiming) func() {
+func (s *Server) runInitiator(ctx context.Context, ex exchanger, peers []config.Partner, t initiatorTiming) func() {
 	var wg sync.WaitGroup
 	for _, p := range peers {
 		wg.Add(1)
@@ -69,13 +69,13 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (s *Server) initiate(ctx context.Context, ex exchanger, p config.N32Peer, t initiatorTiming) {
+func (s *Server) initiate(ctx context.Context, ex exchanger, p config.Partner, t initiatorTiming) {
 	target := n32c.PlmnId{Mcc: p.PLMN.MCC, Mnc: p.PLMN.MNC}
-	apiRoot := "https://" + p.Address
+	apiRoot := "https://" + p.N32.Address
 	ctx = logging.WithCorrelationID(ctx, "")
 	lg := logging.NewProcedureLogger(ctx, s.logger, "N32cExchangeCapability").With(
 		"nf", "SEPP", "interface", "N32c", "direction", "OUT",
-		"peer_plmn", target.String(), "peer_fqdn", p.FQDN, "spec_ref", initiatorSpecRef)
+		"peer_plmn", target.String(), "peer_fqdn", p.FQDN(), "spec_ref", initiatorSpecRef)
 	if !sleep(ctx, t.startDelay) {
 		return
 	}
@@ -95,7 +95,7 @@ func (s *Server) initiate(ctx context.Context, ex exchanger, p config.N32Peer, t
 		}
 		if errors.Is(err, n32c.ErrNegotiationNotAllowed) || errors.Is(err, n32c.ErrForbidden) ||
 			errors.Is(err, n32c.ErrInvalidSelected) || errors.Is(err, n32c.ErrResponderIdentity) ||
-			isCertIdentityError(err) { // peer cert SAN != peers[].fqdn (TS 33.501 §13.1.2)
+			isCertIdentityError(err) { // n32trust reject / peer cert SAN != partner FQDN (TS 33.501 §13.1.2)
 			lg.WarnContext(ctx, "n32 initiator exchange rejected, not retrying",
 				"result", "FAILURE", "cause", err.Error(), "attempt", attempt)
 			return

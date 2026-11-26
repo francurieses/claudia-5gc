@@ -16,10 +16,11 @@ observability and the portal) → **http://localhost:8080**.
 | | Sessions | live PDU sessions and AMF UE contexts, force deregister |
 | | QoS | live SMF QoS, modify a flow, subscription inspector, network-triggered additional PDU session |
 | | gNBs (RAN) | gNBs connected over N2: ID, PLMN, TAs/slices, state, UE counts |
+| | Roaming (N32) (see [`roaming.md`](roaming.md)) | local core ↔ partner PLMN topology with N32 link state, per-SEPP N32 contexts with handshake / teardown, N32-f traffic, home NRF registrations, recent roaming warnings, start / stop the home PLMN, roaming-partners editor (writes the partners file and restarts `sepp` and `amf`) |
 | | UE Location | LMF positions on a map plus table |
 | Test tools | UERANSIM | scenarios, container grid, UEs table, ping, nr-cli, inline logs |
 | | PacketRusher | Xn / N2 mobility scenarios, log viewer, checklist |
-| Operations | Logs | live Docker logs per container |
+| Operations | Logs | live Docker logs per NF container, grouped local core / partner (roaming) / tooling |
 | | PCAP | start / stop / rotate captures, list and download |
 | Safety | Public Warning | cell-broadcast console: compose, per-gNB status, cancel, resend |
 

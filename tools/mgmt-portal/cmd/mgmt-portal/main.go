@@ -38,6 +38,7 @@ func main() {
 	addr := envOr("LISTEN_ADDR", ":8080")
 	dbURL := envOr("DATABASE_URL", "postgres://5gc:5gc-dev@postgres:5432/5gc?sslmode=disable")
 	nrfURL := envOr("NRF_URL", "https://nrf:8000")
+	homeNRFURL := envOr("HOME_NRF_URL", "https://hnrf:8000") // roaming profile (PORTAL-UI-22)
 	promURL := envOr("PROMETHEUS_URL", "http://prometheus:9090")
 	smfURL := envOr("SMF_URL", "https://smf:8004")
 	amfURL := envOr("AMF_URL", "http://amf:9002")
@@ -104,22 +105,25 @@ func main() {
 	}
 
 	deps := api.Deps{
-		Release:     release,
-		AMFMgmtURLs: amfMgmtURLs,
-		Deployment:  detector,
-		Store:       db,
-		Docker:      docker,
-		NRF:         nrf.New(nrfURL, sbiClient),
-		Prometheus:  promclient.New(promURL),
-		Config:      config.New(nfConfigsPath),
-		SMFBaseURL:  smfURL,
-		AMFBaseURL:  amfURL,
-		UDMBaseURL:  udmURL,
-		UDRBaseURL:  udrURL,
-		PCFBaseURL:  pcfURL,
-		LMFBaseURL:  lmfURL,
-		IperfImage:  os.Getenv("PORTAL_IPERF_IMAGE"),
-		MTLSClient:  sbiClient,
+		Release:       release,
+		AMFMgmtURLs:   amfMgmtURLs,
+		Deployment:    detector,
+		Store:         db,
+		Docker:        docker,
+		NRF:           nrf.New(nrfURL, sbiClient),
+		HomeNRF:       nrf.New(homeNRFURL, sbiClient),
+		PartnersFile:  envOr("ROAMING_PARTNERS_FILE", api.DefaultPartnersFile),
+		SEPPAdminBase: envOr("SEPP_ADMIN_URL", api.DefaultSEPPAdminBase),
+		Prometheus:    promclient.New(promURL),
+		Config:        config.New(nfConfigsPath),
+		SMFBaseURL:    smfURL,
+		AMFBaseURL:    amfURL,
+		UDMBaseURL:    udmURL,
+		UDRBaseURL:    udrURL,
+		PCFBaseURL:    pcfURL,
+		LMFBaseURL:    lmfURL,
+		IperfImage:    os.Getenv("PORTAL_IPERF_IMAGE"),
+		MTLSClient:    sbiClient,
 	}
 
 	handler := api.NewRouter(deps, http.FS(assets.FS()))

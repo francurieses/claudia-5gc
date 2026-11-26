@@ -30,7 +30,7 @@ const (
 )
 
 // releaseNFs are the core NF containers inspected, in display order.
-var releaseNFs = []string{"amf", "smf", "pcf", "nrf", "ausf", "udm", "udr", "nssf", "smsf", "bsf", "nef", "lmf"}
+var releaseNFs = []string{"amf", "smf", "pcf", "nrf", "ausf", "udm", "udr", "nssf", "smsf", "bsf", "nef", "lmf", "sepp", "hsepp", "hnrf"}
 
 // ReleaseInfo is the GET /api/v1/release response.
 type ReleaseInfo struct {

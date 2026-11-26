@@ -147,7 +147,7 @@ func TestSEPPAddrDefaultAndEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.SEPPAddr != "https://vsepp:8014" {
+	if cfg.SEPPAddr != "https://sepp:8014" {
 		t.Errorf("default sepp=%q", cfg.SEPPAddr)
 	}
 	t.Setenv("SEPP_ADDR", "https://localhost:8014")

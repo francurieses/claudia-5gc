@@ -22,20 +22,22 @@ import (
 var pcapSidecars = map[string]string{
 	"core": "core-pcap",
 	// Control-plane
-	"nrf":   "nrf-pcap",
-	"amf":   "amf-pcap",
-	"ausf":  "ausf-pcap",
-	"udm":   "udm-pcap",
-	"udr":   "udr-pcap",
-	"smf":   "smf-pcap",
-	"pcf":   "pcf-pcap",
-	"upf":   "upf-pcap",
-	"nssf":  "nssf-pcap",
-	"smsf":  "smsf-pcap",
-	"bsf":   "bsf-pcap",
-	"nef":   "nef-pcap",
-	"lmf":   "lmf-pcap",
-	"vsepp": "vsepp-pcap",
+	"nrf":  "nrf-pcap",
+	"amf":  "amf-pcap",
+	"ausf": "ausf-pcap",
+	"udm":  "udm-pcap",
+	"udr":  "udr-pcap",
+	"smf":  "smf-pcap",
+	"pcf":  "pcf-pcap",
+	"upf":  "upf-pcap",
+	"nssf": "nssf-pcap",
+	"smsf": "smsf-pcap",
+	"bsf":  "bsf-pcap",
+	"nef":  "nef-pcap",
+	"lmf":  "lmf-pcap",
+	"sepp": "sepp-pcap",
+	// Test peer (compose profile roaming) — PORTAL-UI-22. hnrf has no sidecar.
+	"hsepp": "hsepp-pcap",
 }
 
 // PCAPStatus describes the state of a PCAP sidecar.

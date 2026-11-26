@@ -30,7 +30,7 @@
 # The EXIT trap recreates amf/smf/pcf from docker-compose.yml alone (default rel17, no override,
 # no SSLKEYLOGFILE), re-attaches the gNB, restarts the UE and waits for registration + PDU
 # session, so the stack is left healthy. `make down` is never run; other containers
-# (roaming hnrf/hsepp/vsepp, ...) are untouched. Needs `make ueransim UE_COUNT=1` and `make pki`.
+# (roaming hnrf/hsepp/sepp, ...) are untouched. Needs `make ueransim UE_COUNT=1` and `make pki`.
 #
 # Final line: `PASS mixed-release (A: amf19/core17, B: amf17/core19)` (exit 0) or `FAIL <stage>`.
 # Env: UE_CONTAINER, GNB_CONTAINER, AMF_MGMT, PING_TARGET, NRF_URL, WAIT (container/NRF waits,

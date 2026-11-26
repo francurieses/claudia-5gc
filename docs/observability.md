@@ -42,6 +42,7 @@ PCF 9106, UPF 9107, NSSF 9109, SMSF 9110, BSF 9111, NEF 9112, LMF 9113). Main fa
 | sbi-timeline | SBI request timeline |
 | ue-connections | UE registration and connection state |
 | nf-resource-health | per-NF resource and health |
+| n32-roaming | N32 context, handshake and N32-f message rates, p95, TLS rejects by reason |
 
 ## Logs
 

@@ -93,7 +93,7 @@ type Server struct {
 	// boxing of the log arguments.
 	debug bool
 	// drop* are the pre-resolved fivegc_upf_packet_drops_total children.
-	dropNoSession, dropNoRoute, dropTunWrite, dropSend, dropDLNoSession, dropDLNotReady prometheus.Counter
+	dropNoSession, dropNoRoute, dropTunWrite, dropSend, dropDLNoSession, dropDLNotReady, dropULNotReady, dropN9SrcMismatch prometheus.Counter
 	// dropQER holds the QoS enforcement drop counters, indexed by
 	// pfcp.DropReason (qer_gate_closed, qer_mbr_exceeded).
 	dropQER [pfcp.NumDropReasons]prometheus.Counter
@@ -213,6 +213,8 @@ func (s *Server) initCounters() {
 	s.dropSend = metrics.UPFPacketDropsTotal.WithLabelValues("gtpu_send_error")
 	s.dropDLNoSession = metrics.UPFPacketDropsTotal.WithLabelValues("dl_no_session")
 	s.dropDLNotReady = metrics.UPFPacketDropsTotal.WithLabelValues("dl_tunnel_not_ready")
+	s.dropULNotReady = metrics.UPFPacketDropsTotal.WithLabelValues("ul_tunnel_not_ready")
+	s.dropN9SrcMismatch = metrics.UPFPacketDropsTotal.WithLabelValues("n9_source_mismatch")
 	for r := pfcp.DropGateClosed; r < pfcp.NumDropReasons; r++ {
 		s.dropQER[r] = metrics.UPFPacketDropsTotal.WithLabelValues(r.String())
 	}
@@ -350,7 +352,7 @@ func (s *Server) Start(ctx context.Context) error {
 
 	buf := make([]byte, 4096)
 	for {
-		n, _, err := s.conn.ReadFromUDPAddrPort(buf)
+		n, src, err := s.conn.ReadFromUDPAddrPort(buf)
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -361,11 +363,16 @@ func (s *Server) Start(ctx context.Context) error {
 
 		// handlePacket is synchronous and nothing it calls retains pkt (the RS
 		// path copies the source address), so the receive buffer is reused.
-		s.handlePacket(buf[:n])
+		s.handlePacketFrom(buf[:n], src.Addr())
 	}
 }
 
-func (s *Server) handlePacket(pkt []byte) {
+func (s *Server) handlePacket(pkt []byte) { s.handlePacketFrom(pkt, netip.Addr{}) }
+
+// handlePacketFrom processes one datagram received from the UDP source IP src
+// (the zero Addr when unknown). src is only used to validate the N9 peer of a
+// home-routed session. Ref: TS 29.281 §5.1.
+func (s *Server) handlePacketFrom(pkt []byte, src netip.Addr) {
 	if len(pkt) < gtpuMinHdr {
 		return
 	}
@@ -420,6 +427,13 @@ func (s *Server) handlePacket(pkt []byte) {
 		return
 	}
 
+	// N9 downlink at a V-UPF (home-routed session): GTP-U from the H-UPF is
+	// re-encapsulated towards the gNB. TS 23.501 §4.2.4, TS 29.244 §5.2.1.
+	if sess.N9TEID != 0 && teid == sess.N9TEID {
+		s.handleN9Downlink(sess, pkt, inner, src)
+		return
+	}
+
 	if s.debug {
 		s.logger.Debug("GTP-U T-PDU received",
 			"procedure", "GtpuForwarding", "interface", "N3", "direction", "IN",
@@ -430,6 +444,14 @@ func (s *Server) handlePacket(pkt []byte) {
 	// QoS enforcement (gating + MBR + Session-AMBR) comes first: a policed
 	// packet is neither forwarded nor measured. Ref: TS 29.244 §5.4.3, §5.4.4.
 	if !s.AdmitUL(sess, len(inner)) {
+		return
+	}
+
+	// Home-routed UL at a V-UPF: the UL FAR (Destination Core + OHC) sends the
+	// packet to the H-UPF over N9 instead of the N6 TUN. TS 23.502 §4.3.2.2.2.
+	// Volume is counted by relayUplinkN9 only for packets actually forwarded.
+	if sess.ULRelay {
+		s.relayUplinkN9(sess, pkt, inner)
 		return
 	}
 
@@ -857,7 +879,7 @@ func (s *Server) sendFrame(sess *pfcp.Session, frame []byte, innerLen int) bool 
 		s.dropSend.Inc()
 		return false
 	}
-	if _, err := s.conn.WriteToUDPAddrPort(frame, netip.AddrPortFrom(gnb.Unmap(), gtpuPort)); err != nil {
+	if _, err := s.conn.WriteToUDPAddrPort(frame, netip.AddrPortFrom(gnb.Unmap(), peerPort)); err != nil {
 		if s.limiter.allow("send") {
 			s.logger.Error("GTP-U send (repeats suppressed 10s)", "error", err, "gnb", sess.GNBIP.String())
 		}

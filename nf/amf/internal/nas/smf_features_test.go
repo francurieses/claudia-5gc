@@ -6,6 +6,7 @@ package nasmsg
 // Ref: TS 29.500 §6.6.2; TS 29.502 §6.1.8; TS 23.502 §4.3.2.2.1.
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -83,5 +84,38 @@ func TestPDUSessionEstablishment_SMFErrorStoresNothing(t *testing.T) {
 	defer ue.Unlock()
 	if _, ok := ue.PDUSessions[5]; ok {
 		t.Error("PDU session stored despite CreateSMContext failure")
+	}
+}
+
+// TestPDUSessionEstablishment_SMFRejectRelayed: a SmContextCreateError carrying
+// an N1 SM reject yields exactly one DL NAS TRANSPORT and no stored session.
+// Ref: TS 23.502 §4.3.2.2.2 step 16; TS 24.501 §6.4.1.4.
+func TestPDUSessionEstablishment_SMFRejectRelayed(t *testing.T) {
+	rej := nas.WrapPDUSessionEstablishmentRejectBody(5, 1, 26, nil)
+	s := &smfSender{err: &SMContextCreateError{Status: 500, Cause: "SYSTEM_FAILURE", N1SmMsg: rej}}
+	ue := establish(t, s)
+	if s.called != 1 {
+		t.Fatalf("DL NAS TRANSPORT sent %d times, want 1", s.called)
+	}
+	if len(s.lastPDU) == 0 || s.lastPDU[1] != 0x02 { // EPD, SHT=integrity protected+ciphered
+		t.Fatalf("PDU not ciphered: % X", s.lastPDU)
+	}
+	// Decipher (DL COUNT 0 = first DL message of the fresh test UE) and check the
+	// DL NAS TRANSPORT: EPD 5GMM | SHT 0 | MT | PCT | LV-E payload | 0x12 PSI.
+	in := decipherDLPDU(t, ue, 0, s.lastPDU)
+	if in[0] != nas.PDMobilityManagement || in[2] != byte(nas.MsgTypeDLNASTransport) || in[3] != nas.PayloadContainerTypeN1SM {
+		t.Fatalf("inner = % X, want DL NAS TRANSPORT with N1 SM container", in)
+	}
+	n := int(in[4])<<8 | int(in[5])
+	if n != len(rej) || !bytes.Equal(in[6:6+n], rej) {
+		t.Fatalf("relayed 5GSM = % X, want % X (EPD|PSI=5|PTI=1|REJECT|cause 26)", in[6:6+n], rej)
+	}
+	if got := in[6+n:]; !bytes.Equal(got, []byte{0x12, 5}) {
+		t.Fatalf("trailer = % X, want PDU session ID IE 12 05", got)
+	}
+	ue.Lock()
+	defer ue.Unlock()
+	if _, ok := ue.PDUSessions[5]; ok {
+		t.Error("PDU session stored despite SMF reject")
 	}
 }

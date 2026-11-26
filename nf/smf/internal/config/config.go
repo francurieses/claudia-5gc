@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -18,7 +20,11 @@ type Config struct {
 	} `yaml:"plmn"`
 	SBI struct {
 		Address string `yaml:"address"`
-		TLS     struct {
+		// FQDN is the optional FQDN this SMF is reachable at (roaming home core:
+		// the hSEPP resolves the H-SMF through it). Empty = not advertised; the
+		// NRF profile stays byte-identical. Ref: TS 29.510 §6.1.6.2.2.
+		FQDN string `yaml:"fqdn"`
+		TLS  struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
 			CAFile   string `yaml:"ca_file"`
@@ -36,6 +42,11 @@ type Config struct {
 		// Namf_Communication_N1N2MessageTransfer (CN paging of CM-IDLE UEs).
 		// Ref: TS 29.518 §5.2.2.3, TS 23.502 §4.2.3.3.
 		AMF string `yaml:"amf"`
+		// SEPP is the local SEPP (host:port, mTLS) that every home-routed N16 request
+		// (Nsmf_PDUSession Create/Release towards the H-SMF) is sent to; the home FQDN is
+		// only ever put in 3gpp-Sbi-Target-apiRoot. Empty = home routing unavailable (V-SMF
+		// rejects with 5GSM #38). Ref: TS 29.500 §6.1.4.3; TS 23.501 §4.2.4.
+		SEPP string `yaml:"sepp"`
 	} `yaml:"peers"`
 	Metrics struct {
 		Address string `yaml:"address"`
@@ -44,6 +55,15 @@ type Config struct {
 	// Superseded by DNNs when per-DNN subnet isolation is configured.
 	UEIPPool  string `yaml:"ue_ip_pool"`
 	UPFN3Addr string `yaml:"upf_n3_addr"`
+	// UPFN9Addr is the H-UPF N9 address used in the UL PDR F-TEID of home-routed
+	// PDU sessions (hcnTunnelInfo). Empty = use UPFN3Addr (single-interface UPF).
+	// Ref: TS 29.244 §8.2.3 (F-TEID); TS 23.501 §4.2.4.
+	UPFN9Addr string `yaml:"upf_n9_addr"`
+	// VUPFN9AllowedCIDRs (H-SMF role, optional) restricts vcnTunnelInfo addresses of a home-routed
+	// PduSessionCreateData to these networks (e.g. ["192.0.2.0/24"]); empty = no restriction beyond
+	// the always-on loopback/link-local/multicast/unspecified/broadcast refusal. An invalid CIDR is a
+	// startup error. Ref: TS 29.502 §5.2.2.7.1 (vcnTunnelInfo); TS 23.501 §4.2.4.
+	VUPFN9AllowedCIDRs []string `yaml:"vupf_n9_allowed_cidrs"`
 	// SNSSAIs is the list of slices this SMF instance handles.
 	// Ref: TS 29.510 §5.2.2.2.2
 	SNSSAIs []struct {
@@ -199,5 +219,22 @@ func Load() (*Config, error) {
 		}
 	}
 
+	if _, err := cfg.ParseVUPFN9AllowedCIDRs(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// ParseVUPFN9AllowedCIDRs parses vupf_n9_allowed_cidrs; any invalid entry is an error.
+func (c *Config) ParseVUPFN9AllowedCIDRs() ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, raw := range c.VUPFN9AllowedCIDRs {
+		_, n, err := net.ParseCIDR(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("config: vupf_n9_allowed_cidrs %q: %w", raw, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }

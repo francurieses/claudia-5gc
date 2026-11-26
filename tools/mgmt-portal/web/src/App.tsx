@@ -15,6 +15,7 @@ import QoS from './pages/QoS'
 import Location from './pages/Location'
 import PublicWarning from './pages/PublicWarning'
 import RAN from './pages/RAN'
+import Roaming from './pages/Roaming'
 import RequiresTool from './components/RequiresTool'
 import ThemeToggle from './components/ThemeToggle'
 import { Badge, IconButton, useFocusTrap } from './components/ui'
@@ -54,6 +55,7 @@ const PAGES: Record<string, () => JSX.Element> = {
   '/qos': QoS,
   '/policies': Policies,
   '/ran': RAN,
+  '/roaming': Roaming,
   '/ueransim': () => (
     <RequiresTool tool="ueransim">
       <UERANSim />

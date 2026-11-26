@@ -33,10 +33,10 @@ func (f *fakeEx) Exchange(_ context.Context, root string, _ n32c.PlmnId) (n32c.C
 	return n32c.Context{}, nil
 }
 
-func initiatorServer(t *testing.T) (*Server, []config.N32Peer) {
+func initiatorServer(t *testing.T) (*Server, []config.Partner) {
 	t.Helper()
 	cfg, _ := config.Load()
-	peers := []config.N32Peer{{PLMN: config.PLMN{MCC: "001", MNC: "02"}, FQDN: "sepp.5gc.mnc002.mcc001.3gppnetwork.org", Address: "peer:8443"}}
+	peers := []config.Partner{{PLMN: config.PLMN{MCC: "001", MNC: "02"}, N32: config.PartnerN32{CAFile: "/x", Address: "peer:8443"}}}
 	return New(cfg, slog.New(slog.NewJSONHandler(io.Discard, nil))), peers
 }
 

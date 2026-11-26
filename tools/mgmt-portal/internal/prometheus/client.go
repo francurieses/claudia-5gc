@@ -32,6 +32,19 @@ type Sample struct {
 	Value  [2]interface{}    `json:"value"` // [timestamp, "value"]
 }
 
+// Float returns the sample value as a float64 (false when it is not numeric).
+func (s Sample) Float() (float64, bool) {
+	str, ok := s.Value[1].(string)
+	if !ok {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
 // QueryResult holds the result of an instant query.
 type QueryResult struct {
 	Data struct {

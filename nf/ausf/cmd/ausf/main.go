@@ -112,6 +112,8 @@ func main() {
 		SBIAddress:         sbiAddr,
 		SBIAuthority:       cfg.SBI.Authority,
 		ServingNetworkName: snName,
+		// Optional roaming allow-list (TS 33.501 §6.1.2); empty = no check.
+		AuthorizedServingNetworks: cfg.Roaming.AuthorizedServingNetworks,
 	}
 	serverCfg.TLS.CertFile = cfg.SBI.TLS.CertFile
 	serverCfg.TLS.KeyFile = cfg.SBI.TLS.KeyFile
@@ -165,6 +167,11 @@ func main() {
 		nrfAddr := "https://" + cfg.Peers.NRF
 		nrfClient := nrf.New(nrfAddr, httpClient, logger)
 		profile := ausfsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, ausfsbi.NausfUEAuthenticationCatalog())
+		// Optional FQDN identity for cross-PLMN (roaming) addressing; no-op when unset.
+		if err := nrf.ApplyFQDNIdentity(profile, cfg.SBI.FQDN, sbiAddr, mcc, mnc); err != nil {
+			logger.Error("invalid sbi.fqdn identity", "fqdn", cfg.SBI.FQDN, "error", err)
+			os.Exit(1)
+		}
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr, "error", err,
@@ -270,12 +277,21 @@ type Config struct {
 		// Authority is the host[:port] peers reach this AUSF at; used for absolute
 		// Location URIs (TS 29.501 §4.4.1). Optional.
 		Authority string `yaml:"authority"`
-		TLS       struct {
+		// FQDN is the optional NF FQDN advertised in the NRF profile
+		// (TS 23.003 §28.5.2); enables hSEPP resolution by FQDN.
+		FQDN string `yaml:"fqdn"`
+		TLS  struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
 			CAFile   string `yaml:"ca_file"`
 		} `yaml:"tls"`
 	} `yaml:"sbi"`
+	// Roaming holds the optional home-network roaming policy.
+	Roaming struct {
+		// AuthorizedServingNetworks: serving network names (besides the own
+		// one) allowed to authenticate UEs here. TS 33.501 §6.1.2.
+		AuthorizedServingNetworks []string `yaml:"authorized_serving_networks"`
+	} `yaml:"roaming"`
 	Peers struct {
 		NRF string `yaml:"nrf"`
 		UDM string `yaml:"udm"`

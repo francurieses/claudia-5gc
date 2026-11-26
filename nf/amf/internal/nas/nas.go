@@ -31,6 +31,7 @@ import (
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/roaming"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/nas"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
@@ -2923,13 +2924,14 @@ func (h *Handler) handleULNASTransport(
 		return fmt.Errorf("nas: UL NAS Transport type assertion failed")
 	}
 
-	log := h.logger.With(
+	// baseLog carries no interface/direction so that the Nsmf lines below can set
+	// their own without repeating a JSON key (slog never de-duplicates keys).
+	baseLog := h.logger.With(
 		"amf_ue_ngap_id", ue.AMFUENGAPId,
 		"supi", ue.SUPI,
-		"interface", "N1",
-		"direction", "IN",
 		"procedure", "PDUSessionEstablishment",
 	)
+	log := baseLog.With("interface", "N1", "direction", "IN")
 
 	if transport.PayloadContainer == nil {
 		log.Warn("UL NAS Transport with empty payload container")
@@ -2984,7 +2986,7 @@ func (h *Handler) handleULNASTransport(
 	case nas.MsgTypePDUSessionEstablishmentRequest:
 		// Explicit case — falls through to the establishment handler below.
 	case nas.MsgTypePDUSessionReleaseRequest:
-		return h.handlePDUSessionRelease(ctx, ue, pduSessionID, pti, log)
+		return h.handlePDUSessionRelease(ctx, ue, pduSessionID, pti, transport.PayloadContainer, log)
 	case nas.MsgTypePDUSessionReleaseComplete:
 		log.Info("PDU Session Release Complete received",
 			"pdu_session_id", pduSessionID,
@@ -3138,7 +3140,11 @@ func (h *Handler) handleULNASTransport(
 		)
 	}
 
-	log = log.With("pdu_session_id", pduSessionID, "snssai_sst", snssai.SST, "snssai_sd", snssai.SD)
+	pduAttrs := []any{"pdu_session_id", pduSessionID, "snssai_sst", snssai.SST, "snssai_sd", snssai.SD}
+	log = log.With(pduAttrs...)
+	nsmfLog := func(direction string) *slog.Logger {
+		return baseLog.With(pduAttrs...).With("interface", "Nsmf", "direction", direction)
+	}
 	log.Info("PDU Session Establishment Request received")
 
 	// Call SMF to create session context
@@ -3151,9 +3157,54 @@ func (h *Handler) handleULNASTransport(
 		return nil
 	}
 
+	// Home-routed roaming session (ROAM-002): the request still goes to the local
+	// SMF (V-SMF); the descriptor adds hSmfUri / hplmnSnssai / full DNN. A roaming
+	// UE whose partner has no smf_api_root is rejected (fail closed, owner decision):
+	// the 5GSM message is not forwarded; 5GMM cause #90 with the payload echoed.
+	// Ref: TS 23.502 §4.3.2.2.2 step 3a; TS 29.502 Table 6.1.6.2.2-1; TS 24.501 §5.4.5.2.5
+	hSmfURI := ""
+	if route := ue.HomeRoute(); route != nil {
+		if hr, ok := route.NewHomeRouting(dnn, snssai.SST, snssai.SD); ok {
+			ctx = roaming.WithHomeRouting(ctx, hr)
+			hSmfURI = hr.HSMFURI
+			nsmfLog("OUT").Info("home-routed PDU session: V-SMF + H-SMF",
+				"h_smf_uri", hr.HSMFURI, "dnn_full", hr.FullDNN,
+				"spec_ref", "TS 23.502 §4.3.2.2.2 step 3a")
+		} else {
+			log.Warn("home_routing_unconfigured: roaming UE, partner has no smf_api_root — rejecting PDU session",
+				"event", "home_routing_unconfigured", "home_plmn", route.HomePLMN.String(),
+				"result", "REJECT", "cause", nas.CausePayloadNotForwarded,
+				"spec_ref", "TS 24.501 §5.4.5.2.5; §5.4.5.3.1; TS 23.502 §4.3.2.2.2")
+			return h.rejectULNASTransport(ue, pduSessionID,
+				transport.PayloadContainerType, transport.PayloadContainer,
+				uint8(nas.CausePayloadNotForwarded))
+		}
+	}
+
 	smContextRef, n1SmRespBody, n2SmInfo, smfFeatures, err := smfClient.CallSMF(ctx, ue.SUPI, dnn, pduSessionID, transport.PayloadContainer, snssai)
 	if err != nil {
-		log.Error("SMF CreateSMContext failed", "error", err)
+		var ce *SMContextCreateError
+		if errors.As(err, &ce) && len(ce.N1SmMsg) > 0 {
+			// SmContextCreateError with n1SmMsg: relay the PDU SESSION
+			// ESTABLISHMENT REJECT to the UE inside a ciphered DL NAS TRANSPORT
+			// (a 5GSM message never travels alone on N1); no session is stored.
+			// Ref: TS 23.502 §4.3.2.2.2 step 3b/16; TS 24.501 §6.4.1.4.
+			nsmfLog("IN").Warn("SMF rejected PDU session establishment — relaying N1 SM reject to UE",
+				"result", "REJECT",
+				"cause", ce.Cause, "cause_5gsm", ce.Cause5GSM(), "http_status", ce.Status,
+				"spec_ref", "TS 29.502 §5.2.2.2.1; TS 24.501 §6.4.1.4")
+			psi := pduSessionID
+			dlReject := &nas.DLNASTransport{
+				PayloadContainerType: nas.PayloadContainerTypeN1SM,
+				PayloadContainer:     ce.N1SmMsg,
+				PDUSessionID:         &psi,
+			}
+			return h.sendNASSecuredViaDownlink(ue, nas.PDMobilityManagement, nas.MsgTypeDLNASTransport, dlReject)
+		}
+		nsmfLog("IN").Error("SMF CreateSMContext failed",
+			"result", "FAILURE",
+			"cause", err.Error(), "error", err,
+			"spec_ref", "TS 29.502 §5.2.2.2.1; TS 23.502 §4.3.2.2.1 step 3")
 		return nil
 	}
 
@@ -3188,6 +3239,7 @@ func (h *Handler) handleULNASTransport(
 		PDUSessionID:  pduSessionID,
 		SMFInstanceID: smContextRef,
 		DNN:           dnn,
+		HSMFURI:       hSmfURI,
 		SNSSAI:        snssai,
 		N2SmTransfer:  n2SmInfo,
 		Features:      smfFeatures,
@@ -3475,7 +3527,7 @@ func (h *Handler) handleULSMS(
 //  4. Remove PDU session from UE context
 func (h *Handler) handlePDUSessionRelease(
 	ctx context.Context, ue *amfctx.UEContext, pduSessionID, pti uint8,
-	log *slog.Logger,
+	n1SmMsg []byte, log *slog.Logger,
 ) error {
 	log = log.With("procedure", "PDUSessionRelease", "pdu_session_id", pduSessionID)
 	log.Info("PDU Session Release Request received",
@@ -3492,6 +3544,14 @@ func (h *Handler) handlePDUSessionRelease(
 		return nil
 	}
 	smContextRef := pduSess.SMFInstanceID
+
+	// Home-routed session: the V-SMF drives the release (TS 23.502 §4.3.4.3
+	// step 1a). On any failure fall through to the AMF-built release below.
+	if pduSess.HSMFURI != "" {
+		if h.releaseHomeRouted(ctx, ue, pduSessionID, pti, smContextRef, n1SmMsg) {
+			return nil
+		}
+	}
 
 	// Build 5GSM PDU Session Release Command and wrap in a secured DL NAS Transport
 	releaseCmd := nas.WrapPDUSessionReleaseCommandBody(pduSessionID, pti, nas.Cause5GSMRegularDeactivation)

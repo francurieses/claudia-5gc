@@ -3,6 +3,7 @@ package n32c
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32trust"
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/sbi/apiversion"
@@ -24,6 +26,11 @@ const (
 	interfaceN32c = "N32c"
 	// featureNFTLST is TS 29.573 Table 6.1.7-1 feature 1 (N32-f TLS termination via NONE).
 	featureNFTLST = 1
+	// featurePSIU is TS 29.573 Table 6.1.7-1 feature 3 (protection of sensitive
+	// information in URI path/query; mandatory for Rel-18+ SEPPs). Offered only
+	// when the profile release is >= Rel-18 (the shared table gates it), so the
+	// Rel-17 profile keeps offering "1".
+	featurePSIU = 3
 	// maxBodyBytes bounds the request/response body read.
 	maxBodyBytes = 64 << 10
 	// exchangeCapabilityPath is the operation path below {apiRoot}/n32c-handshake/{ver}.
@@ -51,6 +58,19 @@ type PeerIdentity struct {
 	FQDN string
 	// PLMN is parsed from the trailing domain of FQDN.
 	PLMN PlmnId
+	// PLMNs is the PLMN set of the verified certificate (every SAN
+	// mncXXX.mccYYY.3gppnetwork.org, TS 33.501 §13.1.2). Empty only for an
+	// identity injected by a test: consumers then use {PLMN}.
+	PLMNs []PlmnId
+}
+
+// certPLMNs returns the PLMN set of a certificate, canonical and deduplicated.
+func certPLMNs(c *x509.Certificate) []PlmnId {
+	var out []PlmnId
+	for _, p := range n32trust.PLMNsFromCert(c) {
+		out = append(out, PlmnId{Mcc: p.MCC, Mnc: p.MNC}.Canonical())
+	}
+	return out
 }
 
 // CertPeerIdentity derives the peer identity from the verified TLS client
@@ -60,9 +80,10 @@ func CertPeerIdentity(r *http.Request) (PeerIdentity, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return PeerIdentity{}, errors.New("n32c: peer identity: no client certificate")
 	}
-	for _, san := range r.TLS.PeerCertificates[0].DNSNames {
+	leaf := r.TLS.PeerCertificates[0]
+	for _, san := range leaf.DNSNames {
 		if p, err := ParsePLMNFromFQDN(san); err == nil {
-			return PeerIdentity{FQDN: strings.ToLower(san), PLMN: p}, nil
+			return PeerIdentity{FQDN: strings.ToLower(san), PLMN: p, PLMNs: certPLMNs(leaf)}, nil
 		}
 	}
 	return PeerIdentity{}, errors.New("n32c: peer identity: no SAN with a 3gppnetwork.org PLMN domain")
@@ -74,9 +95,10 @@ func CertResponderIdentity(cs *tls.ConnectionState) (PeerIdentity, error) {
 	if cs == nil || len(cs.PeerCertificates) == 0 {
 		return PeerIdentity{}, errors.New("n32c: responder identity: no server certificate")
 	}
-	for _, san := range cs.PeerCertificates[0].DNSNames {
+	leaf := cs.PeerCertificates[0]
+	for _, san := range leaf.DNSNames {
 		if p, err := ParsePLMNFromFQDN(san); err == nil {
-			return PeerIdentity{FQDN: strings.ToLower(san), PLMN: p}, nil
+			return PeerIdentity{FQDN: strings.ToLower(san), PLMN: p, PLMNs: certPLMNs(leaf)}, nil
 		}
 	}
 	return PeerIdentity{}, errors.New("n32c: responder identity: no SAN with a 3gppnetwork.org PLMN domain")
@@ -122,6 +144,9 @@ type Service struct {
 	mu       sync.Mutex
 	inflight map[uint64]*inflightReq
 	nextTok  uint64
+	// amu guards activity (last exchange-capability outcome per remote PLMN).
+	amu      sync.Mutex
+	activity map[string]Attempt
 }
 
 type inflightReq struct {
@@ -135,7 +160,7 @@ func New(cfg Config) (*Service, error) {
 	if cfg.LocalFQDN == "" || !cfg.LocalPLMN.Valid() {
 		return nil, errors.New("n32c: new: local FQDN and valid local PLMN are required")
 	}
-	entries, err := features.Implement(features.N32HandshakeEntries(), featureNFTLST)
+	entries, err := features.Implement(features.N32HandshakeEntries(), featureNFTLST, featurePSIU)
 	if err != nil {
 		return nil, fmt.Errorf("n32c: new: feature table: %w", err)
 	}
@@ -158,13 +183,18 @@ func New(cfg Config) (*Service, error) {
 	cfg.LocalFQDN = strings.ToLower(cfg.LocalFQDN)
 	st := cfg.Store
 	if st == nil {
-		st = NewStore(nil)
+		// Production store: keep fivegc_sepp_n32c_context_established in step.
+		st = NewStore(contextGauge)
+		for _, p := range cfg.Partners { // partners without a context read 0, not absent
+			n32cContextEstablished.WithLabelValues(p.String()).Set(0)
+		}
 	}
 	return &Service{
 		cfg: cfg, store: st, catalog: cat,
 		specLit:  features.SpecLiteral(cfg.Profile),
 		logger:   cfg.Logger,
 		inflight: map[uint64]*inflightReq{},
+		activity: map[string]Attempt{},
 	}, nil
 }
 

@@ -69,7 +69,7 @@ func TestPeerIdentityClientVerifiesFQDN(t *testing.T) {
 			base := &http.Client{Transport: &http2.Transport{
 				TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS13}}}
 			addr := srv.Listener.Addr().String() // dialled by IP: only ServerName can match the SAN
-			c, err := NewPeerIdentityClient(base, []config.N32Peer{{FQDN: fqdn, Address: addr}})
+			c, err := NewPeerIdentityClient(base, []config.Partner{{N32: config.PartnerN32{SEPPFQDN: fqdn, Address: addr}}})
 			if err != nil {
 				t.Fatal(err)
 			}

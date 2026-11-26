@@ -1,0 +1,32 @@
+# Home UPF (H-UPF) of a home-routed roaming PDU session (ROAM-002, TS 23.501 §4.2.4,
+# TS 23.502 §4.3.2.2.2). Container `hupf`: PSA of the roamer, N6 egress in the HPLMN.
+# Same binary as the visited UPF (dev.yaml). The H-SMF installs: UL PDR from N9
+# (F-TEID = n3.ip below) -> N6 TUN, DL PDR (UE IP) -> GTP-U to the V-UPF N9 F-TEID.
+# n3.ip is the GTP-U address of this UPF on the N9 network (172.30.20.200); the
+# visited UPF listens on its 0.0.0.0:2152 socket at 172.30.20.100 (dev.yaml unchanged).
+dnns:
+    - gateway_ip: 172.30.22.1   # Docker bridge of hn6-net
+      name: internet
+      tun_addr: 10.70.0.254/24
+      tun_name: upfgtp0
+      ue_ip_pool: 10.70.0.0/24
+metrics:
+    address: 0.0.0.0:9107
+n3:
+    address: 0.0.0.0:2152
+    ip: 172.30.20.200
+    socket_buffer_bytes: 8388608
+n4:
+    address: 0.0.0.0:8805
+    dl_buffer:
+        default_max_packets: 64
+        max_packets_cap: 256
+n6:
+    l4_checksum_repair: true
+    tcp_mss_clamp: true
+    tun_mtu: 1456
+    tun_txqueuelen: 1000
+nf_instance_id: 00000000-0000-4005-8000-000000000002
+qos:
+    burst_ms: 100
+    mbr_enforcement: true

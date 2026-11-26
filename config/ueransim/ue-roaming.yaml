@@ -1,0 +1,61 @@
+# Roaming UE (ROAM-001): HPLMN 001/02 attaching to the visited 001/01 core. Same K/OPc/AMF as the UDR dev seed.
+supi: 'imsi-001020000000001'
+mcc: '001'
+mnc: '02'
+# Opt-in (patch 0110): camp on a visited PLMN when HPLMN/EPLMN are unavailable (TS 23.122 §4.4.3.1.1).
+allowRoaming: true
+# Null scheme: SUCI carries the SUPI in clear (TS 33.501 Annex C.2); ROAM-001 roaming UE.
+protectionScheme: 0
+routingIndicator: '0000'
+key: '465b5ce8b199b49faa5f0a2ee238a6bc'
+op: 'cd63cb71954a9f4e48a5994e37a02baf'
+opType: 'OPC'
+amf: 'b9b9'
+imei: '356938035643803'
+imeiSv: '4370816125816151'
+gnbSearchList:
+  - ueransim-gnb
+uacAic:
+  mps: false
+  mcs: false
+uacAcc:
+  normalClass: 0
+  class11: false
+  class12: false
+  class13: false
+  class14: false
+  class15: false
+sessions:
+  - type: 'IPv4'
+    apn: 'internet'
+    slice:
+      sst: 1
+      sd: 0x000001
+  - type: 'IPv4'
+    apn: 'ims'
+    slice:
+      sst: 1
+      sd: 0x001234
+configured-nssai:
+  - sst: 1
+    sd: 0x000001
+  - sst: 1
+    sd: 0x001234
+default-nssai:
+  - sst: 1
+    sd: 0x000001
+integrity:
+  IA1: false
+  IA2: true
+  IA3: false
+ciphering:
+  EA1: false
+  EA2: false
+  EA3: false
+integrityMaxRate:
+  uplink: 'full'
+  downlink: 'full'
+# Opt-in Rel-18/19 capability bits (patch 0080, TS 24.501 §9.11.3.1 / §9.11.4.1). "octet.bit" with
+# octet 3 = first value octet. Absent = stock wire bytes (5GMM 0x00, 5GSM 0x00). Example (uncomment to enable):
+#mmCapabilityBits: ['8.3', '8.4', '9.3', '11.5', '12.7', '13.4']
+#smCapabilityBits: ['4.6', '4.7', '4.8', '5.2']

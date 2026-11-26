@@ -51,6 +51,26 @@ type UDMClient interface {
 
 // CauseMandatoryIEIncorrect is the ProblemDetails cause for a malformed
 // mandatory IE. Ref: TS 29.500 §5.2.7.2, Table 5.2.7.2-1.
+// CauseServingNetworkNotAuthorized is the 403 ProblemDetails cause for a
+// serving network the home network does not authorize.
+// Ref: TS 29.509 §6.1.7.3 Table 6.1.7.3-1.
+const CauseServingNetworkNotAuthorized = "SERVING_NETWORK_NOT_AUTHORIZED"
+
+// servingNetworkAuthorized implements the TS 33.501 §6.1.2 check. With no
+// AuthorizedServingNetworks configured every SNN passes (unchanged
+// behaviour); otherwise only the own SNN or a listed one does.
+func (s *Server) servingNetworkAuthorized(snn string) bool {
+	if len(s.cfg.AuthorizedServingNetworks) == 0 || snn == s.cfg.ServingNetworkName {
+		return true
+	}
+	for _, a := range s.cfg.AuthorizedServingNetworks {
+		if a == snn {
+			return true
+		}
+	}
+	return false
+}
+
 const CauseMandatoryIEIncorrect = "MANDATORY_IE_INCORRECT"
 
 // UDMError is a non-2xx Nudm_UEAU answer carrying the UDM ProblemDetails.
@@ -283,7 +303,11 @@ type Config struct {
 	SBIAuthority       string
 	MetricsAddr        string
 	ServingNetworkName string // e.g. "5G:mnc093.mcc208.3gppnetwork.org"
-	TLS                struct {
+	// AuthorizedServingNetworks lists the roaming-partner serving network
+	// names authorized besides the own one. Empty = no check (local stack
+	// behaviour). Ref: TS 33.501 §6.1.2.
+	AuthorizedServingNetworks []string
+	TLS                       struct {
 		CertFile string
 		KeyFile  string
 		CAFile   string
@@ -472,6 +496,16 @@ func (s *Server) handleInitAuth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log = log.With("supi_or_suci", shownID)
+	if !s.servingNetworkAuthorized(authInfo.ServingNetworkName) {
+		log.Warn("serving network not authorized",
+			"result", "REJECT", "cause", CauseServingNetworkNotAuthorized,
+			"serving_network_name", authInfo.ServingNetworkName,
+			"spec_ref", "TS 33.501 §6.1.2; TS 29.509 §5.2.2.2.2, §6.1.7.3")
+		metrics.ProcedureTotal.WithLabelValues("AUSF", "ServingNetworkAuthorization", "REJECT").Inc()
+		problem(w, http.StatusForbidden, CauseServingNetworkNotAuthorized,
+			"serving network is not authorized to use the servingNetworkName")
+		return
+	}
 	span.SetAttributes(
 		attribute.String("supi_or_suci", shownID),
 		attribute.String("serving_net", authInfo.ServingNetworkName),

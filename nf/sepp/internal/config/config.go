@@ -5,7 +5,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 
@@ -20,16 +23,81 @@ type PLMN struct {
 	MNC string `yaml:"mnc"`
 }
 
-// N32Peer is a remote SEPP this SEPP initiates the N32-c exchange-capability
-// towards at startup (TS 29.573 §5.2.2 step 1).
-type N32Peer struct {
-	// PLMN is the peer's PLMN (the targetPlmnId of the exchange).
+// Key is the canonical "mcc-mnc3" form of the PLMN: the MNC is zero-padded to
+// three digits, as in the 3gppnetwork.org FQDNs (TS 23.003 §28.5.2), so the
+// partners, the certificate SAN PLMNs and the file keys compare equal.
+func (p PLMN) Key() string { return p.MCC + "-" + padMNC(p.MNC) }
+
+// String is the "mcc-mnc" form used by the admin view.
+func (p PLMN) String() string { return p.MCC + "-" + p.MNC }
+
+func padMNC(mnc string) string {
+	for len(mnc) < 3 {
+		mnc = "0" + mnc
+	}
+	return mnc
+}
+
+// DeriveSEPPFQDN returns the telescopic-root SEPP FQDN of a PLMN,
+// sepp.5gc.mnc<MNC3>.mcc<MCC>.3gppnetwork.org (TS 23.003 §28.5.2).
+func DeriveSEPPFQDN(p PLMN) string {
+	return "sepp.5gc.mnc" + padMNC(p.MNC) + ".mcc" + p.MCC + ".3gppnetwork.org"
+}
+
+// Partner is one roaming partner (inline `n32.partners` and the shared
+// partners file use the same schema). Ref: docs/procedures/N32InteropReadiness.md §4.1.
+type Partner struct {
+	// PLMN is the partner PLMN; key of its trust anchor.
 	PLMN PLMN `yaml:"plmn"`
-	// FQDN is the peer SEPP FQDN (telescopic form, TS 23.003 §28.5.2).
-	FQDN string `yaml:"fqdn"`
-	// Address is the peer N32 listener host:port that is dialled.
+	// N32 is the SEPP-side part: trust anchor, FQDN, N32-c initiator target.
+	N32 PartnerN32 `yaml:"n32"`
+	// HomeNFs is read by the AMF only; the SEPP ignores it.
+	HomeNFs HomeNFs `yaml:"home_nfs"`
+	// Source is "file" or "config" (set at load, not read from YAML).
+	Source string `yaml:"-"`
+}
+
+// PartnerN32 is the SEPP part of a Partner.
+type PartnerN32 struct {
+	// CAFile is the trust anchor bundle of this partner PLMN only (required
+	// for a SEPP partner). Never the SBI CA. Ref: TS 33.501 §13.1.2.
+	CAFile string `yaml:"ca_file"`
+	// SEPPFQDN is the partner SEPP FQDN; default derived from the PLMN.
+	SEPPFQDN string `yaml:"sepp_fqdn"`
+	// Address is the partner N32 listener host:port; present means the N32-c
+	// initiator targets it at startup (TS 29.573 §5.2.2 step 1).
 	Address string `yaml:"address"`
 }
+
+// HomeNFs are the home-network apiRoots used by the AMF (ignored by the SEPP).
+type HomeNFs struct {
+	AUSFAPIRoot string `yaml:"ausf_api_root"`
+	UDMAPIRoot  string `yaml:"udm_api_root"`
+	SMFAPIRoot  string `yaml:"smf_api_root"` // H-SMF apiRoot (AMF-only; accepted so the shared partners file loads)
+}
+
+// FQDN is the partner SEPP FQDN (explicit or derived from the PLMN).
+func (p Partner) FQDN() string {
+	if p.N32.SEPPFQDN != "" {
+		return p.N32.SEPPFQDN
+	}
+	return DeriveSEPPFQDN(p.PLMN)
+}
+
+const (
+	// PartnersFileEnv overrides n32.partners_file (shared with the AMF).
+	PartnersFileEnv = "ROAMING_PARTNERS_FILE"
+	// DefaultPartnersFile is the partners file used when neither the env nor
+	// n32.partners_file is set. A missing file means no partners.
+	DefaultPartnersFile = "/etc/5gc/roaming/partners.yaml"
+	// DefaultN32CertFile and DefaultN32KeyFile are the local N32 certificate
+	// (never the SBI one). Ref: TS 33.501 §13.1.
+	DefaultN32CertFile = "/etc/5gc/pki/n32/local/sepp.crt"
+	DefaultN32KeyFile  = "/etc/5gc/pki/n32/local/sepp.key"
+	// SourceFile and SourceConfig tag where an effective partner came from.
+	SourceFile   = "file"
+	SourceConfig = "config"
+)
 
 // Config holds all SEPP configuration.
 type Config struct {
@@ -53,29 +121,32 @@ type Config struct {
 		} `yaml:"tls"`
 	} `yaml:"sbi"`
 
-	// N32 holds the inter-PLMN listener (N32-c and N32-f) used from REL19-9.4.
+	// N32 holds the inter-PLMN listener (N32-c and N32-f).
 	N32 struct {
 		Address string `yaml:"address"`
-		// RoamingPartners lists the remote PLMNs accepted on N32-c
-		// (TS 29.573 §5.2.2; TS 33.501 §13.1.2). Empty means none.
-		RoamingPartners []PLMN `yaml:"roaming_partners"`
-		// Peers lists the remote SEPPs to run the N32-c initiator towards.
-		Peers []N32Peer `yaml:"peers"`
+		// Partners are the inline roaming partners; the partners file overrides
+		// entries with the same PLMN. After Load it holds the effective list.
+		Partners []Partner `yaml:"partners"`
+		// PartnersFile is the shared partners file (env ROAMING_PARTNERS_FILE wins).
+		PartnersFile string `yaml:"partners_file"`
 		// TargetAPIRootSupported: local support of the 3gpp-Sbi-Target-apiRoot
 		// header (TS 29.500 §6.1.4.3.4). Default true.
 		TargetAPIRootSupported bool `yaml:"target_api_root_supported"`
 		// TopologyHiding is the operator policy for topology hiding on N32-f
 		// (TS 33.501 §13.1). Omitted means enabled; see TopologyHidingEnabled.
 		TopologyHiding *bool `yaml:"topology_hiding"`
-		// TLS is the N32 trust material; empty fields fall back to sbi.tls
-		// (see N32TLS). A separate CA keeps the roaming-partner trust anchors
-		// apart from the intra-PLMN SBI CA. Ref: TS 33.210 §6.2.
+		// TLS is the local N32 certificate. There is no fallback to sbi.tls and
+		// no CA here: trust anchors are per partner PLMN. Ref: TS 33.210 §6.2.
 		TLS struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
-			CAFile   string `yaml:"ca_file"`
 		} `yaml:"tls"`
 	} `yaml:"n32"`
+
+	// PartnersFilePath is the partners file consulted at load; PartnersFileLoaded
+	// reports whether it existed (a missing file is not an error). Not YAML.
+	PartnersFilePath   string `yaml:"-"`
+	PartnersFileLoaded bool   `yaml:"-"`
 
 	Peers struct {
 		// NRF is the NRF address (host:port). Ref: TS 29.510 §5.2.2.
@@ -91,8 +162,10 @@ type Config struct {
 	Release capability.ReleaseConfig `yaml:"release"`
 }
 
-// Load reads the SEPP configuration from CONFIG_PATH (or /etc/5gc/config.yaml).
-// A missing file is tolerated and defaults are used.
+// Load reads the SEPP configuration from CONFIG_PATH (or /etc/5gc/config.yaml),
+// then the partners file (ROAMING_PARTNERS_FILE, n32.partners_file, default
+// DefaultPartnersFile). A missing config or partners file is tolerated; an
+// invalid partners file or a legacy key is an error (fail closed).
 func Load() (*Config, error) {
 	cfgPath := os.Getenv("CONFIG_PATH")
 	if cfgPath == "" {
@@ -104,8 +177,17 @@ func Load() (*Config, error) {
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("sepp: config: parse YAML: %w", err)
 		}
+		if err := rejectLegacy(data); err != nil {
+			return nil, err
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, fmt.Errorf("sepp: config: read file: %w", err)
+	}
+	if cfg.SBI.FQDN == "" {
+		cfg.SBI.FQDN = DeriveSEPPFQDN(PLMN{MCC: cfg.PLMN.MCC, MNC: cfg.PLMN.MNC})
+	}
+	if err := cfg.loadPartners(); err != nil {
+		return nil, err
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -113,24 +195,98 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-// TLSFiles is a certificate, key and CA bundle path triple.
-type TLSFiles struct{ CertFile, KeyFile, CAFile string }
-
-// N32TLS returns the N32 listener TLS files: n32.tls.* with each empty field
-// falling back to sbi.tls.*.
-func (c *Config) N32TLS() TLSFiles {
-	f := TLSFiles{c.N32.TLS.CertFile, c.N32.TLS.KeyFile, c.N32.TLS.CAFile}
-	if f.CertFile == "" {
-		f.CertFile = c.SBI.TLS.CertFile
+// rejectLegacy refuses the pre-SEPP-005 keys with an error naming the replacement.
+func rejectLegacy(data []byte) error {
+	var probe struct {
+		N32 struct {
+			RoamingPartners yaml.Node `yaml:"roaming_partners"`
+			Peers           yaml.Node `yaml:"peers"`
+			TLS             struct {
+				CAFile yaml.Node `yaml:"ca_file"`
+			} `yaml:"tls"`
+		} `yaml:"n32"`
 	}
-	if f.KeyFile == "" {
-		f.KeyFile = c.SBI.TLS.KeyFile
+	if err := yaml.Unmarshal(data, &probe); err != nil {
+		return fmt.Errorf("sepp: config: parse YAML: %w", err)
 	}
-	if f.CAFile == "" {
-		f.CAFile = c.SBI.TLS.CAFile
+	switch {
+	case probe.N32.RoamingPartners.Kind != 0:
+		return errors.New("sepp: config: n32.roaming_partners is no longer supported: use n32.partners[] (or the partners file) with n32.ca_file")
+	case probe.N32.Peers.Kind != 0:
+		return errors.New("sepp: config: n32.peers is no longer supported: use n32.partners[].n32.address")
+	case probe.N32.TLS.CAFile.Kind != 0:
+		return errors.New("sepp: config: n32.tls.ca_file is no longer supported: use per-partner n32.partners[].n32.ca_file (N32 never trusts a shared CA)")
 	}
-	return f
+	return nil
 }
+
+// loadPartners merges the partners file over the inline partners.
+func (c *Config) loadPartners() error {
+	if err := checkUnique(c.N32.Partners, "n32.partners"); err != nil {
+		return err
+	}
+	for i := range c.N32.Partners {
+		c.N32.Partners[i].Source = SourceConfig
+	}
+	path := os.Getenv(PartnersFileEnv)
+	if path == "" {
+		path = c.N32.PartnersFile
+	}
+	if path == "" {
+		path = DefaultPartnersFile
+	}
+	c.PartnersFilePath = path
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("sepp: config: read partners file %q: %w", path, err)
+	}
+	c.PartnersFileLoaded = true
+	var f struct {
+		Partners []Partner `yaml:"partners"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("sepp: config: partners file %q invalid: %w", path, err)
+	}
+	if err := checkUnique(f.Partners, "partners file "+path); err != nil {
+		return err
+	}
+	for _, fp := range f.Partners {
+		fp.Source = SourceFile
+		replaced := false
+		for i, ip := range c.N32.Partners {
+			if ip.PLMN.Key() == fp.PLMN.Key() {
+				c.N32.Partners[i], replaced = fp, true
+				break
+			}
+		}
+		if !replaced {
+			c.N32.Partners = append(c.N32.Partners, fp)
+		}
+	}
+	return nil
+}
+
+func checkUnique(ps []Partner, label string) error {
+	seen := map[string]bool{}
+	for i, p := range ps {
+		if !validPLMN(p.PLMN.MCC, p.PLMN.MNC) {
+			return fmt.Errorf("sepp: config: %s[%d]: invalid plmn %q/%q", label, i, p.PLMN.MCC, p.PLMN.MNC)
+		}
+		if seen[p.PLMN.Key()] {
+			return fmt.Errorf("sepp: config: %s: duplicate partner plmn %s", label, p.PLMN)
+		}
+		seen[p.PLMN.Key()] = true
+	}
+	return nil
+}
+
+// TLSFiles is a certificate, key and CA bundle path triple (SBI listener).
+type TLSFiles struct{ CertFile, KeyFile, CAFile string }
 
 // TopologyHidingEnabled reports the topology-hiding policy: true unless
 // n32.topology_hiding is explicitly false. Ref: TS 33.501 §13.1.
@@ -138,33 +294,52 @@ func (c *Config) TopologyHidingEnabled() bool {
 	return c.N32.TopologyHiding == nil || *c.N32.TopologyHiding
 }
 
-// HasRoamingConfig reports whether any roaming configuration (n32.peers or
-// n32.roaming_partners) is present, i.e. the N32-f forwarder is required.
-func (c *Config) HasRoamingConfig() bool {
-	return len(c.N32.Peers) > 0 || len(c.N32.RoamingPartners) > 0
+// N32Partners returns the effective partners that carry an N32 trust anchor
+// (n32.ca_file); partners with only home_nfs belong to the AMF.
+func (c *Config) N32Partners() []Partner {
+	var out []Partner
+	for _, p := range c.N32.Partners {
+		if p.N32.CAFile != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
-// Validate checks the roaming-partner list and the local PLMN: mcc is three
-// digits and mnc two or three digits (TS 29.571 §5.4.4.2).
+// Initiators returns the N32 partners with an address: the N32-c initiator targets.
+func (c *Config) Initiators() []Partner {
+	var out []Partner
+	for _, p := range c.N32Partners() {
+		if p.N32.Address != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// HasRoamingConfig reports whether any N32 partner exists, i.e. the N32-f
+// forwarder and the local N32 certificate are required.
+func (c *Config) HasRoamingConfig() bool { return len(c.N32Partners()) > 0 }
+
+// Validate checks the local PLMN and the effective partners: mcc is three
+// digits and mnc two or three digits (TS 29.571 §5.4.4.2); an N32 block needs
+// ca_file; address is host:port.
 func (c *Config) Validate() error {
 	if !validPLMN(c.PLMN.MCC, c.PLMN.MNC) {
 		return fmt.Errorf("sepp: config: invalid plmn %q/%q", c.PLMN.MCC, c.PLMN.MNC)
 	}
-	for i, p := range c.N32.RoamingPartners {
-		if !validPLMN(p.MCC, p.MNC) {
-			return fmt.Errorf("sepp: config: n32.roaming_partners[%d]: invalid plmn %q/%q", i, p.MCC, p.MNC)
-		}
+	if err := checkUnique(c.N32.Partners, "n32.partners"); err != nil {
+		return err
 	}
-	for i, p := range c.N32.Peers {
-		if !validPLMN(p.PLMN.MCC, p.PLMN.MNC) {
-			return fmt.Errorf("sepp: config: n32.peers[%d]: invalid plmn %q/%q", i, p.PLMN.MCC, p.PLMN.MNC)
+	for i, p := range c.N32.Partners {
+		if p.N32.CAFile == "" && (p.N32.Address != "" || p.N32.SEPPFQDN != "") {
+			return fmt.Errorf("sepp: config: n32.partners[%d] (%s): n32.ca_file is required", i, p.PLMN)
 		}
-		if p.FQDN == "" {
-			return fmt.Errorf("sepp: config: n32.peers[%d]: fqdn is required", i)
-		}
-		host, port, err := net.SplitHostPort(p.Address)
-		if err != nil || host == "" || port == "" {
-			return fmt.Errorf("sepp: config: n32.peers[%d]: address %q must be host:port", i, p.Address)
+		if p.N32.Address != "" {
+			host, port, err := net.SplitHostPort(p.N32.Address)
+			if err != nil || host == "" || port == "" {
+				return fmt.Errorf("sepp: config: n32.partners[%d] (%s): address %q must be host:port", i, p.PLMN, p.N32.Address)
+			}
 		}
 	}
 	return nil
@@ -191,11 +366,12 @@ func defaults() *Config {
 	cfg.PLMN.MCC = "001"
 	cfg.PLMN.MNC = "01"
 	cfg.SBI.Address = "0.0.0.0:8014"
-	cfg.SBI.FQDN = "sepp.5gc.mnc001.mcc001.3gppnetwork.org"
 	cfg.SBI.TLS.CAFile = "/etc/5gc/pki/ca.crt"
 	cfg.SBI.TLS.CertFile = "/etc/5gc/pki/sepp.crt"
 	cfg.SBI.TLS.KeyFile = "/etc/5gc/pki/sepp.key"
 	cfg.N32.Address = "0.0.0.0:8443"
+	cfg.N32.TLS.CertFile = DefaultN32CertFile
+	cfg.N32.TLS.KeyFile = DefaultN32KeyFile
 	cfg.N32.TargetAPIRootSupported = true
 	cfg.Peers.NRF = "nrf:8000"
 	cfg.Metrics.Address = "0.0.0.0:9115"

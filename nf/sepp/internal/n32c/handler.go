@@ -26,6 +26,11 @@ const (
 	logCausePlmnMismatch   = "plmn_mismatch"
 	logCauseNoPeerCert     = "peer_identity_unavailable"
 	logCauseNoContext      = "no_context_for_teardown"
+	logCauseSenderDomain   = "sender_domain_mismatch"
+	logCauseTargetPlmn     = "target_plmn_not_served"
+	logCausePurpose        = "purpose_not_allowed"
+	// logCauseAccepted marks an accepted exchange-capability (result=OK).
+	logCauseAccepted = "handshake_accepted"
 )
 
 // reject writes a ProblemDetails response and logs the REJECT outcome.
@@ -40,12 +45,19 @@ func (s *Service) rejectParam(ctx context.Context, w http.ResponseWriter, status
 		pd.InvalidParams = []InvalidParam{{Param: param, Reason: detail}}
 	}
 	w.Header().Set("Content-Type", "application/problem+json")
+	// SEPP-originated error: Server header names the SEPP (same convention as n32f).
+	w.Header().Set("Server", serverHeaderPrefix+s.cfg.LocalFQDN)
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(pd)
 	if logCause == "" {
 		logCause = wireCause
 	}
 	countResult(resultReject)
+	if p, ok := peerFrom(ctx); ok {
+		s.record(p, RoleResponder, resultReject, logCause)
+	} else {
+		s.record(PlmnId{}, RoleResponder, resultReject, logCause)
+	}
 	attrs := append([]any{"result", resultReject, "cause", logCause, "status", status, "spec_ref", specStep2b}, extra...)
 	s.plog(ctx, "IN").Warn("exchange-capability rejected", attrs...)
 }
@@ -99,26 +111,32 @@ func (s *Service) HandleExchangeCapability(w http.ResponseWriter, r *http.Reques
 		s.reject(ctx, w, http.StatusForbidden, "", logCauseNoPeerCert, "peer certificate not usable")
 		return
 	}
+	ctx = withPeer(ctx, peer.PLMN)
 	lg := []any{"peer_plmn", peer.PLMN.String(), "peer_fqdn", peer.FQDN}
 	// E2: roaming-partner authorisation first (cause plmn_not_allowed).
 	if !s.isPartner(peer.PLMN) {
 		s.reject(ctx, w, http.StatusForbidden, "", logCausePlmnNotAllowed, "PLMN not allowed", lg...)
 		return
 	}
-	// E3: sender FQDN PLMN and every plmnIdList PLMN must equal the certificate PLMN.
-	if sp, err := ParsePLMNFromFQDN(req.Sender); err != nil || sp.Key() != peer.PLMN.Key() {
-		s.reject(ctx, w, http.StatusForbidden, "", logCausePlmnMismatch, "sender PLMN differs from certificate PLMN", lg...)
+	certPLMNs := certPLMNSet(peer)
+	// E9 (S4): sender must sit under the Home Network Domain of a certificate
+	// PLMN (TS 23.003 §28.5.1); no exact-FQDN match on the responder.
+	if !senderUnderCertDomain(req.Sender, certPLMNs) {
+		s.reject(ctx, w, http.StatusForbidden, "", logCauseSenderDomain, "sender is not under the certificate PLMN home network domain", lg...)
 		return
 	}
+	// E7 (S5): every plmnIdList entry must be a certificate PLMN (TS 33.501 §13.1.2).
 	for _, p := range req.PlmnIDList {
-		if p.Key() != peer.PLMN.Key() {
+		if !certPLMNs[p.Key()] {
 			s.reject(ctx, w, http.StatusForbidden, "", logCausePlmnMismatch, "plmnIdList differs from certificate PLMN", lg...)
 			return
 		}
 	}
+	// E8 (S3): the PLMN selected by targetPlmnId must be ours (TS 29.573 §5.2.2).
 	if req.TargetPlmnID != nil && req.TargetPlmnID.Key() != s.cfg.LocalPLMN.Key() {
-		s.plog(ctx, "IN").Warn("targetPlmnId is not the local PLMN", append(lg,
-			"target_plmn", req.TargetPlmnID.String(), "spec_ref", specStep1)...)
+		s.reject(ctx, w, http.StatusForbidden, "", logCauseTargetPlmn, "targetPlmnId is not served by this SEPP",
+			append(lg, "target_plmn", req.TargetPlmnID.String())...)
+		return
 	}
 
 	hasTLS, allNone := false, true
@@ -130,7 +148,13 @@ func (s *Service) HandleExchangeCapability(w http.ResponseWriter, r *http.Reques
 
 	switch {
 	case hasTLS:
-		s.negotiate(ctx, w, req, peer, rspFeatures, negotiated, lg)
+		// E10 (S2): purposes per Table 6.1.5.2.3-1 / 6.1.6.3-1.
+		allowed, rejected := splitPurposes(req.IntendedUsagePurpose)
+		if len(req.IntendedUsagePurpose) > 0 && len(allowed) == 0 {
+			s.reject(ctx, w, http.StatusForbidden, CausePurposeNotAllowed, logCausePurpose, "all requested usage purposes rejected", lg...)
+			return
+		}
+		s.negotiate(ctx, w, req, peer, rspFeatures, negotiated, lg, allowed, rejected)
 	case allNone:
 		s.teardown(ctx, w, peer, rspFeatures, lg)
 	default:
@@ -141,7 +165,7 @@ func (s *Service) HandleExchangeCapability(w http.ResponseWriter, r *http.Reques
 
 // negotiate selects TLS and stores the context. Ref: TS 29.573 §5.2.2 step 2a/2b.
 func (s *Service) negotiate(ctx context.Context, w http.ResponseWriter, req SecNegotiateReqData,
-	peer PeerIdentity, rspFeatures string, negotiated features.Set, lg []any) {
+	peer PeerIdentity, rspFeatures string, negotiated features.Set, lg []any, allowed, rejected []IntendedN32Purpose) {
 	// Collision (Rel-19 only; Rel-17 has no 409): step 2b.
 	if s.specLit {
 		if in, ok := s.lookupInflight(peer.PLMN); ok {
@@ -161,7 +185,7 @@ func (s *Service) negotiate(ctx context.Context, w http.ResponseWriter, req SecN
 	c := Context{
 		RemotePLMN: peer.PLMN, SecCapability: CapTLS, TargetAPIRootHeader: both,
 		Features: negotiated, NFTLST: negotiated.Has(featureNFTLST),
-		PeerFQDN: strings.ToLower(req.Sender), CreatedAt: s.cfg.Now(),
+		PeerFQDN: strings.ToLower(req.Sender), CertPLMNs: peerCertPLMNs(peer), CreatedAt: s.cfg.Now(),
 	}
 	// Delete the previous context (and its N32-f connections), then create.
 	_, existed := s.store.Replace(c)
@@ -172,11 +196,14 @@ func (s *Service) negotiate(ctx context.Context, w http.ResponseWriter, req SecN
 		TargetAPIRootSupported: both,
 		PlmnIDList:             []PlmnId{s.cfg.LocalPLMN},
 		SupportedFeatures:      rspFeatures,
+		AllowedUsagePurpose:    allowed,
+		RejectedUsagePurpose:   rejected,
 	}
 	writeFinalJSON(w, http.StatusOK, rsp)
 	countResult(resultOK)
+	s.record(peer.PLMN, RoleResponder, resultOK, "")
 	s.plog(ctx, "IN").Info("exchange-capability accepted", append(lg,
-		"result", resultOK, "selected", string(CapTLS), "target_api_root_header", both,
+		"result", resultOK, "cause", logCauseAccepted, "selected", string(CapTLS), "target_api_root_header", both,
 		"replaced", existed, "negotiated_features", negotiated.String(),
 		"spec_ref", specStep2a)...)
 	// The previous context's N32-f connections go after the response is out.
@@ -203,6 +230,7 @@ func (s *Service) teardown(ctx context.Context, w http.ResponseWriter, peer Peer
 		PlmnIDList: []PlmnId{s.cfg.LocalPLMN}, SupportedFeatures: rspFeatures,
 	})
 	countResult(resultOK)
+	s.record(peer.PLMN, RoleResponder, resultOK, "teardown")
 	s.plog(ctx, "IN").Info("N32-f TLS teardown accepted", append(lg,
 		"result", resultOK, "selected", string(CapNone), "spec_ref", specStep2a)...)
 	if s.cfg.Terminator != nil {
@@ -227,4 +255,42 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// serverHeaderPrefix: Server header of SEPP-originated errors, "SEPP-<FQDN>".
+const serverHeaderPrefix = "SEPP-"
+
+// certPLMNSet returns the canonical keys of the PLMNs of the verified peer
+// certificate (PeerIdentity.PLMNs, filled by CertPeerIdentity, which fails
+// when there is no TLS state). Only an identity injected by a test lacks the
+// set; it then stands for {PLMN}. Ref: TS 33.501 §13.1.2.
+func certPLMNSet(peer PeerIdentity) map[string]bool {
+	set := map[string]bool{peer.PLMN.Key(): true}
+	for _, p := range peer.PLMNs {
+		set[p.Key()] = true
+	}
+	return set
+}
+
+// senderUnderCertDomain reports whether sender ends in
+// ".5gc.mnc<MNC3>.mcc<MCC>.3gppnetwork.org" for a certificate PLMN.
+// Ref: TS 23.003 §28.5.1.
+func senderUnderCertDomain(sender string, plmns map[string]bool) bool {
+	s := strings.TrimSuffix(strings.ToLower(sender), ".")
+	for k := range plmns {
+		mcc, mnc, _ := strings.Cut(k, "-")
+		if strings.HasSuffix(s, ".5gc.mnc"+mnc+".mcc"+mcc+"."+homeNetworkDomainSuffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// peerCertPLMNs is the PLMN set stored in the N32 context: the certificate
+// set, or {PLMN} for an identity without one.
+func peerCertPLMNs(id PeerIdentity) []PlmnId {
+	if len(id.PLMNs) > 0 {
+		return append([]PlmnId(nil), id.PLMNs...)
+	}
+	return []PlmnId{id.PLMN.Canonical()}
 }

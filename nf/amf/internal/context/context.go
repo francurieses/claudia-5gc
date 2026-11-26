@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/roaming"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
 	"github.com/francurieses/claudia-5gc/shared/nas"
@@ -356,6 +357,12 @@ type UEContext struct {
 	// Access through SetSDMSubscriptionID / TakeSDMSubscriptionID (own mutex).
 	SDMSubscriptionID string
 	sdmMu             sync.Mutex
+	// homeRoute is the roaming route (SEPP + home AUSF/UDM apiRoots) chosen at
+	// Phase 1 for a UE of another PLMN; nil = non-roaming (local AUSF/UDM). In
+	// memory only; never recomputed after KSEAF. Access through
+	// SetHomeRoute / HomeRoute (own mutex). Ref: ROAM-001, TS 23.501 §6.3.4
+	homeRoute *roaming.Route
+	routeMu   sync.Mutex
 	// RFSP is the Radio Frequency Selection Priority index returned by PCF (1-256).
 	// Zero means PCF did not provide one.
 	// Ref: TS 23.501 §5.3.4.2, TS 29.507 §6.1.1.2.4
@@ -750,7 +757,11 @@ type PDUSession struct {
 	SNSSAI         SNSSAISubscribed
 	DNN            string
 	PDUSessionType string
-	QFIs           []uint8
+	// HSMFURI is the H-SMF Nsmf_PDUSession API URI of a home-routed (roaming)
+	// session; empty otherwise (and omitted from JSON, so non-HR persisted
+	// contexts are unchanged). Ref: ROAM-002, TS 29.502 Table 6.1.6.2.2-1
+	HSMFURI string `json:"hsmf_uri,omitempty"`
+	QFIs    []uint8
 	// N2SmTransfer is the APER-encoded PDUSessionResourceSetupRequestTransfer from
 	// the SMF at session establishment. Cached here so the AMF can populate the
 	// HandoverRequestTransfer during N2 handover without re-querying the SMF.
@@ -985,6 +996,10 @@ func (u *UEContext) SetCMState(s CMState) {
 // PostgreSQL (store) and the TMSI counter uses Redis (cache).
 type Manager struct {
 	mu sync.RWMutex
+
+	// roamingRouter drops the remembered per-SUPI roaming route when the UE
+	// context is removed (nil = roaming off). Ref: ROAM-001
+	roamingRouter *roaming.Router
 
 	// Key: AMF UE NGAP ID
 	uesByNGAPId map[int64]*UEContext
@@ -1409,6 +1424,14 @@ func (m *Manager) ListContexts() []UESnapshot {
 	return out
 }
 
+// SetRoamingRouter sets the router whose remembered route of a SUPI is forgotten
+// when its UE context is removed.
+func (m *Manager) SetRoamingRouter(r *roaming.Router) {
+	m.mu.Lock()
+	m.roamingRouter = r
+	m.mu.Unlock()
+}
+
 // Remove removes a UE context from all indexes and deletes it from PostgreSQL.
 // When called on a context that was displaced by a newer registration for the same
 // SUPI, it safely skips the SUPI map and DB deletion (the new context already owns
@@ -1442,7 +1465,11 @@ func (m *Manager) Remove(ctx context.Context, ue *UEContext) {
 		m.dropTMSILocked(ue, ue.prevTMSI)
 		ue.prevTMSI, ue.hasPrevTMSI = 0, false
 	}
+	rr := m.roamingRouter
 	m.mu.Unlock()
+	if ownsSUPI {
+		rr.Forget(ue.SUPI) // the UE's last home call is done (nil-safe)
+	}
 
 	if m.db != nil && ownsSUPI {
 		if err := m.db.DeleteUE(ctx, ue.SUPI); err != nil {
@@ -1609,6 +1636,20 @@ func recordToUEContext(rec *store.UERecord) *UEContext {
 		}
 	}
 	return ue
+}
+
+// SetHomeRoute records (nil clears) the roaming route of the UE.
+func (u *UEContext) SetHomeRoute(r *roaming.Route) {
+	u.routeMu.Lock()
+	u.homeRoute = r
+	u.routeMu.Unlock()
+}
+
+// HomeRoute returns the roaming route of the UE, nil when non-roaming.
+func (u *UEContext) HomeRoute() *roaming.Route {
+	u.routeMu.Lock()
+	defer u.routeMu.Unlock()
+	return u.homeRoute
 }
 
 // SetSDMSubscriptionID records the Nudm_SDM subscription id.

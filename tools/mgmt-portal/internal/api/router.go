@@ -43,6 +43,14 @@ type Deps struct {
 	MTLSClient *http.Client
 	// Release resolves the core's release profile from NF startup logs (nil = unknown).
 	Release *ReleaseResolver
+	// HomeNRF lists the NFs of the test peer (roaming profile, HOME_NRF_URL); nil = not wired.
+	HomeNRF *nrf.Client
+	// PartnersFile is the roaming partners file (ROAMING_PARTNERS_FILE); "" = DefaultPartnersFile.
+	PartnersFile string
+	// SEPPAdminBase is the SEPP admin base URL; "" = DefaultSEPPAdminBase.
+	SEPPAdminBase string
+	// Lifecycle overrides Docker for container restarts (tests); nil = Docker.
+	Lifecycle serviceLifecycle
 }
 
 // NewRouter builds the chi router for the management portal API.
@@ -90,6 +98,13 @@ func NewRouter(deps Deps, staticFS http.FileSystem) http.Handler {
 
 		// NF status (NRF + healthz)
 		r.Get("/nf-status", deps.handleNFStatus)
+
+		// Roaming (N32) — PORTAL-UI-22
+		r.Get("/roaming/status", deps.handleRoamingStatus)
+		r.Get("/roaming/partners", deps.handleGetPartners)
+		r.Put("/roaming/partners", deps.handlePutPartners)
+		r.Post("/roaming/{action}", deps.handleRoamingLifecycle)
+		r.Post("/roaming/sepp/{sepp}/n32/{plmn}/{action}", deps.handleRoamingN32Action)
 
 		// Sessions
 		r.Get("/sessions", deps.handleListSessions)

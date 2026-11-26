@@ -148,6 +148,11 @@ func main() {
 			nrfAddr := "https://" + cfg.Peers.NRF
 			nrfClient := nrf.New(nrfAddr, httpClient, logger)
 			profile := server.BuildNFProfile(cfg, relProfile)
+			// Optional sbi.fqdn: FQDN + ipEndPoints + plmnList (roaming home core); no-op when unset.
+			if err := nrf.ApplyFQDNIdentity(profile, cfg.SBI.FQDN, cfg.SBI.Address, cfg.PLMN.MCC, cfg.PLMN.MNC); err != nil {
+				logger.Error("invalid sbi.fqdn identity", "fqdn", cfg.SBI.FQDN, "error", err)
+				os.Exit(1)
+			}
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,

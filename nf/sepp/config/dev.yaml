@@ -12,17 +12,21 @@ sbi:
     key_file: /etc/5gc/pki/sepp.key
     ca_file: /etc/5gc/pki/ca.crt
 
-# N32 listener (N32-c handshake + N32-f forwarding between SEPPs). Used from REL19-9.4/9.5.
+# N32 listener (N32-c handshake + N32-f forwarding between SEPPs), TS 29.573 / TS 33.501 §13.1.
+# The default core has NO roaming partner: the listener starts if the local N32 certificate
+# exists and rejects every handshake until a partner is added.
+# Add a partner (inline `partners:` below, or the shared partners file
+# /etc/5gc/roaming/partners.yaml / env ROAMING_PARTNERS_FILE; the file wins per PLMN), then restart:
+#   see config/roaming/partners.example.yaml and docs/n32-interop-profile.md
+# The SBI CA is never an N32 trust anchor: each partner PLMN has its own ca_file.
 n32:
   address: "0.0.0.0:8443"
-  # Roaming partners accepted on N32-c (TS 29.573 §5.2.2). vSEPP (PLMN 001/01) <-> hSEPP (001/02).
-  roaming_partners:
-    - {mcc: "001", mnc: "02"}
-  # N32-c initiator targets (run at startup with retry/backoff).
-  peers:
-    - plmn: {mcc: "001", mnc: "02"}
-      fqdn: "sepp.5gc.mnc002.mcc001.3gppnetwork.org"
-      address: "sepp.5gc.mnc002.mcc001.3gppnetwork.org:8443"
+  # partners_file: /etc/5gc/roaming/partners.yaml   # default; ROAMING_PARTNERS_FILE overrides
+  # partners: []
+  # Local N32 certificate (SAN must name sbi.fqdn); no fallback to sbi.tls.
+  tls:
+    cert_file: /etc/5gc/pki/n32/local/sepp.crt
+    key_file: /etc/5gc/pki/n32/local/sepp.key
 
 peers:
   nrf: "nrf:8000"

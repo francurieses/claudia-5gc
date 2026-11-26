@@ -129,6 +129,11 @@ type Session struct {
 	DLPagingPending bool
 	dlPagingGen     uint64
 	dlPagingTimer   *time.Timer
+
+	// HR holds the home-routed PDU session attributes (V-SMF / H-SMF roles);
+	// nil for a non-roaming session. In-memory only, like Features: the store
+	// purges every session at startup. Ref: TS 29.502 §5.2.2.7; TS 23.501 §4.2.4.
+	HR *HRSession
 }
 
 // smPolicyQoS carries the QoS parameters extracted from the PCF SM Policy response.
@@ -144,7 +149,9 @@ type smPolicyQoS struct {
 }
 
 type Server struct {
-	shutdownDone chan struct{} // closed when the shutdown cleanup has finished
+	// vupfN9Allowed is vupf_n9_allowed_cidrs parsed once in New (H-SMF vcnTunnelInfo guard); read-only.
+	vupfN9Allowed []*net.IPNet
+	shutdownDone  chan struct{} // closed when the shutdown cleanup has finished
 	// orphanedByRestart lists the PDU sessions the previous SMF run had when it
 	// stopped; once associated with the UPF the SMF asks the AMF to release
 	// them so the UEs re-establish (TS 23.527 §4.3). Guarded by sessionMu.
@@ -176,7 +183,11 @@ type Server struct {
 	ipv6Pools map[string]*IPv6Pool
 	nextSEID  atomic.Uint64 // monotonic counter for PFCP CP-SEID
 	nextTEID  atomic.Uint32 // monotonic counter for UL GTP-U TEIDs
-	pfcpSeq   atomic.Uint32 // PFCP sequence number
+	// nextChargingID is the V-SMF Charging ID counter (home-routed sessions, hr_vsmf.go);
+	// n16Timeout overrides hrN16Timeout (tests only).
+	nextChargingID atomic.Uint32
+	n16Timeout     time.Duration
+	pfcpSeq        atomic.Uint32 // PFCP sequence number
 	// db is optional; nil = in-memory only (dev without Docker / unit tests).
 	db store.Store
 	// secondaryAuthDNNs marks which DNNs require DN-AAA secondary
@@ -202,6 +213,7 @@ type Server struct {
 	recoverCh  chan struct{} // supervisor wake-up after a detection event
 	releaseWG  sync.WaitGroup
 	guardWG    sync.WaitGroup // RELEASING guard timers (pfcp_node.go)
+	hrWG       sync.WaitGroup // deferred home-routed release cleanups (hr_vsmf.go finishDeferredHomeRelease)
 	hoWG       sync.WaitGroup // detached target-failed release/deactivation tasks (pfcp_ho.go)
 
 	// profile is the release profile gating supportedFeatures wire behaviour
@@ -301,6 +313,23 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option
 		ipPools[dnn.Name] = pool
 		logger.Info("SMF: DNN IP pool initialised", "dnn", dnn.Name, "pool", dnn.UEIPPool)
 	}
+	// V-SMF capable (a local SEPP is configured) without a dedicated N9 address: the V-UPF N9 endpoint
+	// and the H-UPF hcnTunnelInfo fall back to upf_n3_addr (valid for a single-interface UPF).
+	if cfg.Peers.SEPP != "" && cfg.UPFN9Addr == "" {
+		logger.Warn("SMF: peers.sepp is set but upf_n9_addr is empty, N9 falls back to upf_n3_addr",
+			"upf_n3_addr", cfg.UPFN3Addr, "spec_ref", "TS 29.244 §8.2.3; TS 23.501 §4.2.4")
+	}
+
+	// vupf_n9_allowed_cidrs (H-SMF vcnTunnelInfo guard): an invalid entry is a startup error.
+	vupfN9Allowed, cidrErr := cfg.ParseVUPFN9AllowedCIDRs()
+	if cidrErr != nil {
+		return nil, fmt.Errorf("smf: %w", cidrErr)
+	}
+	if len(vupfN9Allowed) == 0 {
+		logger.Warn("SMF: vupf_n9_allowed_cidrs is empty, any routable vcnTunnelInfo address is accepted by the H-SMF role",
+			"spec_ref", "TS 29.502 Table 6.1.6.2.28-1")
+	}
+
 	// Safety net: always have an "internet" pool even if config omits it.
 	if _, ok := ipPools["internet"]; !ok {
 		pool, err := NewIPPool(cfg.UEIPPool)
@@ -362,6 +391,7 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option
 	}
 
 	s := &Server{
+		vupfN9Allowed:     vupfN9Allowed,
 		cfg:               cfg,
 		logger:            logger,
 		httpClient:        httpClient,
@@ -399,6 +429,11 @@ func New(cfg *config.Config, logger *slog.Logger, db store.Store, opts ...Option
 	mux.HandleFunc("POST /nsmf-pdusession/v1/sm-contexts", s.handleCreateSMContext)
 	mux.HandleFunc("POST /nsmf-pdusession/v1/sm-contexts/{smContextRef}/modify", s.handleUpdateSMContext)
 	mux.HandleFunc("DELETE /nsmf-pdusession/v1/sm-contexts/{smContextRef}", s.handleDeleteSMContext)
+	// Home-routed roaming, H-SMF role (ROAM-002): Nsmf_PDUSession Create / Release on the
+	// PDU sessions collection. Ref: TS 29.502 §5.2.2.7, §5.2.2.9; TS 23.502 §4.3.2.2.2.
+	mux.HandleFunc("POST /nsmf-pdusession/v1/pdu-sessions", s.handleHsmfCreatePduSession)
+	mux.HandleFunc("POST /nsmf-pdusession/v1/pdu-sessions/{pduSessionRef}/release", s.handleHsmfReleasePduSession)
+	mux.HandleFunc("POST /nsmf-pdusession/v1/pdu-sessions/{pduSessionRef}/modify", s.handleHsmfUpdatePduSession)
 	// Internal management API — session inspection + NW-initiated QoS
 	// modification trigger (not a 3GPP SBI; consumed by MCP + portal).
 	mux.HandleFunc("GET /nsmf-management/v1/sessions", s.handleMgmtListSessions)
@@ -467,6 +502,16 @@ func (s *Server) loadFromStore(ctx context.Context) error {
 	return nil
 }
 
+// Graceful-shutdown HR release sub-budgets (implementation guards, not 3GPP timers). Each leg gets its own
+// deadline so a hung N16 or a slow DROP cannot starve the V-UPF deletion; their sum (hrShutdownBudget, 3.5 s)
+// stays below the 5 s shutdown window (Start shutCtx, main.go WaitShutdown) so the HTTP server still shuts down.
+const (
+	hrShutdownDropBudget = 500 * time.Millisecond
+	hrShutdownN16Budget  = 2 * time.Second
+	hrShutdownN4Budget   = 1 * time.Second
+	hrShutdownBudget     = hrShutdownDropBudget + hrShutdownN16Budget + hrShutdownN4Budget
+)
+
 // cleanupAllSessions releases the UPF side of all currently active sessions
 // (best-effort PFCP Session Deletion, awaited until ctx expires) and the SM
 // policies. The PostgreSQL rows are deliberately kept: the next run purges them
@@ -486,12 +531,42 @@ func (s *Server) cleanupAllSessions(ctx context.Context) {
 
 	var wg sync.WaitGroup
 	for _, sess := range sessions {
-		s.deleteSMPolicy(ctx, sess.SmPolicyID)
+		// Policy deletes run concurrently so they neither delay nor share the HR release window.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.deleteSMPolicy(ctx, sess.SmPolicyID)
+		}()
 		// A session N4Stale (UPF restarted, SEID unknown to the new UPF) gets no
 		// PFCP deletion. Ref: TS 23.527 §4.3, TS 29.244 §7.5.6.
 		s.sessionMu.Lock()
 		n4Stale := sess.N4Stale
+		hrVSMF := sess.HR != nil && sess.HR.Role == HRRoleVSMF
 		s.sessionMu.Unlock()
+		if hrVSMF {
+			// Home-routed V-SMF: UL FAR DROP + N16 Release + V-UPF deletion, honouring the per-leg
+			// flags, so the H-SMF/H-UPF session is not orphaned (state is memory-only, nothing can
+			// catch it after the restart). Ref: TS 23.502 §4.3.4.3 step 1b.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				hctx, hcancel := context.WithTimeout(ctx, hrShutdownBudget)
+				defer hcancel()
+				res := s.vsmfReleaseHomeLegs(hctx, sess, n4Stale, hrLegBudgets{
+					drop: hrShutdownDropBudget, n16: hrShutdownN16Budget, n4: hrShutdownN4Budget})
+				lvl, result := slog.LevelInfo, "OK"
+				if res.Failed() {
+					lvl, result = slog.LevelWarn, "FAILURE"
+				}
+				s.hrLoggerRole(ctx, hrVSMFRole).Log(ctx, lvl, "home-routed PDU session released on shutdown",
+					"interface", "Nsmf", "direction", "OUT", "supi", sess.SUPI, "pdu_session_id", sess.PDUSessionID,
+					"result", result, "failed_legs", res.FailedLegs(),
+					"cause", causeShutdown, "spec_ref", "TS 23.502 §4.3.4.3 step 1b")
+			}()
+			continue
+		}
+		// H-SMF role: only the H-UPF session is deleted here; notifying the V-SMF (Nsmf_PDUSession_StatusNotify,
+		// TS 29.502 §5.2.2.8) is not implemented.
 		if n4Stale {
 			continue
 		}
@@ -564,6 +639,12 @@ func (s *Server) Start(ctx context.Context) error {
 		defer cancel()
 		defer close(s.shutdownDone)
 		s.cleanupAllSessions(shutCtx)
+		hrDone := make(chan struct{})
+		go func() { s.hrWG.Wait(); close(hrDone) }()
+		select {
+		case <-hrDone:
+		case <-shutCtx.Done():
+		}
 		_ = s.httpSrv.Shutdown(shutCtx)
 	}()
 	var err error
@@ -676,6 +757,18 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 	unlockEst := s.lockEstablishment(supi, uint8(pduSessionID))
 	defer unlockEst()
 	s.releaseStaleSessions(r.Context(), log, supi, uint8(pduSessionID))
+
+	// Home-routed roaming (ROAM-002): hSmfUri makes this SMF the V-SMF. The branch is taken
+	// before any local allocation, UDM or PCF access; without hSmfUri nothing below changes.
+	// Ref: TS 29.502 Table 6.1.6.2.2-1 (hSmfUri), TS 23.502 §4.3.2.2.2 step 3a.
+	if hSmfURI, _ := req["hSmfUri"].(string); hSmfURI != "" {
+		s.handleVSMFCreateSMContext(w, r, &vsmfCreateIn{
+			req: req, hSmfURI: hSmfURI, supi: supi, dnn: dnn, psi: uint8(pduSessionID), pti: pti,
+			slice: slice, pduReq: pduReq, n1SmMsg: n1SmMsg, corrID: corrID,
+			negotiated: negotiated, sfAnswer: sfAnswer,
+		})
+		return
+	}
 
 	// Allocate UE IP from the DNN-specific pool (TS 23.501 §5.6.5).
 	// Fall back to "internet" pool when the requested DNN is not explicitly configured.
@@ -906,7 +999,9 @@ func (s *Server) handleCreateSMContext(w http.ResponseWriter, r *http.Request) {
 		attribute.Int("5qi", int(policyQoS.FiveQI)),
 	)
 	span.SetStatus(codes.Ok, "")
-	log.Info("Nsmf_PDUSession_CreateSMContext responded",
+	// The request logger carries direction=IN; build this line from a logger without it so the JSON line
+	// does not repeat the "direction" key.
+	s.logger.With("procedure", "SmContextCreate", "interface", "Nsmf", "correlation_id", corrID).Info("Nsmf_PDUSession_CreateSMContext responded",
 		"smContextRef", smContextRef,
 		"allocatedIP", allocatedIP,
 		"ipv6Prefix", v6PrefixStr,
@@ -1186,6 +1281,13 @@ func (s *Server) handleUpdateSMContext(w http.ResponseWriter, r *http.Request) {
 			"n1SmMsg":  base64.StdEncoding.EncodeToString(n1SmCmd),
 			"n2SmInfo": base64.StdEncoding.EncodeToString(n2SmInfo),
 		})
+		return
+	}
+
+	// UE-initiated release of a home-routed session (V-SMF role): PDU SESSION RELEASE REQUEST (0xD1)
+	// relayed by the AMF. Every other session (non-roaming, H-SMF) falls through unchanged.
+	// Ref: TS 23.502 §4.3.4.3 step 1a; TS 24.501 §8.3.12.
+	if s.handleVSMFUEReleaseRequest(w, r, smContextRef, body) {
 		return
 	}
 
@@ -1726,12 +1828,26 @@ func (s *Server) releaseSessionLocal(ctx context.Context, ref string, sess *Sess
 	delete(s.sessions, ref)
 	s.clearDLPagingLocked(sess) // stop the DLDR guard timer, drop pending
 	n4Stale := sess.N4Stale
+	// A UE-initiated home-routed release still running owns the legs: the DELETE is deferred to it
+	// (hr_vsmf.go runVSMFUERelease); otherwise vsmfReleaseHome retries only the legs not yet done.
+	// Only a caller that asked for N4 (sendN4) defers: a local-only delete sends nothing.
+	deferHome := sendN4 && sess.HR != nil && sess.HR.UEReleaseInProgress
+	if deferHome {
+		sess.HR.DeleteDeferred = true
+	}
 	s.sessionMu.Unlock()
 	s.deleteSession(ctx, ref)
 
 	metrics.PDUSessionsActive.WithLabelValues("SMF", sess.DNN).Dec()
 	// Delete SM Policy association with PCF (TS 29.512 §4.2.5.2; TS 23.502 §4.3.4.2 step 3b)
 	s.deleteSMPolicy(ctx, sess.SmPolicyID)
+	if sendN4 && sess.HR != nil && sess.HR.Role == HRRoleVSMF {
+		// Home-routed V-SMF: N16 release towards the H-SMF, then the V-UPF N4 deletion (hr_vsmf.go).
+		if !deferHome {
+			s.vsmfReleaseHome(ctx, sess, n4Stale)
+		}
+		return true
+	}
 	if sendN4 && !n4Stale {
 		go s.sendPFCPSessionDeletion(context.Background(), sess)
 	}

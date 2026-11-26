@@ -73,11 +73,13 @@ func (s *Service) Exchange(ctx context.Context, peerAPIRoot string, targetPLMN P
 			err = ErrAbandoned
 		}
 		countResult(resultFailure)
+		s.record(targetPLMN, RoleInitiator, resultFailure, err.Error())
 		lg.Warn("exchange-capability failed", "result", resultFailure, "cause", err.Error(), "spec_ref", specStep1)
 		return Context{}, fmt.Errorf("n32c: exchange: %w", err)
 	}
 	if rsp.SelectedSecCapability != CapTLS { // offered only TLS; PRINS/NONE/unknown are invalid
 		countResult(resultFailure)
+		s.record(targetPLMN, RoleInitiator, resultFailure, "invalid_selected_capability")
 		lg.Warn("exchange-capability invalid selection", "result", resultFailure,
 			"cause", "invalid_selected_capability", "selected", string(rsp.SelectedSecCapability), "spec_ref", specStep2a)
 		return Context{}, fmt.Errorf("n32c: exchange: selected %q: %w", rsp.SelectedSecCapability, ErrInvalidSelected)
@@ -85,20 +87,19 @@ func (s *Service) Exchange(ctx context.Context, peerAPIRoot string, targetPLMN P
 	// H1: the responder is authenticated by its server certificate, not by
 	// the body. A re-check of the collision cause guards the store update.
 	id, ierr := s.cfg.ResponderIdentity(rspMeta)
-	if ierr == nil && id.PLMN.Key() != targetPLMN.Key() {
-		ierr = fmt.Errorf("n32c: responder certificate PLMN %s is not the target %s", id.PLMN, targetPLMN)
-	}
 	if ierr == nil {
-		ierr = checkResponseConsistency(rsp, targetPLMN)
+		ierr = checkResponderCert(id, rsp, targetPLMN)
 	}
 	if ierr != nil {
 		countResult(resultFailure)
+		s.record(targetPLMN, RoleInitiator, resultFailure, "responder_identity_mismatch")
 		lg.Warn("responder verification failed", "result", resultFailure,
 			"cause", "responder_identity_mismatch", "error", ierr.Error(), "spec_ref", "TS 33.501 §13.1.2")
 		return Context{}, fmt.Errorf("n32c: exchange: verify responder: %w: %w", ErrResponderIdentity, ierr)
 	}
 	if errors.Is(context.Cause(cctx), ErrAbandoned) {
 		countResult(resultFailure)
+		s.record(targetPLMN, RoleInitiator, resultFailure, "abandoned")
 		lg.Warn("exchange abandoned before storing context", "result", resultFailure,
 			"cause", "abandoned", "spec_ref", specStep2b)
 		return Context{}, fmt.Errorf("n32c: exchange: %w", ErrAbandoned)
@@ -111,7 +112,7 @@ func (s *Service) Exchange(ctx context.Context, peerAPIRoot string, targetPLMN P
 		RemotePLMN: targetPLMN, SecCapability: CapTLS,
 		TargetAPIRootHeader: s.cfg.TargetAPIRootSupported && rsp.TargetAPIRootSupported,
 		Features:            neg, NFTLST: neg.Has(featureNFTLST),
-		PeerFQDN: id.FQDN, CreatedAt: s.cfg.Now(),
+		PeerFQDN: id.FQDN, CertPLMNs: peerCertPLMNs(id), CreatedAt: s.cfg.Now(),
 	}
 	if _, existed := s.store.Replace(c); existed && s.cfg.Terminator != nil {
 		s.cfg.Terminator(cctx, targetPLMN, reasonReplace)
@@ -119,7 +120,8 @@ func (s *Service) Exchange(ctx context.Context, peerAPIRoot string, targetPLMN P
 	// The N32-c HTTP/2 connection is terminated once TLS is selected.
 	s.cfg.HTTPClient.CloseIdleConnections()
 	countResult(resultOK)
-	lg.Info("exchange-capability completed", "result", resultOK, "selected", string(CapTLS), "spec_ref", specStep2a)
+	s.record(targetPLMN, RoleInitiator, resultOK, "")
+	lg.Info("exchange-capability completed", "result", resultOK, "cause", logCauseAccepted, "selected", string(CapTLS), "spec_ref", specStep2a)
 	return c, nil
 }
 
@@ -147,10 +149,12 @@ func (s *Service) Teardown(ctx context.Context, peerAPIRoot string, remote PlmnI
 	rspMeta, err := s.post(ctx, peerAPIRoot, req, &rsp)
 	if err != nil {
 		countResult(resultFailure)
+		s.record(remote, RoleInitiator, resultFailure, "teardown: "+err.Error())
 		lg.Warn("teardown failed", "result", resultFailure, "cause", err.Error(), "spec_ref", specStep1)
 		return fmt.Errorf("n32c: teardown: %w", err)
 	}
-	if id, ierr := s.cfg.ResponderIdentity(rspMeta); ierr != nil || id.PLMN.Key() != remote.Key() {
+	id, ierr := s.cfg.ResponderIdentity(rspMeta)
+	if ierr != nil || !certPLMNSet(id)[remote.Key()] {
 		countResult(resultFailure)
 		lg.Warn("responder verification failed", "result", resultFailure,
 			"cause", "responder_identity_mismatch", "spec_ref", "TS 33.501 §13.1.2")
@@ -161,7 +165,7 @@ func (s *Service) Teardown(ctx context.Context, peerAPIRoot string, remote PlmnI
 			"cause", "unexpected_selected_capability", "selected", string(rsp.SelectedSecCapability), "spec_ref", specStep2a)
 		return fmt.Errorf("n32c: teardown: selected %q: %w", rsp.SelectedSecCapability, ErrInvalidSelected)
 	}
-	if cerr := checkResponseConsistency(rsp, remote); cerr != nil {
+	if cerr := checkResponderCert(id, rsp, remote); cerr != nil {
 		countResult(resultFailure)
 		lg.Warn("responder verification failed", "result", resultFailure,
 			"cause", "responder_identity_mismatch", "error", cerr.Error(), "spec_ref", "TS 33.501 §13.1.2")
@@ -174,6 +178,7 @@ func (s *Service) Teardown(ctx context.Context, peerAPIRoot string, remote PlmnI
 		s.cfg.Terminator(ctx, remote, reasonTeardown)
 	}
 	countResult(resultOK)
+	s.record(remote, RoleInitiator, resultOK, "teardown")
 	lg.Info("teardown completed", "result", resultOK, "spec_ref", specStep2a)
 	return nil
 }
@@ -236,16 +241,22 @@ func (s *Service) offerFeatures() string {
 	return sup.String()
 }
 
-// checkResponseConsistency requires the body to agree with the target: when
-// sender is a 3gppnetwork.org FQDN its PLMN, and every plmnIdList entry, must
-// be the target PLMN (TS 33.501 §13.1.2).
-func checkResponseConsistency(rsp SecNegotiateRspData, target PlmnId) error {
-	if p, err := ParsePLMNFromFQDN(rsp.Sender); err != nil || p.Key() != target.Key() {
-		return fmt.Errorf("n32c: response sender %q is not in target PLMN %s", rsp.Sender, target)
+// checkResponderCert applies to the responder the same rules the responder
+// applies to an initiator: the target PLMN is one of the certificate PLMNs, the
+// response sender sits under the Home Network Domain of a certificate PLMN and
+// every plmnIdList entry is a certificate PLMN (TS 33.501 §13.1.2;
+// TS 23.003 §28.5.1).
+func checkResponderCert(id PeerIdentity, rsp SecNegotiateRspData, target PlmnId) error {
+	set := certPLMNSet(id)
+	if !set[target.Key()] {
+		return fmt.Errorf("n32c: responder certificate PLMNs do not include the target %s", target)
+	}
+	if !senderUnderCertDomain(rsp.Sender, set) {
+		return fmt.Errorf("n32c: response sender %q is not under a certificate PLMN home network domain", rsp.Sender)
 	}
 	for _, p := range rsp.PlmnIDList {
-		if p.Key() != target.Key() {
-			return fmt.Errorf("n32c: response plmnIdList entry %s is not the target PLMN %s", p, target)
+		if !set[p.Key()] {
+			return fmt.Errorf("n32c: response plmnIdList entry %s is not a certificate PLMN", p)
 		}
 	}
 	return nil

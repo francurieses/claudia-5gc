@@ -26,6 +26,34 @@ type Service struct {
 	State   string `json:"state"`
 	Created int64  `json:"created"`
 	Uptime  string `json:"uptime"`
+	// NF is the container's `logging.5gc/nf` label (AMF, SEPP, NRF, ...); empty
+	// for sidecars, simulators and the observability stack.
+	NF string `json:"nf,omitempty"`
+	// Health is the Docker healthcheck state (healthy | unhealthy | starting),
+	// empty when the container has no healthcheck or is not running.
+	Health string `json:"health,omitempty"`
+	// Side is the PLMN side of a roaming deployment (local | partner), set by
+	// the API layer for NF containers (PORTAL-UI-22).
+	Side string `json:"side,omitempty"`
+}
+
+// NFLabel is the compose label naming the NF a container runs (also used by
+// promtail as the Loki `nf` label).
+const NFLabel = "logging.5gc/nf"
+
+// HealthFromStatus extracts the healthcheck state from a container status
+// string such as "Up 5 minutes (healthy)" or "Up 3 seconds (health: starting)".
+func HealthFromStatus(status string) string {
+	switch {
+	case strings.Contains(status, "(healthy)"):
+		return "healthy"
+	case strings.Contains(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.Contains(status, "health: starting"):
+		return "starting"
+	default:
+		return ""
+	}
 }
 
 // ExecResult holds the output of a container exec operation.
@@ -103,6 +131,8 @@ func (c *Client) List(ctx context.Context) ([]Service, error) {
 			State:   ctr.State,
 			Created: ctr.Created,
 			Uptime:  uptime,
+			NF:      ctr.Labels[NFLabel],
+			Health:  HealthFromStatus(ctr.Status),
 		})
 	}
 	return svcs, nil
@@ -344,6 +374,21 @@ func (c *Client) RunOnce(ctx context.Context, name, imageRef, networkMode string
 		return ExecResult{}, err
 	}
 	return ExecResult{ExitCode: code, Output: out}, nil
+}
+
+// TailLogs returns the last tail lines (stdout+stderr) of a container without
+// following the stream.
+func (c *Client) TailLogs(ctx context.Context, name, tail string) (string, error) {
+	rc, err := c.cli.ContainerLogs(ctx, name, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: tail})
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+	var out, errb bytes.Buffer
+	if _, err := stdcopy.StdCopy(&out, &errb, rc); err != nil {
+		return "", err
+	}
+	return out.String() + errb.String(), nil
 }
 
 // ContainerLogs returns the combined stdout+stderr of a container as a string.

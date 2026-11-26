@@ -77,7 +77,7 @@ func All(d Deps) []registry.Tool {
 	return []registry.Tool{
 		coreHealthTool{d}, deploymentTool{d}, subscriberListTool{d}, subscriberGetTool{d},
 		configViewTool{d}, pwsListTool{d},
-		mcpInfoTool{d}, sliceStatusTool{d}, pcfBindingListTool{d},
+		mcpInfoTool{d}, sliceStatusTool{d}, pcfBindingListTool{d}, roamingStatusTool{d},
 	}
 }
 

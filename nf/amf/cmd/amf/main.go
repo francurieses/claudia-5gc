@@ -28,6 +28,7 @@ import (
 	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/roaming"
 	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/store"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
@@ -236,6 +237,24 @@ func main() {
 		)
 	}
 
+	// Roaming over N32 (ROAM-001): nil router = feature off, local peers only.
+	// Partners come from ROAMING_PARTNERS_FILE (SEPP-005); a bad file is fatal.
+	roamingCfg, err := roaming.ResolveConfig(cfg.Roaming, logger)
+	if err == nil {
+		cfg.Roaming = roamingCfg
+		_, err = roaming.New(cfg.Roaming, cfg.PLMN.MCC, cfg.PLMN.MNC)
+	}
+	if err != nil {
+		logger.Error("AMF: invalid roaming config", "cause", "config_invalid", "error", err)
+		os.Exit(1)
+	}
+	roamingRouter, _ := roaming.New(cfg.Roaming, cfg.PLMN.MCC, cfg.PLMN.MNC)
+	if roamingRouter.Enabled() {
+		logger.Info("roaming over N32 enabled",
+			"sepp_address", cfg.Roaming.SEPPAddress, "home_plmns", len(cfg.Roaming.HomePLMNs),
+			"spec_ref", "TS 23.502 §4.2.2.2.2; TS 29.500 §6.1.4.3")
+	}
+
 	ausfClient := &HTTPAUSFClient{
 		address: cfg.Peers.AUSFAddress,
 		client:  sbiClient,
@@ -248,6 +267,7 @@ func main() {
 		profile: relProfile,
 		logger:  logger,
 	}
+	udmClient.router = roamingRouter
 	udmClient.SetSelf(cfg.NFInstanceID, ownAPIRoot(cfg.SBI.APIRoot, cfg.SBI.Address),
 		cfg.PLMN.MCC, cfg.PLMN.MNC, cfg.AMFRegionID, cfg.AMFSetID, cfg.AMFID)
 	smfClient := &HTTPSMFClient{
@@ -340,6 +360,8 @@ func main() {
 		mgr, ausfClient, udmClient, nrfDiscClient,
 		cfg.NFInstanceID, cfg.PLMN.MCC, cfg.PLMN.MNC, logger,
 	)
+	regHandler.WithRoaming(roamingRouter)
+	mgr.SetRoamingRouter(roamingRouter)
 	if cfg.Peers.NSSFAddress != "" {
 		regHandler.WithNSSF(&HTTPNSSFClient{
 			address: cfg.Peers.NSSFAddress,
@@ -685,6 +707,10 @@ func main() {
 		}
 
 		if supi != "" {
+			ctx := roaming.WithRoute(ctx, ue.HomeRoute()) // home UDM of a roaming UE
+			if ue.HomeRoute() != nil {
+				ctx = roaming.WithRoamingRequired(ctx)
+			}
 			if id := ue.TakeSDMSubscriptionID(); id != "" {
 				if err := udmClient.UnsubscribeSDM(ctx, supi, id); err != nil {
 					logger.Warn("UDM SDM unsubscribe failed", "supi", supi, "error", err,
@@ -743,6 +769,10 @@ func main() {
 		}
 
 		if supi != "" {
+			ctx := roaming.WithRoute(ctx, ue.HomeRoute()) // home UDM of a roaming UE
+			if ue.HomeRoute() != nil {
+				ctx = roaming.WithRoamingRequired(ctx)
+			}
 			if id := ue.TakeSDMSubscriptionID(); id != "" {
 				if err := udmClient.UnsubscribeSDM(ctx, supi, id); err != nil {
 					logger.Warn("UDM SDM unsubscribe failed", "supi", supi, "error", err,
@@ -1419,7 +1449,11 @@ type Config struct {
 		// Address>. Ref: TS 29.503 §6.2.6.2.2 deregCallbackUri
 		APIRoot string `yaml:"api_root"`
 	} `yaml:"sbi"`
-	Peers struct {
+	// Roaming configures roaming over N32 (local AMF -> SEPP -> partner SEPP -> hAUSF/hUDM);
+	// absent or enabled: false = local AUSF/UDM only. Ref: ROAM-001,
+	// docs/procedures/RoamingRegistration.md §7.4
+	Roaming roaming.Config `yaml:"roaming"`
+	Peers   struct {
 		NRFAddress  string `yaml:"nrf"`
 		AUSFAddress string `yaml:"ausf"`
 		UDMAddress  string `yaml:"udm"`
@@ -1581,6 +1615,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.NGAP.Address == "" {
 		c.NGAP.Address = "0.0.0.0:38412"
+	}
+	if _, err := roaming.New(c.Roaming, c.PLMN.MCC, c.PLMN.MNC); err != nil {
+		return nil, err
 	}
 	if _, err := ngap.NewRANProfiles(c.NGAP.RANProfiles); err != nil {
 		return nil, fmt.Errorf("amf: ngap config: %w", err)

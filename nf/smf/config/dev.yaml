@@ -30,6 +30,7 @@ peers:
     amf_mgmt: amf:9002
     nrf: nrf:8000
     pcf: pcf:8006
+    sepp: sepp:8014
     udm: udm:8003
     upf: upf:8805
 sbi:
@@ -49,6 +50,7 @@ snssais:
     - sd: "001234"
       sst: 1
 upf_n3_addr: 172.30.3.100
+upf_n9_addr: 172.30.20.100
 
 # Release profile (default rel19; rel17 = frozen legacy baseline). rel19 enables spec-literal
 # SBI supportedFeatures negotiation (TS 29.500 §6.6.2). NF_RELEASE_PROFILE overrides.

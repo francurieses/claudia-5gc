@@ -643,3 +643,24 @@ func TestOutboundPLMNlessHeaderPointsAtHeader(t *testing.T) {
 		t.Fatalf("invalidParams = %+v, want the %s header", pd.InvalidParams, HeaderTargetAPIRoot)
 	}
 }
+
+func TestCertSubset(t *testing.T) {
+	p1, p2 := n32c.PlmnId{Mcc: "001", Mnc: "01"}, n32c.PlmnId{Mcc: "001", Mnc: "02"}
+	ctx := n32c.Context{RemotePLMN: p1, CertPLMNs: []n32c.PlmnId{p1}}
+	for name, tc := range map[string]struct {
+		id   n32c.PeerIdentity
+		c    n32c.Context
+		want bool
+	}{
+		"equal":              {n32c.PeerIdentity{PLMN: p1, PLMNs: []n32c.PlmnId{p1}}, ctx, true},
+		"extra plmn":         {n32c.PeerIdentity{PLMN: p1, PLMNs: []n32c.PlmnId{p1, p2}}, ctx, false},
+		"no set uses PLMN":   {n32c.PeerIdentity{PLMN: p1}, ctx, true},
+		"empty ctx set":      {n32c.PeerIdentity{PLMN: p1}, n32c.Context{RemotePLMN: p1}, true},
+		"empty ctx other":    {n32c.PeerIdentity{PLMN: p2}, n32c.Context{RemotePLMN: p1}, false},
+		"mnc padding equals": {n32c.PeerIdentity{PLMN: p1, PLMNs: []n32c.PlmnId{{Mcc: "001", Mnc: "001"}}}, ctx, true},
+	} {
+		if got := certSubset(tc.id, tc.c); got != tc.want {
+			t.Errorf("%s: got %v want %v", name, got, tc.want)
+		}
+	}
+}

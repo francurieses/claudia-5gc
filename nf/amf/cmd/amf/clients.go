@@ -17,11 +17,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
 	nasmsg "github.com/francurieses/claudia-5gc/nf/amf/internal/nas"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/ngap"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/procedures"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/roaming"
 	amfsbi "github.com/francurieses/claudia-5gc/nf/amf/internal/sbi"
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/crypto/eap"
@@ -201,18 +203,42 @@ func av5gAkaValue(name, s string) ([]byte, error) {
 	return b, nil
 }
 
+// ausfAuthPath is the Nausf_UEAuthentication ue-authentications collection.
+// Ref: TS 29.509 §5.2.2.2
+const ausfAuthPath = "/nausf-auth/v1/ue-authentications"
+
+// ausfProblem reads a non-2xx Nausf answer into a typed *procedures.AUSFError
+// whose text equals the historic untyped error.
+func ausfProblem(op string, resp *http.Response) error {
+	var prob map[string]any
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxNegotiationBodyBytes)).Decode(&prob); err != nil {
+		// cause stays empty: the error is mapped from the status alone, as before.
+		slog.Warn("AUSF problem details not decodable",
+			"nf", "AMF", "procedure", "InitialRegistration", "interface", "Nausf", "direction", "IN",
+			"result", "FAILURE", "operation", op, "status", resp.StatusCode, "error", err,
+			"spec_ref", "TS 29.509 §6.1.7.3; TS 29.571 §5.2.4.1")
+	}
+	cause, _ := prob["cause"].(string)
+	return &procedures.AUSFError{Op: op, Status: resp.StatusCode, Cause: cause}
+}
+
 func (c *HTTPAUSFClient) InitiateAuth(ctx context.Context, supiOrSuci, servingNetName string) (*procedures.AUSFInitResponse, error) {
 	body, offer := c.initAuthBody(map[string]any{
 		"supiOrSuci":         supiOrSuci,
 		"servingNetworkName": servingNetName,
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://"+c.address+"/nausf-auth/v1/ue-authentications",
-		bytes.NewReader(body))
+	rt := roaming.RouteFrom(ctx)
+	if err := requireRoute(ctx, rt); err != nil {
+		return nil, fmt.Errorf("amf: ausf authentication: %w", err)
+	}
+	target, hop := routedTarget(rt, roaming.NFAUSF, c.address, ausfAuthPath)
+	req, err := http.NewRequestWithContext(ctx, "POST", target, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("amf: build ausf authentication request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nausf", "InitialRegistration", "TS 29.509 §5.2.2.2; TS 29.500 §6.1.4.3", rt, hop)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -221,9 +247,7 @@ func (c *HTTPAUSFClient) InitiateAuth(ctx context.Context, supiOrSuci, servingNe
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		var prob map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&prob)
-		return nil, fmt.Errorf("ausf: initiate auth: status %d cause=%v", resp.StatusCode, prob["cause"])
+		return nil, ausfProblem("initiate auth", resp)
 	}
 
 	var result nausfAuthCtx
@@ -259,13 +283,18 @@ func (c *HTTPAUSFClient) ResyncAuth(ctx context.Context, supiOrSuci, servingNetN
 			"auts": hex.EncodeToString(auts),
 		},
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"https://"+c.address+"/nausf-auth/v1/ue-authentications",
-		bytes.NewReader(body))
+	rt := roaming.RouteFrom(ctx)
+	if err := requireRoute(ctx, rt); err != nil {
+		return nil, fmt.Errorf("amf: ausf authentication: %w", err)
+	}
+	target, hop := routedTarget(rt, roaming.NFAUSF, c.address, ausfAuthPath)
+	req, err := http.NewRequestWithContext(ctx, "POST", target, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("amf: build ausf authentication request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nausf", "InitialRegistration", "TS 29.509 §5.2.2.2; TS 29.500 §6.1.4.3", rt, hop)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -273,9 +302,7 @@ func (c *HTTPAUSFClient) ResyncAuth(ctx context.Context, supiOrSuci, servingNetN
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		var prob map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&prob)
-		return nil, fmt.Errorf("ausf: resync auth: status %d cause=%v", resp.StatusCode, prob["cause"])
+		return nil, ausfProblem("resync auth", resp)
 	}
 
 	var result nausfAuthCtx
@@ -313,18 +340,30 @@ func (c *HTTPAUSFClient) ConfirmAuth(ctx context.Context, authCtxID, resStar str
 	if err != nil {
 		return nil, fmt.Errorf("amf: encode ausf confirmation: %w", err)
 	}
-	url := "https://" + c.address + "/nausf-auth/v1/ue-authentications/" + authCtxID + "/5g-aka-confirmation"
+	rt := roaming.RouteFrom(ctx)
+	if err := requireRoute(ctx, rt); err != nil {
+		return nil, fmt.Errorf("amf: ausf confirmation: %w", err)
+	}
+	url, hop := routedTarget(rt, roaming.NFAUSF, c.address, ausfAuthPath+"/"+authCtxID+"/5g-aka-confirmation")
 	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("amf: build ausf confirmation request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nausf", "InitialRegistration", "TS 29.509 §5.2.2.3; TS 29.500 §6.1.4.3", rt, hop,
+		"auth_ctx_id", authCtxID)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ausf: confirm auth: %w", err)
 	}
 	defer resp.Body.Close()
+	if rt != nil && resp.StatusCode >= 300 {
+		// Roaming path only: an error answer (hAUSF 403, SEPP 504) is a typed
+		// failure, not an authentication result. The local path is unchanged.
+		return nil, ausfProblem("confirm auth", resp)
+	}
 
 	var result struct {
 		AuthResult string `json:"authResult"`
@@ -762,6 +801,23 @@ type HTTPUDMClient struct {
 	// deregCallbackUri) and Nudm_SDM subscription (callbackReference) bodies
 	// need; nil = legacy registration body, no SDM subscription.
 	self *udmSelf
+	// router remembers the roaming route per SUPI for the calls that carry no
+	// route on their context (deregistration); nil = roaming off.
+	router *roaming.Router
+}
+
+// route returns the roaming route of a Nudm call: the one on ctx, else the one
+// remembered for the SUPI; nil = local UDM. A UE known to be roaming without a
+// usable route is an error: the request never goes to the local UDM.
+func (c *HTTPUDMClient) route(ctx context.Context, supi string) (*roaming.Route, error) {
+	rt := roaming.RouteFrom(ctx)
+	if rt == nil {
+		rt = c.router.ForSUPI(supi)
+	}
+	if err := requireRoute(ctx, rt); err != nil {
+		return nil, err
+	}
+	return rt, nil
 }
 
 // udmSelf is the AMF's own identity towards the UDM. Ref: TS 29.503 §6.2.6.2.2,
@@ -859,12 +915,19 @@ func (c *HTTPUDMClient) RegisterAMF(ctx context.Context, supi, amfInstanceID, se
 	if err != nil {
 		return fmt.Errorf("amf: encode uecm registration: %w", err)
 	}
-	target := fmt.Sprintf("https://%s/nudm-uecm/v1/%s/registrations/amf-3gpp-access", c.address, supi)
+	rt, rerr := c.route(ctx, supi)
+	if rerr != nil {
+		return &procedures.UDMError{Op: "uecm registration", Err: rerr}
+	}
+	target, hop := routedTarget(rt, roaming.NFUDM, c.address,
+		fmt.Sprintf("/nudm-uecm/v1/%s/registrations/amf-3gpp-access", supi))
 	req, err := http.NewRequestWithContext(ctx, "PUT", target, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("amf: build uecm registration request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nudm", "UECMRegistration", "TS 29.503 §5.3.2.2; TS 29.500 §6.1.4.3", rt, hop, "supi", supi)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return &procedures.UDMError{Op: "uecm register", Err: fmt.Errorf("amf: uecm register: %w", err)}
@@ -932,11 +995,18 @@ func registrationAnswer(r io.Reader) (string, error) {
 // Called after deregistration to clean up UDM state.
 // Ref: TS 29.503 §5.3.2.4 (Nudm_UECM_Deregistration)
 func (c *HTTPUDMClient) DeregisterUECM(ctx context.Context, supi string) error {
-	url := fmt.Sprintf("https://%s/nudm-uecm/v1/%s/registrations/amf-3gpp-access", c.address, supi)
+	rt, rerr := c.route(ctx, supi)
+	if rerr != nil {
+		return &procedures.UDMError{Op: "uecm deregistration", Err: rerr}
+	}
+	url, hop := routedTarget(rt, roaming.NFUDM, c.address,
+		fmt.Sprintf("/nudm-uecm/v1/%s/registrations/amf-3gpp-access", supi))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("amf: build uecm deregistration request: %w", err)
 	}
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nudm", "UECMDeregistration", "TS 29.503 §5.3.2.4; TS 29.500 §6.1.4.3", rt, hop, "supi", supi)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("amf: deregister UE: %w", err)
@@ -946,6 +1016,9 @@ func (c *HTTPUDMClient) DeregisterUECM(ctx context.Context, supi string) error {
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK &&
 		resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("udm: deregister UE: status %d", resp.StatusCode)
+	}
+	if rt != nil {
+		c.router.Forget(supi) // UE deregistered at the home UDM: route no longer needed
 	}
 	return nil
 }
@@ -969,12 +1042,18 @@ func (c *HTTPUDMClient) SubscribeAMData(ctx context.Context, supi string) (strin
 	if err != nil {
 		return "", fmt.Errorf("amf: encode sdm subscription: %w", err)
 	}
-	u := fmt.Sprintf("https://%s/nudm-sdm/v2/%s/sdm-subscriptions", c.address, supi)
+	rt, rerr := c.route(ctx, supi)
+	if rerr != nil {
+		return "", &procedures.UDMError{Op: "sdm subscribe", Err: rerr}
+	}
+	u, hop := routedTarget(rt, roaming.NFUDM, c.address, fmt.Sprintf("/nudm-sdm/v2/%s/sdm-subscriptions", supi))
 	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("amf: build sdm subscribe request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nudm", "SDMSubscribe", "TS 29.503 §5.2.2.3; TS 29.500 §6.1.4.3", rt, hop, "supi", supi)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", &procedures.UDMError{Op: "sdm subscribe", Err: fmt.Errorf("amf: sdm subscribe: %w", err)}
@@ -995,11 +1074,18 @@ func (c *HTTPUDMClient) SubscribeAMData(ctx context.Context, supi string) (strin
 // UnsubscribeSDM implements Nudm_SDM_Unsubscribe (DELETE); 404 = already gone.
 // Ref: TS 29.503 §5.2.2.4
 func (c *HTTPUDMClient) UnsubscribeSDM(ctx context.Context, supi, subscriptionID string) error {
-	u := fmt.Sprintf("https://%s/nudm-sdm/v2/%s/sdm-subscriptions/%s", c.address, supi, url.PathEscape(subscriptionID))
+	rt, rerr := c.route(ctx, supi)
+	if rerr != nil {
+		return &procedures.UDMError{Op: "sdm unsubscribe", Err: rerr}
+	}
+	u, hop := routedTarget(rt, roaming.NFUDM, c.address,
+		fmt.Sprintf("/nudm-sdm/v2/%s/sdm-subscriptions/%s", supi, url.PathEscape(subscriptionID)))
 	req, err := http.NewRequestWithContext(ctx, "DELETE", u, nil)
 	if err != nil {
 		return fmt.Errorf("amf: build sdm unsubscribe request: %w", err)
 	}
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nudm", "SDMUnsubscribe", "TS 29.503 §5.2.2.4; TS 29.500 §6.1.4.3", rt, hop, "supi", supi)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return &procedures.UDMError{Op: "sdm unsubscribe", Err: fmt.Errorf("amf: sdm unsubscribe: %w", err)}
@@ -1021,7 +1107,11 @@ type amSnssai struct {
 }
 
 func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) (*procedures.UDMAMSubscription, error) {
-	reqURL := fmt.Sprintf("https://%s/nudm-sdm/v2/%s/am-data", c.address, supi)
+	rt, rerr := c.route(ctx, supi)
+	if rerr != nil {
+		return nil, &procedures.UDMError{Op: "sdm get", Err: rerr}
+	}
+	reqURL, hop := routedTarget(rt, roaming.NFUDM, c.address, fmt.Sprintf("/nudm-sdm/v2/%s/am-data", supi))
 	// The supported-features query parameter is optional for a GET ("may
 	// include", TS 29.500 §6.6.2): sent under rel19 only (decision D2).
 	offer := features.Request(c.sdmCat(), c.profile)
@@ -1032,11 +1122,17 @@ func (c *HTTPUDMClient) GetAMSubscriptionData(ctx context.Context, supi string) 
 	if err != nil {
 		return nil, fmt.Errorf("amf: build udm am-data request: %w", err)
 	}
+	applyHop(req, hop)
+	logRoamingHop(ctx, c.logger, "Nudm", "SDMGet", "TS 29.503 §5.2.2.2; TS 29.500 §6.1.4.3", rt, hop, "supi", supi)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("amf: get AM data: %w", err)
 	}
 	defer resp.Body.Close()
+	if rt != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		// Roaming path only: an error answer (hUDM, SEPP 504) fails the fetch.
+		return nil, udmProblem("sdm get", resp)
+	}
 
 	var result struct {
 		NSSAI struct {
@@ -1188,6 +1284,13 @@ func (c *HTTPSMFClient) cat() *features.Catalog {
 	return amfsbi.NsmfPDUSessionCatalog()
 }
 
+// hrCreateSMContextTimeout is the CreateSMContext HTTP timeout on the
+// home-routed path: V-SMF -> local SEPP -> remote SEPP -> H-SMF -> hUDM/H-UPF
+// must fit, so it exceeds the 10 s default of the shared SBI client. Used only
+// when a home-routing descriptor is in the context. Ref: ROAM-002, procedure
+// doc HomeRoutedPduSession §7.1; TS 23.502 §4.3.2.2.2
+const hrCreateSMContextTimeout = 30 * time.Second
+
 // CreateSMContext implements Nsmf_PDUSession_CreateSMContext (consumer side).
 // Under the rel19 profile the request carries supportedFeatures (TS 29.500
 // §6.6.2: the client shall include it when creating a resource) and the
@@ -1209,20 +1312,52 @@ func (c *HTTPSMFClient) CreateSMContext(ctx context.Context, supi, dnn string, p
 	if offer != "" {
 		fields["supportedFeatures"] = offer
 	}
-	body, _ := json.Marshal(fields)
-	req, _ := http.NewRequestWithContext(ctx, "POST",
+	// Home-routed roaming session (ROAM-002): the attributes that make the local
+	// SMF a V-SMF. hplmnSnssai is always sent for a roaming session, also with
+	// identity mapping; dnn becomes the full DNN. Absent = byte-identical body.
+	// Ref: TS 29.502 Table 6.1.6.2.2-1; TS 23.003 §9.1.2
+	httpc := c.client
+	if hr, ok := roaming.HomeRoutingFrom(ctx); ok {
+		fields["hSmfUri"] = hr.HSMFURI
+		// sd is optional in Snssai (TS 29.571 §5.4.4.2): omit it when empty.
+		hplmn := map[string]any{"sst": int(hr.HPLMNSST)}
+		if hr.HPLMNSD != "" {
+			hplmn["sd"] = hr.HPLMNSD
+		}
+		fields["hplmnSnssai"] = hplmn
+		fields["dnn"] = hr.FullDNN
+		// The V-SMF waits for 2 SEPP hops + H-SMF + hUDM + H-UPF: widen the timeout
+		// on the HR path only (procedure doc §7.1 budget note).
+		if httpc != nil && httpc.Timeout < hrCreateSMContextTimeout {
+			cp := *httpc
+			cp.Timeout = hrCreateSMContextTimeout
+			httpc = &cp
+		}
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return "", nil, nil, features.Set{}, fmt.Errorf("smf: encode create sm context: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
 		"https://"+c.address+"/nsmf-pdusession/v1/sm-contexts",
 		bytes.NewReader(body))
+	if err != nil {
+		return "", nil, nil, features.Set{}, fmt.Errorf("smf: build create sm context request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.client.Do(req)
+	resp, err := httpc.Do(req)
 	if err != nil {
 		return "", nil, nil, features.Set{}, fmt.Errorf("smf: create sm context: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated {
-		return "", nil, nil, features.Set{}, fmt.Errorf("smf: status %d", resp.StatusCode)
+		// SmContextCreateError with an N1 SM reject is returned typed so the
+		// AMF relays it to the UE; anything else stays a plain error.
+		// Ref: TS 29.502 §5.2.2.2.1; TS 23.502 §4.3.2.2.2 step 3b/16.
+		eb, _ := io.ReadAll(io.LimitReader(resp.Body, maxSMContextCreateErrorBody))
+		return "", nil, nil, features.Set{}, parseSMContextCreateError(resp.StatusCode, resp.Header.Get("Content-Type"), eb)
 	}
 
 	// Unknown attributes are ignored (TS 29.500 §6.6.2): only the ones named

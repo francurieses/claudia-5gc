@@ -26,12 +26,17 @@ var knownNFs = []struct {
 	{"bsf", "https://bsf:8010", "9111"},
 	{"nef", "https://nef:8011", "9112"},
 	{"lmf", "https://lmf:8012", "9113"},
-	{"vsepp", "https://vsepp:8014", "9115"},
+	{"sepp", "https://sepp:8014", "9115"},
+	// Test peer (compose profile roaming): listed only while their container
+	// exists; registered = present in the test-peer NRF (PORTAL-UI-22).
+	{"hsepp", "https://hsepp:8014", "9115"},
+	{"hnrf", "https://hnrf:8000", "9100"},
 }
 
 // NFStatus holds the health status for a single NF.
 type NFStatus struct {
 	Name       string `json:"name"`
+	Side       string `json:"side"` // local | partner (roaming profile)
 	Registered bool   `json:"registered"`
 	HealthzOK  bool   `json:"healthz_ok"`
 	MetricsOK  bool   `json:"metrics_ok"`
@@ -51,13 +56,40 @@ func (d Deps) handleNFStatus(w http.ResponseWriter, r *http.Request) {
 		registeredMap[inst.NfType] = true
 	}
 
+	// Test-peer NFs are shown only when deployed (compose profile roaming).
+	present := map[string]bool{}
+	if d.Docker != nil {
+		if svcs, err := d.Docker.List(ctx); err == nil {
+			for _, s := range svcs {
+				present[s.Name] = true
+			}
+		}
+	}
+	homeRegistered := map[string]bool{}
+	if present["hnrf"] && d.HomeNRF != nil {
+		if home, err := d.HomeNRF.ListNFInstances(ctx); err == nil {
+			for _, inst := range home {
+				homeRegistered[inst.NfType] = true
+			}
+		}
+	}
+
 	probeClient := d.MTLSClient
 
 	statuses := make([]NFStatus, 0, len(knownNFs))
 	for _, nf := range knownNFs {
+		side := sideOf(nf.Name)
+		if side == sidePartner && !present[nf.Name] {
+			continue
+		}
+		reg := registeredMap
+		if side == sidePartner {
+			reg = homeRegistered
+		}
 		st := NFStatus{
 			Name:       nf.Name,
-			Registered: registeredMap[toNFType(nf.Name)],
+			Side:       side,
+			Registered: reg[toNFType(nf.Name)],
 		}
 
 		// Check /healthz via SBI endpoint
@@ -87,7 +119,7 @@ func (d Deps) handleNFStatus(w http.ResponseWriter, r *http.Request) {
 
 		// NRF is the registry itself — it never self-registers. Mark it as
 		// registered whenever it is reachable (healthz or metrics up).
-		if nf.Name == "nrf" && !st.Registered {
+		if (nf.Name == "nrf" || nf.Name == "hnrf") && !st.Registered {
 			st.Registered = st.HealthzOK || st.MetricsOK
 		}
 
@@ -125,8 +157,10 @@ func toNFType(name string) string {
 		return "NEF"
 	case "lmf":
 		return "LMF"
-	case "vsepp":
+	case "sepp", "hsepp":
 		return "SEPP"
+	case "hnrf":
+		return "NRF"
 	default:
 		return name
 	}

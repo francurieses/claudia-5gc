@@ -205,10 +205,12 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 - **Limits**: AMF side only.
 
 ### Roaming (SEPP)
-- **What**: a vSEPP and hSEPP pair with N32-c capability handshake and N32-f forwarding between two PLMNs, registered in each PLMN's NRF.
+- **What**: a SEPP and hSEPP pair with N32-c capability handshake and N32-f forwarding between two PLMNs, registered in each PLMN's NRF.
 - **Spec**: TS 29.573, TS 23.501 §4.2.4.
-- **Try**: `docker compose --profile core --profile roaming up -d vsepp hsepp hnrf`, then `make sepp-e2e` (`PROFILE=rel17|rel19`).
+- **Try**: `docker compose --profile core --profile roaming up -d sepp hsepp hnrf` (test peer), then `make sepp-e2e` (`PROFILE=rel17|rel19`).
 - **Limits**: N32-f runs in TLS protection mode and carries NF discovery in the E2E; see [`implementation-status.md`](implementation-status.md).
+- **Roaming partners**: the default core ships with no partner; add one through the roaming partners file (`ROAMING_PARTNERS_FILE`) or the portal Roaming page, with per-PLMN N32 trust anchors separate from the SBI CA. Checklist: [`n32-interop-profile.md`](n32-interop-profile.md). PRINS-only partners cannot interwork.
+- **Roaming registration**: a UE of a foreign home PLMN (AMF `roaming:` block) is authenticated by the home AUSF/UDM through the SEPP; `make roaming-e2e` (live-validated against the test home PLMN 001/02). Home-routed PDU sessions (V-SMF/H-SMF over N16, V-UPF/H-UPF over N9) are live-validated against the same test home network. Guide: [`roaming.md`](roaming.md); config keys: [`configuration.md`](configuration.md).
 
 ## Tooling
 
@@ -226,6 +228,11 @@ Each feature lists: what it does · the 3GPP reference · how to try it · limit
 Sequence diagrams, information elements, error cases, clause-level conformance and validation
 recipes for each procedure are part of the **members documentation**
 (<https://www.claudia5gc.dev/docs/members/>).
+
+## v3.1.1 release notes
+
+Documentation patch release; no behaviour change. Public documentation no longer carries
+internal task identifiers, and the public documentation checks now reject them.
 
 ## v3.1.0 release notes
 

@@ -1,9 +1,9 @@
 <!-- tier: public -->
-# NGAP equivalence corpus (REL19-4.4)
+# NGAP equivalence corpus
 
 One vector per `*.hex` file: lowercase hex, trailing newline. Consumed by `shared/ngap/corpus_test.go`
 (`TestCorpusRoundTrip`, `TestCorpusNoSUPI`) and `corpus_free5gc_test.go` (new codec vs
-`github.com/free5gc/ngap`; deleted with that dependency in REL19-4.5).
+`github.com/free5gc/ngap`; deleted with that dependency).
 
 | Prefix | Content | Produced by |
 |---|---|---|

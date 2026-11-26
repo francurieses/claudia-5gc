@@ -26,6 +26,7 @@ import (
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32c"
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32f"
 	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
 
 const (
@@ -60,7 +61,13 @@ type Server struct {
 	fwd atomic.Pointer[mounted]
 	// plainN32 allows the N32 listener without certificates (tests only).
 	plainN32 bool
+	// n32tls is the local N32 certificate + per-PLMN verifier (SetN32TLS).
+	n32tls *N32TLS
 }
+
+// SetN32TLS sets the N32 TLS material (nil: N32 listener cannot start in TLS
+// mode). Call before StartN32.
+func (s *Server) SetN32TLS(t *N32TLS) { s.n32tls = t }
 
 // AllowPlainN32ForTests lets StartN32 serve h2c without certificates. It
 // exists for tests only; production refuses to start the N32 listener without
@@ -96,9 +103,9 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 	}
 
 	// N32 listener: only the N32-c route (the SBI mux is never exposed here).
-	partners := make([]n32c.PlmnId, 0, len(cfg.N32.RoamingPartners))
-	for _, p := range cfg.N32.RoamingPartners {
-		partners = append(partners, n32c.PlmnId{Mcc: p.MCC, Mnc: p.MNC})
+	var partners []n32c.PlmnId
+	for _, p := range cfg.N32Partners() {
+		partners = append(partners, n32c.PlmnId{Mcc: p.PLMN.MCC, Mnc: p.PLMN.MNC})
 	}
 	svc, err := n32c.New(n32c.Config{
 		LocalPLMN:              n32c.PlmnId{Mcc: cfg.PLMN.MCC, Mnc: cfg.PLMN.MNC},
@@ -161,9 +168,9 @@ func (s *Server) N32Handler() http.Handler {
 	return s.n32Srv.Handler
 }
 
-// StartN32 serves the N32 listener until ctx is cancelled: mTLS with client
-// certificate verification (TLS 1.2+, h2) when certificates are configured,
-// plain h2c otherwise (tests only). Ref: TS 33.210 §6.2, TS 29.573 §5.2.1.
+// StartN32 serves the N32 listener until ctx is cancelled: mTLS (TLS 1.2+,
+// h2) with the per-PLMN client certificate verification of n32trust, or plain
+// h2c in tests only. Ref: TS 33.210 §6.2, TS 29.573 §5.2.1, TS 33.501 §13.1.2.
 func (s *Server) StartN32(ctx context.Context) error {
 	if s.n32Srv == nil {
 		if s.n32Err != nil {
@@ -171,11 +178,13 @@ func (s *Server) StartN32(ctx context.Context) error {
 		}
 		return errors.New("sepp: server: N32 listener not configured")
 	}
-	f := s.cfg.N32TLS()
-	if f.CertFile == "" && !s.plainN32 {
-		return errors.New("sepp: server: N32 listener requires TLS certificates (n32.tls or sbi.tls)")
+	var tc *tls.Config
+	if s.n32tls != nil {
+		tc = s.n32tls.Verifier.ServerTLSConfig(s.n32tls.Cert, n32MinTLSVersion, sbi.OpenKeyLogWriter())
+	} else if !s.plainN32 {
+		return errors.New("sepp: server: N32 listener requires the local N32 certificate (n32.tls)")
 	}
-	return s.serve(ctx, s.n32Srv, f, n32MinTLSVersion, "N32")
+	return s.serve(ctx, s.n32Srv, tc, "N32")
 }
 
 // Handler returns the HTTP handler for in-process tests (no TLS).
@@ -185,14 +194,29 @@ func (s *Server) Handler() http.Handler { return s.httpSrv.Handler }
 // requires client certificates (mTLS) and negotiates h2; otherwise it serves
 // plain h2c (tests only).
 func (s *Server) Start(ctx context.Context) error {
-	return s.serve(ctx, s.httpSrv, config.TLSFiles{
-		CertFile: s.cfg.SBI.TLS.CertFile, KeyFile: s.cfg.SBI.TLS.KeyFile, CAFile: s.cfg.SBI.TLS.CAFile,
-	}, tls.VersionTLS13, "SBI")
+	var tc *tls.Config
+	if f := s.cfg.SBI.TLS; f.CertFile != "" {
+		cert, err := tls.LoadX509KeyPair(f.CertFile, f.KeyFile)
+		if err != nil {
+			return fmt.Errorf("sepp: server: load TLS cert: %w", err)
+		}
+		caPEM, err := os.ReadFile(f.CAFile)
+		if err != nil {
+			return fmt.Errorf("sepp: server: load CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return fmt.Errorf("sepp: server: SBI CA file %q has no valid certificate", f.CAFile)
+		}
+		tc = &tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool,
+			ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}}
+	}
+	return s.serve(ctx, s.httpSrv, tc, "SBI")
 }
 
-// serve runs srv with the shared TLS material.
-// ALPN invariant: NextProtos is set before http2.ConfigureServer.
-func (s *Server) serve(ctx context.Context, srv *http.Server, files config.TLSFiles, minVersion uint16, label string) error {
+// serve runs srv with tc (nil: plain h2c, tests only).
+// ALPN invariant: NextProtos is set (by the caller) before http2.ConfigureServer.
+func (s *Server) serve(ctx context.Context, srv *http.Server, tc *tls.Config, label string) error {
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
@@ -200,26 +224,8 @@ func (s *Server) serve(ctx context.Context, srv *http.Server, files config.TLSFi
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	if files.CertFile != "" {
-		cert, err := tls.LoadX509KeyPair(files.CertFile, files.KeyFile)
-		if err != nil {
-			return fmt.Errorf("sepp: server: load TLS cert: %w", err)
-		}
-		caPEM, err := os.ReadFile(files.CAFile)
-		if err != nil {
-			return fmt.Errorf("sepp: server: load CA: %w", err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caPEM) {
-			return fmt.Errorf("sepp: server: %s CA file %q has no valid certificate", label, files.CAFile)
-		}
-		srv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientCAs:    pool,
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			MinVersion:   minVersion,
-			NextProtos:   []string{"h2"},
-		}
+	if tc != nil {
+		srv.TLSConfig = tc
 		if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
 			return fmt.Errorf("sepp: server: configure http2: %w", err)
 		}

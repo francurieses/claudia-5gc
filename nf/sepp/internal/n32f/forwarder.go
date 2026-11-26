@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32c"
+	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32trust"
 	"github.com/francurieses/claudia-5gc/shared/logging"
 	"github.com/francurieses/claudia-5gc/shared/observability/metrics"
 )
@@ -303,6 +304,13 @@ func (f *Forwarder) routeInbound(ctx context.Context, r *http.Request) (*route, 
 	if rej != nil {
 		return nil, rej
 	}
+	// TS 33.501 §13.1.2: the PLMN set of the N32-f certificate must be a subset
+	// of the PLMN set of the N32-c certificate that established the context.
+	if !certSubset(id, nctx) {
+		n32trust.CountReject(n32trust.ReasonPLMNMismatch)
+		return nil, &rejection{status: 403, cause: causeContextNotFound,
+			detail: "N32-f certificate PLMNs differ from the N32-c certificate PLMNs", logWhy: "plmn_mismatch", spec: "TS 33.501 §13.1.2"}
+	}
 	rt.remote = id.PLMN
 	authority := strings.ToLower(r.Host)
 	if hdr := r.Header.Get(HeaderTargetAPIRoot); hdr != "" {
@@ -333,6 +341,26 @@ func (f *Forwarder) routeInbound(ctx context.Context, r *http.Request) (*route, 
 	return rt, nil
 }
 
+// certSubset reports whether the PLMN set of the N32-f peer certificate is a
+// subset of the PLMN set recorded in the N32 context (the N32-c certificate).
+// An empty set stands for the single PLMN of the identity / context.
+func certSubset(id n32c.PeerIdentity, c n32c.Context) bool {
+	allowed := map[string]bool{c.RemotePLMN.Key(): len(c.CertPLMNs) == 0}
+	for _, p := range c.CertPLMNs {
+		allowed[p.Key()] = true
+	}
+	got := id.PLMNs
+	if len(got) == 0 {
+		got = []n32c.PlmnId{id.PLMN}
+	}
+	for _, p := range got {
+		if !allowed[p.Key()] {
+			return false
+		}
+	}
+	return true
+}
+
 // context returns the TLS-mode N32 context of the remote PLMN.
 func (f *Forwarder) context(p n32c.PlmnId) (n32c.Context, *rejection) {
 	c, ok := f.cfg.Store.Get(p)
@@ -352,6 +380,8 @@ func (f *Forwarder) context(p n32c.PlmnId) (n32c.Context, *rejection) {
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	// result and peer feed the N32-f metrics (set by reject / after routing).
+	result, peer string
 }
 
 func (w *statusWriter) WriteHeader(code int) {
@@ -386,6 +416,7 @@ func (f *Forwarder) serve(outbound bool) http.Handler {
 		defer cancel()
 		sw := &statusWriter{ResponseWriter: w}
 		lg := f.plog(ctx, dir)
+		defer func() { observe(dir, sw.peer, sw.result, start) }()
 
 		select {
 		case f.sem <- struct{}{}:
@@ -415,6 +446,7 @@ func (f *Forwarder) serve(outbound bool) http.Handler {
 			return
 		}
 		rt.log, rt.cid = lg, cid
+		sw.peer = rt.remote.String()
 		if rej := f.prepareBody(sw, r, rt); rej != nil {
 			f.reject(ctx, sw, lg, rej, "REJECT")
 			return
@@ -433,6 +465,7 @@ func (f *Forwarder) serve(outbound bool) http.Handler {
 		if rt.failed {
 			result = "FAILURE"
 		}
+		sw.result = result
 		metrics.ProcedureTotal.WithLabelValues("SEPP", procedureName, result).Inc()
 		lg.InfoContext(ctx, "n32-f message forwarded",
 			"result", result, "remote_plmn", rt.remote.String(), "status", sw.status,
@@ -636,6 +669,9 @@ func (f *Forwarder) hideResponse(resp *http.Response) error {
 // ---- errors -------------------------------------------------------------
 
 func (f *Forwarder) reject(ctx context.Context, w http.ResponseWriter, lg *slog.Logger, rej *rejection, result string) {
+	if sw, ok := w.(*statusWriter); ok {
+		sw.result = result
+	}
 	f.writeProblem(w, rej)
 	metrics.ProcedureTotal.WithLabelValues("SEPP", procedureName, result).Inc()
 	lg.WarnContext(ctx, "n32-f request rejected",

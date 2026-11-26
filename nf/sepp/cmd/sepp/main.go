@@ -17,7 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/http2"
+
+	"github.com/francurieses/claudia-5gc/nf/sepp/internal/admin"
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/config"
+	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32trust"
 	seppsbi "github.com/francurieses/claudia-5gc/nf/sepp/internal/sbi"
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/server"
 	"github.com/francurieses/claudia-5gc/shared/capability"
@@ -27,6 +31,9 @@ import (
 	"github.com/francurieses/claudia-5gc/shared/observability/tracing"
 	"github.com/francurieses/claudia-5gc/shared/sbi"
 )
+
+// n32ClientTimeout bounds one N32-c request (same bound as the SBI clients).
+const n32ClientTimeout = 10 * time.Second
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
@@ -49,7 +56,8 @@ func main() {
 	// ---- Config ---------------------------------------------------------------
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("config load failed", "error", err)
+		logger.Error("config load failed", "error", err.Error(), "cause", "config_invalid", "result", "FAILURE",
+			"spec_ref", "TS 33.501 §13.1")
 		os.Exit(1)
 	}
 	logger = logger.With("nf_instance_id", cfg.NFInstanceID)
@@ -80,15 +88,6 @@ func main() {
 		}()
 	}
 
-	// ---- Metrics server (Prometheus) ------------------------------------------
-	metricsSrv := metrics.MetricsServerWithAdmin(cfg.Metrics.Address, logging.NewLevelAdmin(logging.Level, logger))
-	go func() {
-		logger.Info("metrics server listening", "addr", cfg.Metrics.Address)
-		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("metrics server error", "error", err)
-		}
-	}()
-
 	// ---- mTLS HTTP/2 client (for NRF) -----------------------------------------
 	var httpClient *http.Client
 	if cfg.SBI.TLS.CertFile != "" && cfg.SBI.TLS.KeyFile != "" {
@@ -102,18 +101,39 @@ func main() {
 		httpClient = http.DefaultClient
 	}
 
+	// ---- N32 trust: partner anchors + local N32 certificate (SEPP-005) ----------
+	if cfg.PartnersFileLoaded {
+		logger.Info("roaming partners file loaded", "path", cfg.PartnersFilePath, "partners", len(cfg.N32Partners()),
+			"spec_ref", "TS 33.501 §13.1.2")
+	} else {
+		if os.Getenv(config.PartnersFileEnv) != "" {
+			logger.Info("ROAMING_PARTNERS_FILE names a file that does not exist: no file partners",
+				"path", cfg.PartnersFilePath, "spec_ref", "TS 33.501 §13.1.2")
+		}
+		logger.Info("no roaming partners file, using inline partners only", "path", cfg.PartnersFilePath,
+			"partners", len(cfg.N32Partners()), "spec_ref", "TS 33.501 §13.1.2")
+	}
+	n32tls, err := server.LoadN32TLS(cfg, logger)
+	if err != nil {
+		logger.Error("N32 trust configuration invalid", "error", err, "cause", "config_invalid", "result", "FAILURE",
+			"spec_ref", "TS 33.501 §13.1")
+		os.Exit(1)
+	}
+
 	// ---- SBI server -----------------------------------------------------------
 	srv := server.New(cfg, logger)
+	srv.SetN32TLS(n32tls)
 
-	if n32 := srv.N32(); n32 != nil {
-		// Initiator side (Exchange/Teardown): mTLS with the N32 trust material.
-		f := cfg.N32TLS()
-		n32Client, cerr := sbi.NewMTLSClient(f.CAFile, f.CertFile, f.KeyFile)
+	if n32 := srv.N32(); n32 != nil && n32tls != nil {
+		// Initiator side (Exchange/Teardown): mTLS with the local N32 certificate,
+		// peers verified against their PLMN anchor and partner FQDN.
+		base := &http.Client{Transport: &http2.Transport{TLSClientConfig: n32tls.ClientTLSConfig()}, Timeout: n32ClientTimeout}
+		n32Client, cerr := server.NewPeerIdentityClient(base, cfg.Initiators())
 		if cerr != nil {
-			logger.Warn("building N32 mTLS client failed — outgoing exchange-capability disabled", "error", cerr)
-		} else {
-			n32.SetHTTPClient(n32Client)
+			logger.Error("building N32 mTLS client failed", "error", cerr, "cause", "config_invalid", "result", "FAILURE")
+			os.Exit(1)
 		}
+		n32.SetHTTPClient(n32Client)
 	}
 
 	// ---- NRF client (registration + N32-f local NF discovery) -------------------
@@ -123,10 +143,35 @@ func main() {
 	}
 
 	// ---- N32-f forwarder (TS 29.573 §5.3) ----------------------------------------
-	if err := mountForwarder(cfg, srv, nrfClient, logger); err != nil {
+	if err := mountForwarder(cfg, srv, nrfClient, n32tls, logger); err != nil {
 		logger.Error("N32-f forwarder required but unavailable", "error", err, "result", "FAILURE", "spec_ref", "TS 29.573 §5.3")
 		os.Exit(1)
 	}
+
+	// ---- Metrics server (Prometheus) + N32 admin view (PORTAL-UI-22) ---------------
+	// The admin routes have no authentication: internal metrics port only.
+	var n32Admin admin.N32
+	if n := srv.N32(); n != nil {
+		n32Admin = n
+	}
+	var anchors []n32trust.AnchorInfo
+	if n32tls != nil {
+		anchors = n32tls.Verifier.Anchors()
+	}
+	n32Handler := admin.NewHandler(n32Admin, admin.Info{
+		ReleaseProfile: relProfile.Name(), TopologyHiding: cfg.TopologyHidingEnabled(),
+		Partners: cfg.N32Partners(), Anchors: anchors,
+	}, logger)
+	metricsSrv := metrics.MetricsServerWithAdmin(cfg.Metrics.Address, logging.NewLevelAdmin(logging.Level, logger),
+		metrics.AdminRoute{Pattern: admin.ContextsPath, Handler: n32Handler},
+		metrics.AdminRoute{Pattern: admin.ContextsSubtree, Handler: n32Handler},
+		metrics.AdminRoute{Pattern: admin.PartnersPath, Handler: http.HandlerFunc(n32Handler.ServePartners)})
+	go func() {
+		logger.Info("metrics server listening", "addr", cfg.Metrics.Address)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server error", "error", err)
+		}
+	}()
 
 	// ---- Signal + context -----------------------------------------------------
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -136,7 +181,11 @@ func main() {
 	// Ref: TS 29.510 §5.2.2.2 (NFRegister), TS 29.573 §6.1 (n32c-handshake)
 	if cfg.Peers.NRF != "" {
 		nrfAddr := "https://" + cfg.Peers.NRF
-		profile := seppsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, cfg.N32.RoamingPartners)
+		var remote []config.PLMN
+		for _, p := range cfg.N32Partners() {
+			remote = append(remote, p.PLMN)
+		}
+		profile := seppsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, remote)
 		if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 			logger.Warn("NRF registration failed (continuing without NRF)",
 				"nrf_addr", nrfAddr, "error", err,
@@ -161,14 +210,21 @@ func main() {
 	}()
 
 	// ---- Start N32 listener (N32-c exchange-capability) -------------------------
+	// Started only with the local N32 certificate; without it (and without
+	// partners) one INFO line, SEPP stays healthy. Ref: TS 33.501 §13.1.
 	n32Failed := make(chan struct{})
-	go func() {
-		if err := srv.StartN32(ctx); err != nil {
-			logger.Error("SEPP N32 server error", "error", err)
-			close(n32Failed)
-			cancel()
-		}
-	}()
+	if n32tls != nil {
+		go func() {
+			if err := srv.StartN32(ctx); err != nil {
+				logger.Error("SEPP N32 server error", "error", err)
+				close(n32Failed)
+				cancel()
+			}
+		}()
+	} else {
+		logger.Info("N32 listener not started: no local N32 certificate and no roaming partner",
+			"cert_file", cfg.N32.TLS.CertFile, "spec_ref", "TS 33.501 §13.1")
+	}
 
 	// ---- N32-c initiator toward configured peers (TS 29.573 §5.2.2 step 1) --------
 	waitInitiator := srv.StartInitiator(ctx)
@@ -198,13 +254,14 @@ func main() {
 	logger.Info("SEPP stopped cleanly")
 }
 
-// mountForwarder builds and mounts the N32-f forwarder. When roaming is
-// configured (n32.peers or n32.roaming_partners) a missing NRF client or an
-// unbuildable forwarder is an error (fail fast); with no roaming configuration
-// it only warns. Ref: TS 29.573 §5.3.
-func mountForwarder(cfg *config.Config, srv *server.Server, nrfClient *nrf.Client, logger *slog.Logger) error {
+// mountForwarder builds and mounts the N32-f forwarder. It needs the N32 TLS
+// material: without it (no partners, no local N32 certificate) there is no N32
+// and nothing is mounted. When partners exist a missing NRF client or an
+// unbuildable forwarder is an error (fail fast); otherwise it logs INFO only.
+// Ref: TS 29.573 §5.3.
+func mountForwarder(cfg *config.Config, srv *server.Server, nrfClient *nrf.Client, n32tls *server.N32TLS, logger *slog.Logger) error {
 	n32 := srv.N32()
-	if n32 == nil {
+	if n32 == nil || n32tls == nil {
 		return nil
 	}
 	required := cfg.HasRoamingConfig()
@@ -212,15 +269,15 @@ func mountForwarder(cfg *config.Config, srv *server.Server, nrfClient *nrf.Clien
 		if required {
 			return errors.New("sepp: n32-f forwarder: roaming configured but peers.nrf is not set")
 		}
-		logger.Warn("N32-f forwarder disabled: no NRF configured", "spec_ref", "TS 29.573 §5.3")
+		logger.Info("N32-f forwarder not mounted: no NRF configured", "spec_ref", "TS 29.573 §5.3")
 		return nil
 	}
-	fwd, err := server.NewForwarder(cfg, n32.Store(), nrfClient, logger)
+	fwd, err := server.NewForwarder(cfg, n32.Store(), nrfClient, n32tls, logger)
 	if err != nil {
 		if required {
 			return fmt.Errorf("sepp: n32-f forwarder: %w", err)
 		}
-		logger.Warn("N32-f forwarder disabled", "error", err, "spec_ref", "TS 29.573 §5.3")
+		logger.Info("N32-f forwarder not mounted", "error", err, "spec_ref", "TS 29.573 §5.3")
 		return nil
 	}
 	srv.MountForwarder(fwd)

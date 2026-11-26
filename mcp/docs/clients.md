@@ -1,7 +1,7 @@
 <!-- tier: public -->
 # 5GC MCP Server — Client Integration Guide
 
-The MCP server exposes 74 tools (codecs, NF discovery, UE contexts, traces, metrics, QoS,
+The MCP server exposes 75 tools (codecs, NF discovery, UE contexts, traces, metrics, QoS,
 status, analysis, core control and runtime configuration) over two transports that run concurrently.
 Tools are classified by risk, and a client's access depends on the server's `access_mode` and its
 bearer token; see [`docs/mcp-tools.md`](../../docs/mcp-tools.md):
@@ -32,7 +32,7 @@ make pki                    # produces pki/ca.crt + pki/mcp.{crt,key}
 Quick liveness check:
 
 ```bash
-curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":77}  (74 tools + 3 deprecated aliases)
+curl -s http://localhost:9300/mcp/health   # {"status":"ok","tools":78}  (75 tools + 3 deprecated aliases)
 ```
 
 ---

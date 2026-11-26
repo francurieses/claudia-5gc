@@ -2,17 +2,9 @@ package server
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +110,7 @@ func TestStartN32RefusesWithoutCertificates(t *testing.T) {
 	cfg, _ := config.Load()
 	cfg.SBI.TLS.CertFile, cfg.N32.TLS.CertFile = "", ""
 	s := New(cfg, slog.Default())
-	if err := s.StartN32(context.Background()); err == nil || !strings.Contains(err.Error(), "requires TLS") {
+	if err := s.StartN32(context.Background()); err == nil || !strings.Contains(err.Error(), "requires the local N32 certificate") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -141,30 +133,6 @@ func TestStartN32AllowsPlainOnlyWhenFlagged(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("StartN32 did not return")
-	}
-}
-
-func TestStartN32RejectsBadCABundle(t *testing.T) {
-	dir := t.TempDir()
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "x"},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
-	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	kb, _ := x509.MarshalECPrivateKey(key)
-	write := func(name string, b []byte) string {
-		p := dir + "/" + name
-		if err := os.WriteFile(p, b, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	cfg, _ := config.Load()
-	cfg.N32.TLS.CertFile = write("c.pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
-	cfg.N32.TLS.KeyFile = write("k.pem", pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kb}))
-	cfg.N32.TLS.CAFile = write("ca.pem", []byte("not a pem"))
-	s := New(cfg, slog.Default())
-	if err := s.StartN32(context.Background()); err == nil || !strings.Contains(err.Error(), "no valid certificate") {
-		t.Fatalf("err = %v", err)
 	}
 }
 

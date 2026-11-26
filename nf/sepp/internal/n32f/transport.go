@@ -32,15 +32,20 @@ type peerKey struct{}
 
 // NewN32Transport returns the outbound N32-f transport: HTTP/2 over mutual
 // TLS. tlsCfg must carry a client certificate (TS 33.501 §13.1.2: N32 is
-// always mutually authenticated); NextProtos is forced to h2.
+// always mutually authenticated); NextProtos is forced to h2. Peer
+// verification is either RootCAs or (InsecureSkipVerify + VerifyConnection,
+// reading the dialled name from ConnectionState.ServerName).
 func NewN32Transport(tlsCfg *tls.Config) (*http.Transport, error) {
 	if tlsCfg == nil || (len(tlsCfg.Certificates) == 0 && tlsCfg.GetClientCertificate == nil) {
 		return nil, errors.New("n32f: new transport: a client certificate is required (mTLS)")
 	}
 	if tlsCfg.InsecureSkipVerify {
-		return nil, errors.New("n32f: new transport: InsecureSkipVerify is not allowed")
-	}
-	if tlsCfg.RootCAs == nil {
+		// Only with a replacement verifier (per-PLMN anchors, n32trust): the
+		// stock verification is then done by tlsCfg.VerifyConnection.
+		if tlsCfg.VerifyConnection == nil {
+			return nil, errors.New("n32f: new transport: InsecureSkipVerify is not allowed without VerifyConnection")
+		}
+	} else if tlsCfg.RootCAs == nil {
 		return nil, errors.New("n32f: new transport: RootCAs (N32 trust anchors) are required")
 	}
 	base := tlsCfg.Clone()

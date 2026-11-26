@@ -62,7 +62,7 @@ var wantRisk = map[string]registry.Risk{
 	"upf_stats": registry.ReadOnly, "core_consistency_check": registry.ReadOnly,
 	"error_summary": registry.ReadOnly, "mcp_info": registry.ReadOnly,
 	"slice_status": registry.ReadOnly, "subscription_am_get": registry.ReadOnly,
-	"pcf_binding_list": registry.ReadOnly,
+	"pcf_binding_list": registry.ReadOnly, "roaming_status": registry.ReadOnly,
 	// MCP-010: AN release, location, AF QoS (NEF), PWS resend, MT-SMS
 	"ue_an_release_nw": registry.Disruptive, "ue_location_get": registry.Disruptive,
 	"af_qos_session_create": registry.Disruptive, "af_qos_session_get": registry.ReadOnly,
@@ -103,8 +103,8 @@ func TestRiskGolden(t *testing.T) {
 			t.Errorf("tool %s is registered but has no reviewed risk level", name)
 		}
 	}
-	if len(got) != 77 {
-		t.Errorf("tool count: got %d, want 77", len(got))
+	if len(got) != 78 {
+		t.Errorf("tool count: got %d, want 78", len(got))
 	}
 }
 

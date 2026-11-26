@@ -1,0 +1,1 @@
+{"anType":"3GPP_ACCESS","dnn":"internet","n1SmMsg":"AQID","pduSessionId":5,"requestType":"INITIAL_REQUEST","servingNfId":"amf-001","snssai":{"sd":"000001","sst":1},"supi":"imsi-001010000000001"}

@@ -140,6 +140,10 @@ func InitializeScenario(sc *godog.ScenarioContext) {
 	// Release of PDU sessions orphaned by an SMF restart, 5GSM cause #39 (SMF-012;
 	// TS 23.502 §4.3.4.2) — in-process: real mgmt route + NAS handler, fake N1/N2.
 	initSMFRestartReleaseSteps(sc)
+
+	// Roaming registration over N32 (ROAM-001; TS 23.502 §4.2.2.2.2, TS 33.501 §6.1.3.2) —
+	// in-process: real NAS + registration handlers with roaming.Router, httptest vSEPP/AUSF/UDM mocks.
+	initRoamingRegistrationSteps(sc)
 }
 
 func TestFeatures(t *testing.T) {

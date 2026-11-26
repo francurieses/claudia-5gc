@@ -36,6 +36,33 @@ type N32Purpose string
 // PurposeRoaming is the only purpose this NF sends. Ref: TS 29.573 §6.1.6.3.
 const PurposeRoaming N32Purpose = "ROAMING"
 
+// Purposes in the fixed local allowed set. Ref: TS 29.573 §6.1.6.3 (N32Purpose
+// enum, Table 6.1.6.3-1); the set is a project policy (no per-partner key).
+const (
+	PurposeInterPlmnMobility     N32Purpose = "INTER_PLMN_MOBILITY"
+	PurposeRoamingTest           N32Purpose = "ROAMING_TEST"
+	PurposeInterPlmnMobilityTest N32Purpose = "INTER_PLMN_MOBILITY_TEST"
+)
+
+// allowedPurposes is the local allowed usage-purpose set (S2).
+var allowedPurposes = map[N32Purpose]bool{
+	PurposeRoaming: true, PurposeInterPlmnMobility: true,
+	PurposeRoamingTest: true, PurposeInterPlmnMobilityTest: true,
+}
+
+// splitPurposes partitions the requested purposes into allowed (without
+// cause, Table 6.1.5.2.3-1) and rejected, preserving request order.
+func splitPurposes(req []IntendedN32Purpose) (allowed, rejected []IntendedN32Purpose) {
+	for _, p := range req {
+		if allowedPurposes[p.UsagePurpose] {
+			allowed = append(allowed, IntendedN32Purpose{UsagePurpose: p.UsagePurpose})
+		} else {
+			rejected = append(rejected, IntendedN32Purpose{UsagePurpose: p.UsagePurpose})
+		}
+	}
+	return allowed, rejected
+}
+
 // IntendedN32Purpose is the purpose container. Ref: TS 29.573 §6.1.5.3.9.
 // oapi: TS29573_N32_Handshake.yaml#/components/schemas/IntendedN32Purpose
 type IntendedN32Purpose struct {
@@ -157,6 +184,8 @@ const (
 	CauseNegotiationNotAllowed = "NEGOTIATION_NOT_ALLOWED"
 	// CauseExchangeOngoing: TS 29.573 §5.2.2 step 2b, §6.1.6.3 Table 6.1.6.3-1 (409, Rel-19).
 	CauseExchangeOngoing = "N32C_EXCHANGE_CAPABILITY_ONGOING"
+	// CausePurposeNotAllowed: all requested purposes rejected, TS 29.573 Table 6.1.6.3-1 (403).
+	CausePurposeNotAllowed = "REQUESTED_PURPOSE_NOT_ALLOWED"
 	// CauseMandatoryIEMissing: TS 29.500 Table 5.2.7.2-1 (400).
 	CauseMandatoryIEMissing = "MANDATORY_IE_MISSING"
 	// CauseMandatoryIEIncorrect: TS 29.500 Table 5.2.7.2-1 (400).

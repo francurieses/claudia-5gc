@@ -38,6 +38,17 @@ peers:
     smf: smf:8004
     smsf: smsf:8009
     udm: udm:8003
+# Roaming over N32 (ROAM-001, docs/procedures/RoamingRegistration.md §7.4): a UE whose
+# SUCI/SUPI home PLMN differs from plmn is authenticated/registered with its home AUSF/UDM
+# through the local SEPP (3gpp-Sbi-Target-apiRoot, TS 29.500 §6.1.4.3). A UE of the serving
+# PLMN never takes this path (local AUSF/UDM, byte-identical requests); a PLMN that is not a
+# partner is rejected with 5GMM #11. Partners come from config/roaming/partners.yaml
+# (env ROAMING_PARTNERS_FILE, default /etc/5gc/roaming/partners.yaml; entries with home_nfs
+# become home PLMNs, overriding inline home_plmns). Default core: no partners.
+roaming:
+    enabled: true
+    sepp_address: sepp:8014
+    home_plmns: []
 sbi:
     address: 0.0.0.0:8001
     ca_file: /etc/5gc/pki/ca.crt

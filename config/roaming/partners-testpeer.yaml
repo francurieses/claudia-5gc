@@ -1,0 +1,13 @@
+# Roaming partners for the opt-in test peer (PLMN 001/02: hsepp, hnrf, hausf, hudm, hudr; compose profile `roaming`).
+# Used by `make sepp-e2e` / `make roaming-e2e` via ROAMING_PARTNERS_FILE=/etc/5gc/roaming/partners-testpeer.yaml.
+partners:
+  - plmn: {mcc: "001", mnc: "02"}
+    n32:
+      ca_file: /etc/5gc/pki/n32/peers/001-02/ca.crt
+      sepp_fqdn: sepp.5gc.mnc002.mcc001.3gppnetwork.org
+      address: sepp.5gc.mnc002.mcc001.3gppnetwork.org:8443
+    home_nfs:
+      ausf_api_root: https://ausf.5gc.mnc002.mcc001.3gppnetwork.org:8002
+      udm_api_root: https://udm.5gc.mnc002.mcc001.3gppnetwork.org:8003
+      # Home SMF (H-SMF) for home-routed PDU sessions; absent = roaming PDU sessions are rejected.
+      smf_api_root: https://smf.5gc.mnc002.mcc001.3gppnetwork.org:8004

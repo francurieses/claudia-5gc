@@ -6,6 +6,7 @@ import {
   Antenna,
   FileText,
   Gauge,
+  Globe2,
   Layers,
   LayoutDashboard,
   MapPin,
@@ -66,6 +67,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/services', label: 'Services', icon: Server },
       { to: '/ran', label: 'gNBs (RAN)', icon: RadioTower },
+      { to: '/roaming', label: 'Roaming (N32)', icon: Globe2 },
       { to: '/sessions', label: 'Sessions', icon: Activity },
       { to: '/qos', label: 'QoS / PDU Sessions', icon: Gauge },
     ],

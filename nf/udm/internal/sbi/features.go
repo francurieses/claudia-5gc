@@ -52,27 +52,43 @@ var nudmUECMCatalog = features.MustCatalog(features.MustImplement(features.NudmU
 // the UDM. TS 29.503 §6.2.8.
 func NudmUECMCatalog() *features.Catalog { return nudmUECMCatalog }
 
-// BuildNFProfile returns the NFProfile the UDM registers at the NRF. It lists
-// the nudm-ueau service only: nudm-sdm and nudm-uecm are not registered today
-// and adding them would change the rel17 registration bytes, so the Nudm_SDM
-// and Nudm_UECM catalogs are not advertised at the NRF yet. The per-service
-// supportedFeatures is advertised only under the rel19 profile (features.Request
-// returns "" otherwise and the omitempty tag drops it), so the rel17
-// registration stays byte-identical.
-// Ref: TS 29.510 §6.1.6.2.2 (NFProfile), §6.1.6.2.3 (NFService); decision D2.
+// BuildNFProfile returns the NFProfile the UDM registers at the NRF.
+//
+// Under the rel17 profile (and a nil profile) it lists the nudm-ueau service
+// only: that is the frozen legacy NFRegister body (golden
+// testdata/golden_nf_profile.json) and the core's own AMF reaches the UDM by
+// static config, so it never needed more. Under the rel19 profile
+// (features.SpecLiteral) it also lists nudm-sdm (v2) and nudm-uecm (v1), the
+// two other services the server mounts, so that NRF discovery by service name
+// (TS 29.510 §6.2.3.2.3.1 service-names) finds the UDM; the hSEPP of a roaming
+// home core resolves the target UDM this way (ROAM-001). The per-service
+// supportedFeatures is advertised only under rel19 (features.Request returns ""
+// otherwise and the omitempty tag drops it).
+// Ref: TS 29.510 §6.1.6.2.2 (NFProfile), §6.1.6.2.3 (NFService); TS 29.503
+// §6.1, §6.2, §6.3 (service names, API versions); decision D2.
 func BuildNFProfile(nfInstanceID string, p *capability.Profile, cat *features.Catalog) *nrf.NFProfile {
+	svc := func(name apiversion.Service, c *features.Catalog) nrf.NFService {
+		return nrf.NFService{
+			ServiceInstanceID: nfInstanceID + "-" + string(name),
+			ServiceName:       string(name),
+			Scheme:            "https",
+			NFServiceStatus:   "REGISTERED",
+			Versions:          []nrf.NFServiceVersion{nrf.ServiceVersion(p, name)},
+			SupportedFeatures: features.Request(c, p),
+		}
+	}
+	services := []nrf.NFService{svc(apiversion.NudmUEAU, cat)}
+	if features.SpecLiteral(p) {
+		services = append(services,
+			svc(apiversion.NudmSDM, NudmSDMCatalog()),
+			svc(apiversion.NudmUECM, NudmUECMCatalog()),
+		)
+	}
 	return &nrf.NFProfile{
 		NFInstanceID: nfInstanceID,
 		NFType:       "UDM",
 		NFStatus:     "REGISTERED",
-		NFServices: []nrf.NFService{{
-			ServiceInstanceID: nfInstanceID + "-nudm-ueau",
-			ServiceName:       "nudm-ueau",
-			Scheme:            "https",
-			NFServiceStatus:   "REGISTERED",
-			Versions:          []nrf.NFServiceVersion{nrf.ServiceVersion(p, apiversion.NudmUEAU)},
-			SupportedFeatures: features.Request(cat, p),
-		}},
+		NFServices:   services,
 	}
 }
 

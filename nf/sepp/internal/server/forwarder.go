@@ -1,11 +1,9 @@
 package server
 
 import (
-	"crypto/tls"
-	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/config"
 	"github.com/francurieses/claudia-5gc/nf/sepp/internal/n32c"
@@ -15,26 +13,17 @@ import (
 
 // NewForwarder builds the N32-f forwarder from the SEPP configuration:
 // SEPPFQDN = sbi.fqdn, topology hiding per n32.topology_hiding (default on), mTLS towards the peer SEPP with the
-// N32 trust material (n32.tls, falling back to sbi.tls) and mTLS towards local
+// local N32 certificate and the per-PLMN verifier of trust (never the SBI CA) and mTLS towards local
 // NFs with sbi.tls; local NFs are resolved through the NRF.
 // Ref: TS 29.573 §5.3, TS 23.003 §28.5.2, TS 33.501 §13.1.
-func NewForwarder(cfg *config.Config, store *n32c.Store, disc n32f.Discoverer, logger *slog.Logger) (*n32f.Forwarder, error) {
-	f := cfg.N32TLS()
-	cert, err := tls.LoadX509KeyPair(f.CertFile, f.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("sepp: new forwarder: load N32 cert: %w", err)
+func NewForwarder(cfg *config.Config, store *n32c.Store, disc n32f.Discoverer, trust *N32TLS, logger *slog.Logger) (*n32f.Forwarder, error) {
+	if trust == nil {
+		return nil, errors.New("sepp: new forwarder: no N32 TLS material")
 	}
-	caPEM, err := os.ReadFile(f.CAFile)
-	if err != nil {
-		return nil, fmt.Errorf("sepp: new forwarder: load N32 CA: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, fmt.Errorf("sepp: new forwarder: N32 CA file %q has no valid certificate", f.CAFile)
-	}
-	n32t, err := n32f.NewN32Transport(&tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: n32MinTLSVersion,
+	tc := trust.Verifier.ClientTLSConfig(trust.Cert, n32MinTLSVersion,
 		// No-op unless SSLKEYLOGFILE is set (opt-in pcap decryption, as in the other NFs).
-		KeyLogWriter: sbi.OpenKeyLogWriter()})
+		sbi.OpenKeyLogWriter())
+	n32t, err := n32f.NewN32Transport(tc)
 	if err != nil {
 		return nil, fmt.Errorf("sepp: new forwarder: %w", err)
 	}

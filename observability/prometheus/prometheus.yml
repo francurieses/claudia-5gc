@@ -31,8 +31,18 @@ scrape_configs:
         labels: {nf: NEF}
       - targets: [lmf:9113]
         labels: {nf: LMF}
-      - targets: [vsepp:9115]
-        labels: {nf: SEPP, role: vsepp}
+      - targets: [sepp:9115]
+        labels: {nf: SEPP, role: sepp}
       # hsepp runs in the roaming profile only; a down target is expected without it.
       - targets: [hsepp:9115]
         labels: {nf: SEPP, role: hsepp}
+      # hnrf (home PLMN 001/02) also runs in the roaming profile only; `role` keeps it apart from nrf.
+      - targets: [hnrf:9100]
+        labels: {nf: NRF, role: hnrf}
+      # Home PLMN NFs of the roaming profile; targets are down until those services exist.
+      - targets: [hausf:9102]
+        labels: {nf: AUSF, role: home}
+      - targets: [hudm:9103]
+        labels: {nf: UDM, role: home}
+      - targets: [hudr:9104]
+        labels: {nf: UDR, role: home}

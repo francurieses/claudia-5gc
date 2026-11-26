@@ -103,7 +103,33 @@ type Session struct {
 	DLFARID uint32
 	BARID   uint8
 	DLBuf   DLBuffer
+
+	// N9 user plane of a home-routed PDU session (TS 23.501 §4.2.4, TS 23.502
+	// §4.3.2.2.2). N9TEID is the F-TEID of a Source Interface Core PDR (the
+	// V-UPF receiving DL from the H-UPF); it is indexed in the SessionTable next
+	// to ULTEID. ULRelay marks a session whose UL FAR (ULFARID, Destination
+	// Interface Core) re-encapsulates into GTP-U towards the peer UPF instead of
+	// leaving through the N6 TUN: set when the session has an N9 DL PDR or its UL
+	// FAR carries an Outer Header Creation. All written at establishment only.
+	N9TEID  uint32
+	ULFARID uint32
+	ULRelay bool
+	ulPeer  atomic.Pointer[GTPUPeer]
 }
+
+// GTPUPeer is a GTP-U endpoint (Outer Header Creation GTP-U/UDP/IPv4, TS 29.244
+// §8.2.56): the TEID to put in the header and the peer's IPv4 address.
+type GTPUPeer struct {
+	TEID uint32
+	Addr netip.Addr
+}
+
+// ULPeer returns the N9 peer the UL FAR forwards to, nil until the Outer Header
+// Creation is known (hot path: lock-free).
+func (s *Session) ULPeer() *GTPUPeer { return s.ulPeer.Load() }
+
+// SetULPeer installs (or with nil clears) the UL FAR's N9 peer.
+func (s *Session) SetULPeer(p *GTPUPeer) { s.ulPeer.Store(p) }
 
 // URRState mirrors the Usage Reporting Rule installed by the SMF for active
 // usage reporting: volume-threshold (VOLTH) and periodic (PERIO) triggers.
@@ -228,6 +254,9 @@ func (t *SessionTable) store(sess *Session) {
 	if sess.ULTEID != 0 {
 		t.byULTEID[sess.ULTEID] = sess
 	}
+	if sess.N9TEID != 0 {
+		t.byULTEID[sess.N9TEID] = sess // N9 DL F-TEID, same index (GetByULTEID)
+	}
 	if len(sess.UEIP) > 0 {
 		if a, ok := ueAddr(sess.UEIP); ok {
 			t.byUEIP[a] = sess
@@ -243,6 +272,9 @@ func (t *SessionTable) delete(upSEID uint64) {
 	defer t.mu.Unlock()
 	if sess, ok := t.bySEID[upSEID]; ok {
 		delete(t.byULTEID, sess.ULTEID)
+		if sess.N9TEID != 0 {
+			delete(t.byULTEID, sess.N9TEID)
+		}
 		if len(sess.UEIP) > 0 {
 			if a, ok := ueAddr(sess.UEIP); ok {
 				delete(t.byUEIP, a)
@@ -492,7 +524,7 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 	// Extract UL TEID, UE IP (v4/v6) and DNN from Create PDR → PDI →
 	// F-TEID / UE-IP-Address / Network Instance. Ref: TS 29.244 §8.2.62
 	// (UE IP Address), §6.3.3.14 (Network Instance).
-	var ulTEID uint32
+	var ulTEID, n9TEID uint32
 	var ueIP, ueIPv6 net.IP
 	var dnn string
 	var pdrStates []*PDRState
@@ -527,7 +559,13 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 				switch pdiChild.Type {
 				case pfcpie.FTEID:
 					if f, err := pdiChild.FTEID(); err == nil {
-						ulTEID = f.TEID
+						if ps.SourceInterface == srcInterfaceCore {
+							// DL PDR with an F-TEID: N9 from the H-UPF at a
+							// V-UPF (TS 23.501 §4.2.4, TS 29.244 §8.2.3).
+							n9TEID = f.TEID
+						} else {
+							ulTEID = f.TEID
+						}
 					}
 				case pfcpie.UEIPAddress:
 					if u, err := pdiChild.UEIPAddress(); err == nil {
@@ -563,6 +601,7 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 		CPSEID: cpSEID,
 		UPSEID: upSEID,
 		ULTEID: ulTEID,
+		N9TEID: n9TEID,
 		UEIP:   ueIP,
 		UEIPv6: ueIPv6,
 		DNN:    dnn,
@@ -639,12 +678,13 @@ func (s *Server) handleSessionEstablishment(ctx context.Context, raddr *net.UDPA
 	}
 
 	s.setupDLBuffering(sess, req, pdrStates, pdrFAR)
+	setupN9(sess, req, pdrStates, pdrFAR)
 
 	s.sessions.store(sess)
 	metrics.UPFPFCPSessionsActive.Inc()
 
 	s.logger.Info("PFCP Session established",
-		"cpSEID", cpSEID, "ulTEID", ulTEID, "ueIP", ueIP, "ueIPv6", ueIPv6, "dnn", dnn,
+		"cpSEID", cpSEID, "ulTEID", ulTEID, "n9TEID", n9TEID, "ul_relay", sess.ULRelay, "ueIP", ueIP, "ueIPv6", ueIPv6, "dnn", dnn,
 		"qer_count", len(sess.QERs), "dl_qfi", sess.DLQFI(),
 		"dl_pdr_id", sess.DLPDRID, "dl_far_id", sess.DLFARID, "bar_id", sess.BARID,
 		"urr_installed", sess.URRState.Installed, "urr_id", sess.URRState.URRID,
@@ -774,6 +814,7 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 			aa     uint8
 		)
 		isDLFAR := true // an Update FAR without a parsable FAR ID is treated as the DL FAR
+		var ufarID uint32
 		for _, child := range ufarIEs {
 			switch child.Type {
 			case pfcpie.ApplyAction:
@@ -781,10 +822,19 @@ func (s *Server) handleSessionModification(ctx context.Context, raddr *net.UDPAd
 					haveAA, aa = true, v
 				}
 			case pfcpie.FARID:
-				if v, err := child.FARID(); err == nil && sess.DLFARID != 0 {
-					isDLFAR = v == sess.DLFARID
+				if v, err := child.FARID(); err == nil {
+					ufarID = v
+					if sess.DLFARID != 0 {
+						isDLFAR = v == sess.DLFARID
+					}
 				}
 			}
+		}
+		// Home-routed UL FAR (V-UPF, TS 23.502 §4.3.2.2.2 step 13a): FORW + OHC sets
+		// the N9 peer, a non-FORW Apply Action clears it. Never touches the DL tunnel.
+		if sess.ULRelay && !isDLFAR && sess.ULFARID != 0 && ufarID == sess.ULFARID {
+			s.updateULRelayFAR(ctx, sess, ufarIEs, haveAA, aa)
+			continue
 		}
 		if haveAA && aa&applyActionFORW == 0 {
 			s.sessions.mu.Lock()

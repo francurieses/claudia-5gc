@@ -1,0 +1,28 @@
+{
+  "supi": "imsi-001020000000001",
+  "pduSessionId": 5,
+  "dnn": "internet.mnc002.mcc001.gprs",
+  "sNssai": {
+    "sst": 1,
+    "sd": "000001"
+  },
+  "vsmfId": "00000000-0000-4005-8000-0000000000aa",
+  "servingNetwork": {
+    "mcc": "001",
+    "mnc": "01"
+  },
+  "requestType": "INITIAL_REQUEST",
+  "vsmfPduSessionUri": "https://smf.5gc.mnc001.mcc001.3gppnetwork.org:8004/nsmf-pdusession/v1/vsmf-pdu-sessions/fixed-ref",
+  "vcnTunnelInfo": {
+    "ipv4Addr": "10.0.0.9",
+    "gtpTeid": "0000ABCD"
+  },
+  "anType": "3GPP_ACCESS",
+  "ratType": "NR",
+  "chargingId": "4242",
+  "maxIntegrityProtectedDataRateUl": "MAX_UE_RATE",
+  "maxIntegrityProtectedDataRateDl": "64_KBPS",
+  "n1SmInfoFromUe": {
+    "contentId": "n1SmInfoFromUe"
+  }
+}

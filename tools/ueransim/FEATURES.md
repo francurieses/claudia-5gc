@@ -173,6 +173,11 @@ nr-cli imsi-001010000000001 -e "commands"
 
 ---
 
+### Patch 0110 — UE roaming PLMN selection (UE)
+
+Opt-in `allowRoaming: true` in ue.yaml (default false = byte-identical stock): `NasMm::performPlmnSelection` falls back to any non-forbidden PLMN when neither HPLMN nor an EPLMN is available (log `Roaming PLMN selection: ...`). SUCI still uses the configured `hplmn`; the cell PLMN is used for TAI/serving PLMN. Config: `config/ueransim/ue-roaming.yaml` (HPLMN 001/02, imsi-001020000000001). Spec: TS 23.122 §4.4.3.1.1. Used by `make roaming-e2e`.
+
+
 ### Existing commands (unchanged)
 
 | Command | What it does |

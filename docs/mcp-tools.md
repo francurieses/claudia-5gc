@@ -114,6 +114,7 @@ Risk: **READ** changes nothing · **MUTATING** changes a stored setting · **DIS
 | `pws_list` | READ | PWS broadcasts in the portal's CBC store. |
 | `mcp_info` | READ | The MCP server itself: version, build commit, access mode, caller role, tool and alias counts, tools hidden by the access mode, and a 2 s parallel reachability probe of every upstream (NRF, AMF, SMF, UDM, PCF, BSF, NEF, SMSF, portal, Prometheus, Loki, Jaeger) with latency.
 | `slice_status` | READ | Per S-NSSAI (optional `sst`, `sd`): registered UEs, active sessions per DNN, configured session AMBR and supporting gNBs (TS 23.501 §5.15). |
+| `roaming_status` | READ | Roaming view: N32 context per partner PLMN (optional `partner_plmn`, `MCC-MNC`) from the portal roaming status API and SEPP metrics, N32-f and handshake counters, TLS rejects by reason, roaming UEs from the AMF and home-routed sessions inferred from SMF sessions of roaming UEs. Degrades per source; returns `deployed:false` with a message when no SEPP or roaming profile is running (TS 29.573 §5.2.2). |
 | `pcf_binding_list` | READ | PCF bindings from the BSF (Nbsf_Management discovery, TS 29.521) by `supi`, `ue_ip` or `dnn`; with no filter, one lookup per SMF session UE IP. Returns the bindings, the BSF active-binding gauge and what was queried. Each lookup is a real discovery; a miss is counted by the BSF as a rejected discovery. |
 
 ### Analysis and PCAP

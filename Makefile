@@ -1,7 +1,7 @@
 # 5GC Rel-19 — Root Makefile
 # Conventions in CLAUDE.md §7
 
-.PHONY: help all build test lint docker-nfs docker-ran ran-up packetrusher-vendor ran-down mcp-start mcp-e2e up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs release-leak-test rolling-upgrade-check mixed-release-e2e
+.PHONY: help all build test lint docker-nfs docker-ran ran-up packetrusher-vendor ran-down mcp-start mcp-e2e up up-obs up-test down pki sync-openapi clean ueransim ueransim-ursp ueransim-no-ursp ueransim-only ueransim-build-only logs-reg ueransim-down ueransim-slices ueransim-slices-down logs-slices test-slices validate-ursp test-ursp-codec ueransim-mod-e2e ursp-e2e qos-mod-e2e nw-session-e2e ueransim-profile-a ueransim-profile-a-down ueransim-all ueransim-all-down ueransim-status ueransim-iperf perf-up perf-down perf-probe perf-baseline perf-ue perf-dn perf-multi-ue perf-bench perf-report handover-test handover-down handover-n2-test handover-n2-down 5gcsa portal portal-build docker-portal full full-down mcp-build mcp-test mcp-docker mcp-up mcp-down release-public release-docs release-leak-test rolling-upgrade-check mixed-release-e2e roaming-e2e
 
 NFS := nrf amf ausf udm udr smf pcf upf nssf smsf bsf nef lmf sepp
 COMPOSE := docker compose
@@ -102,8 +102,11 @@ mcp-test: ## Unit + functional tests for the MCP server
 mcp-e2e: ## Live smoke test of every MCP tool, with a coverage guard (MUTATE=1 state changes, DISRUPT=1 confirmed N1/N2 tools, LAB_URL=<lab mcp> ADMIN tools + roles; each reverted)
 	./scripts/mcp-smoke.sh
 
-sepp-e2e: ## vSEPP<->hSEPP roaming E2E: N32-c, NFDiscover via N32-f (header + telescopic), pcap+keylog (PROFILE=rel17|rel19; needs make up + make pki)
+sepp-e2e: ## local SEPP<->test-peer hSEPP roaming E2E: N32-c, NFDiscover via N32-f (header + telescopic), pcap+keylog (PROFILE=rel17|rel19; needs make up + make pki)
 	PROFILE=$(or $(PROFILE),rel17) ./scripts/sepp-e2e.sh
+
+roaming-e2e: ## Roaming E2E: UE of HPLMN 001/02 registers on the 001/01 core via SEPPs and gets a home-routed PDU session exiting at the H-UPF N6 (needs core + --profile roaming incl. hausf/hudm/hudr/hsmf/hupf)
+	./scripts/roaming-e2e.sh
 
 mcp-docker: ## Build the MCP server Docker image
 	$(MAKE) -C mcp docker

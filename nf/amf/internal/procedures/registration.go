@@ -20,8 +20,10 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	amfctx "github.com/francurieses/claudia-5gc/nf/amf/internal/context"
+	"github.com/francurieses/claudia-5gc/nf/amf/internal/roaming"
 	"github.com/francurieses/claudia-5gc/nf/amf/internal/timercfg"
 	"github.com/francurieses/claudia-5gc/shared/capability"
 	"github.com/francurieses/claudia-5gc/shared/crypto/kdf"
@@ -235,6 +237,9 @@ type RegistrationHandler struct {
 	// budgets are the per-step SBI timeouts (AUD-registration-20); zero value =
 	// DefaultBudgets. See budget.go.
 	budgets Budgets
+	// roaming classifies UEs of another PLMN and selects the home AUSF/UDM route
+	// via the SEPP (ROAM-001); nil = feature off, every UE uses the local peers.
+	roaming *roaming.Router
 }
 
 // NewRegistrationHandler builds a handler wired to the AMF's NF clients.
@@ -260,6 +265,14 @@ func NewRegistrationHandler(
 		abba:           nas.ABBA{0x00, 0x00},
 		imsVoPS3GPP:    true,
 	}
+}
+
+// WithRoaming enables roaming over N32 (ROAM-001): a UE whose SUCI/SUPI home
+// network differs from the serving PLMN is authenticated and registered with its
+// home AUSF/UDM through the SEPP. A nil router keeps today's behaviour.
+// Ref: TS 23.502 §4.2.2.2.2; TS 23.501 §6.3.4
+func (h *RegistrationHandler) WithRoaming(r *roaming.Router) {
+	h.roaming = r
 }
 
 // WithNSSF enables NSSF-delegated slice selection for this handler.
@@ -675,6 +688,11 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 
 	// Step 6-8: AUSF authentication initiation
 	// Ref: TS 23.502 §4.2.2.2.2 step 6-8 (Nausf_UEAuthentication_Authenticate)
+	ctx, rterr := h.selectHomeRoute(ctx, ue, suciOrGUTI, log)
+	if rterr != nil {
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		return nil, rterr
+	}
 	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFInit)
 	ausfResp, err := h.ausf.InitiateAuth(aCtx, suciOrGUTI, h.servingNetName)
 	aCancel()
@@ -683,8 +701,7 @@ func (h *RegistrationHandler) Phase1_InitiateAuthentication(
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "AUSF initiate auth failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
-		return nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
-			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: initiate auth: %w", err)}
+		return nil, h.ausfFailure(ue, log, "initiate auth", err)
 	}
 	ue.AuthCtxID = ausfResp.AuthCtxID
 	ue.PendingRAND = ausfResp.RAND
@@ -742,6 +759,11 @@ func (h *RegistrationHandler) Phase1_AuthenticateWithSUCI(
 		"message_type", "IdentityResponse",
 	)
 
+	ctx, rterr := h.selectHomeRoute(ctx, ue, suci, log)
+	if rterr != nil {
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		return nil, rterr
+	}
 	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFInit)
 	ausfResp, err := h.ausf.InitiateAuth(aCtx, suci, h.servingNetName)
 	aCancel()
@@ -750,8 +772,7 @@ func (h *RegistrationHandler) Phase1_AuthenticateWithSUCI(
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "AUSF initiate auth failed")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
-		return nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
-			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: initiate auth: %w", err)}
+		return nil, h.ausfFailure(ue, log, "initiate auth", err)
 	}
 	ue.AuthCtxID = ausfResp.AuthCtxID
 	ue.PendingRAND = ausfResp.RAND
@@ -800,6 +821,7 @@ func (h *RegistrationHandler) Phase1_ResyncAuth(
 		"direction", "OUT",
 	)
 
+	ctx = ueRouteCtx(ctx, ue) // route fixed at Phase 1
 	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFConfirm)
 	ausfResp, err := h.ausf.ResyncAuth(aCtx, suciOrSUPI, h.servingNetName, ue.PendingRAND, auts)
 	aCancel()
@@ -865,6 +887,9 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	ctx, span := tracing.Tracer(nfName, "procedures").Start(ctx, "InitialRegistration/Phase2")
 	defer span.End()
 	span.SetAttributes(attribute.Int64("amf_ue_ngap_id", ue.AMFUENGAPId))
+	if rt := ue.HomeRoute(); rt != nil {
+		span.SetAttributes(attribute.Bool("roaming", true), attribute.String("home_plmn", rt.HomePLMN.String()))
+	}
 
 	metrics.NASMessagesTotal.WithLabelValues(nfName, "AuthenticationResponse", "IN", "OK").Inc()
 
@@ -891,6 +916,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 
 	// Step 11: forward RES* to AUSF for verification
 	// Ref: TS 23.502 §4.2.2.2.2 step 11
+	ctx = ueRouteCtx(ctx, ue) // route fixed at Phase 1
 	aCtx, aCancel := stepCtx(ctx, h.budget().AUSFConfirm)
 	confirmResp, err := h.ausf.ConfirmAuth(aCtx, ue.AuthCtxID, hex.EncodeToString(authResp.RES))
 	aCancel()
@@ -907,8 +933,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 			// identification procedure. Ref: TS 24.501 §5.4.1.3.5
 			return nil, nil, fmt.Errorf("ausf: confirm auth: %w", err)
 		}
-		return nil, nil, &ErrRejectCause{Cause: NFUnavailableRejectCause,
-			SpecRef: "TS 24.501 §5.5.1.2.5", Err: fmt.Errorf("ausf: confirm auth: %w", err)}
+		return nil, nil, h.ausfFailure(ue, log, "confirm auth", err)
 	}
 
 	// Atomically bind the SUPI to this new context. SetSUPI returns any prior context
@@ -916,8 +941,28 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 	// abrupt disconnect) without having sent a Deregistration NAS message, so its old
 	// context was never cleaned up. The caller receives it and releases it async.
 	// Ref: TS 23.502 §4.2.2.2.2 step 3b
+	// The SUPI returned by the home AUSF is bound to the home network: a SUPI of
+	// another PLMN is never accepted for a roaming UE.
+	// Ref: TS 33.501 §6.1.3.2; procedure doc RoamingRegistration §8 item 9
+	if rt := ue.HomeRoute(); rt != nil && !rt.OwnsSUPI(confirmResp.SUPI) {
+		const specRef = "TS 33.501 §6.1.3.2"
+		log.Error("SUPI returned by home AUSF is not in the home PLMN - rejecting registration",
+			"interface", "Nausf", "direction", "IN", "result", "REJECT",
+			"cause", int(NFUnavailableRejectCause), "roaming", true,
+			"home_plmn", rt.HomePLMN.String(), "supi", confirmResp.SUPI, "spec_ref", specRef)
+		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		metrics.ProcedureTotal.WithLabelValues(nfName, roamingProcedure, "REJECT").Inc()
+		return nil, nil, &ErrRejectCause{Cause: NFUnavailableRejectCause, SpecRef: specRef,
+			Err: fmt.Errorf("ausf: confirm auth: SUPI outside home PLMN %s", rt.HomePLMN)}
+	}
 	displaced := h.mgr.SetSUPI(ue, confirmResp.SUPI)
 	ue.KAUSF = confirmResp.KAUSF
+	// SUPI-only UDM calls follow the route (nil route deletes a stale entry).
+	if !h.roaming.Remember(ue.SUPI, ue.HomeRoute()) {
+		log.Warn("roaming route table full - deregistration follows the UE context route",
+			"interface", "N1", "direction", "IN", "result", "FAILURE",
+			"spec_ref", "TS 29.500 §6.1.4.3")
+	}
 	log = log.With("supi", ue.SUPI)
 	span.SetAttributes(attribute.String("supi", ue.SUPI))
 
@@ -943,6 +988,7 @@ func (h *RegistrationHandler) Phase2_ProcessAuthResponse(
 			"result", "REJECT", "cause", int(UESecCapRejectCause),
 			"spec_ref", "TS 24.501 §5.5.1.2.8 i)")
 		metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "REJECT").Inc()
+		h.roaming.Forget(ue.SUPI)
 		return nil, nil, &ErrRejectCause{Cause: UESecCapRejectCause,
 			SpecRef: "TS 24.501 §5.5.1.2.8 i)", Err: ErrUESecurityCapabilityUnacceptable}
 	}
@@ -1062,7 +1108,7 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 	bud := h.budget()
 	// p3ctx bounds every SBI step of Phase3 below T3510 (budget.go); the AMF's
 	// own state handling keeps using ctx.
-	p3ctx, p3cancel := context.WithTimeout(ctx, bud.Phase3)
+	p3ctx, p3cancel := context.WithTimeout(ueRouteCtx(ctx, ue), bud.Phase3)
 	defer p3cancel()
 	emergency := ue.RegistrationType == byte(nas.RegistrationTypeEmergency)
 
@@ -1081,11 +1127,16 @@ func (h *RegistrationHandler) Phase3_ProcessSMCComplete(
 				"spec_ref", "TS 23.502 §4.2.2.2.2 step 14a")
 		} else {
 			cause, ref := RejectCauseForUDMError(uecmErr)
-			log.Error("UDM AMF registration failed - rejecting registration",
+			uecmAttrs := []any{
 				"error", uecmErr, "interface", "Nudm", "direction", "IN",
-				"result", "REJECT", "cause", int(cause), "spec_ref", ref)
+				"result", "REJECT", "cause", int(cause), "spec_ref", ref}
+			if rt := ue.HomeRoute(); rt != nil {
+				uecmAttrs = append(uecmAttrs, "roaming", true, "home_plmn", rt.HomePLMN.String())
+			}
+			log.Error("UDM AMF registration failed - rejecting registration", uecmAttrs...)
 			span.SetStatus(codes.Error, "UDM UECM registration failed")
 			metrics.ProcedureTotal.WithLabelValues(nfName, "InitialRegistration", "FAILURE").Inc()
+			h.roaming.Forget(ue.SUPI)
 			return nil, &ErrRejectCause{Cause: cause, SpecRef: ref,
 				Err: fmt.Errorf("udm: uecm registration: %w", uecmErr)}
 		}
@@ -1666,6 +1717,11 @@ func (h *RegistrationHandler) DeregisterUECM(ctx context.Context, supi string) e
 			"spec_ref", "TS 23.502 §4.2.2.3.2 step 3, TS 29.503 §5.3.2.4")
 		return nil
 	}
+	if h.mgr != nil {
+		if ue, found := h.mgr.GetBySUPI(supi); found {
+			ctx = ueRouteCtx(ctx, ue)
+		}
+	}
 	h.unsubscribeSDM(ctx, supi)
 	return h.udm.DeregisterUECM(ctx, supi)
 }
@@ -1709,7 +1765,7 @@ func (h *RegistrationHandler) UnsubscribeSDMOf(ctx context.Context, ue *amfctx.U
 	if id == "" {
 		return
 	}
-	if err := sub.UnsubscribeSDM(ctx, ue.SUPI, id); err != nil {
+	if err := sub.UnsubscribeSDM(ueRouteCtx(ctx, ue), ue.SUPI, id); err != nil {
 		h.logger.Warn("UDM SDM unsubscribe failed (non-fatal)", "procedure", "NetworkDeregistration",
 			"interface", "Nudm", "direction", "OUT", "supi", ue.SUPI, "subscription_id", id,
 			"result", "FAILURE", "error", err, "spec_ref", "TS 23.502 §4.2.2.3.3 step 3")
@@ -1829,8 +1885,10 @@ func (h *RegistrationHandler) runOptionalPeers(ctx context.Context, budget time.
 // Best-effort, detached from the caller context. Ref: TS 23.502 §4.2.2.2.2
 // step 14, TS 29.503 §5.2.2.4, §5.3.2.4.
 func (h *RegistrationHandler) rollbackUDMRegistration(ctx context.Context, ue *amfctx.UEContext, uecmOK bool) {
-	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), h.budget().UECM+h.budget().SDMSubscribe)
+	rctx, cancel := context.WithTimeout(ueRouteCtx(context.WithoutCancel(ctx), ue),
+		h.budget().UECM+h.budget().SDMSubscribe)
 	defer cancel()
+	defer h.roaming.Forget(ue.SUPI) // registration rejected: the route is not needed any more
 	log := h.logger.With("procedure", "InitialRegistration", "supi", ue.SUPI,
 		"interface", "Nudm", "direction", "OUT", "spec_ref", "TS 23.502 §4.2.2.2.2 step 14")
 	if sub, ok := h.udm.(UDMSDMSubscriber); ok {
@@ -1879,4 +1937,93 @@ func restrictionType(ue *amfctx.UEContext) string {
 		return ""
 	}
 	return sar.RestrictionType
+}
+
+// ueRouteCtx returns ctx carrying the UE's roaming route and, for a UE known to
+// be roaming, the "roaming required" mark so the SBI client fails instead of
+// falling back to the local home NF. Non-roaming UE: ctx unchanged.
+func ueRouteCtx(ctx context.Context, ue *amfctx.UEContext) context.Context {
+	rt := ue.HomeRoute()
+	if rt == nil {
+		return ctx
+	}
+	return roaming.WithRoamingRequired(roaming.WithRoute(ctx, rt))
+}
+
+// roamingProcedure is the fivegc_procedure_total procedure label of a roaming
+// registration (OK = routed to the home PLMN; REJECT/FAILURE = rejected or the
+// home exchange failed). Ref: TS 23.502 §4.2.2.2.2.
+const roamingProcedure = "RoamingRegistration"
+
+// selectHomeRoute classifies the UE as roaming (SUCI/SUPI home network vs the
+// serving PLMN) and, for a configured home PLMN, stores the route on the UE
+// context and returns ctx carrying it so the Nausf/Nudm clients send the request
+// to the SEPP with 3gpp-Sbi-Target-apiRoot. A non-roaming UE (or roaming off)
+// keeps a nil route and an untouched ctx. A home PLMN without a roaming.home_plmns
+// entry is REGISTRATION REJECT #11 with no SBI request.
+// Ref: TS 23.502 §4.2.2.2.2 step 8; TS 23.501 §6.3.4; TS 24.501 §5.5.1.2.5
+func (h *RegistrationHandler) selectHomeRoute(ctx context.Context, ue *amfctx.UEContext,
+	identity string, log *slog.Logger) (context.Context, error) {
+	if h.roaming == nil {
+		return ctx, nil
+	}
+	if !h.roaming.Classifiable(identity) {
+		// No home network can be derived (5G-GUTI, unparsable SUCI): never
+		// overwrite the route with "non-roaming". A GUTI keeps the route of the
+		// UE context; an unparsable SUCI is a new identity, so it is cleared.
+		if strings.HasPrefix(identity, "suci-") {
+			ue.SetHomeRoute(nil)
+			log.Warn("roaming enabled but SUCI home network identifier not parsable - using local home network",
+				"interface", "N1", "direction", "IN", "result", "FAILURE",
+				"suci", identity, "spec_ref", "TS 23.003 §2.2B; TS 29.571 §5.3.2")
+			return ctx, nil
+		}
+		return ueRouteCtx(ctx, ue), nil
+	}
+	rt, err := h.roaming.Classify(identity)
+	if err != nil {
+		const specRef = "TS 23.501 §6.3.4; TS 24.501 §5.5.1.2.5"
+		ue.SetHomeRoute(nil)
+		log.Warn("roaming UE home PLMN not configured - rejecting registration",
+			"interface", "N1", "direction", "OUT", "result", "REJECT",
+			"cause", int(nas.CausePLMNNotAllowed), "roaming", true,
+			"home_plmn", h.roaming.HomePLMNOf(identity),
+			"error", err, "spec_ref", specRef)
+		metrics.ProcedureTotal.WithLabelValues(nfName, roamingProcedure, "REJECT").Inc()
+		return ctx, &ErrRejectCause{Cause: nas.CausePLMNNotAllowed, SpecRef: specRef, Err: err}
+	}
+	ue.SetHomeRoute(rt)
+	if rt != nil {
+		metrics.ProcedureTotal.WithLabelValues(nfName, roamingProcedure, "OK").Inc()
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Bool("roaming", true),
+			attribute.String("home_plmn", rt.HomePLMN.String()))
+		log.Info("roaming UE - home AUSF/UDM selected via SEPP",
+			"interface", "N12", "direction", "OUT", "roaming", true,
+			"home_plmn", rt.HomePLMN.String(), "via_sepp", rt.ViaSEPP,
+			"target_api_root", rt.AUSFAPIRoot,
+			"spec_ref", "TS 23.501 §6.3.4; TS 29.500 §6.1.4.3")
+	}
+	return ueRouteCtx(ctx, ue), nil
+}
+
+// ausfFailure builds the REGISTRATION REJECT for a failed Nausf exchange. A
+// non-roaming UE keeps the historic #22; a roaming UE uses
+// RejectCauseForRoamingAUSFError (#73 for SERVING_NETWORK_NOT_AUTHORIZED).
+func (h *RegistrationHandler) ausfFailure(ue *amfctx.UEContext, log *slog.Logger,
+	op string, err error) error {
+	cause, ref := NFUnavailableRejectCause, "TS 24.501 §5.5.1.2.5"
+	if rt := ue.HomeRoute(); rt != nil {
+		cause, ref = RejectCauseForRoamingAUSFError(err)
+		result := "REJECT"
+		var ae *AUSFError
+		if !errors.As(err, &ae) {
+			result = "FAILURE" // transport level
+		}
+		log.Error("home AUSF exchange failed - rejecting registration",
+			"interface", "Nausf", "direction", "IN", "result", result,
+			"cause", int(cause), "roaming", true, "home_plmn", rt.HomePLMN.String(),
+			"via_sepp", true, "error", err, "spec_ref", ref)
+		metrics.ProcedureTotal.WithLabelValues(nfName, roamingProcedure, result).Inc()
+	}
+	return &ErrRejectCause{Cause: cause, SpecRef: ref, Err: fmt.Errorf("ausf: %s: %w", op, err)}
 }

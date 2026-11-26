@@ -1,0 +1,66 @@
+# SMF — Home PLMN 001/02 instance (hsmf) for home-routed roaming (ROAM-002); same image as smf.
+# Acts as H-SMF: no AMF/PCF peers, local policy, in-memory sessions (no DATABASE_URL).
+
+nf_instance_id: "00000000-0000-4004-8000-000000000002"
+
+# Home PLMN override (this instance is not the operator's serving PLMN).
+plmn:
+  mcc: "001"
+  mnc: "02"
+
+sbi:
+  address: 0.0.0.0:8004
+  # Advertised in the NF profile; the hSEPP resolver matches it (TS 23.003 §28.5.1).
+  fqdn: smf.5gc.mnc002.mcc001.3gppnetwork.org
+  tls:
+    ca_file: /etc/5gc/pki/ca.crt
+    cert_file: /etc/5gc/pki/smf.crt
+    key_file: /etc/5gc/pki/smf.key
+
+peers:
+  nrf: hnrf:8000
+  udm: hudm:8003
+  upf: hupf-n4.5gc.local:8805
+  # Explicitly empty: override the Go defaults (pcf:8006, amf:8001, amf:9002); the H-SMF uses local
+  # policy and never talks to an AMF or PCF.
+  pcf: ""
+  amf: ""
+  amf_mgmt: ""
+
+dnns:
+  - name: internet
+    ue_ip_pool: 10.70.0.0/24
+
+metrics:
+  address: 0.0.0.0:9105
+
+n4:
+  association_retry_initial_seconds: 1
+  association_retry_max_seconds: 5
+  heartbeat_interval_seconds: 2
+  measurement_period_seconds: 60
+  n1_retransmissions: 3
+  report_listen: 0.0.0.0:8805
+  t1_seconds: 3
+  volume_threshold_bytes: 1000000
+
+# Same slice values on both networks (owner decision).
+snssais:
+  - sd: "000001"
+    sst: 1
+  - sd: "000002"
+    sst: 1
+  - sd: "000001"
+    sst: 2
+  - sd: "000001"
+    sst: 3
+  - sd: "001234"
+    sst: 1
+
+# H-UPF N3/N9 address (hn9 net).
+upf_n3_addr: 172.30.20.200
+upf_n9_addr: 172.30.20.200
+
+# Optional: restrict the V-UPF N9 addresses accepted in vcnTunnelInfo (empty = only the always-on
+# loopback / link-local / multicast / unspecified / broadcast refusal). Invalid CIDR = startup error.
+# vupf_n9_allowed_cidrs: ["172.30.10.0/24"]

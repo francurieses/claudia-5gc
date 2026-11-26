@@ -275,7 +275,7 @@ Four development slices (TS 23.501 §5.15):
 | silver | 2 | 000001 | URLLC | imsi-001010000000203 |
 | bronze | 3 | 000001 | MIoT | imsi-001010000000204 |
 
-> Upgrading: the UDR skips SUPIs already in Postgres, so rows for 202-204 seeded before UERAN-001 keep
+> Upgrading: the UDR skips SUPIs already in Postgres, so rows for 202-204 seeded keep
 > internet-only slices. Reseed with `make down` + `make ueransim-all`.
 
 ```bash

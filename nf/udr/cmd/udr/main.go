@@ -257,6 +257,11 @@ func main() {
 		} else {
 			nrfClient := nrf.New(nrfAddr, httpClient, logger)
 			profile := udrsbi.BuildNFProfile(cfg.NFInstanceID, relProfile, udrsbi.NudrDataRepositoryCatalog())
+			// Optional sbi.fqdn: FQDN + ipEndPoints + plmnList (roaming home core); no-op when unset.
+			if err := nrf.ApplyFQDNIdentity(profile, cfg.SBI.FQDN, cfg.SBI.Address, cfg.PLMN.MCC, cfg.PLMN.MNC); err != nil {
+				logger.Error("invalid sbi.fqdn identity", "fqdn", cfg.SBI.FQDN, "error", err)
+				os.Exit(1)
+			}
 			if err := nrfClient.RegisterAndStartHeartbeat(ctx, profile, 45*time.Second); err != nil {
 				logger.Warn("NRF registration failed (continuing without NRF)",
 					"nrf_addr", nrfAddr, "error", err,
@@ -305,9 +310,17 @@ func getEnvIntDefault(key string, def int) int {
 
 type Config struct {
 	NFInstanceID string `yaml:"nf_instance_id"`
-	SBI          struct {
+	// PLMN optionally overrides the operator PLMN (home-PLMN roaming instance);
+	// advertised as plmnList only together with sbi.fqdn.
+	PLMN struct {
+		MCC string `yaml:"mcc"`
+		MNC string `yaml:"mnc"`
+	} `yaml:"plmn"`
+	SBI struct {
 		Address string `yaml:"address"`
-		TLS     struct {
+		// FQDN, when set, is advertised in the NF profile (TS 23.003 §28.5.1).
+		FQDN string `yaml:"fqdn"`
+		TLS  struct {
 			CertFile string `yaml:"cert_file"`
 			KeyFile  string `yaml:"key_file"`
 			CAFile   string `yaml:"ca_file"`

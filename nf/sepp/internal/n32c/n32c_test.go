@@ -64,7 +64,12 @@ func newFixture(t *testing.T, profile string, mut ...func(*Config)) *fixture {
 			if err != nil {
 				return PeerIdentity{}, err
 			}
-			return PeerIdentity{FQDN: fq, PLMN: pl}, nil
+			id := PeerIdentity{FQDN: fq, PLMN: pl}
+			// Test hook: like CertPeerIdentity, take the PLMN set from a TLS state.
+			if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+				id.PLMNs = certPLMNs(r.TLS.PeerCertificates[0])
+			}
+			return id, nil
 		},
 		ResponderIdentity: func(*tls.ConnectionState) (PeerIdentity, error) {
 			return PeerIdentity{FQDN: peer1FQDN, PLMN: plmn1}, nil
@@ -279,9 +284,9 @@ func TestRejections(t *testing.T) {
 		{name: "E1 PRINS only", peer: peer1FQDN, body: `{"sender":"` + peer1FQDN + `","supportedSecCapabilityList":["PRINS"]}`, status: 403, cause: CauseNegotiationNotAllowed},
 		{name: "E1 unknown only", peer: peer1FQDN, body: `{"sender":"` + peer1FQDN + `","supportedSecCapabilityList":["PRINS","FUTURE_CAP"]}`, status: 403, cause: CauseNegotiationNotAllowed},
 		{name: "E2 non partner", peer: "sepp.5gc.mnc099.mcc999.3gppnetwork.org", body: `{` + sender("sepp.5gc.mnc099.mcc999.3gppnetwork.org") + `,"plmnIdList":[{"mcc":"999","mnc":"99"}]}`, status: 403, logCause: "plmn_not_allowed"},
-		{name: "E3 sender vs cert", peer: peer1FQDN, body: `{` + sender("sepp.5gc.mnc005.mcc001.3gppnetwork.org") + `,"plmnIdList":[{"mcc":"001","mnc":"05"}]}`, status: 403, logCause: "plmn_mismatch"},
+		{name: "E3 sender vs cert", peer: peer1FQDN, body: `{` + sender("sepp.5gc.mnc005.mcc001.3gppnetwork.org") + `,"plmnIdList":[{"mcc":"001","mnc":"05"}]}`, status: 403, logCause: "sender_domain_mismatch"},
 		{name: "E3 plmnIdList vs cert", peer: peer1FQDN, body: `{` + sender(peer1FQDN) + `,"plmnIdList":[{"mcc":"001","mnc":"03"}]}`, status: 403, logCause: "plmn_mismatch"},
-		{name: "E3 sender not a 3gpp domain", peer: peer1FQDN, body: `{` + sender("sepp.example.org") + `}`, status: 403, logCause: "plmn_mismatch"},
+		{name: "E3 sender not a 3gpp domain", peer: peer1FQDN, body: `{` + sender("sepp.example.org") + `}`, status: 403, logCause: "sender_domain_mismatch"},
 		{name: "E3 no usable cert", peer: "bogus.example.org", body: validBody(""), status: 403},
 		{name: "E4 no sender", peer: peer1FQDN, body: `{"supportedSecCapabilityList":["TLS"]}`, status: 400, cause: CauseMandatoryIEMissing},
 		{name: "E4 no list", peer: peer1FQDN, body: `{"sender":"` + peer1FQDN + `"}`, status: 400, cause: CauseMandatoryIEMissing},
@@ -549,6 +554,7 @@ func TestParsePLMNFromFQDN(t *testing.T) {
 
 func TestClientSendsSupportedFeaturesUnderBothProfiles(t *testing.T) {
 	for _, profile := range []string{"rel17", "rel19"} {
+		want := map[string]string{"rel17": "1", "rel19": "5"}[profile] // S1: NFTLST (+PSIU on rel19)
 		t.Run(profile, func(t *testing.T) {
 			var bodies []SecNegotiateReqData
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -568,7 +574,7 @@ func TestClientSendsSupportedFeaturesUnderBothProfiles(t *testing.T) {
 			} else if !errors.Is(err, ErrTeardownNotAllowed) {
 				t.Fatal(err)
 			}
-			if len(bodies) != 1 || bodies[0].SupportedFeatures != "1" {
+			if len(bodies) != 1 || bodies[0].SupportedFeatures != want {
 				t.Fatalf("request features %+v", bodies)
 			}
 		})

@@ -22,9 +22,9 @@
 #
 # Environment: MCP_URL (default http://localhost:9300), MCP_TOKEN (bearer for MCP_URL, optional),
 #   SUPI / SUPI2 (the two test UEs), EXPECTED_UES (expected registered UEs, default 2; not UE_COUNT, which the Makefile exports as 1),
-#   EXPECT_TOOLS (expected tools/list size of MCP_URL, default 74), EXPECT_MODE (default operator),
+#   EXPECT_TOOLS (expected tools/list size of MCP_URL, default 75), EXPECT_MODE (default operator),
 #   PORTAL_URL (default http://localhost:8080, URSP template lookup and cleanup),
-#   LAB_URL, LAB_TOKEN, VIEWER_TOKEN, EXPECT_LAB_TOOLS (default 77).
+#   LAB_URL, LAB_TOKEN, VIEWER_TOKEN, EXPECT_LAB_TOOLS (default 78).
 #
 # Portability: bash 3.2 (macOS) and GNU/Linux. Needs curl, jq and python3 (3.9+).
 set -u
@@ -36,13 +36,13 @@ DISRUPT="${DISRUPT:-0}"
 SUPI="${SUPI:-imsi-001010000000001}"
 SUPI2="${SUPI2:-imsi-001010000000002}"
 EXPECTED_UES="${EXPECTED_UES:-2}"
-EXPECT_TOOLS="${EXPECT_TOOLS:-74}"
+EXPECT_TOOLS="${EXPECT_TOOLS:-75}"
 EXPECT_MODE="${EXPECT_MODE:-operator}"
 PORTAL_URL="${PORTAL_URL:-http://localhost:8080}"
 LAB_URL="${LAB_URL:-}"
 LAB_TOKEN="${LAB_TOKEN:-}"
 VIEWER_TOKEN="${VIEWER_TOKEN:-}"
-EXPECT_LAB_TOOLS="${EXPECT_LAB_TOOLS:-77}"
+EXPECT_LAB_TOOLS="${EXPECT_LAB_TOOLS:-78}"
 
 TOKEN="$MCP_TOKEN"   # bearer token used by rpc(); switched in the lab section
 PASS=0
@@ -373,6 +373,9 @@ ok "nf_discover SMF" nf_discover '{"target_nf_type":"SMF","requester_nf_type":"A
 ok "slice_status sst 1 sd 000001: all UEs, all sessions" slice_status '{"sst":1,"sd":"000001"}' \
   "type == \"array\" and .[0].registered_ues == $EXPECTED_UES and .[0].active_sessions_by_dnn.internet == $EXPECTED_UES"
 refused "slice_status bad sd refused" slice_status '{"sd":"zz"}'
+ok "roaming_status: N32 partner context established (or no roaming deployed)" roaming_status '{}' \
+  '((.deployed == true and (.partners|length) >= 1 and .sources.portal == "ok" and .sources.prometheus == "ok") or (.deployed == false and (.message|length) > 0))'
+refused "roaming_status bad partner_plmn refused" roaming_status '{"partner_plmn":"abc"}'
 ok "subscription_am_get $SUPI: allowed NSSAI, no key fields" subscription_am_get "{\"supi\":\"$SUPI\"}" \
   '(.nssai.defaultSingleNssais | length) >= 1 and ([.. | objects | (.k?, .opc?) // empty] | length == 0)'
 ok "subscription_qos_get $SUPI" subscription_qos_get "{\"supi\":\"$SUPI\"}" '.found == true and .subscriptions[0].default5qi != null'

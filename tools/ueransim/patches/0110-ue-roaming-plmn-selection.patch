@@ -1,0 +1,66 @@
+--- a/src/ue/types.hpp
++++ b/src/ue/types.hpp
+@@ -98,6 +98,8 @@
+     OctetString homeNetworkPublicKey{};
+     std::optional<std::string> routingIndicator{};
+     Plmn hplmn{};
++    /* Opt-in (ROAM-001): fall back to any non-forbidden PLMN, TS 23.122 §4.4.3.1.1 "other PLMN". Default off. */
++    bool allowRoaming{};
+     OctetString key{};
+     OctetString opC{};
+     OpType opType{};
+--- a/src/ue.cpp
++++ b/src/ue.cpp
+@@ -268,6 +268,7 @@
+         result->integrityMaxRate.downlinkFull = downlink == "full";
+     }
+ 
++    result->allowRoaming = yaml::HasField(config, "allowRoaming") && yaml::GetBool(config, "allowRoaming");
+     result->mmCapabilityExt = ParseCapabilityBits(config, "mmCapabilityBits");
+     result->smCapabilityExt = ParseCapabilityBits(config, "smCapabilityBits");
+ 
+@@ -403,6 +404,7 @@
+     c->tunName = g_refConfig->tunName;
+     c->tunNetmask = g_refConfig->tunNetmask;
+     c->hplmn = g_refConfig->hplmn;
++    c->allowRoaming = g_refConfig->allowRoaming;
+     c->configuredNssai = g_refConfig->configuredNssai;
+     c->defaultConfiguredNssai = g_refConfig->defaultConfiguredNssai;
+     c->supportedAlgs = g_refConfig->supportedAlgs;
+--- a/src/ue/nas/mm/radio.cpp
++++ b/src/ue/nas/mm/radio.cpp
+@@ -90,7 +90,24 @@
+         if (nas::utils::ServiceAreaListForbidsPlmn(m_storage->serviceAreaList->get(), nas::utils::PlmnFrom(plmn)))
+             continue;
+         if (m_storage->equivalentPlmnList->contains(plmn))
++            candidates.push_back(plmn);
++    }
++
++    // Opt-in roaming (ROAM-001): automatic mode, no HPLMN/EPLMN available -> any other non-forbidden PLMN
++    // (TS 23.122 §4.4.3.1.1). Only when allowRoaming is set; otherwise behaviour is unchanged.
++    bool roamingFallback = false;
++    if (candidates.empty() && m_base->config->allowRoaming)
++    {
++        for (auto &plmn : plmns)
++        {
++            if (m_storage->forbiddenPlmnList->contains(plmn))
++                continue;
++            if (nas::utils::ServiceAreaListForbidsPlmn(m_storage->serviceAreaList->get(), nas::utils::PlmnFrom(plmn)))
++                continue;
+             candidates.push_back(plmn);
++            roamingFallback = true;
++            break;
++        }
+     }
+ 
+     Plmn selected = candidates.empty() ? Plmn{} : candidates[0];
+@@ -105,6 +122,9 @@
+     }
+     else if (lastSelectedPlmn != selected)
+     {
++        if (roamingFallback)
++            m_logger->info("Roaming PLMN selection: no HPLMN/EPLMN available, selected visited plmn[%s]",
++                           ToJson(selected).str().c_str());
+         m_logger->info("Selected plmn[%s]", ToJson(selected).str().c_str());
+         m_base->rrcTask->push(std::make_unique<NmUeNasToRrc>(NmUeNasToRrc::RRC_NOTIFY));
+ 

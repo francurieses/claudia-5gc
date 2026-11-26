@@ -27,7 +27,11 @@ type Context struct {
 	// NFTLST is true iff feature NFTLST was negotiated (N32-f TLS teardown via NONE).
 	NFTLST bool
 	// PeerFQDN is the peer SEPP FQDN (sender).
-	PeerFQDN  string
+	PeerFQDN string
+	// CertPLMNs is the PLMN set of the N32-c peer certificate. N32-f
+	// connections of this context must present a certificate whose PLMN set
+	// is a subset of it (TS 33.501 §13.1.2). Empty: only RemotePLMN.
+	CertPLMNs []PlmnId
 	CreatedAt time.Time
 }
 

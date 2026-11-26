@@ -39,10 +39,18 @@ export interface Service {
   state: string
   created: number
   uptime: string
+  /** `logging.5gc/nf` label (AMF, SEPP, NRF…); absent for sidecars/tooling. */
+  nf?: string
+  /** Docker healthcheck state. */
+  health?: 'healthy' | 'unhealthy' | 'starting'
+  /** PLMN side of a roaming deployment (NF containers only). */
+  side?: 'local' | 'partner'
 }
 
 export interface NFStatus {
   name: string
+  /** local = default core; partner = test-peer NFs (hsepp, hnrf), listed only when deployed. */
+  side?: 'local' | 'partner'
   registered: boolean
   healthz_ok: boolean
   metrics_ok: boolean
@@ -188,6 +196,97 @@ export const restartService = (name: string) => request<{ status: string }>('POS
 // ---- NF Status -----------------------------------------------------------
 
 export const getNFStatus = () => request<NFStatus[]>('GET', '/nf-status')
+
+// ---- Roaming (N32) — PORTAL-UI-22 ------------------------------------------
+
+export type RoamingSide = 'local' | 'partner'
+export type N32LinkState = 'UP' | 'DEGRADED' | 'DOWN' | 'NOT_DEPLOYED'
+
+export interface N32Attempt { at: string; role: 'initiator' | 'responder'; result: 'OK' | 'REJECT' | 'FAILURE'; cause?: string }
+
+export interface N32Partner {
+  plmn: string
+  state: 'ESTABLISHED' | 'NONE'
+  initiator: boolean
+  peer_fqdn?: string
+  peer_address?: string
+  security?: string
+  target_api_root_header: boolean
+  nftlst: boolean
+  negotiated_features?: string
+  established_at?: string
+  last_attempt?: N32Attempt
+}
+
+export interface N32View {
+  nf: string
+  local_plmn: string
+  local_fqdn: string
+  release_profile: string
+  security_mode: string
+  topology_hiding: boolean
+  established: number
+  partners: N32Partner[]
+}
+
+export interface RoamingNF {
+  name: string
+  role: string
+  side: RoamingSide
+  plmn?: string
+  deployed: boolean
+  state?: string
+  health?: string
+  uptime?: string
+  healthz_ok: boolean
+  metrics_ok: boolean
+}
+
+export interface RoamingSEPP { name: string; role: string; side: RoamingSide; n32?: N32View; error?: string }
+
+export interface RoamingStatus {
+  deployed: boolean
+  deploy_hint?: string
+  link: { state: N32LinkState; reason: string; local_plmn?: string; partner_plmn?: string }
+  nfs: RoamingNF[]
+  sepps: RoamingSEPP[]
+  traffic: {
+    available: boolean
+    out_per_sec: number | null
+    in_per_sec: number | null
+    error_per_sec: number | null
+    p95_ms: number | null
+    handshakes_ok_15m: number | null
+    error?: string
+  }
+  partner_nrf: { reachable: boolean; error?: string; instances: { nfInstanceId: string; nfType: string; nfStatus: string }[] }
+  recent_errors: { container: string; time?: string; level: string; msg: string; procedure?: string; cause?: string }[]
+  generated_at: string
+}
+
+export const getRoamingStatus = () => request<RoamingStatus>('GET', '/roaming/status')
+export const roamingLifecycle = (action: 'start' | 'stop' | 'restart') =>
+  request<{ action: string; results: Record<string, string> }>('POST', `/roaming/${action}`)
+/** plmn as `mcc-mnc` (e.g. 001-02). */
+export const roamingN32Action = (sepp: string, plmn: string, action: 'handshake' | 'teardown') =>
+  request<N32View>('POST', `/roaming/sepp/${sepp}/n32/${plmn}/${action}`)
+
+// ---- Roaming partners editor (SEPP-005) ------------------------------------
+export interface RoamingPartner {
+  plmn: { mcc: string; mnc: string }
+  n32: { ca_file: string; sepp_fqdn?: string; address?: string }
+  home_nfs?: { ausf_api_root?: string; udm_api_root?: string; smf_api_root?: string }
+}
+export interface RoamingPartners {
+  file: RoamingPartner[]
+  path: string
+  /** Effective list from the SEPP admin API; null when unavailable (see effective_reason). */
+  effective: { partners: { plmn: string; source: string; caFile?: string; seppFqdn?: string; address?: string; anchorSubject?: string; anchorNotAfter?: string }[] } | null
+  effective_reason?: string
+}
+export const getRoamingPartners = () => request<RoamingPartners>('GET', '/roaming/partners')
+export const putRoamingPartners = (partners: RoamingPartner[]) =>
+  request<{ saved: boolean; restart: Record<string, string> }>('PUT', '/roaming/partners', { partners })
 
 // ---- Sessions ------------------------------------------------------------
 

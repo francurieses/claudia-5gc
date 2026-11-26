@@ -1,0 +1,22 @@
+# Roaming partners (SEPP N32 trust + AMF home-network routing) — one file for SEPP, AMF and portal.
+# Copy to config/roaming/partners.yaml (gitignored) and uncomment. Mounted at
+# /etc/5gc/roaming/partners.yaml; override the path with ROAMING_PARTNERS_FILE.
+# A missing file = no partners (INFO log). A present but invalid file = startup error (fail closed).
+# SEPP and AMF read the file at startup: restart both after editing (the portal does this).
+#
+# partners:
+#   - plmn: {mcc: "001", mnc: "02"}
+#     n32:                                   # SEPP use
+#       # REQUIRED: trust anchor bundle (PEM) for this partner PLMN. Never the SBI CA.
+#       ca_file: /etc/5gc/pki/n32/peers/001-02/ca.crt
+#       # Optional; default derived from the PLMN (TS 23.003 §28.5.2).
+#       sepp_fqdn: sepp.5gc.mnc002.mcc001.3gppnetwork.org
+#       # Optional; present => the SEPP initiates N32-c towards it at startup.
+#       address: sepp.5gc.mnc002.mcc001.3gppnetwork.org:8443
+#     home_nfs:                              # AMF use (optional; absent => UEs of this PLMN are not routed)
+#       ausf_api_root: https://ausf.5gc.mnc002.mcc001.3gppnetwork.org:8002
+#       udm_api_root: https://udm.5gc.mnc002.mcc001.3gppnetwork.org:8003
+#       # Optional: home SMF for home-routed PDU sessions; absent => the PDU sessions of
+#       # this PLMN's roaming UEs are rejected (fail closed).
+#       smf_api_root: https://smf.5gc.mnc002.mcc001.3gppnetwork.org:8004
+partners: []

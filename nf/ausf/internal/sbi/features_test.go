@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/francurieses/claudia-5gc/shared/capability"
+	"github.com/francurieses/claudia-5gc/shared/nrf"
 )
 
 func profileNamed(t *testing.T, name string) *capability.Profile {
@@ -56,5 +57,30 @@ func TestGolden_NFProfile(t *testing.T) {
 	got, _ := json.Marshal(BuildNFProfile(id, profileNamed(t, "rel19"), NausfUEAuthenticationCatalog()))
 	if !strings.Contains(string(got), `"supportedFeatures":"0"`) {
 		t.Errorf("rel19 profile lacks per-service supportedFeatures: %s", got)
+	}
+}
+
+// TestNFProfileFQDNIdentity: fqdn unset leaves the profile byte-identical;
+// set adds fqdn, ipEndPoints port and plmnList.
+func TestNFProfileFQDNIdentity(t *testing.T) {
+	const id = "11111111-2222-3333-4444-555555555555"
+	p := profileNamed(t, "rel19")
+	base, _ := json.Marshal(BuildNFProfile(id, p, NausfUEAuthenticationCatalog()))
+	unset := BuildNFProfile(id, p, NausfUEAuthenticationCatalog())
+	if err := nrf.ApplyFQDNIdentity(unset, "", "0.0.0.0:8002", "001", "02"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := json.Marshal(unset); string(got) != string(base) {
+		t.Fatalf("unset fqdn changed profile: %s", got)
+	}
+	set := BuildNFProfile(id, p, NausfUEAuthenticationCatalog())
+	if err := nrf.ApplyFQDNIdentity(set, "ausf.5gc.mnc002.mcc001.3gppnetwork.org", "0.0.0.0:8002", "001", "02"); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := json.Marshal(set)
+	for _, w := range []string{`"fqdn":"ausf.5gc.mnc002.mcc001.3gppnetwork.org"`, `"port":8002`, `"plmnList":[{"mcc":"001","mnc":"02"}]`} {
+		if !strings.Contains(string(got), w) {
+			t.Errorf("profile lacks %s: %s", w, got)
+		}
 	}
 }

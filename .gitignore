@@ -17,6 +17,8 @@ pki/*.key
 pki/*.csr
 pki/*.srl
 pki/*.cnf
+pki/n32/**/*.key
+pki/n32/**/*.srl
 # ca.crt is public and needed to verify NF connections
 !pki/ca.crt
 
@@ -24,6 +26,9 @@ pki/*.cnf
 .env
 .env.*
 !.env.example
+
+# Roaming partners (operator-specific; the example and test-peer files are committed)
+config/roaming/partners.yaml
 
 # PCAPs
 pcaps/

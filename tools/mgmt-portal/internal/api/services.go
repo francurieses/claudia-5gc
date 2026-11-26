@@ -22,6 +22,11 @@ func (d Deps) handleListServices(w http.ResponseWriter, r *http.Request) {
 	if svcs == nil {
 		svcs = []dockerclient.Service{}
 	}
+	for i := range svcs {
+		if svcs[i].NF != "" {
+			svcs[i].Side = sideOf(svcs[i].Name)
+		}
+	}
 	writeJSON(w, http.StatusOK, svcs)
 }
 

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
 import type { ReactNode } from 'react'
 import { Download, Loader, Pause, Play, Trash2, Wifi, WifiOff } from 'lucide-react'
 import { getServices } from '../lib/api'
+import type { Service } from '../lib/api'
 import {
   Badge,
   Button,
@@ -19,7 +21,28 @@ import { useStickToBottom } from '../lib/useStickToBottom'
 import { clearLogs, ensureStream, setLogsPaused, useLogStream } from '../lib/logStream'
 import type { ConnState } from '../lib/logStream'
 
-const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'lmf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf']
+/**
+ * Fallback list when the Services API is unavailable. Normally the list is
+ * derived from the Docker `logging.5gc/nf` label, so new NFs (sepp, and the
+ * roaming-profile hsepp/hnrf) appear without a code change (PORTAL-UI-22).
+ */
+const NF_CONTAINERS = ['nrf', 'amf', 'ausf', 'bsf', 'lmf', 'nef', 'nssf', 'pcf', 'smf', 'smsf', 'udm', 'udr', 'upf', 'sepp']
+
+/** Label values that are not network functions (load generators). */
+const NON_NF_LABELS = new Set(['PERF'])
+
+interface ContainerGroup { label: string; names: string[] }
+
+/** NF containers grouped by PLMN side; tooling (MCP) last. */
+function groupContainers(services: Service[]): ContainerGroup[] {
+  const nfs = services.filter(s => s.nf && !NON_NF_LABELS.has(s.nf))
+  const pick = (f: (s: Service) => boolean) => nfs.filter(f).map(s => s.name).sort()
+  return [
+    { label: 'Local core', names: pick(s => s.side !== 'partner' && s.nf !== 'MCP') },
+    { label: 'Roaming partner (test peer)', names: pick(s => s.side === 'partner') },
+    { label: 'Tooling', names: pick(s => s.nf === 'MCP') },
+  ].filter(g => g.names.length > 0)
+}
 
 /**
  * Log level → semantic token. The level word itself is always printed next to
@@ -45,7 +68,8 @@ const CONN: Record<ConnState, { variant: BadgeVariant; icon: ReactNode; label: s
 }
 
 export default function Logs() {
-  const [container, setContainer] = useState('amf')
+  const [searchParams] = useSearchParams()
+  const [container, setContainer] = useState(searchParams.get('container') || 'amf')
   const [paused, setPaused] = useState(false)
   const [filter, setFilter] = useState('')
   const logRef = useRef<HTMLDivElement>(null)
@@ -61,10 +85,7 @@ export default function Logs() {
     queryFn: getServices,
   })
 
-  const containers = services
-    .filter(s => NF_CONTAINERS.includes(s.name))
-    .map(s => s.name)
-    .sort()
+  const groups = groupContainers(services)
 
   // Auto-scroll while streaming (suspended while paused so the operator can read).
   const { atBottom, jumpToLatest } = useStickToBottom(logRef, lines, paused)
@@ -73,10 +94,9 @@ export default function Logs() {
     ? lines.filter(l => l.raw.toLowerCase().includes(filter.toLowerCase()))
     : lines
 
-  const containerOptions = (containers.length > 0 ? containers : NF_CONTAINERS).map(c => ({
-    value: c,
-    label: c,
-  }))
+  const optionGroups: ContainerGroup[] = groups.length > 0 ? groups : [{ label: 'Network functions', names: NF_CONTAINERS }]
+  // Keep a deep-linked or stopped container selectable even when it is not listed.
+  const listed = optionGroups.some(g => g.names.includes(container))
 
   const downloadLogs = () => {
     const blob = new Blob([lines.map(l => l.raw).join('\n')], { type: 'text/plain' })
@@ -122,12 +142,16 @@ export default function Logs() {
         <div className="flex flex-wrap items-end gap-4">
           <Field label="Container" className="w-48">
             {({ id }) => (
-              <Select
-                id={id}
-                value={container}
-                options={containerOptions}
-                onChange={e => setContainer(e.target.value)}
-              />
+              <Select id={id} value={container} onChange={e => setContainer(e.target.value)}>
+                {!listed && <option value={container}>{container}</option>}
+                {optionGroups.map(g => (
+                  <optgroup key={g.label} label={g.label}>
+                    {g.names.map(n => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </optgroup>
+                ))}
+              </Select>
             )}
           </Field>
 
